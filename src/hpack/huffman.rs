@@ -1,0 +1,277 @@
+//! Table-driven RFC 7541 Huffman coding.
+//!
+//! * Encoding uses a u64 bit accumulator with whole-byte drains — one
+//!   table lookup plus a shift per symbol.
+//! * Decoding uses lazily-built two-level tables: the first 8 bits index
+//!   a 256-entry root table; codes longer than 8 bits descend through
+//!   additional 256-entry levels (max code length is 30 bits, so at most
+//!   four levels). A symbol is resolved by a single indexed read per 8
+//!   consumed bits, with no backtracking.
+
+use crate::hpack::huffman_table::{HUFFMAN, EOS_SYMBOL};
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+
+/// Errors produced while decoding a Huffman string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeError {
+    /// The bit sequence does not match any code.
+    InvalidCode,
+    /// The stream contained the EOS symbol.
+    Eos,
+    /// Trailing padding is not all-ones (RFC 7541 §5.2).
+    InvalidPadding,
+}
+
+#[derive(Clone, Copy)]
+enum Entry {
+    /// A complete symbol (`u16`) with its code length.
+    Leaf(u16, u8),
+    /// Descend into another 256-entry level.
+    Next(usize),
+    /// No code starts here.
+    Empty,
+}
+
+/// A table-driven Huffman decoder. The tables (up to four 256-entry
+/// levels) are built once per instance and then decode with a single
+/// indexed read per 8 consumed bits, no backtracking.
+pub struct HuffmanDecoder {
+    levels: Vec<Box<[Entry; 256]>>,
+}
+
+impl HuffmanDecoder {
+    /// Build the decode tables from the RFC 7541 code.
+    pub fn new() -> Self {
+        Self {
+            levels: build_levels(),
+        }
+    }
+
+    /// Decode `src` into `out`, returning the number of bytes appended.
+    pub fn decode(&self, src: &[u8], out: &mut Vec<u8>) -> Result<usize, DecodeError> {
+        let start = out.len();
+        decode_with(&self.levels, src, out)?;
+        Ok(out.len() - start)
+    }
+}
+
+impl Default for HuffmanDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn build_levels() -> Vec<Box<[Entry; 256]>> {
+    let mut levels: Vec<Box<[Entry; 256]>> = vec![Box::new([Entry::Empty; 256])];
+    for (sym, &(code, len)) in HUFFMAN.iter().enumerate() {
+        let mut node = 0usize;
+        let mut consumed = 0usize;
+        // Walk full 8-bit steps while more than 8 bits remain.
+        while (len as usize) - consumed > 8 {
+            let shift = (len as usize) - consumed - 8;
+            let idx = ((code >> shift) & 0xFF) as usize;
+            match levels[node][idx] {
+                Entry::Next(n) => node = n,
+                _ => {
+                    let n = levels.len();
+                    levels.push(Box::new([Entry::Empty; 256]));
+                    levels[node][idx] = Entry::Next(n);
+                    node = n;
+                }
+            }
+            consumed += 8;
+        }
+        // Remaining 1..=8 bits land in this level as a leaf that covers
+        // every 8-bit window sharing the same prefix.
+        let rem = (len as usize) - consumed;
+        let shift = 8 - rem;
+        let idx_base = ((code >> shift) & (((1u32 << rem) - 1))) << shift;
+        let span = 1usize << shift;
+        for i in 0..span {
+            levels[node][(idx_base as usize) + i] = Entry::Leaf(sym as u16, len);
+        }
+    }
+    levels
+}
+
+/// Encode `src` with the static Huffman code, appending EOS-compatible
+/// padding, into `out`. Returns the number of bytes appended.
+pub fn encode(src: &[u8], out: &mut Vec<u8>) -> usize {
+    let mut acc: u64 = 0;
+    let mut nbits: u32 = 0;
+    for &b in src {
+        let (code, len) = HUFFMAN[b as usize];
+        acc = (acc << len) | code as u64;
+        nbits += len as u32;
+        while nbits >= 8 {
+            nbits -= 8;
+            out.push((acc >> nbits) as u8);
+        }
+    }
+    if nbits > 0 {
+        let pad = 8 - nbits;
+        // EOS's most significant bits are all ones, so padding is ones.
+        let v = ((acc << pad) | ((1u64 << pad) - 1)) as u8;
+        out.push(v);
+        nbits = 0;
+    }
+    let _ = nbits;
+    src.len()
+}
+
+/// Decode a Huffman string into `out`. Validates padding per RFC 7541
+/// §5.2. Returns the number of bytes appended.
+///
+/// Convenience wrapper that builds a fresh decoder; the hot path should
+/// hold a [`HuffmanDecoder`] and call it directly.
+pub fn decode(src: &[u8], out: &mut Vec<u8>) -> Result<usize, DecodeError> {
+    HuffmanDecoder::new().decode(src, out)
+}
+
+fn decode_with(levels: &[Box<[Entry; 256]>], src: &[u8], out: &mut Vec<u8>) -> Result<(), DecodeError> {
+    let total_bits = src.len() * 8;
+    let mut br = BitReader::new(src);
+    let mut consumed = 0usize;
+    let mut node = 0usize;
+    while consumed < total_bits {
+        let remaining = total_bits - consumed;
+        if remaining < 8 {
+            let v = br.peek(remaining as u32) as u32;
+            if v == (1u32 << remaining) - 1 {
+                break; // valid all-ones padding
+            }
+            return Err(DecodeError::InvalidPadding);
+        }
+        let idx = br.peek(8) as usize;
+        match levels[node][idx] {
+            Entry::Leaf(sym, len) => {
+                if sym as usize == EOS_SYMBOL {
+                    return Err(DecodeError::Eos);
+                }
+                out.push(sym as u8);
+                br.skip(len as u32);
+                consumed += len as usize;
+                node = 0;
+            }
+            Entry::Next(n) => {
+                br.skip(8);
+                consumed += 8;
+                node = n;
+                // A `Next` means the code continues; if the stream ends
+                // right here the code is incomplete, which is malformed
+                // (padding longer than 7 bits / truncated code).
+                if consumed == total_bits {
+                    return Err(DecodeError::InvalidCode);
+                }
+            }
+            Entry::Empty => return Err(DecodeError::InvalidCode),
+        }
+    }
+    Ok(())
+}
+
+/// MSB-first bit reader over a byte slice. `peek` does not advance;
+/// `skip` advances without interpreting.
+struct BitReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+    bit: u32,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0, bit: 0 }
+    }
+
+    /// Read up to 8 bits starting at the current position without
+    /// advancing. Assumes `n` bits are available.
+    fn peek(&self, n: u32) -> u16 {
+        debug_assert!(n >= 1 && n <= 8);
+        let mut v = 0u16;
+        let mut have = 0u32;
+        let mut p = self.pos;
+        let mut b = self.bit;
+        while have < n {
+            let byte = self.data[p] as u16;
+            let take = core::cmp::min(8 - b, n - have);
+            let shift = 8 - b - take;
+            v = (v << take) | ((byte >> shift) & ((1u16 << take) - 1));
+            have += take;
+            b += take;
+            if b == 8 {
+                b = 0;
+                p += 1;
+            }
+        }
+        v
+    }
+
+    /// Advance `n` bits.
+    fn skip(&mut self, n: u32) {
+        self.bit += n;
+        self.pos += (self.bit / 8) as usize;
+        self.bit %= 8;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(data: &[u8]) {
+        let mut enc = Vec::new();
+        encode(data, &mut enc);
+        let mut dec = Vec::new();
+        decode(&enc, &mut dec).unwrap();
+        assert_eq!(dec, data);
+    }
+
+    #[test]
+    fn roundtrip_ascii() {
+        roundtrip(b"www.example.com");
+        roundtrip(b"GET /index.html HTTP/1.1\r\n");
+        roundtrip(b"custom-key: custom-value");
+        roundtrip(b"Mon, 21 Oct 2013 20:13:22 GMT");
+        roundtrip(b"https://www.example.com");
+    }
+
+    #[test]
+    fn roundtrip_all_bytes() {
+        let all: Vec<u8> = (0u16..=255).map(|b| b as u8).collect();
+        roundtrip(&all);
+    }
+
+    #[test]
+    fn roundtrip_long_and_binary() {
+        let long = vec![b'a'; 4096];
+        roundtrip(&long);
+        let binary: Vec<u8> = (0u8..=255).cycle().take(8192).collect();
+        roundtrip(&binary);
+    }
+
+    #[test]
+    fn rfc_example_authority() {
+        // RFC 7541 C.4.1: :authority = www.example.com -> f1e3c2e5f23a6ba0ab90f4ff
+        let hex: Vec<u8> = (0..12)
+            .map(|i| {
+                let b = [0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff][i];
+                b
+            })
+            .collect();
+        let mut out = Vec::new();
+        decode(&hex, &mut out).unwrap();
+        assert_eq!(out, b"www.example.com");
+    }
+
+    #[test]
+    fn rejects_eos_and_padding() {
+        // EOS is 30 ones; a string of 0xff 0xff 0xff 0xfc-ish decodes to EOS.
+        let eos_encoded = [0xffu8, 0xff, 0xff, 0xff];
+        let mut out = Vec::new();
+        assert!(decode(&eos_encoded, &mut out).is_err());
+        // A single byte 0xff has 8 leading ones: prefix of EOS => InvalidCode
+        let mut out2 = Vec::new();
+        assert!(decode(&[0xff], &mut out2).is_err());
+    }
+}

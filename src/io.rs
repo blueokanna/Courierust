@@ -1,0 +1,325 @@
+//! Minimal, dependency-free `Read`/`Write` traits plus buffered adapters.
+//!
+//! The traits are intentionally tiny so any transport (TCP, TLS stream,
+//! memory pipe, ...) can be adapted in a few lines, keeping the whole
+//! protocol core `no_std`-capable.
+
+use crate::error::{Error, Result};
+use alloc::vec::Vec;
+
+/// A byte source. Returns `Ok(0)` on clean EOF.
+pub trait Read {
+    /// Read into `buf`, returning the number of bytes read.
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
+}
+
+/// A byte sink.
+pub trait Write {
+    /// Write as many bytes as possible; returns the count written.
+    fn write(&mut self, buf: &[u8]) -> Result<usize>;
+
+    /// Flush any buffered output.
+    fn flush(&mut self) -> Result<()>;
+}
+
+impl<T: Read + ?Sized> Read for &mut T {
+    #[inline]
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        (**self).read(buf)
+    }
+}
+
+impl<T: Write + ?Sized> Write for &mut T {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        (**self).write(buf)
+    }
+
+    #[inline]
+    fn flush(&mut self) -> Result<()> {
+        (**self).flush()
+    }
+}
+
+/// Buffered reader with exact-read and big-endian integer helpers.
+pub struct BufReader<R> {
+    inner: R,
+    buf: Vec<u8>,
+    pos: usize,
+    cap: usize,
+}
+
+impl<R> BufReader<R> {
+    /// Wrap `inner` with a `cap`-byte buffer.
+    pub fn new(inner: R, cap: usize) -> Self {
+        Self {
+            inner,
+            buf: vec![0u8; cap],
+            pos: 0,
+            cap: 0,
+        }
+    }
+
+    /// Access the wrapped reader.
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
+    /// Number of bytes currently buffered.
+    #[inline]
+    pub fn buffered(&self) -> usize {
+        self.cap - self.pos
+    }
+}
+
+impl<R: Read> BufReader<R> {
+    /// Fill the buffer if it is empty; returns the buffered slice.
+    pub fn fill_buf(&mut self) -> Result<&[u8]> {
+        if self.pos == self.cap {
+            self.pos = 0;
+            self.cap = 0;
+            let n = self.inner.read(&mut self.buf)?;
+            if n == 0 {
+                return Ok(&[]);
+            }
+            self.cap = n;
+        }
+        Ok(&self.buf[self.pos..self.cap])
+    }
+
+    /// Mark `n` buffered bytes as consumed.
+    pub fn consume(&mut self, n: usize) {
+        debug_assert!(n <= self.cap - self.pos);
+        self.pos += n;
+        if self.pos == self.cap {
+            self.pos = 0;
+            self.cap = 0;
+        }
+    }
+
+    /// Read exactly `n` bytes (fails with `UnexpectedEof` on short read).
+    pub fn read_exact(&mut self, n: usize) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(n);
+        while out.len() < n {
+            let b = self.fill_buf()?;
+            if b.is_empty() {
+                return Err(Error::eof());
+            }
+            let take = core::cmp::min(n - out.len(), b.len());
+            out.extend_from_slice(&b[..take]);
+            self.consume(take);
+        }
+        Ok(out)
+    }
+
+    /// Read exactly `n` bytes into `out`.
+    pub fn read_exact_into(&mut self, out: &mut [u8]) -> Result<()> {
+        let mut filled = 0;
+        while filled < out.len() {
+            let b = self.fill_buf()?;
+            if b.is_empty() {
+                return Err(Error::eof());
+            }
+            let take = core::cmp::min(out.len() - filled, b.len());
+            out[filled..filled + take].copy_from_slice(&b[..take]);
+            self.consume(take);
+            filled += take;
+        }
+        Ok(())
+    }
+
+    /// Read a single byte.
+    pub fn read_u8(&mut self) -> Result<u8> {
+        let b = self.fill_buf()?;
+        if b.is_empty() {
+            return Err(Error::eof());
+        }
+        let v = b[0];
+        self.consume(1);
+        Ok(v)
+    }
+
+    /// Big-endian u16.
+    pub fn read_u16(&mut self) -> Result<u16> {
+        let mut b = [0u8; 2];
+        self.read_exact_into(&mut b)?;
+        Ok(u16::from_be_bytes(b))
+    }
+
+    /// Big-endian 24-bit value.
+    pub fn read_u24(&mut self) -> Result<u32> {
+        let mut b = [0u8; 3];
+        self.read_exact_into(&mut b)?;
+        Ok(((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32))
+    }
+
+    /// Big-endian u32.
+    pub fn read_u32(&mut self) -> Result<u32> {
+        let mut b = [0u8; 4];
+        self.read_exact_into(&mut b)?;
+        Ok(u32::from_be_bytes(b))
+    }
+
+    /// Big-endian u64.
+    pub fn read_u64(&mut self) -> Result<u64> {
+        let mut b = [0u8; 8];
+        self.read_exact_into(&mut b)?;
+        Ok(u64::from_be_bytes(b))
+    }
+
+    /// Read up to `max` bytes, stopping at (and including) `delim`.
+    /// Returns the bytes read including `delim` (or up to `max`).
+    pub fn read_until(&mut self, delim: u8, max: usize) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(64);
+        loop {
+            if out.len() >= max {
+                return Err(Error::overflow("read_until exceeded max"));
+            }
+            let b = self.fill_buf()?;
+            if b.is_empty() {
+                return Err(Error::eof());
+            }
+            let mut idx = 0;
+            let room = max - out.len();
+            let scan = core::cmp::min(room, b.len());
+            while idx < scan {
+                let c = b[idx];
+                out.push(c);
+                idx += 1;
+                if c == delim {
+                    self.consume(idx);
+                    return Ok(out);
+                }
+            }
+            self.consume(idx);
+        }
+    }
+}
+
+/// Buffered writer that coalesces small writes.
+pub struct BufWriter<W> {
+    inner: W,
+    buf: Vec<u8>,
+}
+
+impl<W> BufWriter<W> {
+    /// Wrap `inner` with a `cap`-byte buffer.
+    pub fn new(inner: W, cap: usize) -> Self {
+        Self {
+            inner,
+            buf: Vec::with_capacity(cap),
+        }
+    }
+
+    /// Access the wrapped writer.
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    /// Number of bytes currently buffered.
+    #[inline]
+    pub fn buffered(&self) -> usize {
+        self.buf.len()
+    }
+}
+
+impl<W: Write> BufWriter<W> {
+    /// Consume the wrapper, returning the inner writer (flushes first).
+    pub fn into_inner(mut self) -> Result<W> {
+        self.flush()?;
+        Ok(self.inner)
+    }
+
+    /// Write a whole slice, buffering as needed.
+    pub fn write_all(&mut self, data: &[u8]) -> Result<()> {
+        // Large writes bypass the buffer when it is empty.
+        if self.buf.is_empty() && data.len() >= self.buf.capacity() {
+            self.inner.write(data)?;
+            return Ok(());
+        }
+        if self.buf.len() + data.len() > self.buf.capacity() {
+            self.flush()?;
+        }
+        self.buf.extend_from_slice(data);
+        Ok(())
+    }
+
+    /// Write a single byte.
+    pub fn write_u8(&mut self, b: u8) -> Result<()> {
+        self.write_all(&[b])
+    }
+}
+
+impl<W: Write> BufWriter<W> {
+    /// Flush the internal buffer to the inner writer.
+    pub fn flush(&mut self) -> Result<()> {
+        if !self.buf.is_empty() {
+            self.inner.write(&self.buf)?;
+            self.buf.clear();
+        }
+        self.inner.flush()
+    }
+}
+
+/// Read-adaptor for an in-memory byte slice (useful for tests and
+/// no-transport codecs).
+pub struct SliceReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> SliceReader<'a> {
+    /// Wrap a slice.
+    pub fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+}
+
+impl Read for SliceReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        if self.pos >= self.data.len() {
+            return Ok(0);
+        }
+        let n = core::cmp::min(buf.len(), self.data.len() - self.pos);
+        buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+/// Write-adaptor that appends into a `Vec` (useful for tests).
+pub struct VecWriter(pub Vec<u8>);
+
+impl Write for VecWriter {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        self.0.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bufreader_exact_and_until() {
+        let mut r = BufReader::new(SliceReader::new(b"hello\r\nworld"), 4);
+        assert_eq!(r.read_until(b'\n', 64).unwrap(), b"hello\r\n");
+        let rest = r.read_exact(5).unwrap();
+        assert_eq!(rest, b"world");
+    }
+
+    #[test]
+    fn bufwriter_coalesces_and_flushes() {
+        let mut w = BufWriter::new(VecWriter(Vec::new()), 8);
+        w.write_all(b"ab").unwrap();
+        w.write_all(b"cd").unwrap();
+        assert_eq!(w.buffered(), 4);
+        w.flush().unwrap();
+        assert_eq!(w.get_ref().0, b"abcd");
+    }
+}

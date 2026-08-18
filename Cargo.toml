@@ -1,0 +1,30 @@
+[package]
+name = "courierust"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["blueokanna", "HyphenTeam"]
+description = "no_std HTTP/1+2/gRPC engine with work-stealing, RFC 9218, and JA3/JA4 fingerprinting."
+homepage = "https://github.com/blueokanna/Courierust"
+repository = "https://github.com/blueokanna/Courierust"
+readme = "README.md"
+keywords = ["http2", "network", "client", "no-std", "multicore"]
+categories = [
+    "network-programming",
+    "web-programming::http-client",
+    "web-programming::http-server",
+]
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+nextjson = { version = "0.1" }
+rustbinary = { version = "0.1" }
+
+[dev-dependencies]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
