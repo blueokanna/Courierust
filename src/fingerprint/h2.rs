@@ -45,8 +45,8 @@ impl Default for ChromeH2Fingerprint {
             header_table_size: 65_536,
             enable_push: 0,
             max_concurrent_streams: 100,
-            initial_window_size: 6_291_456, // 0x00600000
-            max_header_list_size: 262_144,  // 0x00040000
+            initial_window_size: 6_291_456,       // 0x00600000
+            max_header_list_size: 262_144,        // 0x00040000
             connection_window_update: 12_517_377, // 0x00BF0001
             sort_headers: true,
         }
@@ -62,11 +62,26 @@ impl ChromeH2Fingerprint {
     /// The SETTINGS entries in the order Chrome sends them.
     pub fn settings_entries(&self) -> Vec<Setting> {
         alloc::vec![
-            Setting { id: SETTINGS_HEADER_TABLE_SIZE, value: self.header_table_size },
-            Setting { id: SETTINGS_ENABLE_PUSH, value: self.enable_push },
-            Setting { id: SETTINGS_MAX_CONCURRENT_STREAMS, value: self.max_concurrent_streams },
-            Setting { id: SETTINGS_INITIAL_WINDOW_SIZE, value: self.initial_window_size },
-            Setting { id: SETTINGS_MAX_HEADER_LIST_SIZE, value: self.max_header_list_size },
+            Setting {
+                id: SETTINGS_HEADER_TABLE_SIZE,
+                value: self.header_table_size
+            },
+            Setting {
+                id: SETTINGS_ENABLE_PUSH,
+                value: self.enable_push
+            },
+            Setting {
+                id: SETTINGS_MAX_CONCURRENT_STREAMS,
+                value: self.max_concurrent_streams
+            },
+            Setting {
+                id: SETTINGS_INITIAL_WINDOW_SIZE,
+                value: self.initial_window_size
+            },
+            Setting {
+                id: SETTINGS_MAX_HEADER_LIST_SIZE,
+                value: self.max_header_list_size
+            },
         ]
     }
 
@@ -82,8 +97,10 @@ impl ChromeH2Fingerprint {
 
     /// Build an `h2::Config` shaped like Chrome (client role).
     pub fn h2_config(&self) -> crate::h2::connection::Config {
-        let mut cfg = crate::h2::connection::Config::default();
-        cfg.client = true;
+        let mut cfg = crate::h2::connection::Config {
+            client: true,
+            ..Default::default()
+        };
         self.apply_to_settings(&mut cfg.local_settings);
         cfg
     }
@@ -116,7 +133,7 @@ mod tests {
 
     fn hf(n: &str, v: &str) -> HeaderField {
         HeaderField::new(
-            HeaderName::from_bytes(n.as_bytes()).unwrap(),
+            HeaderName::from_hpack_bytes(n.as_bytes()).unwrap(),
             HeaderValue::from_bytes(v.as_bytes()).unwrap(),
         )
     }
@@ -143,6 +160,15 @@ mod tests {
         ];
         let ordered = order_headers_chrome(&fields);
         let names: Vec<&str> = ordered.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(names, vec![":method", ":path", "accept-encoding", "cache-control", "user-agent"]);
+        assert_eq!(
+            names,
+            vec![
+                ":method",
+                ":path",
+                "accept-encoding",
+                "cache-control",
+                "user-agent"
+            ]
+        );
     }
 }

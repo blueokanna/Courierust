@@ -80,8 +80,8 @@ pub fn chrome_tls_profile() -> TlsProfile {
         has_sni: true,
         // TLS 1.3 AES-GCM / CHACHA + TLS 1.2 ECDHE suites + CBC fallbacks.
         ciphers: alloc::vec![
-            0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc013,
-            0xc014, 0x009c, 0x009d, 0x002f, 0x0035,
+            0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc013, 0xc014,
+            0x009c, 0x009d, 0x002f, 0x0035,
         ],
         // Classic wire order: SNI, extended_master_secret,
         // renegotiation_info, supported_groups, ec_point_formats,
@@ -90,8 +90,8 @@ pub fn chrome_tls_profile() -> TlsProfile {
         // supported_versions, compress_certificate,
         // application_settings, padding.
         extensions: alloc::vec![
-            0x0000, 0x0017, 0xff01, 0x000a, 0x000b, 0x0023, 0x0010, 0x0005, 0x000d, 0x0012,
-            0x0033, 0x002d, 0x002b, 0x001b, 0x4469, 0x0015,
+            0x0000, 0x0017, 0xff01, 0x000a, 0x000b, 0x0023, 0x0010, 0x0005, 0x000d, 0x0012, 0x0033,
+            0x002d, 0x002b, 0x001b, 0x4469, 0x0015,
         ],
         // rsa_pss_rsae_sha256, rsa_pss_rsae_sha384, rsa_pkcs1_sha256,
         // ecdsa_secp256r1_sha256, rsa_pss_rsae_sha512, rsa_pkcs1_sha512,
@@ -105,4 +105,3 @@ pub fn chrome_tls_profile() -> TlsProfile {
         alpn: alloc::vec!["h2".into(), "http/1.1".into()],
     }
 }
-

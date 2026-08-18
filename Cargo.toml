@@ -20,11 +20,17 @@ default = ["std"]
 std = []
 
 [dependencies]
-nextjson = { version = "0.1" }
-rustbinary = { version = "0.1" }
 
 [dev-dependencies]
 
+[[bench]]
+name = "throughput"
+harness = false
+
 [profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
 lto = "thin"
 codegen-units = 1

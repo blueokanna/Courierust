@@ -53,7 +53,10 @@ impl Error {
     /// Build an error from a kind.
     #[inline]
     pub fn new(kind: ErrorKind) -> Self {
-        Self { kind, message: None }
+        Self {
+            kind,
+            message: None,
+        }
     }
 
     /// Build an error with a message.
@@ -69,6 +72,12 @@ impl Error {
     #[inline]
     pub fn io(msg: impl Into<String>) -> Self {
         Self::with_message(ErrorKind::Io, msg)
+    }
+
+    /// The operation exceeded its deadline.
+    #[inline]
+    pub fn timeout(msg: impl Into<String>) -> Self {
+        Self::with_message(ErrorKind::Timeout, msg)
     }
 
     /// Unexpected end of stream.
@@ -183,6 +192,6 @@ impl From<std::io::Error> for Error {
 #[cfg(feature = "std")]
 impl From<Error> for std::io::Error {
     fn from(e: Error) -> Self {
-        std::io::Error::new(std::io::ErrorKind::Other, e)
+        std::io::Error::other(e)
     }
 }

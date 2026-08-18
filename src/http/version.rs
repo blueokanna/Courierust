@@ -4,6 +4,7 @@ use core::fmt;
 
 /// HTTP version.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default)]
+#[allow(non_camel_case_types)]
 pub enum Version {
     /// HTTP/0.9 (legacy, minimal support)
     HTTP_09,

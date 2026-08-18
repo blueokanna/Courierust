@@ -6,7 +6,6 @@
 
 use crate::bytes::Bytes;
 use alloc::collections::VecDeque;
-use alloc::vec::Vec;
 
 /// FNV-1a 64-bit hash (public-domain algorithm, Fowler/Noll/Vo).
 pub(crate) const fn fnv1a(data: &[u8]) -> u64 {
@@ -144,6 +143,12 @@ impl DynamicTable {
         self.entries.len()
     }
 
+    /// Whether the table is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Change the capacity, evicting from the tail as needed.
     pub fn set_max_size(&mut self, max: usize) {
         self.max_size = max;
@@ -187,7 +192,9 @@ impl DynamicTable {
     /// Get the 0-based dynamic entry at `i`.
     #[inline]
     pub fn get(&self, i: usize) -> Option<(&[u8], &[u8])> {
-        self.entries.get(i).map(|e| (e.name.as_slice(), e.value.as_slice()))
+        self.entries
+            .get(i)
+            .map(|e| (e.name.as_slice(), e.value.as_slice()))
     }
 
     /// Find a dynamic entry with matching name AND value. Returns the
@@ -216,17 +223,9 @@ impl DynamicTable {
 }
 
 /// Combined static + dynamic table with 1-based global indexing.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Table {
     dyn_table: DynamicTable,
-}
-
-impl Default for Table {
-    fn default() -> Self {
-        Self {
-            dyn_table: DynamicTable::default(),
-        }
-    }
 }
 
 impl Table {
@@ -238,7 +237,10 @@ impl Table {
 
     /// Resolve a 1-based global index into a header field.
     pub fn get(&self, index: usize) -> Option<(&[u8], &[u8])> {
-        if (1..=STATIC_LEN).contains(&index) {
+        if index == 0 {
+            return None; // index 0 is never valid (RFC 7541 §6.1)
+        }
+        if index <= STATIC_LEN {
             Some(STATIC_TABLE[index - 1])
         } else {
             let d = index - STATIC_LEN - 1;
@@ -290,9 +292,18 @@ mod tests {
 
     #[test]
     fn static_indices() {
-        assert_eq!(Table::default().get(1), Some((b":authority".as_slice(), b"".as_slice())));
-        assert_eq!(Table::default().get(2), Some((b":method".as_slice(), b"GET".as_slice())));
-        assert_eq!(Table::default().get(61), Some((b"www-authenticate".as_slice(), b"".as_slice())));
+        assert_eq!(
+            Table::default().get(1),
+            Some((b":authority".as_slice(), b"".as_slice()))
+        );
+        assert_eq!(
+            Table::default().get(2),
+            Some((b":method".as_slice(), b"GET".as_slice()))
+        );
+        assert_eq!(
+            Table::default().get(61),
+            Some((b"www-authenticate".as_slice(), b"".as_slice()))
+        );
         assert_eq!(Table::default().get(62), None);
         assert_eq!(Table::default().get(0), None);
     }

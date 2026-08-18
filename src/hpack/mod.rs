@@ -13,9 +13,9 @@ pub mod table;
 
 use crate::bytes::{Bytes, BytesMut};
 use crate::error::{Error, Result};
-use crate::http::header::{HeaderName, HeaderValue};
 use crate::hpack::huffman::{encode as huffman_encode, HuffmanDecoder};
 use crate::hpack::table::Table;
+use crate::http::header::{HeaderName, HeaderValue};
 use alloc::vec::Vec;
 
 /// One decoded/encoded header field with its sensitivity marker.
@@ -54,7 +54,12 @@ impl HeaderField {
 pub type HeaderList = Vec<HeaderField>;
 
 /// Names that are conventionally never compressed (RFC 7541 §7.1.3).
-const SENSITIVE_NAMES: [&str; 4] = ["authorization", "cookie", "proxy-authorization", "set-cookie"];
+const SENSITIVE_NAMES: [&str; 4] = [
+    "authorization",
+    "cookie",
+    "proxy-authorization",
+    "set-cookie",
+];
 
 /// Read an RFC 7541 §5.1 integer with an `n`-bit prefix whose value bits
 /// are in `prefix`. `pos` is advanced past continuation octets.
@@ -83,7 +88,12 @@ fn read_int(input: &[u8], pos: &mut usize, n: u8, prefix: u8) -> Result<usize> {
 }
 
 /// Read an RFC 7541 §5.2 string literal (Huffman bit + 7-bit length).
-fn read_string(input: &[u8], pos: &mut usize, max_len: usize, huff: &HuffmanDecoder) -> Result<Bytes> {
+fn read_string(
+    input: &[u8],
+    pos: &mut usize,
+    max_len: usize,
+    huff: &HuffmanDecoder,
+) -> Result<Bytes> {
     if *pos >= input.len() {
         return Err(Error::protocol("HPACK: truncated string"));
     }
@@ -101,9 +111,8 @@ fn read_string(input: &[u8], pos: &mut usize, max_len: usize, huff: &HuffmanDeco
     *pos += len;
     if huffman {
         let mut out = Vec::with_capacity(len);
-        huff.decode(raw, &mut out).map_err(|e| {
-            Error::protocol(format!("HPACK: Huffman decode error: {e:?}"))
-        })?;
+        huff.decode(raw, &mut out)
+            .map_err(|e| Error::protocol(format!("HPACK: Huffman decode error: {e:?}")))?;
         Ok(Bytes::from(out))
     } else {
         Ok(Bytes::from(raw))
@@ -151,7 +160,10 @@ impl Decoder {
         let mut pos = 0usize;
         let mut saw_rep = false;
         while pos < input.len() {
+            // The dispatch byte is consumed here; `read_int` only consumes
+            // continuation octets beyond the prefix.
             let b = input[pos];
+            pos += 1;
             if b & 0x80 != 0 {
                 // Indexed header field (§6.1)
                 let idx = read_int(input, &mut pos, 7, b & 0x7f)?;
@@ -205,7 +217,9 @@ impl Decoder {
                 }
                 let new = read_int(input, &mut pos, 5, b & 0x1f)?;
                 if new > self.max_table_size {
-                    return Err(Error::protocol("HPACK: size update exceeds advertised maximum"));
+                    return Err(Error::protocol(
+                        "HPACK: size update exceeds advertised maximum",
+                    ));
                 }
                 self.table.dynamic().set_max_size(new);
             } else {
@@ -398,10 +412,11 @@ fn write_table_size_update(size: usize, out: &mut BytesMut) {
 mod tests {
     use super::*;
     use crate::hpack::huffman_table::HUFFMAN;
+    use alloc::string::String;
 
     fn hex(s: &str) -> Vec<u8> {
         let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-        assert!(s.len() % 2 == 0);
+        assert!(s.len().is_multiple_of(2));
         (0..s.len() / 2)
             .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap())
             .collect()
@@ -411,99 +426,151 @@ mod tests {
         list.iter()
             .map(|(n, v)| {
                 HeaderField::new(
-                    HeaderName::from_bytes(n.as_bytes()).unwrap(),
+                    HeaderName::from_hpack_bytes(n.as_bytes()).unwrap(),
                     HeaderValue::from_bytes(v.as_bytes()).unwrap(),
                 )
             })
             .collect()
     }
 
-    fn assert_decodes(wire: &[u8], expected: &[(&str, &str)]) {
-        let mut dec = Decoder::new(4096, 1 << 20);
-        let out = dec.decode(wire).unwrap();
-        let exp = headers(expected);
-        assert_eq!(out.len(), exp.len(), "field count");
-        for (a, b) in out.iter().zip(exp.iter()) {
-            assert_eq!(a.name.as_str(), b.name.as_str());
-            assert_eq!(a.value.as_bytes(), b.value.as_bytes());
-        }
-    }
-
     #[test]
-    fn rfc_c3_1_first_request_no_huffman() {
-        // :method GET, :scheme http, :path /, :authority www.example.com
-        assert_decodes(
-            &hex("8286 8441 0f77 7777 2e65 7861 6d70 6c65 2e63 6f6d"),
-            &[(":method", "GET"), (":scheme", "http"), (":path", "/"), (":authority", "www.example.com")],
+    fn rfc_c3_request_sequence_no_huffman() {
+        // RFC 7541 C.3: three consecutive requests on one connection.
+        let mut dec = Decoder::new(4096, 1 << 20);
+        let out1 = dec
+            .decode(&hex("8286 8441 0f77 7777 2e65 7861 6d70 6c65 2e63 6f6d"))
+            .unwrap();
+        assert_eq!(
+            out1,
+            headers(&[
+                (":method", "GET"),
+                (":scheme", "http"),
+                (":path", "/"),
+                (":authority", "www.example.com"),
+            ])
+        );
+        let out2 = dec
+            .decode(&hex("8286 84be 5808 6e6f 2d63 6163 6865"))
+            .unwrap();
+        assert_eq!(
+            out2,
+            headers(&[
+                (":method", "GET"),
+                (":scheme", "http"),
+                (":path", "/"),
+                (":authority", "www.example.com"),
+                ("cache-control", "no-cache"),
+            ])
+        );
+        let out3 = dec
+            .decode(&hex(
+                "8287 85bf 400a 6375 7374 6f6d 2d6b 6579 0c63 7573 746f 6d2d 7661 6c75 65",
+            ))
+            .unwrap();
+        assert_eq!(
+            out3,
+            headers(&[
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":path", "/index.html"),
+                (":authority", "www.example.com"),
+                ("custom-key", "custom-value"),
+            ])
         );
     }
 
     #[test]
-    fn rfc_c3_2_second_request_no_huffman() {
+    fn rfc_c4_request_sequence_huffman() {
         let mut dec = Decoder::new(4096, 1 << 20);
-        let out = dec
-            .decode(&hex("8286 84be 5808 6e6f 2d63 6163 6865"))
-            .unwrap();
-        let exp = headers(&[
-            (":method", "GET"),
-            (":scheme", "http"),
-            (":path", "/"),
-            (":authority", "www.example.com"),
-            ("cache-control", "no-cache"),
-        ]);
-        assert_eq!(out, exp);
-    }
-
-    #[test]
-    fn rfc_c3_3_third_request_no_huffman() {
-        // Requires eviction (table size 256) and dynamic indexing.
-        let mut dec = Decoder::new(256, 1 << 20);
-        let out = dec
-            .decode(&hex("8286 84be 400a 6375 7374 6f6d 2d6b 6579 0c63 7573 746f 6d2d 7661 6c75 65"))
-            .unwrap();
-        let exp = headers(&[
-            (":method", "GET"),
-            (":scheme", "https"),
-            (":path", "/index.html"),
-            (":authority", "www.example.com"),
-            ("custom-key", "custom-value"),
-        ]);
-        assert_eq!(out, exp);
-    }
-
-    #[test]
-    fn rfc_c4_1_first_request_huffman() {
-        let mut dec = Decoder::new(4096, 1 << 20);
-        let out = dec
+        let out1 = dec
             .decode(&hex("8286 8441 8cf1 e3c2 e5f2 3a6b a0ab 90f4 ff"))
             .unwrap();
-        let exp = headers(&[
-            (":method", "GET"),
-            (":scheme", "http"),
-            (":path", "/"),
-            (":authority", "www.example.com"),
-        ]);
-        assert_eq!(out, exp);
+        assert_eq!(
+            out1,
+            headers(&[
+                (":method", "GET"),
+                (":scheme", "http"),
+                (":path", "/"),
+                (":authority", "www.example.com"),
+            ])
+        );
+        let out2 = dec.decode(&hex("8286 84be 5886 a8eb 1064 9cbf")).unwrap();
+        assert_eq!(
+            out2,
+            headers(&[
+                (":method", "GET"),
+                (":scheme", "http"),
+                (":path", "/"),
+                (":authority", "www.example.com"),
+                ("cache-control", "no-cache"),
+            ])
+        );
+        let out3 = dec
+            .decode(&hex(
+                "8287 85bf 4088 25a8 49e9 5ba9 7d7f 8925 a849 e95b b8e8 b4bf",
+            ))
+            .unwrap();
+        assert_eq!(
+            out3,
+            headers(&[
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":path", "/index.html"),
+                (":authority", "www.example.com"),
+                ("custom-key", "custom-value"),
+            ])
+        );
     }
 
     #[test]
-    fn rfc_c6_1_first_response_huffman() {
+    fn rfc_c6_response_sequence_huffman() {
         let mut dec = Decoder::new(256, 1 << 20);
-        let out = dec
-            .decode(&hex(
-                "4882 6402 5885 aec3 771a 4b61 96d0 7abe \
+        let out1 = dec
+            .decode(&hex("4882 6402 5885 aec3 771a 4b61 96d0 7abe \
                  9410 54d4 44a8 2005 9504 0b81 66e0 82a6 \
                  2d1b ff6e 919d 29ad 1718 63c7 8f0b 97c8 \
-                 e9ae 82ae 43d3",
-            ))
+                 e9ae 82ae 43d3"))
             .unwrap();
-        let exp = headers(&[
-            (":status", "302"),
-            ("cache-control", "private"),
-            ("date", "Mon, 21 Oct 2013 20:13:21 GMT"),
-            ("location", "https://www.example.com"),
-        ]);
-        assert_eq!(out, exp);
+        assert_eq!(
+            out1,
+            headers(&[
+                (":status", "302"),
+                ("cache-control", "private"),
+                ("date", "Mon, 21 Oct 2013 20:13:21 GMT"),
+                ("location", "https://www.example.com"),
+            ])
+        );
+        let out2 = dec.decode(&hex("4883 640e ffc1 c0bf")).unwrap();
+        assert_eq!(
+            out2,
+            headers(&[
+                (":status", "307"),
+                ("cache-control", "private"),
+                ("date", "Mon, 21 Oct 2013 20:13:21 GMT"),
+                ("location", "https://www.example.com"),
+            ])
+        );
+        let out3 = dec
+            .decode(&hex("88c1 6196 d07a be94 1054 d444 a820 0595 \
+                 040b 8166 e084 a62d 1bff c05a 839b d9ab \
+                 77ad 94e7 821d d7f2 e6c7 b335 dfdf cd5b \
+                 3960 d5af 2708 7f36 72c1 ab27 0fb5 291f \
+                 9587 3160 65c0 03ed 4ee5 b106 3d50 07"))
+            .unwrap();
+        assert_eq!(
+            out3,
+            headers(&[
+                (":status", "200"),
+                ("cache-control", "private"),
+                ("date", "Mon, 21 Oct 2013 20:13:22 GMT"),
+                ("location", "https://www.example.com"),
+                ("content-encoding", "gzip"),
+                (
+                    "set-cookie",
+                    "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1"
+                ),
+            ])
+        );
     }
 
     #[test]
@@ -511,12 +578,11 @@ mod tests {
         // C.2.1 literal indexed with new name
         let mut dec = Decoder::new(4096, 1 << 20);
         let out = dec
-            .decode(&hex("400a 6375 7374 6f6d 2d6b 6579 0d63 7573 746f 6d2d 6865 6164 6572"))
+            .decode(&hex(
+                "400a 6375 7374 6f6d 2d6b 6579 0d63 7573 746f 6d2d 6865 6164 6572",
+            ))
             .unwrap();
-        assert_eq!(
-            out,
-            headers(&[("custom-key", "custom-header")])
-        );
+        assert_eq!(out, headers(&[("custom-key", "custom-header")]));
 
         // C.2.2 literal without indexing, indexed name
         let out2 = dec
@@ -542,9 +608,12 @@ mod tests {
     fn huffman_table_is_complete() {
         assert_eq!(HUFFMAN.len(), 257);
         // Every length is within 5..=30 bits.
-        for &(code, len) in HUFFMAN.iter() {
-            assert!((5..=30).contains(&(len as u16)), "bad len {len}");
-            assert!(code < (1u32 << len), "code does not fit len");
+        for (i, &(code, len)) in HUFFMAN.iter().enumerate() {
+            assert!((5..=30).contains(&(len as u16)), "bad len {len} at sym {i}");
+            assert!(
+                code < (1u32 << len),
+                "code does not fit len at sym {i}: code={code:#x} len={len}"
+            );
         }
     }
 
@@ -576,7 +645,11 @@ mod tests {
         let mut dec = Decoder::new(4096, 1 << 20);
         let back = dec.decode(wire.as_slice()).unwrap();
         assert_eq!(back, fields);
-        assert!(wire.len() < 32, "expected compact encoding, got {} bytes", wire.len());
+        assert!(
+            wire.len() < 32,
+            "expected compact encoding, got {} bytes",
+            wire.len()
+        );
     }
 
     #[test]

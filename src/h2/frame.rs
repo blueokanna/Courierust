@@ -205,7 +205,10 @@ impl Frame {
         match header.kind {
             kind::DATA => {
                 if sid == 0 {
-                    return Err(Error::h2(ErrorCode::ProtocolError.as_u32(), "DATA on stream 0"));
+                    return Err(Error::h2(
+                        ErrorCode::ProtocolError.as_u32(),
+                        "DATA on stream 0",
+                    ));
                 }
                 let (data, pad) = strip_padding(payload, header.flags, flag::PADDED)?;
                 let _ = pad;
@@ -217,23 +220,28 @@ impl Frame {
             }
             kind::HEADERS => {
                 if sid == 0 {
-                    return Err(Error::h2(ErrorCode::ProtocolError.as_u32(), "HEADERS on stream 0"));
+                    return Err(Error::h2(
+                        ErrorCode::ProtocolError.as_u32(),
+                        "HEADERS on stream 0",
+                    ));
                 }
                 let mut rest = payload;
                 let pad_len = if header.flags & flag::PADDED != 0 {
-                    let p = *rest
-                        .first()
-                        .ok_or_else(|| Error::h2(ErrorCode::FrameSizeError.as_u32(), "padded HEADERS empty"))?
-                        as usize;
+                    let p = *rest.first().ok_or_else(|| {
+                        Error::h2(ErrorCode::FrameSizeError.as_u32(), "padded HEADERS empty")
+                    })? as usize;
                     rest = &rest[1..];
                     p
                 } else {
                     0
                 };
                 let priority = if header.flags & flag::PRIORITY != 0 {
-                    let raw = rest
-                        .get(..5)
-                        .ok_or_else(|| Error::h2(ErrorCode::FrameSizeError.as_u32(), "HEADERS priority truncated"))?;
+                    let raw = rest.get(..5).ok_or_else(|| {
+                        Error::h2(
+                            ErrorCode::FrameSizeError.as_u32(),
+                            "HEADERS priority truncated",
+                        )
+                    })?;
                     let dep = u32::from_be_bytes([raw[0] & 0x7f, raw[1], raw[2], raw[3]]);
                     let weight = raw[4].wrapping_add(1);
                     rest = &rest[5..];
@@ -246,7 +254,10 @@ impl Frame {
                     None
                 };
                 if rest.len() + pad_len > payload.len() {
-                    return Err(Error::h2(ErrorCode::FrameSizeError.as_u32(), "HEADERS padding overrun"));
+                    return Err(Error::h2(
+                        ErrorCode::FrameSizeError.as_u32(),
+                        "HEADERS padding overrun",
+                    ));
                 }
                 let block_len = rest.len().saturating_sub(pad_len);
                 Ok(Frame::Headers {
@@ -259,12 +270,19 @@ impl Frame {
             }
             kind::PRIORITY => {
                 if sid == 0 {
-                    return Err(Error::h2(ErrorCode::ProtocolError.as_u32(), "PRIORITY on stream 0"));
+                    return Err(Error::h2(
+                        ErrorCode::ProtocolError.as_u32(),
+                        "PRIORITY on stream 0",
+                    ));
                 }
                 if payload.len() != 5 {
-                    return Err(Error::h2(ErrorCode::FrameSizeError.as_u32(), "PRIORITY length != 5"));
+                    return Err(Error::h2(
+                        ErrorCode::FrameSizeError.as_u32(),
+                        "PRIORITY length != 5",
+                    ));
                 }
-                let dep = u32::from_be_bytes([payload[0] & 0x7f, payload[1], payload[2], payload[3]]);
+                let dep =
+                    u32::from_be_bytes([payload[0] & 0x7f, payload[1], payload[2], payload[3]]);
                 Ok(Frame::Priority {
                     stream_id: sid,
                     priority: LegacyPriority {
@@ -276,10 +294,16 @@ impl Frame {
             }
             kind::RST_STREAM => {
                 if sid == 0 {
-                    return Err(Error::h2(ErrorCode::ProtocolError.as_u32(), "RST_STREAM on stream 0"));
+                    return Err(Error::h2(
+                        ErrorCode::ProtocolError.as_u32(),
+                        "RST_STREAM on stream 0",
+                    ));
                 }
                 if payload.len() != 4 {
-                    return Err(Error::h2(ErrorCode::FrameSizeError.as_u32(), "RST_STREAM length != 4"));
+                    return Err(Error::h2(
+                        ErrorCode::FrameSizeError.as_u32(),
+                        "RST_STREAM length != 4",
+                    ));
                 }
                 let code = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
                 Ok(Frame::RstStream {
@@ -289,17 +313,29 @@ impl Frame {
             }
             kind::SETTINGS => {
                 if sid != 0 {
-                    return Err(Error::h2(ErrorCode::ProtocolError.as_u32(), "SETTINGS on stream != 0"));
+                    return Err(Error::h2(
+                        ErrorCode::ProtocolError.as_u32(),
+                        "SETTINGS on stream != 0",
+                    ));
                 }
                 let ack = header.flags & flag::ACK != 0;
                 if ack {
                     if !payload.is_empty() {
-                        return Err(Error::h2(ErrorCode::FrameSizeError.as_u32(), "SETTINGS ACK with payload"));
+                        return Err(Error::h2(
+                            ErrorCode::FrameSizeError.as_u32(),
+                            "SETTINGS ACK with payload",
+                        ));
                     }
-                    return Ok(Frame::Settings { ack: true, entries: Vec::new() });
+                    return Ok(Frame::Settings {
+                        ack: true,
+                        entries: Vec::new(),
+                    });
                 }
-                if payload.len() % 6 != 0 {
-                    return Err(Error::h2(ErrorCode::FrameSizeError.as_u32(), "SETTINGS length % 6 != 0"));
+                if !payload.len().is_multiple_of(6) {
+                    return Err(Error::h2(
+                        ErrorCode::FrameSizeError.as_u32(),
+                        "SETTINGS length % 6 != 0",
+                    ));
                 }
                 let mut entries = Vec::with_capacity(payload.len() / 6);
                 for c in payload.chunks_exact(6) {
@@ -307,30 +343,42 @@ impl Frame {
                     let value = u32::from_be_bytes([c[2], c[3], c[4], c[5]]);
                     entries.push(Setting { id, value });
                 }
-                Ok(Frame::Settings { ack: false, entries })
+                Ok(Frame::Settings {
+                    ack: false,
+                    entries,
+                })
             }
             kind::PUSH_PROMISE => {
                 if sid == 0 {
-                    return Err(Error::h2(ErrorCode::ProtocolError.as_u32(), "PUSH_PROMISE on stream 0"));
+                    return Err(Error::h2(
+                        ErrorCode::ProtocolError.as_u32(),
+                        "PUSH_PROMISE on stream 0",
+                    ));
                 }
                 let mut rest = payload;
                 let pad_len = if header.flags & flag::PADDED != 0 {
-                    let p = *rest
-                        .first()
-                        .ok_or_else(|| Error::h2(ErrorCode::FrameSizeError.as_u32(), "padded PUSH_PROMISE empty"))?
-                        as usize;
+                    let p = *rest.first().ok_or_else(|| {
+                        Error::h2(
+                            ErrorCode::FrameSizeError.as_u32(),
+                            "padded PUSH_PROMISE empty",
+                        )
+                    })? as usize;
                     rest = &rest[1..];
                     p
                 } else {
                     0
                 };
-                let promised = rest
-                    .get(..4)
-                    .ok_or_else(|| Error::h2(ErrorCode::FrameSizeError.as_u32(), "PUSH_PROMISE truncated"))?;
-                let promised_id = u32::from_be_bytes([promised[0] & 0x7f, promised[1], promised[2], promised[3]]);
+                let promised = rest.get(..4).ok_or_else(|| {
+                    Error::h2(ErrorCode::FrameSizeError.as_u32(), "PUSH_PROMISE truncated")
+                })?;
+                let promised_id =
+                    u32::from_be_bytes([promised[0] & 0x7f, promised[1], promised[2], promised[3]]);
                 rest = &rest[4..];
                 if rest.len() + pad_len > payload.len() {
-                    return Err(Error::h2(ErrorCode::FrameSizeError.as_u32(), "PUSH_PROMISE padding overrun"));
+                    return Err(Error::h2(
+                        ErrorCode::FrameSizeError.as_u32(),
+                        "PUSH_PROMISE padding overrun",
+                    ));
                 }
                 let block_len = rest.len().saturating_sub(pad_len);
                 Ok(Frame::PushPromise {
@@ -342,10 +390,16 @@ impl Frame {
             }
             kind::PING => {
                 if sid != 0 {
-                    return Err(Error::h2(ErrorCode::ProtocolError.as_u32(), "PING on stream != 0"));
+                    return Err(Error::h2(
+                        ErrorCode::ProtocolError.as_u32(),
+                        "PING on stream != 0",
+                    ));
                 }
                 if payload.len() != 8 {
-                    return Err(Error::h2(ErrorCode::FrameSizeError.as_u32(), "PING length != 8"));
+                    return Err(Error::h2(
+                        ErrorCode::FrameSizeError.as_u32(),
+                        "PING length != 8",
+                    ));
                 }
                 let mut data = [0u8; 8];
                 data.copy_from_slice(payload);
@@ -356,12 +410,19 @@ impl Frame {
             }
             kind::GOAWAY => {
                 if sid != 0 {
-                    return Err(Error::h2(ErrorCode::ProtocolError.as_u32(), "GOAWAY on stream != 0"));
+                    return Err(Error::h2(
+                        ErrorCode::ProtocolError.as_u32(),
+                        "GOAWAY on stream != 0",
+                    ));
                 }
                 if payload.len() < 8 {
-                    return Err(Error::h2(ErrorCode::FrameSizeError.as_u32(), "GOAWAY too short"));
+                    return Err(Error::h2(
+                        ErrorCode::FrameSizeError.as_u32(),
+                        "GOAWAY too short",
+                    ));
                 }
-                let last = u32::from_be_bytes([payload[0] & 0x7f, payload[1], payload[2], payload[3]]);
+                let last =
+                    u32::from_be_bytes([payload[0] & 0x7f, payload[1], payload[2], payload[3]]);
                 let code = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
                 Ok(Frame::GoAway {
                     last_stream_id: last,
@@ -371,11 +432,18 @@ impl Frame {
             }
             kind::WINDOW_UPDATE => {
                 if payload.len() != 4 {
-                    return Err(Error::h2(ErrorCode::FrameSizeError.as_u32(), "WINDOW_UPDATE length != 4"));
+                    return Err(Error::h2(
+                        ErrorCode::FrameSizeError.as_u32(),
+                        "WINDOW_UPDATE length != 4",
+                    ));
                 }
-                let inc = u32::from_be_bytes([payload[0] & 0x7f, payload[1], payload[2], payload[3]]);
+                let inc =
+                    u32::from_be_bytes([payload[0] & 0x7f, payload[1], payload[2], payload[3]]);
                 if inc == 0 {
-                    return Err(Error::h2(ErrorCode::ProtocolError.as_u32(), "WINDOW_UPDATE increment 0"));
+                    return Err(Error::h2(
+                        ErrorCode::ProtocolError.as_u32(),
+                        "WINDOW_UPDATE increment 0",
+                    ));
                 }
                 Ok(Frame::WindowUpdate {
                     stream_id: sid,
@@ -384,7 +452,10 @@ impl Frame {
             }
             kind::CONTINUATION => {
                 if sid == 0 {
-                    return Err(Error::h2(ErrorCode::ProtocolError.as_u32(), "CONTINUATION on stream 0"));
+                    return Err(Error::h2(
+                        ErrorCode::ProtocolError.as_u32(),
+                        "CONTINUATION on stream 0",
+                    ));
                 }
                 Ok(Frame::Continuation {
                     stream_id: sid,
@@ -394,14 +465,24 @@ impl Frame {
             }
             kind::PRIORITY_UPDATE => {
                 if sid != 0 {
-                    return Err(Error::h2(ErrorCode::ProtocolError.as_u32(), "PRIORITY_UPDATE on stream != 0"));
+                    return Err(Error::h2(
+                        ErrorCode::ProtocolError.as_u32(),
+                        "PRIORITY_UPDATE on stream != 0",
+                    ));
                 }
                 if payload.len() < 4 {
-                    return Err(Error::h2(ErrorCode::FrameSizeError.as_u32(), "PRIORITY_UPDATE too short"));
+                    return Err(Error::h2(
+                        ErrorCode::FrameSizeError.as_u32(),
+                        "PRIORITY_UPDATE too short",
+                    ));
                 }
-                let prioritized = u32::from_be_bytes([payload[0] & 0x7f, payload[1], payload[2], payload[3]]);
+                let prioritized =
+                    u32::from_be_bytes([payload[0] & 0x7f, payload[1], payload[2], payload[3]]);
                 if prioritized == 0 {
-                    return Err(Error::h2(ErrorCode::ProtocolError.as_u32(), "PRIORITY_UPDATE stream 0"));
+                    return Err(Error::h2(
+                        ErrorCode::ProtocolError.as_u32(),
+                        "PRIORITY_UPDATE stream 0",
+                    ));
                 }
                 Ok(Frame::PriorityUpdate {
                     prioritized_stream_id: prioritized,
@@ -419,15 +500,26 @@ impl Frame {
 
     /// Serialize a frame into `out`.
     pub fn encode(&self, out: &mut BytesMut) {
-        let (kind, flags, stream_id, payload): (u8, u8, u32, &[u8]) = match self {
-            Frame::Data { stream_id, data, end_stream } => {
+        match self {
+            Frame::Data {
+                stream_id,
+                data,
+                end_stream,
+            } => {
                 let mut f = 0u8;
                 if *end_stream {
                     f |= flag::END_STREAM;
                 }
-                (kind::DATA, f, *stream_id, data.as_slice())
+                encode_header(data.len() as u32, kind::DATA, f, *stream_id, out);
+                out.extend_from_slice(data);
             }
-            Frame::Headers { stream_id, block, end_stream, end_headers, priority } => {
+            Frame::Headers {
+                stream_id,
+                block,
+                end_stream,
+                end_headers,
+                priority,
+            } => {
                 let mut f = 0u8;
                 if *end_stream {
                     f |= flag::END_STREAM;
@@ -435,7 +527,7 @@ impl Frame {
                 if *end_headers {
                     f |= flag::END_HEADERS;
                 }
-                let mut payload = BytesMut::new();
+                let mut payload = BytesMut::with_capacity(block.len() + 5);
                 if let Some(p) = priority {
                     f |= flag::PRIORITY;
                     let mut dep = p.dependency;
@@ -446,72 +538,122 @@ impl Frame {
                     payload.put_u8(p.weight.wrapping_sub(1));
                 }
                 payload.extend_from_slice(block);
-                (kind::HEADERS, f, *stream_id, payload.as_slice())
+                encode_header(payload.len() as u32, kind::HEADERS, f, *stream_id, out);
+                out.extend_from_slice(payload.as_slice());
             }
-            Frame::Priority { stream_id, priority } => {
-                let mut payload = BytesMut::new();
+            Frame::Priority {
+                stream_id,
+                priority,
+            } => {
+                let mut payload = BytesMut::with_capacity(5);
                 let mut dep = priority.dependency;
                 if priority.exclusive {
                     dep |= 0x8000_0000;
                 }
                 payload.put_u32(dep);
                 payload.put_u8(priority.weight.wrapping_sub(1));
-                (kind::PRIORITY, 0, *stream_id, payload.as_slice())
+                encode_header(5, kind::PRIORITY, 0, *stream_id, out);
+                out.extend_from_slice(payload.as_slice());
             }
-            Frame::RstStream { stream_id, error_code } => {
-                let mut payload = BytesMut::new();
+            Frame::RstStream {
+                stream_id,
+                error_code,
+            } => {
+                let mut payload = BytesMut::with_capacity(4);
                 payload.put_u32(error_code.as_u32());
-                (kind::RST_STREAM, 0, *stream_id, payload.as_slice())
+                encode_header(4, kind::RST_STREAM, 0, *stream_id, out);
+                out.extend_from_slice(payload.as_slice());
             }
             Frame::Settings { ack, entries } => {
                 let flags = if *ack { flag::ACK } else { 0 };
-                let mut payload = BytesMut::new();
+                let mut payload = BytesMut::with_capacity(entries.len() * 6);
                 for s in entries {
                     payload.put_u16(s.id);
                     payload.put_u32(s.value);
                 }
-                (kind::SETTINGS, flags, 0, payload.as_slice())
+                encode_header(payload.len() as u32, kind::SETTINGS, flags, 0, out);
+                out.extend_from_slice(payload.as_slice());
             }
-            Frame::PushPromise { stream_id, promised_id, block, end_headers } => {
+            Frame::PushPromise {
+                stream_id,
+                promised_id,
+                block,
+                end_headers,
+            } => {
                 let flags = if *end_headers { flag::END_HEADERS } else { 0 };
-                let mut payload = BytesMut::new();
+                let mut payload = BytesMut::with_capacity(block.len() + 4);
                 payload.put_u32(*promised_id & 0x7fff_ffff);
                 payload.extend_from_slice(block);
-                (kind::PUSH_PROMISE, flags, *stream_id, payload.as_slice())
+                encode_header(
+                    payload.len() as u32,
+                    kind::PUSH_PROMISE,
+                    flags,
+                    *stream_id,
+                    out,
+                );
+                out.extend_from_slice(payload.as_slice());
             }
             Frame::Ping { ack, data } => {
                 let flags = if *ack { flag::ACK } else { 0 };
-                (kind::PING, flags, 0, data)
+                encode_header(8, kind::PING, flags, 0, out);
+                out.extend_from_slice(data);
             }
-            Frame::GoAway { last_stream_id, error_code, debug } => {
-                let mut payload = BytesMut::new();
+            Frame::GoAway {
+                last_stream_id,
+                error_code,
+                debug,
+            } => {
+                let mut payload = BytesMut::with_capacity(debug.len() + 8);
                 payload.put_u32(*last_stream_id & 0x7fff_ffff);
                 payload.put_u32(error_code.as_u32());
                 payload.extend_from_slice(debug);
-                (kind::GOAWAY, 0, 0, payload.as_slice())
+                encode_header(payload.len() as u32, kind::GOAWAY, 0, 0, out);
+                out.extend_from_slice(payload.as_slice());
             }
-            Frame::WindowUpdate { stream_id, increment } => {
-                let mut payload = BytesMut::new();
+            Frame::WindowUpdate {
+                stream_id,
+                increment,
+            } => {
+                let mut payload = BytesMut::with_capacity(4);
                 payload.put_u32(*increment & 0x7fff_ffff);
-                (kind::WINDOW_UPDATE, 0, *stream_id, payload.as_slice())
+                encode_header(4, kind::WINDOW_UPDATE, 0, *stream_id, out);
+                out.extend_from_slice(payload.as_slice());
             }
-            Frame::Continuation { stream_id, end_headers, block } => {
+            Frame::Continuation {
+                stream_id,
+                end_headers,
+                block,
+            } => {
                 let flags = if *end_headers { flag::END_HEADERS } else { 0 };
-                (kind::CONTINUATION, flags, *stream_id, block.as_slice())
+                encode_header(
+                    block.len() as u32,
+                    kind::CONTINUATION,
+                    flags,
+                    *stream_id,
+                    out,
+                );
+                out.extend_from_slice(block);
             }
-            Frame::PriorityUpdate { prioritized_stream_id, priority_field } => {
-                let mut payload = BytesMut::new();
+            Frame::PriorityUpdate {
+                prioritized_stream_id,
+                priority_field,
+            } => {
+                let mut payload = BytesMut::with_capacity(priority_field.len() + 4);
                 payload.put_u32(*prioritized_stream_id & 0x7fff_ffff);
                 payload.extend_from_slice(priority_field);
-                (kind::PRIORITY_UPDATE, 0, 0, payload.as_slice())
+                encode_header(payload.len() as u32, kind::PRIORITY_UPDATE, 0, 0, out);
+                out.extend_from_slice(payload.as_slice());
             }
-            Frame::Unknown { kind, flags, stream_id, payload } => (*kind, *flags, *stream_id, payload.as_slice()),
-        };
-        out.put_u24(payload.len() as u32);
-        out.put_u8(kind);
-        out.put_u8(flags);
-        out.put_u32(stream_id & 0x7fff_ffff);
-        out.extend_from_slice(payload);
+            Frame::Unknown {
+                kind,
+                flags,
+                stream_id,
+                payload,
+            } => {
+                encode_header(payload.len() as u32, *kind, *flags, *stream_id, out);
+                out.extend_from_slice(payload);
+            }
+        }
     }
 
     /// The frame's own stream id (0 for connection-level frames).
@@ -539,7 +681,10 @@ fn strip_padding(payload: &[u8], flags: u8, padded_flag: u8) -> Result<(&[u8], u
         .ok_or_else(|| Error::h2(ErrorCode::FrameSizeError.as_u32(), "padded frame empty"))?
         as usize;
     if pad >= payload.len() {
-        return Err(Error::h2(ErrorCode::FrameSizeError.as_u32(), "padding overrun"));
+        return Err(Error::h2(
+            ErrorCode::FrameSizeError.as_u32(),
+            "padding overrun",
+        ));
     }
     Ok((&payload[1..payload.len() - pad], pad))
 }
@@ -565,6 +710,7 @@ pub fn decode_header(b: &[u8; 9]) -> FrameHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::h2::settings::{SETTINGS_HEADER_TABLE_SIZE, SETTINGS_INITIAL_WINDOW_SIZE};
 
     fn roundtrip(f: &Frame) {
         let mut buf = BytesMut::new();
@@ -595,18 +741,33 @@ mod tests {
         roundtrip(&Frame::Settings {
             ack: false,
             entries: vec![
-                Setting { id: SETTINGS_HEADER_TABLE_SIZE, value: 4096 },
-                Setting { id: SETTINGS_INITIAL_WINDOW_SIZE, value: 65535 },
+                Setting {
+                    id: SETTINGS_HEADER_TABLE_SIZE,
+                    value: 4096,
+                },
+                Setting {
+                    id: SETTINGS_INITIAL_WINDOW_SIZE,
+                    value: 65535,
+                },
             ],
         });
-        roundtrip(&Frame::Settings { ack: true, entries: vec![] });
-        roundtrip(&Frame::Ping { ack: false, data: [1, 2, 3, 4, 5, 6, 7, 8] });
+        roundtrip(&Frame::Settings {
+            ack: true,
+            entries: vec![],
+        });
+        roundtrip(&Frame::Ping {
+            ack: false,
+            data: [1, 2, 3, 4, 5, 6, 7, 8],
+        });
         roundtrip(&Frame::GoAway {
             last_stream_id: 100,
             error_code: ErrorCode::NoError,
             debug: Bytes::from_static(b"bye"),
         });
-        roundtrip(&Frame::WindowUpdate { stream_id: 0, increment: 65535 });
+        roundtrip(&Frame::WindowUpdate {
+            stream_id: 0,
+            increment: 65535,
+        });
         roundtrip(&Frame::PriorityUpdate {
             prioritized_stream_id: 7,
             priority_field: Bytes::from_static(b"u=0, i"),
@@ -620,8 +781,14 @@ mod tests {
         Frame::Settings {
             ack: false,
             entries: vec![
-                Setting { id: SETTINGS_HEADER_TABLE_SIZE, value: 65536 },
-                Setting { id: SETTINGS_INITIAL_WINDOW_SIZE, value: 6291456 },
+                Setting {
+                    id: SETTINGS_HEADER_TABLE_SIZE,
+                    value: 65536,
+                },
+                Setting {
+                    id: SETTINGS_INITIAL_WINDOW_SIZE,
+                    value: 6291456,
+                },
             ],
         }
         .encode(&mut buf);

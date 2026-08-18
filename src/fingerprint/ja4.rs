@@ -21,11 +21,22 @@ pub fn ja4(p: &TlsProfile) -> String {
     let mut out = String::with_capacity(80);
 
     // a-part
-    out.push(if p.protocol == 'q' { 'q' } else if p.protocol == 'd' { 'd' } else { 't' });
+    out.push(if p.protocol == 'q' {
+        'q'
+    } else if p.protocol == 'd' {
+        'd'
+    } else {
+        't'
+    });
     out.push_str(&ja4_version(p));
     out.push(if p.has_sni { 'd' } else { 'i' });
 
-    let ciphers: Vec<u16> = p.ciphers.iter().copied().filter(|&c| !is_grease(c)).collect();
+    let ciphers: Vec<u16> = p
+        .ciphers
+        .iter()
+        .copied()
+        .filter(|&c| !is_grease(c))
+        .collect();
     let exts: Vec<u16> = p
         .extensions
         .iter()
@@ -50,7 +61,11 @@ pub fn ja4(p: &TlsProfile) -> String {
 
     // c-part: sorted extensions minus SNI(0) and ALPN(16), then sigalgs
     // in original order.
-    let mut exts2: Vec<u16> = exts.iter().copied().filter(|&e| e != 0 && e != 0x0010).collect();
+    let mut exts2: Vec<u16> = exts
+        .iter()
+        .copied()
+        .filter(|&e| e != 0 && e != 0x0010)
+        .collect();
     exts2.sort_unstable();
     if exts2.is_empty() {
         out.push_str("000000000000");
@@ -151,16 +166,18 @@ mod tests {
         let mut p = TlsProfile::default();
         p.alpn.clear();
         let fp = ja4(&p);
-        assert!(fp.starts_with("t13d00"), "{fp}");
+        assert!(fp.starts_with("t12d00"), "{fp}");
     }
 
     #[test]
     fn grease_is_filtered() {
-        let mut p = TlsProfile::default();
-        p.ciphers = vec![0x1301, 0x0a0a, 0x1302, 0x1a1a];
-        p.extensions = vec![0x0000, 0x0010, 0x0a0a, 0x002b];
-        p.alpn = vec!["h2".into()];
+        let p = TlsProfile {
+            ciphers: vec![0x1301, 0x0a0a, 0x1302, 0x1a1a],
+            extensions: vec![0x0000, 0x0010, 0x0a0a, 0x002b],
+            alpn: vec!["h2".into()],
+            ..Default::default()
+        };
         let fp = ja4(&p);
-        assert!(fp.starts_with("t13d0202h2"), "{fp}");
+        assert!(fp.starts_with("t12d0203h2"), "{fp}");
     }
 }

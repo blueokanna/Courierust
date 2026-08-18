@@ -1,1 +1,0 @@
-(&mut std::vec::Vec<_>, &mut std::vec::Vec<_>, for<'a, 'b> fn(&'a mut connection::Connection<_, io::VecWriter>, &'b mut std::vec::Vec<u8>) {drain::<io::VecWriter, _>}, connection::Connection<io::SliceReader<'_>, io::VecWriter>, connection::Connection<io::SliceReader<'_>, io::VecWriter>)

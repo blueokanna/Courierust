@@ -45,8 +45,23 @@ impl<B> Response<B> {
         self
     }
 
+    /// Build a response with a status code for any body type.
+    pub fn with_status(status: StatusCode) -> Self
+    where
+        B: Default,
+    {
+        Self {
+            status,
+            ..Self::default()
+        }
+    }
+
     /// Append a header (keeps duplicates).
-    pub fn append_header(mut self, name: impl Into<HeaderName>, value: impl Into<HeaderValue>) -> Self {
+    pub fn append_header(
+        mut self,
+        name: impl Into<HeaderName>,
+        value: impl Into<HeaderValue>,
+    ) -> Self {
         self.headers.append(name.into(), value.into());
         self
     }

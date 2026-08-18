@@ -52,9 +52,13 @@ pub mod http;
 pub mod io;
 
 #[cfg(feature = "std")]
+pub mod body;
+#[cfg(feature = "std")]
 pub mod client;
 #[cfg(feature = "std")]
 pub mod grpc;
+#[cfg(feature = "std")]
+pub mod h1;
 #[cfg(feature = "std")]
 pub mod net;
 #[cfg(feature = "std")]

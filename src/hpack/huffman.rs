@@ -8,7 +8,7 @@
 //!   four levels). A symbol is resolved by a single indexed read per 8
 //!   consumed bits, with no backtracking.
 
-use crate::hpack::huffman_table::{HUFFMAN, EOS_SYMBOL};
+use crate::hpack::huffman_table::{EOS_SYMBOL, HUFFMAN};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
@@ -83,13 +83,15 @@ fn build_levels() -> Vec<Box<[Entry; 256]>> {
             consumed += 8;
         }
         // Remaining 1..=8 bits land in this level as a leaf that covers
-        // every 8-bit window sharing the same prefix.
+        // every 8-bit window sharing the same prefix. The remaining bits
+        // are the low `rem` bits of the code, aligned to the top of the
+        // window.
         let rem = (len as usize) - consumed;
         let shift = 8 - rem;
-        let idx_base = ((code >> shift) & (((1u32 << rem) - 1))) << shift;
+        let idx_base = ((code & ((1u32 << rem) - 1)) << shift) as usize;
         let span = 1usize << shift;
         for i in 0..span {
-            levels[node][(idx_base as usize) + i] = Entry::Leaf(sym as u16, len);
+            levels[node][idx_base + i] = Entry::Leaf(sym as u16, len);
         }
     }
     levels
@@ -129,43 +131,82 @@ pub fn decode(src: &[u8], out: &mut Vec<u8>) -> Result<usize, DecodeError> {
     HuffmanDecoder::new().decode(src, out)
 }
 
-fn decode_with(levels: &[Box<[Entry; 256]>], src: &[u8], out: &mut Vec<u8>) -> Result<(), DecodeError> {
+fn decode_with(
+    levels: &[Box<[Entry; 256]>],
+    src: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), DecodeError> {
     let total_bits = src.len() * 8;
     let mut br = BitReader::new(src);
-    let mut consumed = 0usize;
+    let mut consumed = 0usize; // bits consumed from the stream
+    let mut code_start = 0usize; // stream position where the current code began
     let mut node = 0usize;
-    while consumed < total_bits {
+    loop {
         let remaining = total_bits - consumed;
-        if remaining < 8 {
-            let v = br.peek(remaining as u32) as u32;
-            if v == (1u32 << remaining) - 1 {
-                break; // valid all-ones padding
+        if remaining == 0 {
+            // A clean end is only valid at a symbol boundary.
+            if node != 0 {
+                return Err(DecodeError::InvalidCode);
             }
-            return Err(DecodeError::InvalidPadding);
+            break;
         }
-        let idx = br.peek(8) as usize;
-        match levels[node][idx] {
+        // Read as much of an 8-bit window as is available (fewer bits at
+        // the tail, zero-filled below).
+        let window_bits = if remaining < 8 { remaining as u32 } else { 8 };
+        let v = (br.peek(window_bits) as usize) << (8 - window_bits as usize);
+        match levels[node][v] {
             Entry::Leaf(sym, len) => {
+                // The code ends at `code_start + len`. The window may
+                // contain trailing padding bits (the tail), so validity is
+                // decided by whether the code fits inside the stream.
+                let code_end = code_start + len as usize;
+                if code_end > total_bits {
+                    // Truncated code. If fewer than 8 bits remain this is
+                    // the tail: it must be all-ones padding (MSBs of EOS).
+                    if remaining < 8 {
+                        let bits = br.peek(remaining as u32) as u32;
+                        if bits == (1u32 << remaining) - 1 {
+                            break;
+                        }
+                    }
+                    return Err(DecodeError::InvalidCode);
+                }
                 if sym as usize == EOS_SYMBOL {
                     return Err(DecodeError::Eos);
                 }
                 out.push(sym as u8);
-                br.skip(len as u32);
-                consumed += len as usize;
+                if code_end > consumed {
+                    br.skip((code_end - consumed) as u32);
+                    consumed = code_end;
+                }
                 node = 0;
+                code_start = code_end;
             }
             Entry::Next(n) => {
+                if remaining < 8 {
+                    // The code cannot complete in the remaining bits; the
+                    // only legal tail is all-ones padding.
+                    let bits = br.peek(remaining as u32) as u32;
+                    if bits == (1u32 << remaining) - 1 {
+                        break;
+                    }
+                    return Err(DecodeError::InvalidCode);
+                }
                 br.skip(8);
                 consumed += 8;
                 node = n;
-                // A `Next` means the code continues; if the stream ends
-                // right here the code is incomplete, which is malformed
-                // (padding longer than 7 bits / truncated code).
-                if consumed == total_bits {
-                    return Err(DecodeError::InvalidCode);
-                }
             }
-            Entry::Empty => return Err(DecodeError::InvalidCode),
+            Entry::Empty => {
+                // No code starts here. At the tail this is legal only if
+                // the remaining bits are all-ones padding.
+                if remaining < 8 {
+                    let bits = br.peek(remaining as u32) as u32;
+                    if bits == (1u32 << remaining) - 1 {
+                        break;
+                    }
+                }
+                return Err(DecodeError::InvalidCode);
+            }
         }
     }
     Ok(())
@@ -181,13 +222,17 @@ struct BitReader<'a> {
 
 impl<'a> BitReader<'a> {
     fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0, bit: 0 }
+        Self {
+            data,
+            pos: 0,
+            bit: 0,
+        }
     }
 
     /// Read up to 8 bits starting at the current position without
     /// advancing. Assumes `n` bits are available.
     fn peek(&self, n: u32) -> u16 {
-        debug_assert!(n >= 1 && n <= 8);
+        debug_assert!((1..=8).contains(&n));
         let mut v = 0u16;
         let mut have = 0u32;
         let mut p = self.pos;
@@ -223,7 +268,9 @@ mod tests {
         let mut enc = Vec::new();
         encode(data, &mut enc);
         let mut dec = Vec::new();
-        decode(&enc, &mut dec).unwrap();
+        if let Err(e) = decode(&enc, &mut dec) {
+            panic!("data={data:?} enc={enc:02x?} err={e:?}");
+        }
         assert_eq!(dec, data);
     }
 
@@ -255,13 +302,33 @@ mod tests {
         // RFC 7541 C.4.1: :authority = www.example.com -> f1e3c2e5f23a6ba0ab90f4ff
         let hex: Vec<u8> = (0..12)
             .map(|i| {
-                let b = [0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff][i];
-                b
+                [
+                    0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,
+                ][i]
             })
             .collect();
         let mut out = Vec::new();
         decode(&hex, &mut out).unwrap();
         assert_eq!(out, b"www.example.com");
+    }
+
+    #[test]
+    fn roundtrip_crlf() {
+        roundtrip(b"\r\n");
+        roundtrip(b"a\r\n");
+        roundtrip(b"GET /\r\n");
+        roundtrip(b"\r\n\r\n");
+    }
+
+    #[test]
+    fn encode_matches_rfc_example() {
+        // Encode "www.example.com" and compare with the RFC C.4.1 hex.
+        let mut enc = Vec::new();
+        encode(b"www.example.com", &mut enc);
+        let expected: Vec<u8> = vec![
+            0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,
+        ];
+        assert_eq!(enc, expected);
     }
 
     #[test]
@@ -273,5 +340,34 @@ mod tests {
         // A single byte 0xff has 8 leading ones: prefix of EOS => InvalidCode
         let mut out2 = Vec::new();
         assert!(decode(&[0xff], &mut out2).is_err());
+    }
+
+    #[test]
+    fn table_is_prefix_free() {
+        use crate::hpack::huffman_table::HUFFMAN;
+        // A shorter code must never be a prefix of a longer code.
+        for (i, &(c1, l1)) in HUFFMAN.iter().enumerate() {
+            for (j, &(c2, l2)) in HUFFMAN.iter().enumerate() {
+                if i != j && l1 < l2 {
+                    // c2's top l1 bits equal c1?
+                    let prefix = c2 >> (l2 - l1);
+                    assert_ne!(
+                        prefix, c1,
+                        "symbol {i} (len {l1}) is a prefix of symbol {j} (len {l2})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn kraft_sum_is_one() {
+        use crate::hpack::huffman_table::HUFFMAN;
+        // Sum of 2^-len over all symbols must equal 1 for a complete code.
+        let mut acc: f64 = 0.0;
+        for &(_, len) in HUFFMAN.iter() {
+            acc += 2f64.powi(-(len as i32));
+        }
+        assert!((acc - 1.0).abs() < 1e-12, "kraft sum = {acc}");
     }
 }

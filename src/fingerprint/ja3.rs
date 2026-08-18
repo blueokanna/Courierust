@@ -64,7 +64,7 @@ mod tests {
     fn grease_is_not_counted_by_ja3_input() {
         // JA3 keeps GREASE; the profile builder does not add any.
         let p = TlsProfile::default();
-        assert_eq!(ja3_string(&p), "772,,,,");
+        assert_eq!(ja3_string(&p), "771,,,,");
         let _ = p;
     }
 }

@@ -62,6 +62,7 @@ impl Stream {
             send_done: false,
             recv_ended: false,
             recv_unreleased: 0,
+            headers_delivered: false,
         }
     }
 
@@ -74,10 +75,7 @@ impl Stream {
     /// Whether the stream can still receive data from the peer.
     #[inline]
     pub fn can_recv(&self) -> bool {
-        matches!(
-            self.state,
-            StreamState::Open | StreamState::HalfClosedLocal
-        ) && !self.recv_ended
+        matches!(self.state, StreamState::Open | StreamState::HalfClosedLocal) && !self.recv_ended
     }
 
     /// Whether the stream can still send data.
@@ -97,6 +95,7 @@ pub struct StreamMap {
     /// Next client-initiated stream id we will use.
     next_client_id: u32,
     /// Next server-initiated stream id we will use (push).
+    #[allow(dead_code)]
     next_server_id: u32,
     /// Highest peer-initiated stream id seen.
     last_peer_id: u32,
@@ -136,12 +135,11 @@ impl StreamMap {
         self.streams.insert(s.id, s);
     }
 
-    /// Remove a stream (returns it).
+    /// Remove a stream (returns it). Streams are removed only once they
+    /// have closed, so the open count always drops with the record.
     pub fn remove(&mut self, id: &u32) -> Option<Stream> {
         let s = self.streams.remove(id)?;
-        if !s.is_closed() {
-            self.open_count = self.open_count.saturating_sub(1);
-        }
+        self.open_count = self.open_count.saturating_sub(1);
         Some(s)
     }
 

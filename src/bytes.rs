@@ -9,7 +9,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
-use core::ops::Deref;
+use core::ops::{Deref, Range};
 
 /// Immutable byte buffer with O(1) slicing and cheap clone.
 #[derive(Clone, Default)]
@@ -392,6 +392,15 @@ impl BytesMut {
         BytesMut {
             buf: self.buf.split_off(at),
         }
+    }
+
+    /// Split off the first `at` bytes, keeping the rest.
+    #[inline]
+    pub fn split_to(&mut self, at: usize) -> BytesMut {
+        assert!(at <= self.buf.len());
+        let head = self.buf[..at].to_vec();
+        self.buf.drain(..at);
+        BytesMut { buf: head }
     }
 
     /// Steal the inner `Vec`.

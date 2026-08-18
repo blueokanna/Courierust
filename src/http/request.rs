@@ -5,7 +5,6 @@ use crate::http::header::{HeaderMap, HeaderName, HeaderValue};
 use crate::http::method::Method;
 use crate::http::uri::PathAndQuery;
 use crate::http::version::Version;
-use alloc::vec::Vec;
 
 /// An HTTP request. The body type is generic so the `no_std` core can use
 /// [`Body`] while the threaded layer can use a streaming body.
@@ -69,7 +68,11 @@ impl<B> Request<B> {
     }
 
     /// Append a header (keeps duplicates).
-    pub fn append_header(mut self, name: impl Into<HeaderName>, value: impl Into<HeaderValue>) -> Self {
+    pub fn append_header(
+        mut self,
+        name: impl Into<HeaderName>,
+        value: impl Into<HeaderValue>,
+    ) -> Self {
         self.headers.append(name.into(), value.into());
         self
     }
@@ -154,7 +157,11 @@ impl RequestHead {
             HeaderValue::from_bytes(self.uri.as_bytes())
                 .unwrap_or_else(|_| HeaderValue::from_static("/")),
         ));
-        if let Some(auth) = self.headers.get("authority").or_else(|| self.headers.get("host")) {
+        if let Some(auth) = self
+            .headers
+            .get("authority")
+            .or_else(|| self.headers.get("host"))
+        {
             fields.push(crate::hpack::HeaderField::new(
                 HeaderName::from_lowercase(":authority"),
                 auth.clone(),
@@ -166,9 +173,13 @@ impl RequestHead {
             HeaderValue::from_static("http"),
         ));
         for (n, v) in self.headers.iter() {
-            if n.as_str() == "authority" || n.as_str() == "host" || n.as_str() == "connection"
-                || n.as_str() == "keep-alive" || n.as_str() == "proxy-connection"
-                || n.as_str() == "transfer-encoding" || n.as_str() == "upgrade"
+            if n.as_str() == "authority"
+                || n.as_str() == "host"
+                || n.as_str() == "connection"
+                || n.as_str() == "keep-alive"
+                || n.as_str() == "proxy-connection"
+                || n.as_str() == "transfer-encoding"
+                || n.as_str() == "upgrade"
             {
                 continue; // hop-by-hop / translated by HTTP/2
             }

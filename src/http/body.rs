@@ -18,6 +18,7 @@ pub enum Body {
 }
 
 impl Body {
+    /// Whether the body is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
         match self {
@@ -26,6 +27,7 @@ impl Body {
         }
     }
 
+    /// Number of bytes.
     #[inline]
     pub fn len(&self) -> usize {
         match self {

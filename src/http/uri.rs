@@ -3,7 +3,7 @@
 use crate::bytes::Bytes;
 use crate::error::{Error, Result};
 use alloc::string::String;
-use alloc::vec::Vec;
+use alloc::string::ToString;
 use core::fmt;
 
 /// A request target: path + optional query, origin-form (`/x?y`),

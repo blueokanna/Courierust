@@ -14,7 +14,10 @@ use core::fmt;
 /// Case-insensitive ASCII equality for header names (RFC 9110 §5.1).
 #[inline]
 pub(crate) fn eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.eq_ignore_ascii_case(y))
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
 /// An HTTP header field name. Invariant: a lowercase token (RFC 9110
@@ -33,7 +36,17 @@ impl HeaderName {
             lower.push(c.to_ascii_lowercase());
         }
         // Safety of the invariant: we just lowercased and validated tokens.
-        Ok(Self(String::from_utf8(lower).map_err(|_| Error::invalid_header_name())?.into_boxed_str()))
+        Ok(Self(
+            String::from_utf8(lower)
+                .map_err(|_| Error::invalid_header_name())?
+                .into_boxed_str(),
+        ))
+    }
+
+    /// A static header name, validated at construction.
+    #[inline]
+    pub fn from_static(s: &'static str) -> Self {
+        Self::from_bytes(s.as_bytes()).expect("invalid static header name")
     }
 
     /// Parse a header name as it appears in an HPACK block: HTTP/2
@@ -50,10 +63,18 @@ impl HeaderName {
         Self::from_bytes(b)
     }
 
-    /// A known lowercase header name (no validation).
+    /// A known lowercase header name (no validation). Allows a leading
+    /// `:` for HTTP/2 pseudo-headers.
     #[inline]
     pub fn from_lowercase(s: &'static str) -> Self {
-        debug_assert!(!s.is_empty() && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-_.~".contains(&(b as char))));
+        debug_assert!({
+            let b = s.as_bytes();
+            let rest = if b.first() == Some(&b':') { &b[1..] } else { b };
+            !rest.is_empty()
+                && rest
+                    .iter()
+                    .all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"-_.~".contains(&c))
+        });
         Self(s.into())
     }
 
@@ -118,7 +139,9 @@ pub struct HeaderValue(Bytes);
 impl HeaderValue {
     /// Validate and wrap bytes.
     pub fn from_bytes(b: &[u8]) -> Result<Self> {
-        if b.iter().any(|&c| c == 0 || c == b'\r' || c == b'\n' || (c < 0x20 && c != b'\t')) {
+        if b.iter()
+            .any(|&c| c == 0 || c == b'\r' || c == b'\n' || (c < 0x20 && c != b'\t'))
+        {
             return Err(Error::invalid_header_value());
         }
         Ok(Self(Bytes::from(b)))
@@ -357,7 +380,11 @@ impl HeaderMap {
 impl fmt::Debug for HeaderMap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list()
-            .entries(self.entries.iter().map(|(n, v)| (n.as_str(), v.to_str().unwrap_or("<binary>"))))
+            .entries(
+                self.entries
+                    .iter()
+                    .map(|(n, v)| (n.as_str(), v.to_str().unwrap_or("<binary>"))),
+            )
             .finish()
     }
 }
@@ -380,7 +407,10 @@ mod tests {
 
     #[test]
     fn header_name_lowercases_and_validates() {
-        assert_eq!(HeaderName::from_bytes(b"Content-Type").unwrap().as_str(), "content-type");
+        assert_eq!(
+            HeaderName::from_bytes(b"Content-Type").unwrap().as_str(),
+            "content-type"
+        );
         assert!(HeaderName::from_bytes(b"bad name").is_err());
         assert!(HeaderName::from_bytes(b"").is_err());
     }
@@ -395,10 +425,19 @@ mod tests {
     #[test]
     fn map_insert_replace_and_append() {
         let mut m = HeaderMap::new();
-        m.append(HeaderName::from_static("set-cookie"), HeaderValue::from_static("a=1"));
-        m.append(HeaderName::from_static("set-cookie"), HeaderValue::from_static("b=2"));
+        m.append(
+            HeaderName::from_static("set-cookie"),
+            HeaderValue::from_static("a=1"),
+        );
+        m.append(
+            HeaderName::from_static("set-cookie"),
+            HeaderValue::from_static("b=2"),
+        );
         assert_eq!(m.get_all("set-cookie").count(), 2);
-        m.insert(HeaderName::from_static("SET-COOKIE"), HeaderValue::from_static("c=3"));
+        m.insert(
+            HeaderName::from_static("SET-COOKIE"),
+            HeaderValue::from_static("c=3"),
+        );
         assert_eq!(m.get_all("set-cookie").count(), 1);
         assert_eq!(m.get("set-cookie").unwrap().to_str().unwrap(), "c=3");
     }

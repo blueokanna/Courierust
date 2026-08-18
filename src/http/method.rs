@@ -73,10 +73,7 @@ impl Method {
     /// Whether the method is defined as safe (RFC 9110 §9.2.1).
     #[inline]
     pub fn is_safe(&self) -> bool {
-        matches!(
-            self,
-            Self::GET | Self::HEAD | Self::OPTIONS | Self::TRACE
-        )
+        matches!(self, Self::GET | Self::HEAD | Self::OPTIONS | Self::TRACE)
     }
 
     /// Whether the method is idempotent (RFC 9110 §9.2.2).

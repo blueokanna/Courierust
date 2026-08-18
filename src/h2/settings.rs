@@ -88,7 +88,9 @@ impl Settings {
                 SETTINGS_MAX_HEADER_LIST_SIZE => self.max_header_list_size = s.value,
                 SETTINGS_NO_RFC7540_PRIORITIES => {
                     if s.value > 1 {
-                        return Err(Error::protocol("SETTINGS_NO_RFC7540_PRIORITIES must be 0 or 1"));
+                        return Err(Error::protocol(
+                            "SETTINGS_NO_RFC7540_PRIORITIES must be 0 or 1",
+                        ));
                     }
                     self.no_rfc7540_priorities = s.value;
                 }
@@ -101,14 +103,35 @@ impl Settings {
     /// Emit all known parameters in a canonical order (fingerprint
     /// modules can reorder this).
     pub fn to_vec(&self) -> Vec<Setting> {
-        let mut v = Vec::with_capacity(7);
-        v.push(Setting { id: SETTINGS_HEADER_TABLE_SIZE, value: self.header_table_size });
-        v.push(Setting { id: SETTINGS_ENABLE_PUSH, value: self.enable_push });
-        v.push(Setting { id: SETTINGS_MAX_CONCURRENT_STREAMS, value: self.max_concurrent_streams });
-        v.push(Setting { id: SETTINGS_INITIAL_WINDOW_SIZE, value: self.initial_window_size });
-        v.push(Setting { id: SETTINGS_MAX_FRAME_SIZE, value: self.max_frame_size });
-        v.push(Setting { id: SETTINGS_MAX_HEADER_LIST_SIZE, value: self.max_header_list_size });
-        v.push(Setting { id: SETTINGS_NO_RFC7540_PRIORITIES, value: self.no_rfc7540_priorities });
-        v
+        vec![
+            Setting {
+                id: SETTINGS_HEADER_TABLE_SIZE,
+                value: self.header_table_size,
+            },
+            Setting {
+                id: SETTINGS_ENABLE_PUSH,
+                value: self.enable_push,
+            },
+            Setting {
+                id: SETTINGS_MAX_CONCURRENT_STREAMS,
+                value: self.max_concurrent_streams,
+            },
+            Setting {
+                id: SETTINGS_INITIAL_WINDOW_SIZE,
+                value: self.initial_window_size,
+            },
+            Setting {
+                id: SETTINGS_MAX_FRAME_SIZE,
+                value: self.max_frame_size,
+            },
+            Setting {
+                id: SETTINGS_MAX_HEADER_LIST_SIZE,
+                value: self.max_header_list_size,
+            },
+            Setting {
+                id: SETTINGS_NO_RFC7540_PRIORITIES,
+                value: self.no_rfc7540_priorities,
+            },
+        ]
     }
 }

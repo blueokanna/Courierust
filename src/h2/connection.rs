@@ -11,7 +11,7 @@ use crate::bytes::{Bytes, BytesMut};
 use crate::error::{Error, ErrorKind, Result};
 use crate::h2::error::ErrorCode;
 use crate::h2::flow::FlowWindow;
-use crate::h2::frame::{self, Frame, FrameHeader, LegacyPriority};
+use crate::h2::frame::{self, Frame, FrameHeader};
 use crate::h2::priority::{Priority, Scheduler};
 use crate::h2::settings::{Setting, Settings};
 use crate::h2::stream::{Stream, StreamMap, StreamState};
@@ -135,7 +135,6 @@ struct PendingHeaders {
     stream_id: u32,
     block: BytesMut,
     end_stream: bool,
-    priority: Option<LegacyPriority>,
 }
 
 /// HTTP/2 connection session.
@@ -187,26 +186,28 @@ impl<R: Read, W: Write> Connection<R, W> {
     /// connection preface; for a server the caller must have already
     /// consumed and verified the client's preface.
     pub fn new(reader: R, writer: W, config: Config) -> Self {
+        let is_client = config.client;
+        let quantum = config.scheduler_quantum;
         let peer = Settings::default();
         let local = config.local_settings.clone();
-        let initial_window = local.initial_window_size as i64;
         let conn_window = 65535i64;
         Self {
             reader: BufReader::new(reader, 16 * 1024),
             writer: BufWriter::new(writer, 16 * 1024),
+            config,
             encoder: Encoder::new(),
             decoder: Decoder::new(
                 local.header_table_size as usize,
                 local.max_header_list_size as usize,
             ),
-            preface_pending: config.client,
+            preface_pending: is_client,
             local,
             peer,
             settings_sent: false,
             pending_frames: VecDeque::new(),
             pending_headers: None,
-            streams: StreamMap::new(config.client),
-            scheduler: Scheduler::new(config.scheduler_quantum),
+            streams: StreamMap::new(is_client),
+            scheduler: Scheduler::new(quantum),
             scheduled: alloc::collections::BTreeSet::new(),
             send_queue: BTreeMap::new(),
             pending_priority: BTreeMap::new(),
@@ -276,20 +277,22 @@ impl<R: Read, W: Write> Connection<R, W> {
     }
 
     /// Process one I/O step: flush outbound, read+process one frame,
-    /// flush again. Transport timeouts / would-block are treated as "no
-    /// data yet".
-    pub fn poll(&mut self) -> Result<()> {
+    /// flush again. Returns `true` if any work happened (a frame was
+    /// read or outbound frames were flushed). Transport timeouts /
+    /// would-block are treated as "no data yet" and return `Ok(false)`.
+    pub fn poll(&mut self) -> Result<bool> {
         if self.closed {
-            return Ok(());
+            return Ok(false);
         }
+        let had_pending = !self.pending_frames.is_empty();
         self.flush_outbound()?;
-        match self.read_and_process_one() {
-            Ok(()) => {}
-            Err(e) if e.kind == ErrorKind::Timeout => {}
+        let read_any = match self.read_and_process_one() {
+            Ok(r) => r,
+            Err(e) if e.kind == ErrorKind::Timeout => false,
             Err(e) => return Err(e),
-        }
+        };
         self.flush_outbound()?;
-        Ok(())
+        Ok(had_pending || read_any)
     }
 
     /// Flush pending outbound frames to the transport.
@@ -313,24 +316,35 @@ impl<R: Read, W: Write> Connection<R, W> {
         self.encoder.encode(fields, &mut block);
         let max = self.peer.max_frame_size as usize;
 
-        let stream = self
-            .streams
-            .get_mut(&stream_id)
-            .ok_or_else(|| Error::protocol("send_headers: unknown stream"))?;
-        if stream.state == StreamState::Idle {
-            stream.state = if end_stream {
-                StreamState::HalfClosedLocal
-            } else {
-                StreamState::Open
-            };
-        } else if end_stream {
-            stream.state = match stream.state {
-                StreamState::Open => StreamState::HalfClosedLocal,
-                StreamState::HalfClosedRemote => StreamState::Closed,
-                s => s,
-            };
+        let now_closed = {
+            let stream = self
+                .streams
+                .get_mut(&stream_id)
+                .ok_or_else(|| Error::protocol("send_headers: unknown stream"))?;
+            if stream.state == StreamState::Idle {
+                stream.state = if end_stream {
+                    StreamState::HalfClosedLocal
+                } else {
+                    StreamState::Open
+                };
+            } else if end_stream {
+                stream.state = match stream.state {
+                    StreamState::Open => StreamState::HalfClosedLocal,
+                    StreamState::HalfClosedRemote => StreamState::Closed,
+                    s => s,
+                };
+            }
+            stream.send_done = end_stream;
+            stream.state == StreamState::Closed
+        };
+        // Both endpoints are done (e.g. a server response whose HEADERS
+        // carry END_STREAM): drop the record now so open_count tracks
+        // truly-open streams (RFC 9113 §5.1) instead of growing without
+        // bound.
+        if now_closed {
+            self.events.push_back(Event::StreamClosed { stream_id });
+            self.close_stream(stream_id);
         }
-        stream.send_done = end_stream;
 
         // Split the block into HEADERS + CONTINUATION frames.
         if block.len() <= max {
@@ -390,6 +404,7 @@ impl<R: Read, W: Write> Connection<R, W> {
         if self.goaway_sent || self.closed {
             return Err(Error::canceled("connection closing"));
         }
+        let data_len = data.len();
         let stream = self
             .streams
             .get_mut(&stream_id)
@@ -402,10 +417,10 @@ impl<R: Read, W: Write> Connection<R, W> {
             .get(&stream_id)
             .map(|q| q.iter().map(|c| c.data.len()).sum())
             .unwrap_or(0);
-        if buffered + data.len() > self.config.max_send_buffer {
+        if buffered + data_len > self.config.max_send_buffer {
             return Err(Error::overflow("per-stream send buffer full"));
         }
-        stream.send_buffered += data.len();
+        stream.send_buffered += data_len;
         if end_stream {
             stream.send_done = true;
         }
@@ -414,7 +429,7 @@ impl<R: Read, W: Write> Connection<R, W> {
             .or_default()
             .push_back(Chunk { data, end_stream });
         self.maybe_schedule(stream_id);
-        Ok(data.len())
+        Ok(data_len)
     }
 
     /// Send RST_STREAM.
@@ -422,7 +437,10 @@ impl<R: Read, W: Write> Connection<R, W> {
         if self.closed {
             return;
         }
-        self.pending_frames.push_back(Frame::RstStream { stream_id, error_code: code });
+        self.pending_frames.push_back(Frame::RstStream {
+            stream_id,
+            error_code: code,
+        });
         self.close_stream(stream_id);
     }
 
@@ -431,7 +449,8 @@ impl<R: Read, W: Write> Connection<R, W> {
         if self.closed {
             return;
         }
-        self.pending_frames.push_back(Frame::Ping { ack: false, data });
+        self.pending_frames
+            .push_back(Frame::Ping { ack: false, data });
     }
 
     /// Send GOAWAY and stop accepting new work.
@@ -543,11 +562,15 @@ impl<R: Read, W: Write> Connection<R, W> {
         }
         let max_frame = self.peer.max_frame_size as i64;
         for _ in 0..64 {
-            let want = max_frame as u32;
+            let want = max_frame as usize;
             let sid = match self.scheduler.next(want) {
                 Some(s) => s,
                 None => break,
             };
+            // `next` popped the stream from the scheduler queue; mark it
+            // unscheduled so `maybe_schedule` can re-queue it if it still
+            // has data.
+            self.scheduled.remove(&sid);
             let can_send = {
                 let s = match self.streams.get(&sid) {
                     Some(s) => s,
@@ -556,11 +579,9 @@ impl<R: Read, W: Write> Connection<R, W> {
                         continue;
                     }
                 };
-                if !s.can_send() || s.send_window <= 0 {
-                    false
-                } else {
-                    true
-                }
+                // Buffered data is always drainable while credit remains,
+                // even after `send_done`.
+                s.send_window > 0
             };
             if !can_send {
                 self.scheduler.remove(sid);
@@ -578,7 +599,9 @@ impl<R: Read, W: Write> Connection<R, W> {
                 self.scheduled.remove(&sid);
                 continue;
             }
-            let (payload, chunk_end, exhausted) = {
+            let payload;
+            let chunk_end;
+            {
                 let q = match self.send_queue.get_mut(&sid) {
                     Some(q) => q,
                     None => {
@@ -596,13 +619,20 @@ impl<R: Read, W: Write> Connection<R, W> {
                     }
                 };
                 let take = core::cmp::min(amount, chunk.data.len());
-                let payload = chunk.data.split_to(take);
-                let chunk_end = chunk.end_stream;
-                let exhausted = q.is_empty();
-                let _ = chunk;
-                (payload, chunk_end, exhausted)
-            };
-            let end_stream = if exhausted { chunk_end } else { false };
+                payload = chunk.data.split_to(take);
+                chunk_end = chunk.end_stream;
+            }
+            // Pop the front chunk once fully consumed and decide whether
+            // the stream ends here.
+            let mut end_stream = false;
+            if let Some(q) = self.send_queue.get_mut(&sid) {
+                let front_empty = q.front().map(|c| c.data.is_empty()).unwrap_or(false);
+                if front_empty {
+                    let popped = q.pop_front().unwrap();
+                    end_stream = popped.end_stream && q.is_empty();
+                }
+            }
+            let _ = chunk_end;
             {
                 let s = self.streams.get_mut(&sid).unwrap();
                 s.send_window -= payload.len() as i64;
@@ -614,9 +644,34 @@ impl<R: Read, W: Write> Connection<R, W> {
                 data: payload,
                 end_stream,
             });
+            // Advance the local send state. When both endpoints have
+            // finished, the stream record is dropped so open_count tracks
+            // only live streams (RFC 9113 §5.1).
+            if end_stream {
+                let remote_done = self
+                    .streams
+                    .get(&sid)
+                    .map(|s| s.state == StreamState::HalfClosedRemote)
+                    .unwrap_or(false);
+                if remote_done {
+                    self.events
+                        .push_back(Event::StreamClosed { stream_id: sid });
+                    self.close_stream(sid);
+                    continue;
+                }
+                let s = self.streams.get_mut(&sid).unwrap();
+                if s.state == StreamState::Open {
+                    s.state = StreamState::HalfClosedLocal;
+                }
+            }
             // Reschedule if the stream still has data and credit.
             let stream = self.streams.get(&sid).unwrap();
-            if !exhausted && stream.send_window > 0 && !stream.send_done {
+            let exhausted = self
+                .send_queue
+                .get(&sid)
+                .map(|q| q.is_empty())
+                .unwrap_or(true);
+            if !exhausted && stream.send_window > 0 {
                 self.maybe_schedule(sid);
             } else if exhausted {
                 self.scheduler.remove(sid);
@@ -630,13 +685,9 @@ impl<R: Read, W: Write> Connection<R, W> {
         if self.scheduled.contains(&stream_id) {
             return;
         }
-        let ok = match self.streams.get(&stream_id) {
-            Some(s) => s.can_send() && s.send_window > 0,
-            None => false,
-        };
-        if !ok {
-            return;
-        }
+        // A stream is schedulable while it has buffered data and send
+        // credit — even if `send_done` is set (END_STREAM is queued behind
+        // the data).
         let has_data = self
             .send_queue
             .get(&stream_id)
@@ -645,7 +696,18 @@ impl<R: Read, W: Write> Connection<R, W> {
         if !has_data {
             return;
         }
-        let p = self.streams.get(&stream_id).map(|s| s.priority).unwrap_or_default();
+        let ok = match self.streams.get(&stream_id) {
+            Some(s) => s.send_window > 0,
+            None => false,
+        };
+        if !ok {
+            return;
+        }
+        let p = self
+            .streams
+            .get(&stream_id)
+            .map(|s| s.priority)
+            .unwrap_or_default();
         self.scheduler.add(stream_id, p);
         self.scheduled.insert(stream_id);
     }
@@ -654,12 +716,12 @@ impl<R: Read, W: Write> Connection<R, W> {
     // Inbound
     // ------------------------------------------------------------------
 
-    fn read_and_process_one(&mut self) -> Result<()> {
+    fn read_and_process_one(&mut self) -> Result<bool> {
         let mut hdr = [0u8; 9];
         match self.reader.read_exact_into(&mut hdr) {
             Ok(()) => {}
             Err(e) if e.kind == ErrorKind::Timeout || e.kind == ErrorKind::WouldBlock => {
-                return Ok(())
+                return Ok(false)
             }
             Err(e) => return Err(e),
         }
@@ -680,12 +742,13 @@ impl<R: Read, W: Write> Connection<R, W> {
         let payload = match self.reader.read_exact(header.len as usize) {
             Ok(p) => p,
             Err(e) if e.kind == ErrorKind::Timeout || e.kind == ErrorKind::WouldBlock => {
-                return Ok(())
+                return Ok(false)
             }
             Err(e) => return Err(e),
         };
         let frame = Frame::parse(header, &payload, self.local.max_frame_size)?;
-        self.process_frame(frame)
+        self.process_frame(frame)?;
+        Ok(true)
     }
 
     fn process_frame(&mut self, frame: Frame) -> Result<()> {
@@ -694,10 +757,17 @@ impl<R: Read, W: Write> Connection<R, W> {
         // follow (RFC 9113 §6.10).
         if self.pending_headers.is_some() {
             match frame {
-                Frame::Continuation { stream_id, end_headers, block } => {
+                Frame::Continuation {
+                    stream_id,
+                    end_headers,
+                    block,
+                } => {
                     let pending = self.pending_headers.as_mut().unwrap();
                     if pending.stream_id != stream_id {
-                        return self.conn_error(ErrorCode::ProtocolError, "CONTINUATION on different stream");
+                        return self.conn_error(
+                            ErrorCode::ProtocolError,
+                            "CONTINUATION on different stream",
+                        );
                     }
                     pending.block.extend_from_slice(block.as_slice());
                     if end_headers {
@@ -713,30 +783,44 @@ impl<R: Read, W: Write> Connection<R, W> {
         }
 
         match frame {
-            Frame::Headers { stream_id, block, end_stream, end_headers, priority } => {
+            Frame::Headers {
+                stream_id,
+                block,
+                end_stream,
+                end_headers,
+                priority: _p,
+            } => {
                 if end_headers {
                     self.finish_header_block(PendingHeaders {
                         stream_id,
                         block: BytesMut::from_vec(block.into_vec()),
                         end_stream,
-                        priority,
                     })
                 } else {
                     self.pending_headers = Some(PendingHeaders {
                         stream_id,
                         block: BytesMut::from_vec(block.into_vec()),
                         end_stream,
-                        priority,
                     });
                     Ok(())
                 }
             }
-            Frame::Data { stream_id, data, end_stream } => self.on_data(stream_id, data, end_stream),
-            Frame::RstStream { stream_id, error_code } => {
+            Frame::Data {
+                stream_id,
+                data,
+                end_stream,
+            } => self.on_data(stream_id, data, end_stream),
+            Frame::RstStream {
+                stream_id,
+                error_code,
+            } => {
                 if !self.streams.contains(&stream_id) {
                     return self.conn_error(ErrorCode::ProtocolError, "RST_STREAM on idle stream");
                 }
-                self.events.push_back(Event::Rst { stream_id, error_code });
+                self.events.push_back(Event::Rst {
+                    stream_id,
+                    error_code,
+                });
                 self.close_stream(stream_id);
                 Ok(())
             }
@@ -751,12 +835,17 @@ impl<R: Read, W: Write> Connection<R, W> {
                 if ack {
                     Ok(())
                 } else {
-                    self.pending_frames.push_back(Frame::Ping { ack: true, data });
+                    self.pending_frames
+                        .push_back(Frame::Ping { ack: true, data });
                     self.events.push_back(Event::Ping { data });
                     Ok(())
                 }
             }
-            Frame::GoAway { last_stream_id, error_code, debug } => {
+            Frame::GoAway {
+                last_stream_id,
+                error_code,
+                debug,
+            } => {
                 self.goaway_received = true;
                 self.peer_last_stream = last_stream_id;
                 self.events.push_back(Event::GoAway {
@@ -780,14 +869,23 @@ impl<R: Read, W: Write> Connection<R, W> {
                 }
                 Ok(())
             }
-            Frame::WindowUpdate { stream_id, increment } => self.on_window_update(stream_id, increment),
-            Frame::Priority { stream_id, priority: _p } => {
+            Frame::WindowUpdate {
+                stream_id,
+                increment,
+            } => self.on_window_update(stream_id, increment),
+            Frame::Priority {
+                stream_id,
+                priority: _p,
+            } => {
                 // RFC 7540 stream priority is deprecated (RFC 9218 §2);
                 // we honor PRIORITY_UPDATE / the Priority header instead.
                 let _ = stream_id;
                 Ok(())
             }
-            Frame::PriorityUpdate { prioritized_stream_id, priority_field } => {
+            Frame::PriorityUpdate {
+                prioritized_stream_id,
+                priority_field,
+            } => {
                 if self.config.client {
                     return self.conn_error(
                         ErrorCode::ProtocolError,
@@ -803,10 +901,12 @@ impl<R: Read, W: Write> Connection<R, W> {
                     // Buffer the most recent update for an idle stream
                     // (RFC 9218 §7: bounded, most-recent wins).
                     if self.pending_priority.len() < 1024 {
-                        self.pending_priority.insert(prioritized_stream_id, priority);
+                        self.pending_priority
+                            .insert(prioritized_stream_id, priority);
                     } else {
                         self.pending_priority.clear();
-                        self.pending_priority.insert(prioritized_stream_id, priority);
+                        self.pending_priority
+                            .insert(prioritized_stream_id, priority);
                     }
                 }
                 self.events.push_back(Event::PriorityUpdate {
@@ -820,6 +920,10 @@ impl<R: Read, W: Write> Connection<R, W> {
                 // a connection error.
                 self.conn_error(ErrorCode::ProtocolError, "unexpected PUSH_PROMISE")
             }
+            Frame::Continuation { .. } => self.conn_error(
+                ErrorCode::ProtocolError,
+                "unexpected CONTINUATION without a pending header block",
+            ),
             Frame::Unknown { .. } => Ok(()), // RFC 9113 §4.1: ignore
         }
     }
@@ -854,7 +958,8 @@ impl<R: Read, W: Write> Connection<R, W> {
                     stream_id: sid,
                     error_code: ErrorCode::RefusedStream,
                 });
-                self.events.push_back(Event::StreamClosed { stream_id: sid });
+                self.events
+                    .push_back(Event::StreamClosed { stream_id: sid });
                 return Ok(());
             }
             let initial = self.local.initial_window_size as i64;
@@ -905,7 +1010,8 @@ impl<R: Read, W: Write> Connection<R, W> {
                 s => s,
             };
             if stream.state == StreamState::Closed {
-                self.events.push_back(Event::StreamClosed { stream_id: sid });
+                self.events
+                    .push_back(Event::StreamClosed { stream_id: sid });
                 self.close_stream(sid);
             }
             return Ok(());
@@ -921,10 +1027,12 @@ impl<R: Read, W: Write> Connection<R, W> {
                     }
                 }
                 StreamState::HalfClosedLocal => {
+                    // We already ended our side; the peer may still send a
+                    // response body.
                     if p.end_stream {
                         StreamState::Closed
                     } else {
-                        return self.conn_error(ErrorCode::ProtocolError, "HEADERS without END_STREAM on half-closed(local)");
+                        StreamState::HalfClosedLocal
                     }
                 }
                 _ => {
@@ -934,12 +1042,18 @@ impl<R: Read, W: Write> Connection<R, W> {
         } else {
             // Server receiving additional HEADERS on an existing stream:
             // only trailers allowed, which must end the stream.
-            return self.conn_error(ErrorCode::ProtocolError, "unexpected HEADERS on existing stream");
+            return self.conn_error(
+                ErrorCode::ProtocolError,
+                "unexpected HEADERS on existing stream",
+            );
         }
         if p.end_stream {
             stream.recv_ended = true;
         }
-        let priority = self.pending_priority.remove(&sid).unwrap_or(stream.priority);
+        let priority = self
+            .pending_priority
+            .remove(&sid)
+            .unwrap_or(stream.priority);
         stream.priority = priority;
         stream.headers_delivered = true;
         self.events.push_back(Event::Headers {
@@ -949,7 +1063,8 @@ impl<R: Read, W: Write> Connection<R, W> {
             priority,
         });
         if stream.state == StreamState::Closed {
-            self.events.push_back(Event::StreamClosed { stream_id: sid });
+            self.events
+                .push_back(Event::StreamClosed { stream_id: sid });
             self.close_stream(sid);
         }
         Ok(())
@@ -996,7 +1111,11 @@ impl<R: Read, W: Write> Connection<R, W> {
             self.release_data(stream_id, len as usize);
         }
         if end_stream {
-            let closed = self.streams.get(&stream_id).map(|s| s.is_closed()).unwrap_or(false);
+            let closed = self
+                .streams
+                .get(&stream_id)
+                .map(|s| s.is_closed())
+                .unwrap_or(false);
             if closed {
                 self.events.push_back(Event::StreamClosed { stream_id });
                 self.close_stream(stream_id);
@@ -1015,10 +1134,14 @@ impl<R: Read, W: Write> Connection<R, W> {
         if self.peer.no_rfc7540_priorities != new_settings.no_rfc7540_priorities
             && self.peer.no_rfc7540_priorities != 0
         {
-            return self.conn_error(ErrorCode::ProtocolError, "SETTINGS_NO_RFC7540_PRIORITIES changed");
+            return self.conn_error(
+                ErrorCode::ProtocolError,
+                "SETTINGS_NO_RFC7540_PRIORITIES changed",
+            );
         }
         // Apply the HPACK table size the peer allows us to use.
-        self.encoder.set_peer_table_size(new_settings.header_table_size as usize);
+        self.encoder
+            .set_peer_table_size(new_settings.header_table_size as usize);
         // Apply INITIAL_WINDOW_SIZE delta to every stream's send window.
         let delta = new_settings.initial_window_size as i64 - self.peer.initial_window_size as i64;
         if delta != 0 {
@@ -1027,16 +1150,26 @@ impl<R: Read, W: Write> Connection<R, W> {
                 let s = self.streams.get_mut(&id).unwrap();
                 let next = s.send_window.saturating_add(delta);
                 if next < i64::from(i32::MIN) {
-                    return self.conn_error(ErrorCode::FlowControlError, "initial window delta overflow");
+                    return self
+                        .conn_error(ErrorCode::FlowControlError, "initial window delta overflow");
                 }
                 s.send_window = next;
             }
         }
         self.peer = new_settings;
-        self.pending_frames.push_back(Frame::Settings { ack: true, entries: Vec::new() });
-        self.events.push_back(Event::PeerSettings(self.peer.clone()));
+        self.pending_frames.push_back(Frame::Settings {
+            ack: true,
+            entries: Vec::new(),
+        });
+        self.events
+            .push_back(Event::PeerSettings(self.peer.clone()));
         // Reschedule streams whose send window grew.
-        let ids: Vec<u32> = self.streams.iter().filter(|s| s.can_send()).map(|s| s.id).collect();
+        let ids: Vec<u32> = self
+            .streams
+            .iter()
+            .filter(|s| s.can_send())
+            .map(|s| s.id)
+            .collect();
         for id in ids {
             self.maybe_schedule(id);
         }
@@ -1048,7 +1181,12 @@ impl<R: Read, W: Write> Connection<R, W> {
             if !self.conn_send_window.increase(increment) {
                 return self.conn_error(ErrorCode::FlowControlError, "connection window overflow");
             }
-            let ids: Vec<u32> = self.streams.iter().filter(|s| s.can_send()).map(|s| s.id).collect();
+            let ids: Vec<u32> = self
+                .streams
+                .iter()
+                .filter(|s| s.can_send())
+                .map(|s| s.id)
+                .collect();
             for id in ids {
                 self.maybe_schedule(id);
             }
@@ -1138,8 +1276,6 @@ mod tests {
     use super::*;
     use crate::hpack::HeaderField;
     use crate::http::header::{HeaderName, HeaderValue};
-    use crate::io::{SliceReader, VecWriter};
-    use std::io::{Read as _, Write as _};
 
     fn hf(name: &str, value: &str) -> HeaderField {
         HeaderField::new(
@@ -1151,7 +1287,13 @@ mod tests {
     #[test]
     fn priority_header_parsing() {
         let fields = vec![hf("priority", "u=1, i")];
-        assert_eq!(Priority::parse_headers(&fields), Some(Priority { urgency: 1, incremental: true }));
+        assert_eq!(
+            Priority::parse_headers(&fields),
+            Some(Priority {
+                urgency: 1,
+                incremental: true
+            })
+        );
         let none = vec![hf("x-a", "b")];
         assert_eq!(Priority::parse_headers(&none), None);
     }

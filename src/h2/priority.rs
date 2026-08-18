@@ -56,7 +56,9 @@ impl Priority {
             match tok {
                 b"i" => out.incremental = true,
                 _ => {
-                    if let Some((k, v)) = tok.split_once(|&c| c == b'=') {
+                    if let Some(eq) = tok.iter().position(|&c| c == b'=') {
+                        let k = &tok[..eq];
+                        let v = &tok[eq + 1..];
                         if k == b"u" {
                             let v = core::str::from_utf8(v).ok()?;
                             let u: u8 = v.parse().ok()?;
@@ -71,17 +73,16 @@ impl Priority {
         }
         Some(out)
     }
+}
 
+impl core::fmt::Display for Priority {
     /// Serialize as a priority field value (e.g. `u=0, i`).
-    pub fn to_string(&self) -> alloc::string::String {
-        use alloc::string::ToString;
-        let mut s = alloc::string::String::new();
-        s.push_str("u=");
-        s.push_str(&self.urgency.to_string());
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::write!(f, "u={}", self.urgency)?;
         if self.incremental {
-            s.push_str(", i");
+            f.write_str(", i")?;
         }
-        s
+        Ok(())
     }
 }
 
@@ -219,7 +220,9 @@ impl Scheduler {
                     b.incremental.push_back(sid);
                     return Some(sid);
                 }
-                if !b.non_incremental.is_empty() && b.deficit.saturating_add(want as u32) <= b.quantum {
+                if !b.non_incremental.is_empty()
+                    && b.deficit.saturating_add(want as u32) <= b.quantum
+                {
                     b.deficit = b.deficit.saturating_add(want as u32);
                     return b.non_incremental.pop_front();
                 }
@@ -236,19 +239,61 @@ mod tests {
     #[test]
     fn parse_priority_values() {
         assert_eq!(Priority::parse(b""), Some(Priority::default()));
-        assert_eq!(Priority::parse(b"u=0"), Some(Priority { urgency: 0, incremental: false }));
-        assert_eq!(Priority::parse(b"u=5, i"), Some(Priority { urgency: 5, incremental: true }));
-        assert_eq!(Priority::parse(b"i, u=1"), Some(Priority { urgency: 1, incremental: true }));
+        assert_eq!(
+            Priority::parse(b"u=0"),
+            Some(Priority {
+                urgency: 0,
+                incremental: false
+            })
+        );
+        assert_eq!(
+            Priority::parse(b"u=5, i"),
+            Some(Priority {
+                urgency: 5,
+                incremental: true
+            })
+        );
+        assert_eq!(
+            Priority::parse(b"i, u=1"),
+            Some(Priority {
+                urgency: 1,
+                incremental: true
+            })
+        );
         assert_eq!(Priority::parse(b"u=9"), Some(Priority::default())); // out of range ignored
-        assert_eq!(Priority::parse(b"x=y, u=7"), Some(Priority { urgency: 7, incremental: false }));
+        assert_eq!(
+            Priority::parse(b"x=y, u=7"),
+            Some(Priority {
+                urgency: 7,
+                incremental: false
+            })
+        );
     }
 
     #[test]
     fn urgency_ordering() {
         let mut s = Scheduler::new(16_384);
-        s.add(10, Priority { urgency: 3, incremental: false });
-        s.add(11, Priority { urgency: 0, incremental: false });
-        s.add(12, Priority { urgency: 7, incremental: false });
+        s.add(
+            10,
+            Priority {
+                urgency: 3,
+                incremental: false,
+            },
+        );
+        s.add(
+            11,
+            Priority {
+                urgency: 0,
+                incremental: false,
+            },
+        );
+        s.add(
+            12,
+            Priority {
+                urgency: 7,
+                incremental: false,
+            },
+        );
         assert_eq!(s.next(100), Some(11));
         assert_eq!(s.next(100), Some(10));
         assert_eq!(s.next(100), Some(12));
@@ -258,9 +303,27 @@ mod tests {
     #[test]
     fn incremental_round_robin() {
         let mut s = Scheduler::new(16_384);
-        s.add(1, Priority { urgency: 3, incremental: true });
-        s.add(2, Priority { urgency: 3, incremental: true });
-        s.add(3, Priority { urgency: 0, incremental: false });
+        s.add(
+            1,
+            Priority {
+                urgency: 3,
+                incremental: true,
+            },
+        );
+        s.add(
+            2,
+            Priority {
+                urgency: 3,
+                incremental: true,
+            },
+        );
+        s.add(
+            3,
+            Priority {
+                urgency: 0,
+                incremental: false,
+            },
+        );
         // urgency 0 first
         assert_eq!(s.next(100), Some(3));
         // then incremental round-robin
@@ -271,24 +334,73 @@ mod tests {
 
     #[test]
     fn no_starvation_across_urgencies() {
-        // Saturate urgency 0 with a large stream, verify urgency 7 still
-        // gets served (DRR anti-starvation).
+        // Emulate a caller that re-queues a stream while it still has data
+        // (the connection does exactly this). DRR anti-starvation: once
+        // urgency 0's deficit saturates, urgency 7 still gets a turn.
         let mut s = Scheduler::new(1000);
-        s.add(1, Priority { urgency: 0, incremental: false });
-        s.add(2, Priority { urgency: 7, incremental: false });
-        for _ in 0..10 {
-            assert_eq!(s.next(1000), Some(1)); // top bucket within quantum
+        s.add(
+            1,
+            Priority {
+                urgency: 0,
+                incremental: false,
+            },
+        );
+        s.add(
+            2,
+            Priority {
+                urgency: 7,
+                incremental: false,
+            },
+        );
+        let mut served: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+        for _ in 0..16 {
+            if let Some(sid) = s.next(100) {
+                served.push(sid);
+                if sid == 1 {
+                    // Stream 1 still has data, so the caller re-queues it.
+                    s.add(
+                        1,
+                        Priority {
+                            urgency: 0,
+                            incremental: false,
+                        },
+                    );
+                }
+            }
         }
-        // Now the top bucket is saturated; lower urgency gets a turn.
-        assert_eq!(s.next(1000), Some(2));
+        assert_eq!(&served[..10], &[1, 1, 1, 1, 1, 1, 1, 1, 1, 1]);
+        // The 11th turn goes to the lower-urgency stream (no starvation).
+        assert_eq!(served[10], 2);
     }
 
     #[test]
     fn priority_update_moves_bucket() {
         let mut s = Scheduler::new(16_384);
-        s.add(1, Priority { urgency: 3, incremental: false });
-        s.add(2, Priority { urgency: 7, incremental: false });
-        s.update(2, Priority { urgency: 7, incremental: false }, Priority { urgency: 0, incremental: false });
+        s.add(
+            1,
+            Priority {
+                urgency: 3,
+                incremental: false,
+            },
+        );
+        s.add(
+            2,
+            Priority {
+                urgency: 7,
+                incremental: false,
+            },
+        );
+        s.update(
+            2,
+            Priority {
+                urgency: 7,
+                incremental: false,
+            },
+            Priority {
+                urgency: 0,
+                incremental: false,
+            },
+        );
         assert_eq!(s.next(100), Some(2));
         assert_eq!(s.next(100), Some(1));
     }
