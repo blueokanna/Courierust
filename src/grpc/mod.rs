@@ -4,8 +4,9 @@
 //! `grpc-status`. This module implements the framing and status handling
 //! on top of [`crate::client::Client`] (h2) and [`crate::server::Server`].
 //! Protobuf itself is deliberately out of scope: implement
-//! [`EncodeMessage`] / [`DecodeMessage`] for your message types (or use
-//! the raw-bytes API) and plug in your own protobuf codec.
+//! [`crate::grpc::codec::EncodeMessage`] / [`crate::grpc::codec::DecodeMessage`]
+//! for your message types (or use the raw-bytes API) and plug in your own
+//! protobuf codec.
 
 pub mod codec;
 pub mod status;

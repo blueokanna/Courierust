@@ -1,6 +1,8 @@
-# Courierust
+# Courierust - [中文文档](README.md)
 
 > A self-contained HTTP/1.1 + HTTP/2 + gRPC protocol stack with zero third-party dependencies.
+
+> Hands-on tutorials (English & 中文) live on the [wiki](https://github.com/blueokanna/Courierust/wiki).
 
 The protocol core (`http` / `hpack` / `h2` / `fingerprint` / `crypto` / `bytes` / `io`) compiles under `no_std + alloc` with **no dependencies at all**. The `std` feature (on by default) layers the threaded networking on top: a work-stealing thread pool, TCP adapters, client, server, and gRPC.
 

@@ -1,6 +1,8 @@
-# Courierust
+# Courierust - [English Doc](README.md)
 
 > 一个零依赖、协议自研的 HTTP/1.1 + HTTP/2 + gRPC 协议栈。
+
+> 中英文手把手教程见 [Wiki](https://github.com/blueokanna/Courierust/wiki)。
 
 `courierust` 的协议核心（`http` / `hpack` / `h2` / `fingerprint` / `crypto` / `bytes` / `io`）在 `no_std + alloc` 下即可编译，**不依赖任何第三方库**。`std` feature（默认开启）在此基础上补上多线程网络层：工作窃取线程池、TCP 适配、客户端、服务器与 gRPC。
 
