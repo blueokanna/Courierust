@@ -5,7 +5,6 @@ pub mod h1;
 pub mod h2;
 
 use crate::body::Body;
-use crate::bytes::Bytes;
 use crate::client::h1::H1Connection;
 use crate::client::h2::{H2Cmd, H2Conn};
 use crate::error::{Error, Result};
@@ -20,6 +19,33 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// Client-side TLS settings for `https://` URLs.
+///
+/// When `None`, `https://` URLs are rejected with a clear error. Set
+/// [`ClientConfig::tls`] to enable TLS 1.3 on the client.
+#[derive(Debug, Clone)]
+pub struct TlsSettings {
+    /// Trust anchors for server certificate validation.
+    pub roots: crate::tls::RootStore,
+    /// Whether to validate the server certificate (and hostname).
+    pub verify: bool,
+    /// ALPN protocols offered (raw wire values, e.g. `h2`, `http/1.1`).
+    pub alpn: Vec<Vec<u8>>,
+    /// The current time (Unix seconds) used for validity checks.
+    pub now: i64,
+}
+
+impl Default for TlsSettings {
+    fn default() -> Self {
+        Self {
+            roots: crate::tls::RootStore::new(),
+            verify: true,
+            alpn: Vec::new(),
+            now: 0,
+        }
+    }
+}
 
 /// Client configuration.
 #[derive(Debug, Clone)]
@@ -41,6 +67,9 @@ pub struct ClientConfig {
     pub max_header_list: usize,
     /// Maximum accepted body size.
     pub max_body: usize,
+    /// TLS settings for `https://` URLs. `None` (the default) disables
+    /// TLS; `https://` requests then fail with a clear error.
+    pub tls: Option<TlsSettings>,
 }
 
 impl Default for ClientConfig {
@@ -54,6 +83,7 @@ impl Default for ClientConfig {
             user_agent: Some(format!("courierust/{}", env!("CARGO_PKG_VERSION"))),
             max_header_list: 1 << 20,
             max_body: 16 * 1024 * 1024,
+            tls: None,
         }
     }
 }
@@ -146,15 +176,10 @@ impl Client {
         req: Request<Body>,
         priority: Priority,
     ) -> Result<crate::client::h2::H2Response> {
-        if url.scheme != "http" {
-            return Err(Error::protocol(format!(
-                "scheme {} not supported by the built-in connector (TLS is external)",
-                url.scheme
-            )));
-        }
+        let tls = self.tls_for_scheme(&url.scheme)?;
         let addr = resolve_addr(&url.host, url.port)?;
         let authority = url.authority();
-        self.execute_h2(url, &authority, addr, req, priority)
+        self.execute_h2(url, &authority, addr, tls, req, priority)
     }
 
     fn execute_with_redirects(
@@ -204,17 +229,12 @@ impl Client {
         req: Request<Body>,
         priority: Priority,
     ) -> Result<Response<Body>> {
-        if url.scheme != "http" {
-            return Err(Error::protocol(format!(
-                "scheme {} not supported by the built-in connector (TLS is external)",
-                url.scheme
-            )));
-        }
+        let tls = self.tls_for_scheme(&url.scheme)?;
         self.inner.seq.fetch_add(1, Ordering::Relaxed);
         let addr = resolve_addr(&url.host, url.port)?;
         let authority = url.authority();
         if self.inner.config.http2 {
-            let raw = self.execute_h2(url, &authority, addr, req, priority)?;
+            let raw = self.execute_h2(url, &authority, addr, tls, req, priority)?;
             Ok(Response {
                 status: raw.head.status,
                 version: raw.head.version,
@@ -222,15 +242,40 @@ impl Client {
                 body: raw.body,
             })
         } else {
-            self.execute_h1(url, &authority, addr, req)
+            self.execute_h1(url, &authority, addr, tls, req)
+        }
+    }
+
+    /// Resolve the TLS connector for a scheme, or reject unsupported /
+    /// unconfigured `https`.
+    fn tls_for_scheme(&self, scheme: &str) -> Result<Option<crate::tls::TlsConnector>> {
+        match scheme {
+            "http" => Ok(None),
+            "https" => match &self.inner.config.tls {
+                Some(t) => Ok(Some(crate::tls::TlsConnector::new(
+                    crate::tls::ClientConfig {
+                        roots: t.roots.clone(),
+                        verify: t.verify,
+                        alpn: t.alpn.clone(),
+                        now: t.now,
+                    },
+                ))),
+                None => Err(Error::protocol(
+                    "https requires TLS settings (set ClientConfig.tls)",
+                )),
+            },
+            other => Err(Error::protocol(format!(
+                "scheme {other} not supported by the built-in connector"
+            ))),
         }
     }
 
     fn execute_h1(
         &self,
-        _url: &Url,
+        url: &Url,
         authority: &str,
         addr: SocketAddr,
+        tls: Option<crate::tls::TlsConnector>,
         req: Request<Body>,
     ) -> Result<Response<Body>> {
         let conn = {
@@ -241,9 +286,10 @@ impl Client {
                 .position(|(a, _)| *a == addr)
                 .map(|i| entry.remove(i).1)
         };
+        let hostname = url.host.clone();
         let mut owned = match conn {
             Some(c) => c,
-            None => H1Connection::connect(addr, &self.inner.config)?,
+            None => H1Connection::connect(addr, tls.as_ref(), &hostname, &self.inner.config)?,
         };
         let result = owned.send(&req, &self.inner.config, authority);
         match result {
@@ -261,67 +307,99 @@ impl Client {
         }
     }
 
-    fn execute_h2(
+    /// Perform an h2 request with a streaming body (`Body::Channel`):
+    /// the body is fed to the peer as DATA frames, enabling
+    /// client-streaming / bidi gRPC calls. Fully materialized bodies use
+    /// the regular [`Self::execute_h2_raw`] path.
+    pub fn execute_h2_stream(
         &self,
-        _url: &Url,
-        authority: &str,
-        addr: SocketAddr,
+        url: &Url,
         req: Request<Body>,
         priority: Priority,
     ) -> Result<crate::client::h2::H2Response> {
-        let conn = self.get_h2_conn(authority, addr)?;
+        let tls = self.tls_for_scheme(&url.scheme)?;
+        let addr = resolve_addr(&url.host, url.port)?;
+        let authority = url.authority();
+        self.execute_h2(url, &authority, addr, tls, req, priority)
+    }
+
+    fn execute_h2(
+        &self,
+        url: &Url,
+        authority: &str,
+        addr: SocketAddr,
+        tls: Option<crate::tls::TlsConnector>,
+        req: Request<Body>,
+        priority: Priority,
+    ) -> Result<crate::client::h2::H2Response> {
+        let conn = self.get_h2_conn(authority, addr, tls.as_ref(), &url.host)?;
         let fields = h2::request_fields(&req);
-        let (body, end_stream) = match req.body {
-            Body::Empty => (None, true),
-            Body::Bytes(b) => (Some(b), true),
-            Body::Channel(rx) => {
-                // Materialize a channel body for the request.
-                let mut buf = Vec::new();
-                while let Ok(chunk) = rx.recv() {
-                    let b = chunk?;
-                    buf.extend_from_slice(&b);
-                }
-                if buf.is_empty() {
-                    (None, true)
-                } else {
-                    (Some(Bytes::from(buf)), true)
-                }
-            }
-        };
+        // A channel body streams as DATA frames; anything else is sent as
+        // one block with END_STREAM.
         let (tx, rx) = std::sync::mpsc::channel();
-        if conn
-            .tx
-            .send(H2Cmd::Request {
-                fields: fields.clone(),
-                body: body.clone(),
-                end_stream,
+        let cmd = match req.body {
+            Body::Channel(body_rx) => H2Cmd::RequestStream {
+                fields,
+                body: body_rx,
                 priority,
                 reply: tx,
-            })
-            .is_err()
-        {
-            // The driver is gone; open a fresh connection and retry once.
-            let fresh = self.open_h2_conn(authority, addr)?;
-            let (tx2, rx2) = std::sync::mpsc::channel();
-            fresh
-                .tx
-                .send(H2Cmd::Request {
+            },
+            other => {
+                let (body, end_stream) = match other {
+                    Body::Empty => (None, true),
+                    Body::Bytes(b) => (Some(b), true),
+                    Body::Channel(_) => unreachable!(),
+                };
+                H2Cmd::Request {
                     fields,
                     body,
                     end_stream,
                     priority,
-                    reply: tx2,
-                })
-                .map_err(|_| Error::canceled("h2 driver is gone"))?;
-            return rx2
-                .recv()
-                .map_err(|_| Error::canceled("h2 driver closed the channel"))?;
-        }
-        rx.recv()
-            .map_err(|_| Error::canceled("h2 driver closed the channel"))?
+                    reply: tx,
+                }
+            }
+        };
+        self.send_h2_cmd(conn, authority, addr, tls.as_ref(), &url.host, cmd, rx)
     }
 
-    fn get_h2_conn(&self, authority: &str, addr: SocketAddr) -> Result<H2Conn> {
+    /// Send a driver command, retrying once on a fresh connection if the
+    /// driver is gone, then wait for the reply.
+    fn send_h2_cmd(
+        &self,
+        conn: H2Conn,
+        authority: &str,
+        addr: SocketAddr,
+        tls: Option<&crate::tls::TlsConnector>,
+        hostname: &str,
+        cmd: H2Cmd,
+        rx: std::sync::mpsc::Receiver<Result<crate::client::h2::H2Response>>,
+    ) -> Result<crate::client::h2::H2Response> {
+        match conn.tx.send(cmd) {
+            Ok(()) => rx
+                .recv()
+                .map_err(|_| Error::canceled("h2 driver closed the channel"))?,
+            Err(std::sync::mpsc::SendError(cmd)) => {
+                // The driver is gone; open a fresh connection and retry.
+                let fresh = self.open_h2_conn(authority, addr, tls, hostname)?;
+                let (tx2, rx2) = std::sync::mpsc::channel();
+                let cmd2 = retarget_reply(cmd, tx2);
+                fresh
+                    .tx
+                    .send(cmd2)
+                    .map_err(|_| Error::canceled("h2 driver is gone"))?;
+                rx2.recv()
+                    .map_err(|_| Error::canceled("h2 driver closed the channel"))?
+            }
+        }
+    }
+
+    fn get_h2_conn(
+        &self,
+        authority: &str,
+        addr: SocketAddr,
+        tls: Option<&crate::tls::TlsConnector>,
+        hostname: &str,
+    ) -> Result<H2Conn> {
         let mut pools = self.inner.h2_pool.lock().unwrap();
         let list = pools.entry(authority.to_string()).or_default();
         // Reuse a live connection.
@@ -331,7 +409,7 @@ impl Client {
         // Open a new one (up to the per-host cap; beyond it, multiplex on
         // an existing connection).
         if list.len() < self.inner.config.max_connections_per_host {
-            let stream = crate::net::connect(&addr, self.inner.config.connect_timeout)?;
+            let stream = self.open_h2_stream(addr, tls, hostname)?;
             let conn = h2::start(stream, &self.inner.config)?;
             list.push(conn.clone());
             return Ok(conn);
@@ -343,18 +421,72 @@ impl Client {
         Ok(list[idx].clone())
     }
 
-    fn open_h2_conn(&self, authority: &str, addr: SocketAddr) -> Result<H2Conn> {
-        let stream = crate::net::connect(&addr, self.inner.config.connect_timeout)?;
+    fn open_h2_conn(
+        &self,
+        authority: &str,
+        addr: SocketAddr,
+        tls: Option<&crate::tls::TlsConnector>,
+        hostname: &str,
+    ) -> Result<H2Conn> {
+        let stream = self.open_h2_stream(addr, tls, hostname)?;
         let conn = h2::start(stream, &self.inner.config)?;
         let mut pools = self.inner.h2_pool.lock().unwrap();
         let list = pools.entry(authority.to_string()).or_default();
         list.push(conn.clone());
         Ok(conn)
     }
+
+    /// Open a raw (possibly TLS-wrapped) stream for the h2 driver.
+    fn open_h2_stream(
+        &self,
+        addr: SocketAddr,
+        tls: Option<&crate::tls::TlsConnector>,
+        hostname: &str,
+    ) -> Result<crate::net::ConnStream> {
+        let stream = crate::net::connect(&addr, self.inner.config.connect_timeout)?;
+        match tls {
+            Some(c) => crate::net::ConnStream::tls_client(stream, c, hostname),
+            None => Ok(crate::net::ConnStream::plain(stream)),
+        }
+    }
+}
+
+/// Rebuild a driver command with a fresh reply channel (used when
+/// retrying on a new connection).
+fn retarget_reply(
+    cmd: H2Cmd,
+    reply: std::sync::mpsc::Sender<Result<crate::client::h2::H2Response>>,
+) -> H2Cmd {
+    match cmd {
+        H2Cmd::Request {
+            fields,
+            body,
+            end_stream,
+            priority,
+            ..
+        } => H2Cmd::Request {
+            fields,
+            body,
+            end_stream,
+            priority,
+            reply,
+        },
+        H2Cmd::RequestStream {
+            fields,
+            body,
+            priority,
+            ..
+        } => H2Cmd::RequestStream {
+            fields,
+            body,
+            priority,
+            reply,
+        },
+        H2Cmd::Shutdown => H2Cmd::Shutdown,
+    }
 }
 
 fn resolve_addr(host: &str, port: u16) -> Result<SocketAddr> {
-    // Fast path: literal IP.
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return Ok(SocketAddr::new(ip, port));
     }
@@ -384,10 +516,11 @@ fn resolve_redirect(base: &Url, location: &str) -> Result<Url> {
     if location.starts_with("http://") || location.starts_with("https://") {
         return Url::parse(location);
     }
-    // Relative or protocol-relative redirect.
-    let mut s = format!("http://{}{}", base.authority(), location);
+    // Relative or protocol-relative redirect (preserve the base scheme).
+    let scheme = base.scheme.as_str();
+    let mut s = format!("{scheme}://{}{}", base.authority(), location);
     if location.starts_with("//") {
-        s = format!("http:{}", location);
+        s = format!("{scheme}:{}", location);
     }
     Url::parse(&s)
 }

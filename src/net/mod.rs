@@ -6,9 +6,12 @@
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::time::Duration;
+
+#[cfg(windows)]
+pub(crate) mod poller;
 
 impl Read for &TcpStream {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
@@ -19,6 +22,13 @@ impl Read for &TcpStream {
             }
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                 Err(Error::new(ErrorKind::Timeout))
+            }
+            // Windows may transiently surface WSA_IO_PENDING (997) from
+            // the socket timeout machinery under load. A read error never
+            // consumes bytes, so treating it as "no data yet" is safe and
+            // prevents spurious connection kills.
+            Err(e) if e.raw_os_error() == Some(997) => {
+                Err(Error::new(ErrorKind::WouldBlock))
             }
             Err(e) => Err(e.into()),
         }
@@ -69,6 +79,190 @@ impl Write for Arc<TcpStream> {
 
 /// Re-export of the standard listener.
 pub type Listener = TcpListener;
+
+/// A transport that is either a plain TCP socket or a TLS 1.3 stream.
+///
+/// Both the HTTP client and server speak over [`ConnStream`], so HTTPS is
+/// a drop-in: a `https://` URL wraps the socket in TLS before the HTTP
+/// codec reads or writes, and a server configured with a TLS identity
+/// accepts TLS on the same accept loop as plain HTTP.
+pub(crate) struct ConnStream {
+    peer: SocketAddr,
+    inner: ConnStreamKind,
+}
+
+enum ConnStreamKind {
+    Plain(TcpStream),
+    Tls {
+        /// The raw socket (shared with the TLS layer, used to reconfigure
+        /// timeouts after the handshake).
+        socket: Arc<TcpStream>,
+        /// The TLS 1.3 stream. Guarded because the shared `&ConnStream`
+        /// transport used by the h1/h2 codecs must reach `&mut` access.
+        tls: std::sync::Mutex<crate::tls::TlsStream<Arc<TcpStream>, Arc<TcpStream>>>,
+    },
+}
+
+impl ConnStream {
+    /// Wrap a plain TCP stream.
+    pub(crate) fn plain(stream: TcpStream) -> Self {
+        let peer = stream
+            .peer_addr()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+        Self {
+            peer,
+            inner: ConnStreamKind::Plain(stream),
+        }
+    }
+
+    /// Establish a TLS 1.3 client connection over `stream`, authenticating
+    /// `hostname` against the server certificate.
+    pub(crate) fn tls_client(
+        stream: TcpStream,
+        connector: &crate::tls::TlsConnector,
+        hostname: &str,
+    ) -> crate::Result<Self> {
+        let peer = stream.peer_addr().map_err(|e| Error::io(e.to_string()))?;
+        let socket = Arc::new(stream);
+        let tls = connector
+            .connect(hostname, socket.clone(), socket.clone())
+            .map_err(|e| Error::io(e.to_string()))?;
+        Ok(Self {
+            peer,
+            inner: ConnStreamKind::Tls {
+                socket,
+                tls: std::sync::Mutex::new(tls),
+            },
+        })
+    }
+
+    /// Wrap an already-completed server-side TLS stream.
+    pub(crate) fn tls_server(
+        tls: crate::tls::TlsStream<Arc<TcpStream>, Arc<TcpStream>>,
+        peer: SocketAddr,
+    ) -> Self {
+        let socket = tls.underlying().clone();
+        Self {
+            peer,
+            inner: ConnStreamKind::Tls {
+                socket,
+                tls: std::sync::Mutex::new(tls),
+            },
+        }
+    }
+
+    /// The remote address.
+    pub(crate) fn peer_addr(&self) -> SocketAddr {
+        self.peer
+    }
+
+    /// The negotiated ALPN protocol (TLS connections only).
+    pub(crate) fn alpn(&self) -> Option<Vec<u8>> {
+        match &self.inner {
+            ConnStreamKind::Tls { tls, .. } => {
+                tls.lock().ok().and_then(|g| g.alpn().map(|a| a.to_vec()))
+            }
+            ConnStreamKind::Plain(_) => None,
+        }
+    }
+
+    /// Peek bytes without consuming (plain connections only).
+    pub(crate) fn peek(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match &self.inner {
+            ConnStreamKind::Plain(s) => s.peek(buf),
+            ConnStreamKind::Tls { .. } => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "peek is not supported on TLS streams",
+            )),
+        }
+    }
+
+    /// Configure nodelay + read timeout on the underlying socket.
+    pub(crate) fn configure(&self, read_timeout: Option<Duration>) -> Result<()> {
+        match &self.inner {
+            ConnStreamKind::Plain(s) => configure(s, read_timeout),
+            ConnStreamKind::Tls { socket, .. } => configure(socket, read_timeout),
+        }
+    }
+}
+
+impl crate::io::Read for &ConnStream {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        match &self.inner {
+            ConnStreamKind::Plain(s) => {
+                let mut r: &TcpStream = s;
+                crate::io::Read::read(&mut r, buf)
+            }
+            ConnStreamKind::Tls { tls, .. } => {
+                let mut g = tls.lock().unwrap();
+                crate::io::Read::read(&mut *g, buf)
+            }
+        }
+    }
+}
+
+impl crate::io::Write for &ConnStream {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        match &self.inner {
+            ConnStreamKind::Plain(s) => {
+                let mut w: &TcpStream = s;
+                crate::io::Write::write(&mut w, buf)
+            }
+            ConnStreamKind::Tls { tls, .. } => {
+                let mut g = tls.lock().unwrap();
+                crate::io::Write::write(&mut *g, buf)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        match &self.inner {
+            ConnStreamKind::Plain(s) => {
+                let mut w: &TcpStream = s;
+                crate::io::Write::flush(&mut w)
+            }
+            ConnStreamKind::Tls { tls, .. } => {
+                let mut g = tls.lock().unwrap();
+                crate::io::Write::flush(&mut *g)
+            }
+        }
+    }
+}
+
+impl crate::io::Read for ConnStream {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        (&*self).read(buf)
+    }
+}
+
+impl crate::io::Write for ConnStream {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        (&*self).write(buf)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        (&*self).flush()
+    }
+}
+
+impl crate::io::Read for Arc<ConnStream> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        let mut r: &ConnStream = self;
+        r.read(buf)
+    }
+}
+
+impl crate::io::Write for Arc<ConnStream> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        let mut w: &ConnStream = self;
+        w.write(buf)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        let mut w: &ConnStream = self;
+        w.flush()
+    }
+}
 
 /// Configure a stream for the blocking driver loops used by the client
 /// and server.

@@ -14,9 +14,9 @@ use crate::http::header::{HeaderMap, HeaderName, HeaderValue};
 use crate::http::request::Request;
 use crate::http::response::Response;
 use crate::http::version::Version;
+use crate::net::ConnStream;
 use crate::server::{Handler, ServerConfig};
 use std::collections::HashMap;
-use std::net::TcpStream;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 /// A response body waiting for flow-control room.
@@ -26,11 +26,12 @@ struct Deferred {
 }
 
 /// Serve HTTP/2 requests on `stream` (client preface already verified via
-/// peek; consumed here).
-pub fn serve(stream: TcpStream, handler: &dyn Handler, config: &ServerConfig) -> Result<()> {
-    // The caller peeked the preface; consume exactly the 24 bytes so the
-    // connection reads the client's SETTINGS next.
-    let mut br = crate::io::BufReader::new(&stream, 24);
+/// peek or ALPN; consumed here).
+pub(crate) fn serve(stream: &ConnStream, handler: &dyn Handler, config: &ServerConfig) -> Result<()> {
+    // The caller verified the preface (peek for plain TCP, ALPN for TLS);
+    // consume exactly the 24 bytes so the connection reads the client's
+    // SETTINGS next.
+    let mut br = crate::io::BufReader::new(stream, 24);
     let mut preface = [0u8; 24];
     br.read_exact_into(&mut preface)?;
     if !crate::h2::connection::is_preface(&preface) {
@@ -41,10 +42,11 @@ pub fn serve(stream: TcpStream, handler: &dyn Handler, config: &ServerConfig) ->
     // A short read timeout lets the serve loop wake to flush deferred
     // (channel) response bodies even while the peer is silent; without it
     // a blocked read and a pending stream body deadlock until the long
-    // timeout.
-    let _ = crate::net::configure(&stream, Some(std::time::Duration::from_millis(20)));
+    // timeout. 250 ms is long enough that a legitimate read (including a
+    // multi-record TLS read) is never spuriously interrupted under load.
+    let _ = stream.configure(Some(std::time::Duration::from_millis(250)));
 
-    let mut conn = Connection::new(&stream, &stream, server_config(config));
+    let mut conn = Connection::new(stream, stream, server_config(config));
 
     let mut req_bodies: HashMap<u32, RequestBuilder> = HashMap::new();
     let mut deferred: HashMap<u32, Deferred> = HashMap::new();
@@ -59,10 +61,7 @@ pub fn serve(stream: TcpStream, handler: &dyn Handler, config: &ServerConfig) ->
 
         match conn.poll() {
             Ok(_) => {}
-            Err(e) => {
-                eprintln!("DEBUG h2 serve poll err: {:?}", e);
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         }
 
         while let Some(ev) = conn.next_event() {
@@ -194,7 +193,7 @@ pub fn build_request(headers: &[HeaderField], body: Body) -> Result<Request<Body
 
 /// Convert a response into HPACK fields and send it.
 fn send_response(
-    conn: &mut Connection<&TcpStream, &TcpStream>,
+    conn: &mut Connection<&ConnStream, &ConnStream>,
     sid: u32,
     resp: Response<Body>,
     deferred: &mut HashMap<u32, Deferred>,
@@ -244,7 +243,7 @@ pub fn response_fields(resp: &Response<Body>) -> Vec<HeaderField> {
 
 /// Drain deferred (channel) bodies into the connection as room allows.
 fn flush_deferred(
-    conn: &mut Connection<&TcpStream, &TcpStream>,
+    conn: &mut Connection<&ConnStream, &ConnStream>,
     deferred: &mut HashMap<u32, Deferred>,
 ) -> Result<()> {
     let mut done: Vec<u32> = Vec::new();

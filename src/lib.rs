@@ -50,6 +50,8 @@ pub mod h2;
 pub mod hpack;
 pub mod http;
 pub mod io;
+#[cfg(feature = "std")]
+pub mod tls;
 
 #[cfg(feature = "std")]
 pub mod body;

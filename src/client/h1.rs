@@ -16,16 +16,15 @@ use crate::http::response::{Response, ResponseHead};
 use crate::http::status::StatusCode;
 use crate::http::version::Version;
 use crate::io::{BufReader, BufWriter, Scratch};
-use crate::net;
+use crate::net::{self, ConnStream};
 use std::net::SocketAddr;
-use std::net::TcpStream;
 use std::sync::Arc;
 
 /// One HTTP/1 connection with persistent buffers.
 pub struct H1Connection {
-    stream: Arc<TcpStream>,
-    reader: BufReader<Arc<TcpStream>>,
-    writer: BufWriter<Arc<TcpStream>>,
+    stream: Arc<ConnStream>,
+    reader: BufReader<Arc<ConnStream>>,
+    writer: BufWriter<Arc<ConnStream>>,
     scratch: Scratch,
     /// Negotiated version.
     version: Version,
@@ -34,15 +33,26 @@ pub struct H1Connection {
 }
 
 impl H1Connection {
-    /// Connect to `addr` and configure the socket once.
-    pub fn connect(addr: SocketAddr, cfg: &ClientConfig) -> Result<Self> {
+    /// Connect to `addr` and configure the socket once. When `tls` is
+    /// set, wrap the socket in a TLS 1.3 client connection validated
+    /// against `hostname`.
+    pub fn connect(
+        addr: SocketAddr,
+        tls: Option<&crate::tls::TlsConnector>,
+        hostname: &str,
+        cfg: &ClientConfig,
+    ) -> Result<Self> {
         let stream = net::connect(&addr, cfg.connect_timeout)?;
         net::configure(&stream, cfg.read_timeout)?;
-        let stream = Arc::new(stream);
+        let conn = match tls {
+            Some(c) => ConnStream::tls_client(stream, c, hostname)?,
+            None => ConnStream::plain(stream),
+        };
+        let conn = Arc::new(conn);
         Ok(Self {
-            reader: BufReader::new(stream.clone(), 16 * 1024),
-            writer: BufWriter::new(stream.clone(), 16 * 1024),
-            stream,
+            reader: BufReader::new(conn.clone(), 16 * 1024),
+            writer: BufWriter::new(conn.clone(), 16 * 1024),
+            stream: conn,
             scratch: Scratch::new(),
             version: Version::HTTP_11,
             reusable: true,
@@ -55,10 +65,8 @@ impl H1Connection {
     }
 
     /// The remote address.
-    pub fn peer_addr(&self) -> Result<SocketAddr> {
-        self.stream
-            .peer_addr()
-            .map_err(|e| Error::io(e.to_string()))
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.stream.peer_addr()
     }
 
     /// Send a request and read the full response.
@@ -177,7 +185,7 @@ impl H1Connection {
 /// Read a body delimited by connection close into the scratch body
 /// buffer.
 fn read_until_eof_scratch(
-    reader: &mut BufReader<Arc<TcpStream>>,
+    reader: &mut BufReader<Arc<ConnStream>>,
     max: usize,
     scratch: &mut Scratch,
 ) -> Result<Bytes> {

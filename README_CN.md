@@ -135,9 +135,56 @@ let client = GrpcClient::new("http://127.0.0.1:50051")?;
 let reply = client.call("helloworld.Greeter/SayHello", Bytes::from("world"))?;
 ```
 
+## HTTPS（内置 TLS 1.3）
+
+自 0.1 起，本 crate 自带一套零依赖、从零实现的 TLS 1.3（RFC 8446），
+因此 `https://` 成为同一套客户端/服务端的一等公民能力：
+
+```rust
+use courierust::client::{Client, ClientConfig, TlsSettings as ClientTls};
+use courierust::server::{Server, ServerConfig, TlsSettings as ServerTls};
+
+// 服务端：用你的证书链 + 私钥开 HTTPS。
+let identity = courierust::tls::Identity {
+    cert_chain: vec![cert_der],        // 叶子在前（DER）
+    private_key: key_der,              // PKCS#8 或 PKCS#1（DER）
+    is_rsa: false,                     // Ed25519/ECDSA 为 false
+};
+let server_cfg = ServerConfig {
+    http2: true,                        // TLS 之上同时支持 h2 与 HTTP/1.1（ALPN）
+    tls: Some(ServerTls {
+        identity,
+        alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+    }),
+    ..Default::default()
+};
+
+// 客户端：信任你的根证书并开启 TLS。
+let mut roots = courierust::tls::RootStore::new();
+roots.add_der(root_der);                // 或用 RootStore::add_pem(...)
+let client_cfg = ClientConfig {
+    tls: Some(ClientTls {
+        roots,
+        verify: true,
+        alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        now: unix_now_secs,             // 证书有效期校验用
+    }),
+    ..Default::default()
+};
+let client = Client::with_config(client_cfg);
+let resp = client.get("https://example.com/")?;
+```
+
+支持的 TLS 1.3 配置：`TLS_CHACHA20_POLY1305_SHA256`、
+`TLS_AES_128_GCM_SHA256`、`TLS_AES_256_GCM_SHA384`；X25519 密钥交换；
+RSA-PSS / RSA-PKCS#1 v1.5 / ECDSA P-256 / Ed25519 证书签名；完整的
+X.509 链校验（有效期、名称链、签名验证、basic-constraints /
+key-usage、RFC 6125 主机名校验含 IP SAN、可插拔根证书库）。
+`cargo run --example https` 可跑一个自签名证书的端到端示例。
+
 ## 指纹：让连接「看起来像」 Chrome
 
-TLS 握手通常由外置库完成，但指纹参数是你自己说了算的：
+TLS 握手参数完全由你掌控（包括内置 TLS 层）：
 
 ```rust
 use courierust::fingerprint::{chrome_tls_profile, ja3_hash, ja4, h2::ChromeH2Fingerprint};
@@ -167,11 +214,12 @@ courierust = { version = "0.1", default-features = false }
 
 这个仓库刻意不做的，以及你接手前应该知道的：
 
-- **没有内置 TLS**。这既是零依赖的代价也是卖点：h2c（TCP 直连的 HTTP/2 前导知识）与 HTTP/1.1 可直接用；要 HTTPS，把任意 TLS 流实现 `io::Read` / `io::Write` 喂给同一套编解码即可。`TlsProfile` 就是为此准备的——指纹参数在你这侧，TLS 库在另一次握手里使用它们。
-- **没有 HTTP/3 / QUIC**。理由同上：没有外部依赖就没有可用实现。
+- **没有 HTTP/3 / QUIC**。零外部依赖意味着没有可用的 QUIC 实现（QUIC 需要用户态 UDP 栈 + TLS 1.3——TLS 部分已有，传输层没有）。
+- **TLS 暂无 PSK / 0-RTT 恢复 / session ticket / key update**。每次都做完整 1-RTT 握手；对端发来的 NewSessionTicket 会被忽略。
+- **事件驱动服务器仅限 Windows 且只处理 HTTP/1.1**。Windows 上 `ServerConfig::event_driven`（默认开启）把空闲明文 HTTP 连接挂在轮询器上，少量 worker 即可服务大量 idle keep-alive / SSE / 长轮询连接；TLS 与 HTTP/2 连接仍走阻塞池模型。非 Windows 平台回退到每连接一任务的池模型。
 - **请求体流式上传目前只在 HTTP/2 下可靠**（h2 天然分帧）。HTTP/1.1 的请求体要么一次性给全（`Body::Bytes`），要么你自己拼 chunked。
 - **gRPC 不含 protobuf**。消息编解码需要你实现 codec trait 或接你自己的 protobuf 生成代码。
-- **服务器是「每个连接一个池任务」**。慢请求会占住一个 worker 直到读完——对大多数场景够用，但高并发长连接场景可能需要进一步拆事件循环。
+- **长时间阻塞的同步 handler 会占住一个 worker**（事件驱动与否都一样）——任何同步服务器的通病；流式场景用 channel 响应体。
 - 客户端重定向、keep-alive 复用等策略以「正确」为先，未做激进调优。
 
 ## 目录结构

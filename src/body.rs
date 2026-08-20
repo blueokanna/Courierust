@@ -139,6 +139,12 @@ pub struct BodySender {
 }
 
 impl BodySender {
+    /// Build a sender from a raw channel (used by adapters that
+    /// transform the stream before it reaches the transport).
+    pub fn from_sender(tx: std::sync::mpsc::Sender<Result<Bytes>>) -> Self {
+        Self { tx }
+    }
+
     /// Send a chunk.
     pub fn send(&self, chunk: Bytes) -> Result<()> {
         self.tx
@@ -149,6 +155,13 @@ impl BodySender {
     /// Send a chunk from a slice.
     pub fn send_bytes(&self, chunk: &[u8]) -> Result<()> {
         self.send(Bytes::from(chunk))
+    }
+
+    /// Send a raw result (a chunk or a transport error) to the receiver.
+    pub fn send_result(&self, result: Result<Bytes>) -> Result<()> {
+        self.tx
+            .send(result)
+            .map_err(|_| Error::canceled("body receiver dropped"))
     }
 
     /// Send an error to the receiver.

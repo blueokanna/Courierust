@@ -1,0 +1,12 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "run-integration-stability",
+			"type": "shell",
+			"command": "for /L %i in (1,1,5) do (cargo test --test integration > tmp_stab_task_run.txt 2>&1 & findstr /C:\"test result: ok. 26 passed\" tmp_stab_task_run.txt >nul && echo run=%i PASS >> tmp_stab_task.txt || echo run=%i FAILED >> tmp_stab_task.txt)",
+			"problemMatcher": [],
+			"group": "test"
+		}
+	]
+}

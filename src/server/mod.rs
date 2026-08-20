@@ -1,8 +1,15 @@
 //! HTTP server: each accepted connection becomes a job on the
 //! work-stealing pool, so connection handling scales across cores.
+//!
+//! On Windows an optional **event-driven** mode parks idle connections on
+//! a `WSAPoll` poller instead of holding a worker thread (see
+//! [`ServerConfig::event_driven`]).
 
 pub mod h1;
 pub mod h2;
+
+#[cfg(windows)]
+pub(crate) mod event;
 
 use crate::body::Body;
 use crate::http::request::Request;
@@ -11,6 +18,17 @@ use crate::pool::ThreadPool;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Server-side TLS settings. When set, the server speaks HTTPS on its
+/// accept loop (TLS handshakes run on the worker pool).
+#[derive(Debug, Clone)]
+pub struct TlsSettings {
+    /// The server's certificate chain and private key.
+    pub identity: crate::tls::Identity,
+    /// ALPN protocols offered (the first client match wins; `h2` selects
+    /// HTTP/2, anything else falls back to HTTP/1.1).
+    pub alpn: Vec<Vec<u8>>,
+}
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -25,6 +43,15 @@ pub struct ServerConfig {
     pub http2: bool,
     /// Number of worker threads.
     pub threads: usize,
+    /// Optional TLS identity; when set, the server accepts HTTPS.
+    pub tls: Option<TlsSettings>,
+    /// Use the event-driven connection scheduler (Windows). Plain
+    /// HTTP/1.1 connections park on a `WSAPoll` poller when idle instead
+    /// of holding a worker thread; TLS and HTTP/2 connections still use
+    /// the pool model.
+    pub event_driven: bool,
+    /// Number of event-worker threads (0 = auto).
+    pub event_workers: usize,
 }
 
 impl Default for ServerConfig {
@@ -35,6 +62,9 @@ impl Default for ServerConfig {
             max_body: 16 * 1024 * 1024,
             http2: true,
             threads: 0, // 0 = auto (logical cores)
+            tls: None,
+            event_driven: cfg!(windows),
+            event_workers: 0, // auto
         }
     }
 }
@@ -112,6 +142,10 @@ impl Server {
         let handler = Arc::new(handler);
         let config = self.config;
         let pool = self.pool;
+        #[cfg(windows)]
+        if config.event_driven {
+            return event::serve_event(self.listener, handler, config, pool);
+        }
         for stream in self.listener.incoming() {
             match stream {
                 Ok(stream) => {
@@ -119,7 +153,8 @@ impl Server {
                     let c = config.clone();
                     let p = pool.clone();
                     p.spawn(move || {
-                        let _ = serve_connection(stream, h.as_ref(), &c);
+                        // TLS handshakes (blocking) also run on the pool.
+                        let _ = serve_accepted(stream, h.as_ref(), &c);
                     });
                 }
                 Err(_) => continue,
@@ -153,19 +188,52 @@ impl ServerHandle {
     }
 }
 
-/// Dispatch a connection to h1 or h2 based on the client preface.
-pub fn serve_connection(
+/// Configure the raw socket and run one connection (plain or TLS).
+pub(crate) fn serve_accepted(
     stream: TcpStream,
     handler: &dyn Handler,
     config: &ServerConfig,
 ) -> crate::Result<()> {
     crate::net::configure(&stream, config.read_timeout)?;
-    // Peek the client preface without consuming.
+    match &config.tls {
+        Some(t) => {
+            let acceptor = crate::tls::TlsAcceptor::new(crate::tls::ServerConfig {
+                identity: t.identity.clone(),
+                alpn: t.alpn.clone(),
+            });
+            let arc = Arc::new(stream);
+            let peer = arc
+                .peer_addr()
+                .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+            let tls = acceptor.accept(arc.clone(), arc.clone()).map_err(|e| {
+                crate::error::Error::with_message(crate::error::ErrorKind::Other, e.to_string())
+            })?;
+            serve_connection(crate::net::ConnStream::tls_server(tls, peer), handler, config)
+        }
+        None => serve_connection(crate::net::ConnStream::plain(stream), handler, config),
+    }
+}
+
+/// Dispatch a connection to h1 or h2. TLS connections use the ALPN
+/// result when available; plain TCP connections sniff the client preface.
+pub(crate) fn serve_connection(
+    stream: crate::net::ConnStream,
+    handler: &dyn Handler,
+    config: &ServerConfig,
+) -> crate::Result<()> {
+    // TLS with ALPN: the negotiated protocol is authoritative.
+    if let Some(alpn) = stream.alpn() {
+        if config.http2 && alpn == b"h2" {
+            return h2::serve(&stream, handler, config);
+        }
+        return h1::serve(&stream, handler, config);
+    }
+    // Plain TCP (or TLS without ALPN): sniff the h2 preface.
     let mut prefix = [0u8; 24];
     let n = stream.peek(&mut prefix).unwrap_or(0);
     if config.http2 && n == 24 && crate::h2::connection::is_preface(&prefix) {
-        h2::serve(stream, handler, config)
+        h2::serve(&stream, handler, config)
     } else {
-        h1::serve(stream, handler, config)
+        h1::serve(&stream, handler, config)
     }
 }

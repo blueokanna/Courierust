@@ -1,4 +1,4 @@
-# Courierust - [中文文档](README.md)
+# Courierust - [中文文档](README_CN.md)
 
 > A self-contained HTTP/1.1 + HTTP/2 + gRPC protocol stack with zero third-party dependencies.
 
@@ -135,9 +135,59 @@ let client = GrpcClient::new("http://127.0.0.1:50051")?;
 let reply = client.call("helloworld.Greeter/SayHello", Bytes::from("world"))?;
 ```
 
+## HTTPS (built-in TLS 1.3)
+
+Since 0.1, the crate ships a from-scratch, zero-dependency TLS 1.3
+implementation (RFC 8446), so `https://` is a first-class capability of
+the same client and server:
+
+```rust
+use courierust::client::{Client, ClientConfig, TlsSettings as ClientTls};
+use courierust::server::{Server, ServerConfig, TlsSettings as ServerTls};
+
+// Server: serve HTTPS with your certificate chain + private key.
+let identity = courierust::tls::Identity {
+    cert_chain: vec![cert_der],        // leaf first (DER)
+    private_key: key_der,              // PKCS#8 or PKCS#1 (DER)
+    is_rsa: false,                     // false for Ed25519/ECDSA
+};
+let server_cfg = ServerConfig {
+    http2: true,                        // h2 + HTTP/1.1 over TLS (ALPN)
+    tls: Some(ServerTls {
+        identity,
+        alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+    }),
+    ..Default::default()
+};
+
+// Client: trust your roots and enable TLS.
+let mut roots = courierust::tls::RootStore::new();
+roots.add_der(root_der);                // or RootStore::add_pem(...)
+let client_cfg = ClientConfig {
+    tls: Some(ClientTls {
+        roots,
+        verify: true,
+        alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        now: unix_now_secs,             // for certificate validity checks
+    }),
+    ..Default::default()
+};
+let client = Client::with_config(client_cfg);
+let resp = client.get("https://example.com/")?;
+```
+
+Supported TLS 1.3 profile: `TLS_CHACHA20_POLY1305_SHA256`,
+`TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`; X25519 key
+exchange; RSA-PSS / RSA-PKCS#1 v1.5 / ECDSA P-256 / Ed25519 certificate
+signatures; full X.509 chain validation (validity windows, name
+chaining, signature verification, basic-constraints / key-usage,
+RFC 6125 hostname matching incl. IP SANs, plus a pluggable root store).
+Run `cargo run --example https` for a self-signed end-to-end demo.
+
 ## Fingerprints: making a connection "look like" Chrome
 
-The TLS handshake itself is usually done by an external library, but the fingerprint parameters are yours to control:
+The TLS handshake parameters are fully yours to control (including via
+the built-in TLS layer):
 
 ```rust
 use courierust::fingerprint::{chrome_tls_profile, ja3_hash, ja4, h2::ChromeH2Fingerprint};
@@ -167,11 +217,12 @@ Building with `--no-default-features` compiles only the protocol core, suitable 
 
 Things this crate deliberately does *not* do, so you know before you commit:
 
-- **No built-in TLS.** That is both the price of zero deps and the point: h2c (HTTP/2 over clear TCP with prior knowledge) and HTTP/1.1 work directly; for HTTPS, wrap any TLS stream in the `io::Read` / `io::Write` traits and drive the same codec. `TlsProfile` exists precisely for this — the fingerprint parameters are yours, and the TLS library you choose uses them in its own handshake.
-- **No HTTP/3 / QUIC.** Same reason: no external deps means no usable implementation.
+- **No HTTP/3 / QUIC.** No external deps means no usable QUIC implementation (and QUIC needs a userspace UDP stack plus TLS 1.3; the TLS half exists, the transport does not).
+- **TLS: no PSK / 0-RTT resumption / session tickets / key update yet.** A full 1-RTT handshake happens every time; NewSessionTicket from a peer is ignored.
+- **Event-driven server is Windows-only and HTTP/1.1-only.** On Windows, `ServerConfig::event_driven` (default on) parks idle plain-HTTP connections on a poller so a small worker pool serves many idle keep-alive / SSE / long-poll connections; TLS and HTTP/2 connections still use the blocking pool model. On non-Windows platforms the per-connection pool model is used.
 - **Streaming request bodies are only reliable over HTTP/2** (h2 frames naturally). Over HTTP/1.1, either send the whole body at once (`Body::Bytes`) or build chunked framing yourself.
 - **gRPC does not include protobuf.** You implement the codec traits or wire in your own protobuf-generated code.
-- **The server is "one pool job per connection."** A slow request holds a worker until it finishes reading. Fine for most workloads; very long-lived connections may eventually warrant a split event loop.
+- **A synchronous handler that blocks for a long time holds a worker** (event-driven or not) — exactly as with any synchronous server; use channel response bodies for streaming.
 - Redirects, keep-alive reuse, and friends prioritize correctness over aggressive tuning.
 
 ## Layout

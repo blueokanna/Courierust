@@ -40,6 +40,11 @@ name = "compare"
 harness = false
 path = "src/compare.rs"
 
+[[bench]]
+name = "concurrency"
+harness = false
+path = "src/concurrency.rs"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

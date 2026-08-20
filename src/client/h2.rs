@@ -14,9 +14,9 @@ use crate::http::header::{HeaderMap, HeaderName, HeaderValue};
 use crate::http::response::ResponseHead;
 use crate::http::status::StatusCode;
 use crate::http::version::Version;
-use crate::net;
+use crate::net::ConnStream;
 use std::collections::HashMap;
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
@@ -43,6 +43,19 @@ pub enum H2Cmd {
         body: Option<Bytes>,
         /// Whether the stream ends after the headers/body.
         end_stream: bool,
+        /// RFC 9218 priority to signal.
+        priority: Priority,
+        /// Reply carrying the response head + streaming body.
+        reply: Sender<Result<H2Response>>,
+    },
+    /// Open a stream with a streaming request body (client-streaming /
+    /// bidi gRPC). Body chunks are drained from the channel until it
+    /// closes; the final chunk ends the stream.
+    RequestStream {
+        /// HPACK header block.
+        fields: Vec<HeaderField>,
+        /// Request-body chunks (or an error to abort the stream).
+        body: Receiver<Result<Bytes>>,
         /// RFC 9218 priority to signal.
         priority: Priority,
         /// Reply carrying the response head + streaming body.
@@ -78,9 +91,18 @@ struct Pending {
     body_len: usize,
 }
 
-/// Start an h2 connection driver over `stream`.
-pub fn start(stream: TcpStream, cfg: &ClientConfig) -> Result<H2Conn> {
-    let peer = stream.peer_addr().map_err(|e| Error::io(e.to_string()))?;
+/// An in-flight streaming request body being fed to the connection.
+struct StreamBody {
+    /// The channel the caller feeds body chunks into.
+    rx: Receiver<Result<Bytes>>,
+    /// A chunk that could not be queued yet (flow control) and must be
+    /// retried on the next poll.
+    pending_chunk: Option<Bytes>,
+}
+
+/// Start an h2 connection driver over `stream` (plain TCP or TLS).
+pub(crate) fn start(stream: ConnStream, cfg: &ClientConfig) -> Result<H2Conn> {
+    let peer = stream.peer_addr();
     let (tx, rx) = channel::<H2Cmd>();
     let cfg = cfg.clone();
     let accepting = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -95,29 +117,42 @@ pub fn start(stream: TcpStream, cfg: &ClientConfig) -> Result<H2Conn> {
     })
 }
 
-fn driver(stream: TcpStream, rx: Receiver<H2Cmd>, cfg: ClientConfig, accepting: Arc<AtomicBool>) {
+fn driver(stream: ConnStream, rx: Receiver<H2Cmd>, cfg: ClientConfig, accepting: Arc<AtomicBool>) {
     // A short read timeout wakes the driver to drain commands even when
-    // the peer is silent.
-    let _ = net::configure(&stream, Some(Duration::from_millis(20)));
+    // the peer is silent. 250 ms is long enough that a legitimate read
+    // (including a multi-record TLS read) is never spuriously interrupted
+    // under load, yet short enough to keep command/stream-body draining
+    // responsive.
+    let _ = stream.configure(Some(Duration::from_millis(250)));
     let mut conn = Connection::new(&stream, &stream, h2_config(&cfg));
     let mut pending: HashMap<u32, Pending> = HashMap::new();
+    let mut stream_bodies: HashMap<u32, StreamBody> = HashMap::new();
     let mut goaway = false;
+
+    // Write the client preface + our SETTINGS immediately, without
+    // waiting for the first command. The server classifies an inbound
+    // connection by peeking its first bytes; if the preface only appears
+    // after the first command arrives, a slow/starved driver thread can
+    // lose the race and the connection is misclassified as HTTP/1.1.
+    // Reading the server's SETTINGS here also starts the exchange early.
+    let _ = conn.poll();
 
     loop {
         // 1. Drain commands.
         let mut got_cmd = false;
         while let Ok(cmd) = rx.try_recv() {
             got_cmd = true;
-            if !handle_cmd(&mut conn, &mut pending, &mut goaway, cmd) {
-                cleanup(&mut conn, &mut pending);
+            if !handle_cmd(&mut conn, &mut pending, &mut stream_bodies, &mut goaway, cmd) {
+                cleanup(&mut conn, &mut pending, &mut stream_bodies);
                 return;
             }
         }
 
         // 2. Poll the socket only when there is work to do (a command to
-        //    flush or a stream in flight). Idle connections block on the
-        //    command channel instead of burning a read-timeout per loop.
-        if got_cmd || !pending.is_empty() {
+        //    flush, a stream in flight, or a streaming body to feed).
+        //    Idle connections block on the command channel instead of
+        //    burning a read-timeout per loop.
+        if got_cmd || !pending.is_empty() || !stream_bodies.is_empty() {
             let _ = match conn.poll() {
                 Ok(p) => p,
                 Err(e) => {
@@ -132,6 +167,7 @@ fn driver(stream: TcpStream, rx: Receiver<H2Cmd>, cfg: ClientConfig, accepting: 
                 &accepting,
                 cfg.max_body,
             );
+            drain_stream_bodies(&mut conn, &mut stream_bodies);
             if conn.is_closed() {
                 accepting.store(false, std::sync::atomic::Ordering::Release);
                 fail_all(&mut pending, Error::eof());
@@ -142,7 +178,8 @@ fn driver(stream: TcpStream, rx: Receiver<H2Cmd>, cfg: ClientConfig, accepting: 
             // unsolicited inbound (PING / GOAWAY) is still serviced.
             match rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(cmd) => {
-                    if !handle_cmd(&mut conn, &mut pending, &mut goaway, cmd) {
+                    if !handle_cmd(&mut conn, &mut pending, &mut stream_bodies, &mut goaway, cmd)
+                    {
                         break;
                     }
                 }
@@ -155,6 +192,7 @@ fn driver(stream: TcpStream, rx: Receiver<H2Cmd>, cfg: ClientConfig, accepting: 
                         &accepting,
                         cfg.max_body,
                     );
+                    drain_stream_bodies(&mut conn, &mut stream_bodies);
                     if conn.is_closed() {
                         accepting.store(false, std::sync::atomic::Ordering::Release);
                         fail_all(&mut pending, Error::eof());
@@ -165,13 +203,14 @@ fn driver(stream: TcpStream, rx: Receiver<H2Cmd>, cfg: ClientConfig, accepting: 
             }
         }
     }
-    cleanup(&mut conn, &mut pending);
+    cleanup(&mut conn, &mut pending, &mut stream_bodies);
 }
 
 /// Handle one driver command. Returns `false` to shut the driver down.
 fn handle_cmd(
-    conn: &mut Connection<&TcpStream, &TcpStream>,
+    conn: &mut Connection<&ConnStream, &ConnStream>,
     pending: &mut HashMap<u32, Pending>,
+    stream_bodies: &mut HashMap<u32, StreamBody>,
     goaway: &mut bool,
     cmd: H2Cmd,
 ) -> bool {
@@ -223,12 +262,119 @@ fn handle_cmd(
             }
             true
         }
+        H2Cmd::RequestStream {
+            fields,
+            body,
+            priority,
+            reply,
+        } => {
+            if *goaway {
+                let _ = reply.send(Err(Error::canceled("connection received GOAWAY")));
+                return true;
+            }
+            match conn.open_request(priority) {
+                Ok(sid) => {
+                    let (body_tx, body_rx) = channel::<Result<Bytes>>();
+                    let trailers = Arc::new(std::sync::Mutex::new(None));
+                    // Headers with END_STREAM clear; the body is streamed.
+                    if let Err(e) = conn.send_headers(sid, &fields, false) {
+                        let _ = reply.send(Err(e));
+                        return true;
+                    }
+                    stream_bodies.insert(
+                        sid,
+                        StreamBody {
+                            rx: body,
+                            pending_chunk: None,
+                        },
+                    );
+                    pending.insert(
+                        sid,
+                        Pending {
+                            reply: Some(reply),
+                            body_tx: Some(body_tx),
+                            body_rx: Some(body_rx),
+                            trailers,
+                            body_len: 0,
+                        },
+                    );
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                }
+            }
+            true
+        }
+    }
+}
+
+/// Feed streaming request-body chunks into the connection, respecting
+/// flow control. Chunks that cannot be queued yet are held for the next
+/// poll; a disconnected channel ends the stream.
+fn drain_stream_bodies(
+    conn: &mut Connection<&ConnStream, &ConnStream>,
+    bodies: &mut HashMap<u32, StreamBody>,
+) {
+    let mut done = Vec::new();
+    for (&sid, b) in bodies.iter_mut() {
+        // Send a held chunk first.
+        if let Some(chunk) = b.pending_chunk.take() {
+            match conn.send_data(sid, chunk.clone(), false) {
+                Ok(_) => {}
+                Err(e) if e.kind == crate::error::ErrorKind::Overflow => {
+                    b.pending_chunk = Some(chunk);
+                    continue;
+                }
+                Err(_) => {
+                    // Stream closed / connection error: drop the body.
+                    done.push(sid);
+                    continue;
+                }
+            }
+        }
+        // Drain the channel.
+        loop {
+            match b.rx.try_recv() {
+                Ok(Ok(chunk)) => {
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    match conn.send_data(sid, chunk.clone(), false) {
+                        Ok(_) => {}
+                        Err(e) if e.kind == crate::error::ErrorKind::Overflow => {
+                            b.pending_chunk = Some(chunk);
+                            break;
+                        }
+                        Err(_) => {
+                            done.push(sid);
+                            break;
+                        }
+                    }
+                }
+                Ok(Err(_)) => {
+                    // Application error: abort the request stream.
+                    let _ = conn.send_data(sid, Bytes::new(), true);
+                    done.push(sid);
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Body complete: END_STREAM.
+                    let _ = conn.send_data(sid, Bytes::new(), true);
+                    done.push(sid);
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            }
+        }
+    }
+    for sid in done {
+        bodies.remove(&sid);
     }
 }
 
 /// Drain and dispatch connection events to pending streams.
 fn drain_events(
-    conn: &mut Connection<&TcpStream, &TcpStream>,
+    conn: &mut Connection<&ConnStream, &ConnStream>,
     pending: &mut HashMap<u32, Pending>,
     goaway: &mut bool,
     accepting: &Arc<AtomicBool>,
@@ -399,7 +545,11 @@ fn fail_all(pending: &mut HashMap<u32, Pending>, err: Error) {
     }
 }
 
-fn cleanup(_conn: &mut Connection<&TcpStream, &TcpStream>, pending: &mut HashMap<u32, Pending>) {
+fn cleanup(
+    _conn: &mut Connection<&ConnStream, &ConnStream>,
+    pending: &mut HashMap<u32, Pending>,
+    _bodies: &mut HashMap<u32, StreamBody>,
+) {
     fail_all(pending, Error::canceled("connection closed"));
 }
 

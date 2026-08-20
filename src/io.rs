@@ -128,17 +128,23 @@ impl<R: Read> BufReader<R> {
         Ok(())
     }
 
-    /// Read as much as possible into `out`, stopping on clean EOF or a
-    /// transport timeout/would-block. Returns the number of bytes
-    /// appended. Unlike [`Self::read_exact_into`], a timeout mid-read does
-    /// not discard the bytes already consumed — the caller keeps the buffer
+    /// Read as much as possible into `out`, stopping on a transport
+    /// timeout/would-block. Returns the number of bytes appended.
+    /// Unlike [`Self::read_exact_into`], a timeout mid-read does not
+    /// discard the bytes already consumed — the caller keeps the buffer
     /// and resumes on the next call. This is what makes frame decoding
     /// atomic across polls (HTTP/2).
+    ///
+    /// A *clean* EOF (the peer closed the connection) is reported as
+    /// [`ErrorKind::UnexpectedEof`] rather than "no data yet": the h2
+    /// connection layer must be able to distinguish a dead peer from a
+    /// silent one, otherwise its poll loops spin forever on a closed
+    /// socket (and a pool worker is never released).
     pub fn read_more(&mut self, out: &mut [u8]) -> Result<usize> {
         let mut filled = 0;
         while filled < out.len() {
             match self.fill_buf() {
-                Ok([]) => break, // clean EOF
+                Ok([]) => return Err(Error::eof()), // clean EOF
                 Ok(b) => {
                     let take = core::cmp::min(out.len() - filled, b.len());
                     out[filled..filled + take].copy_from_slice(&b[..take]);

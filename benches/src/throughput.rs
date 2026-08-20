@@ -1,166 +1,221 @@
-//! Zero-dependency throughput benchmarks (std only, no criterion).
+//! Self-contained throughput and latency benchmarks for Courierust.
 //!
-//! Run with `cargo bench --bench throughput`. Every case prints one line
-//! that the GitHub Actions benchmark workflow parses:
-//!
-//! ```text
-//! <name>: <N> req/s (total=<seconds>, n=<count>, workers=<w>)
-//! ```
-//!
-//! The cases mirror what the crate actually claims:
-//! * `h1_sequential` — HTTP/1.1 keep-alive round-trip latency on one conn;
-//! * `h1_concurrent` — HTTP/1.1 across `workers` threads (pool sharding);
-//! * `h2_multiplex`  — many streams on a single HTTP/2 connection;
-//! * `h2_priority`   — RFC 9218 priority: high-urgency stream wins.
+//! The suite measures the protocol claims that are specific to this crate:
+//! HTTP/1.1 keep-alive, HTTP/1.1 worker scaling, HTTP/2 multiplexing, and
+//! RFC 9218 priority scheduling. Each case emits a machine-readable result.
+
+mod metrics;
 
 use courierust::body::Body;
+use courierust::bytes::Bytes;
 use courierust::client::{Client, ClientConfig};
 use courierust::h2::priority::Priority;
 use courierust::http::request::Request;
 use courierust::http::response::Response;
 use courierust::server::{Server, ServerConfig};
-use std::net::SocketAddr;
+use metrics::{run_concurrent, run_sequential, Timing, MAX_SAMPLES};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-fn echo_handler(req: Request<Body>) -> Response<Body> {
-    let mut resp = Response::<Body>::with_status(200.into());
-    let body = req.body.collect().unwrap_or_default();
-    resp.body = Body::Bytes(body);
-    resp
+const EMPTY: Payload = Payload {
+    name: "empty",
+    bytes: 0,
+};
+const ONE_KIB: Payload = Payload {
+    name: "1k",
+    bytes: 1024,
+};
+const SIXTY_FOUR_KIB: Payload = Payload {
+    name: "64k",
+    bytes: 64 * 1024,
+};
+
+#[derive(Clone, Copy)]
+struct Payload {
+    name: &'static str,
+    bytes: usize,
 }
 
-fn spawn_server(cfg: ServerConfig) -> SocketAddr {
-    let server = Server::bind_with_config("127.0.0.1:0", cfg).unwrap();
-    let addr = server.local_addr().unwrap();
-    let handle = server.serve_background(echo_handler).unwrap();
-    std::mem::forget(handle); // keep serving for the whole bench process
-    addr
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
 
-fn report(name: &str, n: usize, workers: usize, elapsed: Duration) {
-    let per_sec = n as f64 / elapsed.as_secs_f64();
+fn payload_bytes(payload: Payload) -> Bytes {
+    if payload.bytes == 0 {
+        Bytes::new()
+    } else {
+        Bytes::from(vec![b'x'; payload.bytes])
+    }
+}
+
+fn spawn_server(payload: Bytes, http2: bool, threads: usize) -> std::net::SocketAddr {
+    let server = Server::bind_with_config(
+        "127.0.0.1:0",
+        ServerConfig {
+            http2,
+            threads,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let address = server.local_addr().unwrap();
+    let handle = server
+        .serve_background(move |_request: Request<Body>| {
+            Response::<Body>::with_status(200.into()).with_body(Body::Bytes(payload.clone()))
+        })
+        .unwrap();
+    std::mem::forget(handle);
+    address
+}
+
+fn assert_courierust_response(response: Response<Body>, expected_bytes: usize) {
+    assert_eq!(response.status.as_u16(), 200);
+    assert_eq!(response.body.collect().unwrap().len(), expected_bytes);
+}
+
+fn courierust_get(client: &Client, base_url: &str, path: &str, expected_bytes: usize) {
+    let response = client.execute(base_url, Request::get(path)).unwrap();
+    assert_courierust_response(response, expected_bytes);
+}
+
+fn metric(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.2}"))
+        .unwrap_or_else(|| "na".to_owned())
+}
+
+fn print_result(
+    case: &str,
+    protocol: &str,
+    mode: &str,
+    payload: Payload,
+    workers: usize,
+    mut timing: Timing,
+) {
+    timing.sort_samples();
     println!(
-        "{name}: {per_sec:.0} req/s (total={elapsed:.3}s, n={n}, workers={workers})",
-        elapsed = elapsed.as_secs_f64()
+        "RESULT|suite=throughput|case={case}|protocol={protocol}|mode={mode}|payload={}|bytes={}|workers={workers}|requests={}|elapsed_ms={:.3}|rps={:.1}|response_mbps={:.3}|p50_us={}|p95_us={}|p99_us={}|samples={}",
+        payload.name,
+        payload.bytes,
+        timing.requests,
+        timing.elapsed.as_secs_f64() * 1000.0,
+        timing.requests_per_second(),
+        timing.response_megabytes_per_second(payload.bytes),
+        metric(timing.percentile_us(0.50)),
+        metric(timing.percentile_us(0.95)),
+        metric(timing.percentile_us(0.99)),
+        timing.samples.len(),
     );
 }
 
-fn report_latency(name: &str, elapsed: Duration, workers: usize) {
-    println!(
-        "{name}: {:.2} ms (high-urgency completion, workers={workers})",
-        elapsed.as_secs_f64() * 1000.0
-    );
-}
-
-fn bench_h1_sequential() {
-    let addr = spawn_server(ServerConfig::default());
+fn bench_h1_sequential(payload: Payload, requests: usize, server_threads: usize) {
+    let address = spawn_server(payload_bytes(payload), false, server_threads);
     let client = Client::new();
-    let url = format!("http://{addr}/bench");
+    let base_url = format!("http://{address}");
+    courierust_get(&client, &base_url, "/bench", payload.bytes);
 
-    // Warm up the keep-alive connection.
-    let _ = client.get(&url).unwrap();
-
-    const N: usize = 20_000;
-    let start = Instant::now();
-    for _ in 0..N {
-        let resp = client.get(&url).unwrap();
-        debug_assert_eq!(resp.status.as_u16(), 200);
-    }
-    report("h1_sequential", N, 1, start.elapsed());
-}
-
-fn bench_h1_concurrent() {
-    let addr = spawn_server(ServerConfig::default());
-    let url = Arc::new(format!("http://{addr}/bench"));
-
-    const WORKERS: usize = 8;
-    const PER_WORKER: usize = 2_000;
-
-    // One client per worker: each owns its shard of the keep-alive pool.
-    let clients: Vec<Client> = (0..WORKERS).map(|_| Client::new()).collect();
-
-    let start = Instant::now();
-    let handles: Vec<_> = clients
-        .into_iter()
-        .map(|client| {
-            let url = url.clone();
-            std::thread::spawn(move || {
-                for _ in 0..PER_WORKER {
-                    let resp = client.get(&url).unwrap();
-                    debug_assert_eq!(resp.status.as_u16(), 200);
-                }
-            })
-        })
-        .collect();
-    for h in handles {
-        h.join().unwrap();
-    }
-    report(
-        "h1_concurrent",
-        WORKERS * PER_WORKER,
-        WORKERS,
-        start.elapsed(),
+    let timing = run_sequential(
+        requests,
+        MAX_SAMPLES,
+        || courierust_get(&client, &base_url, "/bench", payload.bytes),
+        || {},
+        || 0,
+    );
+    print_result(
+        "h1_sequential",
+        "h1",
+        "sequential",
+        payload,
+        1,
+        timing,
     );
 }
 
-fn bench_h2_multiplex() {
-    let cfg = ServerConfig {
-        http2: true,
-        ..Default::default()
-    };
-    let addr = spawn_server(cfg);
-    let client_cfg = ClientConfig {
-        http2: true,
-        ..Default::default()
-    };
-    let client = Client::with_config(client_cfg);
-    let url = format!("http://{addr}/bench");
+fn bench_h1_parallel(
+    payload: Payload,
+    requests: usize,
+    workers: usize,
+    server_threads: usize,
+) {
+    let address = spawn_server(payload_bytes(payload), false, server_threads);
+    let base_url = Arc::new(format!("http://{address}"));
+    let clients = Arc::new((0..workers).map(|_| Client::new()).collect::<Vec<_>>());
 
-    // Warm up (opens the h2 connection).
-    let _ = client.get(&url).unwrap();
+    for client in clients.iter() {
+        courierust_get(client, &base_url, "/bench", payload.bytes);
+    }
 
-    // 32 threads hammer the shared (≤4) h2 connections; streams from all
-    // of them interleave on the same connections.
-    const WORKERS: usize = 32;
-    const PER_WORKER: usize = 200;
-    let start = Instant::now();
-    let handles: Vec<_> = (0..WORKERS)
-        .map(|_| {
+    let timing = run_concurrent(
+        requests,
+        workers,
+        MAX_SAMPLES,
+        |index| {
+            let client = clients[index].clone();
+            let base_url = base_url.clone();
+            Box::new(move || courierust_get(&client, &base_url, "/bench", payload.bytes))
+        },
+        || {},
+        || 0,
+    );
+    print_result(
+        &format!("h1_parallel_w{workers}"),
+        "h1",
+        "parallel",
+        payload,
+        workers,
+        timing,
+    );
+}
+
+fn bench_h2_multiplex(
+    payload: Payload,
+    requests: usize,
+    workers: usize,
+    server_threads: usize,
+) {
+    let address = spawn_server(payload_bytes(payload), true, server_threads);
+    let base_url = Arc::new(format!("http://{address}"));
+    let client = Client::with_config(ClientConfig {
+        http2: true,
+        max_connections_per_host: 1,
+        ..Default::default()
+    });
+    courierust_get(&client, &base_url, "/bench", payload.bytes);
+
+    let timing = run_concurrent(
+        requests,
+        workers,
+        MAX_SAMPLES,
+        |_| {
             let client = client.clone();
-            let url = url.clone();
-            std::thread::spawn(move || {
-                for _ in 0..PER_WORKER {
-                    let resp = client.get(&url).unwrap();
-                    debug_assert_eq!(resp.status.as_u16(), 200);
-                }
-            })
-        })
-        .collect();
-    for h in handles {
-        h.join().unwrap();
-    }
-    report(
-        "h2_multiplex",
-        WORKERS * PER_WORKER,
-        WORKERS,
-        start.elapsed(),
+            let base_url = base_url.clone();
+            Box::new(move || courierust_get(&client, &base_url, "/bench", payload.bytes))
+        },
+        || {},
+        || 0,
+    );
+    print_result(
+        &format!("h2_multiplex_w{workers}"),
+        "h2c",
+        "multiplex",
+        payload,
+        workers,
+        timing,
     );
 }
 
-fn bench_h2_priority() {
-    let cfg = ServerConfig {
+fn bench_h2_priority(requests: usize, server_threads: usize) {
+    let address = spawn_server(Bytes::new(), true, server_threads);
+    let client = Client::with_config(ClientConfig {
         http2: true,
+        max_connections_per_host: 1,
         ..Default::default()
-    };
-    let addr = spawn_server(cfg);
-    let client_cfg = ClientConfig {
-        http2: true,
-        ..Default::default()
-    };
-    let client = Client::with_config(client_cfg);
-    let url = format!("http://{addr}/bench");
-
+    });
+    let base_url = format!("http://{address}");
     let high = Priority {
         urgency: 0,
         incremental: false,
@@ -169,38 +224,79 @@ fn bench_h2_priority() {
         urgency: 7,
         incremental: false,
     };
+    let request = Request::get("/priority");
+    let _ = client
+        .execute_priority(&base_url, request.clone(), high)
+        .unwrap();
 
-    // Measure the total time to finish one high-urgency request launched
-    // *after* a pile of low-urgency ones — the scheduler should not let
-    // the low-urgency backlog starve or delay it.
-    let mut lows = Vec::with_capacity(64);
-    for _ in 0..64 {
-        let client = client.clone();
-        let url = url.clone();
-        lows.push(std::thread::spawn(move || {
-            let req = Request::new(courierust::http::method::Method::GET, "/low");
-            let _ = client.execute_priority(&url, req, low);
-        }));
+    let rounds = requests.min(32);
+    let mut latencies = Vec::with_capacity(rounds);
+    let started = Instant::now();
+    for _ in 0..rounds {
+        let mut low_requests = Vec::with_capacity(32);
+        for _ in 0..32 {
+            let client = client.clone();
+            let base_url = base_url.clone();
+            let request = request.clone();
+            low_requests.push(std::thread::spawn(move || {
+                let _ = client.execute_priority(&base_url, request, low);
+            }));
+        }
+
+        let high_started = Instant::now();
+        let response = client
+            .execute_priority(&base_url, request.clone(), high)
+            .unwrap();
+        assert_eq!(response.status.as_u16(), 200);
+        latencies.push(high_started.elapsed());
+
+        for worker in low_requests {
+            worker.join().unwrap();
+        }
     }
 
-    let start = Instant::now();
-    let req = Request::new(courierust::http::method::Method::GET, "/high");
-    let resp = client.execute_priority(&url, req, high).unwrap();
-    debug_assert_eq!(resp.status.as_u16(), 200);
-    let high_elapsed = start.elapsed();
-
-    for h in lows {
-        let _ = h.join();
-    }
-    report_latency("h2_priority_high_latency", high_elapsed, 64);
+    let timing = Timing {
+        elapsed: started.elapsed(),
+        requests: rounds,
+        samples: latencies,
+        allocations: 0,
+    };
+    print_result(
+        "h2_priority_high_latency",
+        "h2c",
+        "priority",
+        EMPTY,
+        32,
+        timing,
+    );
 }
 
 fn main() {
-    let started = Instant::now();
-    println!("courierust benchmarks (release, std)");
-    bench_h1_sequential();
-    bench_h1_concurrent();
-    bench_h2_multiplex();
-    bench_h2_priority();
-    println!("total: {:.3}s", started.elapsed().as_secs_f64());
+    let requests = env_usize("BENCH_REQUESTS", 4_000);
+    let server_threads = env_usize("BENCH_SERVER_THREADS", 4);
+    println!("courierust throughput suite (loopback)");
+    println!(
+        "META|suite=throughput|requests={requests}|server_threads={server_threads}|max_samples={MAX_SAMPLES}"
+    );
+
+    for payload in [EMPTY, ONE_KIB, SIXTY_FOUR_KIB] {
+        bench_h1_sequential(payload, requests, server_threads);
+    }
+
+    for workers in [1, 4, 8] {
+        if workers <= requests {
+            bench_h1_parallel(ONE_KIB, requests, workers, server_threads);
+        }
+    }
+
+    for payload in [ONE_KIB, SIXTY_FOUR_KIB] {
+        for workers in [1, 8, 32] {
+            if workers <= requests {
+                bench_h2_multiplex(payload, requests, workers, server_threads);
+            }
+        }
+    }
+
+    bench_h2_priority(requests, server_threads);
+    println!("total: complete");
 }

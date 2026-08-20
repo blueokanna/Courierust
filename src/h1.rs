@@ -146,7 +146,7 @@ pub fn read_headers_scratch<R: Read>(
 }
 
 /// Split a single `Name: value` line.
-fn split_header(line: &[u8]) -> Result<(HeaderName, HeaderValue)> {
+pub(crate) fn split_header(line: &[u8]) -> Result<(HeaderName, HeaderValue)> {
     let colon = line
         .iter()
         .position(|&b| b == b':')
@@ -166,7 +166,7 @@ fn split_header(line: &[u8]) -> Result<(HeaderName, HeaderValue)> {
 }
 
 /// Trim CR/LF and surrounding whitespace.
-fn trim_crlf(line: &[u8]) -> &[u8] {
+pub(crate) fn trim_crlf(line: &[u8]) -> &[u8] {
     let mut end = line.len();
     while end > 0 && (line[end - 1] == b'\n' || line[end - 1] == b'\r' || line[end - 1] == b' ') {
         end -= 1;

@@ -8,14 +8,14 @@ use crate::http::header::{HeaderMap, HeaderName, HeaderValue};
 use crate::http::request::Request;
 use crate::http::version::Version;
 use crate::io::{BufReader, BufWriter, Scratch};
+use crate::net::ConnStream;
 use crate::server::{Handler, ServerConfig};
-use std::net::TcpStream;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 
 /// Serve HTTP/1.1 requests on `stream` until the connection closes.
-pub fn serve(stream: TcpStream, handler: &dyn Handler, config: &ServerConfig) -> Result<()> {
-    let mut reader = BufReader::new(&stream, 16 * 1024);
-    let mut writer = BufWriter::new(&stream, 16 * 1024);
+pub(crate) fn serve(stream: &ConnStream, handler: &dyn Handler, config: &ServerConfig) -> Result<()> {
+    let mut reader = BufReader::new(stream, 16 * 1024);
+    let mut writer = BufWriter::new(stream, 16 * 1024);
     let mut scratch = Scratch::new();
     loop {
         // Request line.
@@ -129,7 +129,7 @@ pub fn serve(stream: TcpStream, handler: &dyn Handler, config: &ServerConfig) ->
 
 /// Stream a channel body as chunked encoding.
 fn stream_response(
-    writer: &mut BufWriter<&TcpStream>,
+    writer: &mut BufWriter<&ConnStream>,
     rx: Receiver<Result<Bytes>>,
     timeout: Option<std::time::Duration>,
 ) -> Result<()> {

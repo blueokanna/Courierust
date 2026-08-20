@@ -329,6 +329,13 @@ impl<R: Read, W: Write> Connection<R, W> {
         let read_any = match self.read_and_process_one() {
             Ok(r) => r,
             Err(e) if e.kind == ErrorKind::Timeout => false,
+            // A clean EOF (peer closed) ends the session: mark it closed
+            // so `is_closed()` reports it and drivers stop treating the
+            // connection as reusable.
+            Err(e) if e.kind == ErrorKind::UnexpectedEof => {
+                self.closed = true;
+                return Err(e);
+            }
             Err(e) => return Err(e),
         };
         self.flush_outbound()?;
