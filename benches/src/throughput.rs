@@ -98,7 +98,7 @@ fn print_result(
 ) {
     timing.sort_samples();
     println!(
-        "RESULT|suite=throughput|case={case}|protocol={protocol}|mode={mode}|payload={}|bytes={}|workers={workers}|requests={}|elapsed_ms={:.3}|rps={:.1}|response_mbps={:.3}|p50_us={}|p95_us={}|p99_us={}|samples={}",
+        "RESULT|suite=throughput|case={case}|protocol={protocol}|mode={mode}|payload={}|bytes={}|workers={workers}|requests={}|elapsed_ms={:.3}|rps={:.1}|response_mbps={:.3}|p50_us={}|p75_us={}|p90_us={}|p95_us={}|p99_us={}|samples={}",
         payload.name,
         payload.bytes,
         timing.requests,
@@ -106,6 +106,8 @@ fn print_result(
         timing.requests_per_second(),
         timing.response_megabytes_per_second(payload.bytes),
         metric(timing.percentile_us(0.50)),
+        metric(timing.percentile_us(0.75)),
+        metric(timing.percentile_us(0.90)),
         metric(timing.percentile_us(0.95)),
         metric(timing.percentile_us(0.99)),
         timing.samples.len(),

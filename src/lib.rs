@@ -27,10 +27,14 @@
 //!   self-contained MD5/SHA-256, so a browser-shaped fingerprint can be
 //!   fed to an external TLS layer of your choice.
 //!
-//! TLS is intentionally out of scope (the crate has no dependencies);
-//! HTTP/2-over-clear-TCP (`h2c` prior knowledge) and HTTP/1.1 are
-//! supported directly, and a [`io::Write`]/[`io::Read`] trait lets you
-//! drive the same codec over any TLS stream.
+//! TLS 1.3 (RFC 8446) is implemented from scratch under the `std`
+//! feature (`tls` module) — client and server handshakes, X.25519 key
+//! exchange, AES-GCM / ChaCha20-Poly1305 record protection, and X.509
+//! chain validation — so `https://` is a first-class capability on both
+//! the client and the server. The protocol core (`http`, `hpack`, `h2`,
+//! `fingerprint`, `crypto`, `bytes`, `io`) stays `no_std + alloc` with
+//! zero third-party dependencies; the transport traits let the same
+//! codecs also run over an externally supplied TLS stream.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(unsafe_code)]

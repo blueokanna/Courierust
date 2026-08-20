@@ -134,4 +134,19 @@ impl Settings {
             },
         ]
     }
+
+    /// Serialize the settings as an HTTP/2 SETTINGS frame **payload**
+    /// (RFC 7540 §6.5): a sequence of 6-byte entries
+    /// `{ u16 identifier, u32 value }`. This is the exact byte layout
+    /// used by the `HTTP2-Settings` header of an RFC 7540 §3.2 `h2c`
+    /// Upgrade (base64url-encoded, without the frame header).
+    pub fn to_wire(&self) -> Vec<u8> {
+        let entries = self.to_vec();
+        let mut out = Vec::with_capacity(entries.len() * 6);
+        for s in entries {
+            out.extend_from_slice(&s.id.to_be_bytes());
+            out.extend_from_slice(&s.value.to_be_bytes());
+        }
+        out
+    }
 }

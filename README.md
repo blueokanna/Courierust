@@ -248,8 +248,8 @@ src/
 
 ## Tests
 
-- 49 unit tests: all HPACK RFC vectors (C.2/C.3/C.4/C.6), Huffman encode/decode, frame codec, state machine, flow control, WUCS scheduling, JA3/JA4 comparison against published records, fingerprint parsing.
-- 9 integration tests: real loopback TCP round trips for h1/h2, keep-alive reuse, chunked, redirects, h2 concurrent multiplexing, streaming responses, gRPC unary and error status.
+- 104 unit tests: all HPACK RFC vectors (C.2/C.3/C.4/C.6), Huffman encode/decode, frame codec, state machine, flow control, WUCS scheduling, JA3/JA4 comparison against published records, fingerprint parsing, TLS 1.3 handshake + RFC 8448 key schedule, X.25519/Ed25519/ECDSA/RSA primitives.
+- 42 integration tests: real loopback TCP round trips for h1/h2/HTTPS, keep-alive reuse, chunked, redirects, h2 concurrent multiplexing, streaming responses, gRPC unary/server/client/bidi streaming + error status + trailers + deadline enforcement, RFC 7540 §3.2 `h2c` Upgrade, TLS trust rejection, plus a hardening suite of 16 hostile-frame tests (oversized frames, malformed SETTINGS/PING/WINDOW_UPDATE, HPACK header-list bombs, pseudo-header ordering, `h2c` liveness: SETTINGS_TIMEOUT and keepalive dead-peer detection).
 
 ```bash
 cargo test                 # everything

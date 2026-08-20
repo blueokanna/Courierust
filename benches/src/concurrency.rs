@@ -124,12 +124,18 @@ fn main() {
         }
         samples.sort_unstable();
         let p50 = samples[reqs / 2].as_secs_f64() * 1_000_000.0;
+        let p75 = samples[(reqs as f64 * 0.75) as usize]
+            .as_secs_f64()
+            * 1_000_000.0;
+        let p90 = samples[(reqs as f64 * 0.90) as usize]
+            .as_secs_f64()
+            * 1_000_000.0;
         let p99 = samples[(reqs as f64 * 0.99) as usize]
             .as_secs_f64()
             * 1_000_000.0;
 
         println!(
-            "model={model} idle={idle} workers=2 reqs={reqs} p50_us={p50:.1} p99_us={p99:.1}",
+            "model={model} idle={idle} workers=2 reqs={reqs} p50_us={p50:.1} p75_us={p75:.1} p90_us={p90:.1} p99_us={p99:.1}",
         );
         drop(herd);
     }

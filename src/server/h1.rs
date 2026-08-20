@@ -30,6 +30,7 @@ pub(crate) fn serve(stream: &ConnStream, handler: &dyn Handler, config: &ServerC
         }
         let rl = h1::parse_request_line(line)?;
         let headers = h1::read_headers_scratch(&mut reader, &mut scratch)?;
+        let upgrade = is_h2c_upgrade(&headers);
         let body = match h1::body_length(&headers, Some(&rl.method), None)? {
             h1::BodyLen::None => Body::Empty,
             h1::BodyLen::Length(n) => Body::Bytes(h1::read_body_fixed_scratch(
@@ -52,6 +53,20 @@ pub(crate) fn serve(stream: &ConnStream, handler: &dyn Handler, config: &ServerC
             body,
         };
         let resp = handler.handle(req);
+
+        // RFC 7540 §3.2: an `h2c` Upgrade request switches this connection
+        // to HTTP/2 (when the server is configured to speak h2). The
+        // handler's response to the upgrade request is delivered on h2
+        // stream 1. An h1-only server ignores the Upgrade and answers
+        // normally.
+        if upgrade && config.http2 {
+            let out = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n";
+            writer.write_all(out)?;
+            writer.flush()?;
+            drop(writer);
+            drop(reader);
+            return crate::server::h2::serve_upgraded(stream, handler, config, resp);
+        }
 
         let keep_alive = h1::keep_alive_requested(resp.version, &resp.headers)
             && !resp
@@ -125,6 +140,29 @@ pub(crate) fn serve(stream: &ConnStream, handler: &dyn Handler, config: &ServerC
         }
     }
     Ok(())
+}
+
+/// Whether the request is an RFC 7540 §3.2 `h2c` Upgrade: `Upgrade: h2c`
+/// plus a `Connection` token of `upgrade` and an `HTTP2-Settings` header.
+fn is_h2c_upgrade(headers: &HeaderMap) -> bool {
+    let upgrade = headers
+        .get("upgrade")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if upgrade != "h2c" {
+        return false;
+    }
+    if !headers.contains_key("http2-settings") {
+        return false;
+    }
+    headers
+        .get("connection")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .split(',')
+        .any(|t| t.trim() == "upgrade")
 }
 
 /// Stream a channel body as chunked encoding.

@@ -70,10 +70,23 @@ impl<R> BufReader<R> {
     pub fn buffered(&self) -> usize {
         self.cap - self.pos
     }
+
+    /// Seed the buffer with bytes that were already read from the
+    /// transport before this reader was created (used by the RFC 7540
+    /// §3.2 `h2c` Upgrade path: the server's SETTINGS frame may already
+    /// be buffered behind the `101` response). Must be called on a fresh
+    /// reader; the seed must fit in the buffer.
+    pub fn seed(&mut self, data: &[u8]) {
+        debug_assert!(self.pos == 0 && self.cap == 0);
+        let n = core::cmp::min(data.len(), self.buf.len());
+        self.buf[..n].copy_from_slice(&data[..n]);
+        self.cap = n;
+    }
 }
 
 impl<R: Read> BufReader<R> {
     /// Fill the buffer if it is empty; returns the buffered slice.
+    /// Returns `Ok(&[])` on clean EOF.
     pub fn fill_buf(&mut self) -> Result<&[u8]> {
         if self.pos == self.cap {
             self.pos = 0;
@@ -222,8 +235,6 @@ impl<R: Read> BufReader<R> {
             if b.is_empty() {
                 return Err(Error::eof());
             }
-            // Scan the buffered window in bulk and extend once, instead
-            // of pushing byte-by-byte.
             let room = max - out.len();
             let scan = core::cmp::min(room, b.len());
             match b[..scan].iter().position(|&c| c == delim) {

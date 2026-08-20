@@ -285,6 +285,25 @@ fn dns_match(name: &str, pattern: &str) -> bool {
     !label.is_empty() && !label.contains('.')
 }
 
+/// TLS server authentication EKU OID (1.3.6.1.5.5.7.3.1), DER
+/// sub-identifier bytes.
+const EKU_SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+/// anyExtendedKeyUsage OID (2.5.29.37.0), DER sub-identifier bytes.
+const EKU_ANY: &[u8] = &[0x55, 0x1d, 0x25, 0x00];
+
+/// RFC 5280 §4.2.1.12: when a certificate carries an Extended Key Usage
+/// extension, a TLS peer using it for **server authentication** must find
+/// `serverAuth` (or `anyExtendedKeyUsage`) among its purposes. An absent
+/// EKU extension imposes no restriction (returns `true`).
+pub fn has_server_auth_eku(cert: &Certificate) -> bool {
+    if cert.eku.is_empty() {
+        return true;
+    }
+    cert.eku
+        .iter()
+        .any(|e| e.as_slice() == EKU_SERVER_AUTH || e.as_slice() == EKU_ANY)
+}
+
 /// Validate a certificate chain (leaf first) against the root store.
 ///
 /// Performs: validity-window checks for every certificate, name chaining

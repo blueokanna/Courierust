@@ -245,8 +245,8 @@ src/
 
 ## 测试
 
-- 单元测试 49 个：覆盖 HPACK 全部 RFC 向量（C.2/C.3/C.4/C.6）、Huffman 编解码、帧编解码、状态机、流控、WUCS 调度、JA3/JA4 公开记录比对、指纹解析。
-- 集成测试 9 个：真实 TCP 环回上的 h1/h2 请求往返、keep-alive 复用、chunked、重定向、h2 并发多路复用、流式响应、gRPC unary 与错误状态。
+- 单元测试 104 个：覆盖 HPACK 全部 RFC 向量（C.2/C.3/C.4/C.6）、Huffman 编解码、帧编解码、状态机、流控、WUCS 调度、JA3/JA4 公开记录比对、指纹解析、TLS 1.3 握手与 RFC 8448 密钥调度、X.25519/Ed25519/ECDSA/RSA 原语。
+- 集成测试 42 个：真实 TCP 环回上的 h1/h2/HTTPS 请求往返、keep-alive 复用、chunked、重定向、h2 并发多路复用、流式响应、gRPC unary/服务端流/客户端流/双向流与错误状态/trailers/deadline 执行、RFC 7540 §3.2 `h2c` Upgrade、TLS 信任拒绝，另有 16 个恶意帧加固测试（超长帧、畸形 SETTINGS/PING/WINDOW_UPDATE、HPACK 头表压缩炸弹、伪头顺序、`h2c` 存活检测：SETTINGS_TIMEOUT 与 keepalive 死对端检测）。
 
 ```bash
 cargo test                 # 全部测试

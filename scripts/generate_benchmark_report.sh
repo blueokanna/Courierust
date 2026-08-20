@@ -39,6 +39,44 @@ write_table() {
     done <<< "$lines"
 }
 
+# Render `RESULT|suite=throughput|case=...|rps=...|...|p50_us=..|p75_us=..|p90_us=..|p95_us=..|p99_us=..|...`
+# lines as a latency table covering P50..P99.
+write_result_table() {
+    local lines=$1
+    local line
+    local field
+
+    if [[ -z "$lines" ]]; then
+        printf '| _No benchmark result captured_ |\n'
+        return
+    fi
+
+    printf '| Case | RPS | resp MB/s | P50 µs | P75 µs | P90 µs | P95 µs | P99 µs |\n'
+    printf '| --- | --- | --- | --- | --- | --- | --- | --- |\n'
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        field() { printf '%s' "$line" | sed -n "s/.*$1=[^|]*//;s/.*$1=\([^|]*\).*/\1/p"; }
+        local case_name
+        local rps
+        local mbps
+        local p50
+        local p75
+        local p90
+        local p95
+        local p99
+        case_name=$(field 'case')
+        rps=$(field 'rps')
+        mbps=$(field 'response_mbps')
+        p50=$(field 'p50_us')
+        p75=$(field 'p75_us')
+        p90=$(field 'p90_us')
+        p95=$(field 'p95_us')
+        p99=$(field 'p99_us')
+        printf '| `%s` | %s | %s | %s | %s | %s | %s | %s |\n' \
+            "$case_name" "$rps" "$mbps" "$p50" "$p75" "$p90" "$p95" "$p99"
+    done <<< "$lines"
+}
+
 write_raw_block() {
     local file=$1
     local pattern=$2
@@ -57,7 +95,7 @@ runner=${RUNNER_OS:-$(uname -s)}
 throughput_status=${BENCHMARK_THROUGHPUT_EXIT:-not-recorded}
 compare_status=${BENCHMARK_COMPARE_EXIT:-not-recorded}
 
-throughput_results=$(extract_lines '^(h1_|h2_)[^:]*:' "$throughput_log")
+throughput_results=$(extract_lines '^RESULT\|suite=throughput' "$throughput_log")
 compare_results=$(extract_lines '^(raw_tcp_floor|h1 |h2 )[^:]*:' "$compare_log")
 
 {
@@ -76,10 +114,8 @@ compare_results=$(extract_lines '^(raw_tcp_floor|h1 |h2 )[^:]*:' "$compare_log")
         printf -- '- Workflow run: `%s`\n' "$run_id"
     fi
 
-    printf '\n%s\n\n' '## Throughput'
-    printf '| Benchmark | Result |\n'
-    printf '| --- | --- |\n'
-    write_table "$throughput_results"
+    printf '\n%s\n\n' '## Throughput (P50–P99 latency)'
+    write_result_table "$throughput_results"
     printf '\n'
 
     printf '%s\n\n' '## Cross-library comparison'

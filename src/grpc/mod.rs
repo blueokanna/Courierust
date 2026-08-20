@@ -708,6 +708,84 @@ struct GrpcHandler {
     max_message_size: usize,
 }
 
+/// A parsed gRPC call deadline (`grpc-timeout`, gRPC A6). `None` means no
+/// deadline was set by the client.
+struct Deadline(Option<std::time::Instant>);
+
+impl Deadline {
+    /// Parse the `grpc-timeout` header. A malformed value is
+    /// `INVALID_ARGUMENT`; a value of `0` units is treated as an
+    /// already-expired deadline.
+    fn parse(headers: &HeaderMap) -> Result<Self> {
+        let Some(v) = headers.get("grpc-timeout") else {
+            return Ok(Self(None));
+        };
+        let s = v.to_str().map_err(|_| {
+            Error::grpc(status::INVALID_ARGUMENT, "malformed grpc-timeout value")
+        })?;
+        if s.len() < 2 {
+            return Err(Error::grpc(
+                status::INVALID_ARGUMENT,
+                "grpc-timeout must be a value plus a unit",
+            ));
+        }
+        let (num, unit) = s.split_at(s.len() - 1);
+        let n: u64 = num
+            .parse()
+            .map_err(|_| Error::grpc(status::INVALID_ARGUMENT, "bad grpc-timeout value"))?;
+        if n > 99_999_999 {
+            return Err(Error::grpc(
+                status::INVALID_ARGUMENT,
+                "grpc-timeout value too large",
+            ));
+        }
+        let dur = match unit {
+            "H" => Duration::from_secs(n),
+            "M" => Duration::from_secs(n.saturating_mul(60)),
+            "S" => Duration::from_secs(n),
+            "m" => Duration::from_millis(n),
+            "u" => Duration::from_micros(n),
+            "n" => Duration::from_nanos(n),
+            _ => {
+                return Err(Error::grpc(
+                    status::INVALID_ARGUMENT,
+                    "bad grpc-timeout unit",
+                ));
+            }
+        };
+        Ok(Self(Some(std::time::Instant::now() + dur)))
+    }
+
+    /// Whether the deadline has already passed.
+    fn expired(&self) -> bool {
+        match self.0 {
+            Some(d) => std::time::Instant::now() >= d,
+            None => false,
+        }
+    }
+}
+
+/// A request-message iterator that yields `DEADLINE_EXCEEDED` once the
+/// call deadline has passed (enforced between message polls, so
+/// client-streaming / bidi loops observe it naturally).
+struct DeadlineIter<'a, I> {
+    inner: I,
+    deadline: &'a Deadline,
+}
+
+impl<'a, I: Iterator<Item = Result<Bytes>>> Iterator for DeadlineIter<'a, I> {
+    type Item = Result<Bytes>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.deadline.expired() {
+            return Some(Err(Error::grpc(
+                status::DEADLINE_EXCEEDED,
+                "deadline exceeded",
+            )));
+        }
+        self.inner.next()
+    }
+}
+
 impl Handler for GrpcHandler {
     fn handle(&self, req: Request<Body>) -> Response<Body> {
         // The request path is the method (we POST to /pkg.Svc/Method).
@@ -726,6 +804,23 @@ impl Handler for GrpcHandler {
             resp.body = Body::Bytes(Bytes::from_static(b"content-type must be application/grpc"));
             return resp;
         }
+
+        // Deadline enforcement (gRPC A6): parse grpc-timeout. A malformed
+        // value is INVALID_ARGUMENT; an already-expired deadline is
+        // DEADLINE_EXCEEDED before any work is dispatched.
+        let deadline = match Deadline::parse(&req.headers) {
+            Ok(d) => d,
+            Err(e) => {
+                return grpc_error_response(
+                    e.grpc_code().unwrap_or(status::INTERNAL),
+                    &e.to_string(),
+                );
+            }
+        };
+        if deadline.expired() {
+            return grpc_error_response(status::DEADLINE_EXCEEDED, "deadline exceeded");
+        }
+
         // Decode all request messages from the buffered body.
         let raw = match req.body.collect() {
             Ok(b) => b.to_vec(),
@@ -769,11 +864,19 @@ impl Handler for GrpcHandler {
             });
 
         let result = {
-            let mut iter = messages.into_iter();
+            let mut iter = DeadlineIter {
+                inner: messages.into_iter(),
+                deadline: &deadline,
+            };
             self.service.serve(&method, &mut iter, &msg_sender)
         };
         match result {
             Ok(()) => {
+                // A synchronous handler may have overrun the deadline;
+                // surface DEADLINE_EXCEEDED rather than a late OK.
+                if deadline.expired() {
+                    return grpc_error_response(status::DEADLINE_EXCEEDED, "deadline exceeded");
+                }
                 let mut resp = Response::<Body>::with_status(200.into());
                 resp.headers.insert(
                     HeaderName::from_lowercase("content-type"),
@@ -783,12 +886,15 @@ impl Handler for GrpcHandler {
                     HeaderName::from_lowercase("grpc-encoding"),
                     HeaderValue::from_static("identity"),
                 );
-                // grpc-status in the header block is interoperable with
-                // trailer-aware and simple clients alike.
-                resp.headers.insert(
+                // `grpc-status` is carried in the trailing header block
+                // (the gRPC wire contract), not the initial metadata; the
+                // body streams and the trailers end the stream.
+                let mut tr = HeaderMap::new();
+                tr.insert(
                     HeaderName::from_lowercase("grpc-status"),
                     HeaderValue::from_static("0"),
                 );
+                resp.trailers = Some(tr);
                 resp.body = body;
                 resp
             }

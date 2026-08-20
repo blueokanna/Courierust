@@ -70,6 +70,24 @@ pub struct ClientConfig {
     /// TLS settings for `https://` URLs. `None` (the default) disables
     /// TLS; `https://` requests then fail with a clear error.
     pub tls: Option<TlsSettings>,
+    /// h2: drop the connection if the peer does not ACK our SETTINGS
+    /// within this long (`SETTINGS_TIMEOUT`, RFC 9113 §6.5.3).
+    pub h2_settings_timeout: Option<Duration>,
+    /// h2: send a keepalive PING after this much inbound silence.
+    pub h2_ping_interval: Option<Duration>,
+    /// h2: drop the connection if no frame at all arrives within this
+    /// long after a keepalive PING was sent (dead-peer detection).
+    pub h2_ping_timeout: Option<Duration>,
+    /// h2: close a connection with no in-flight streams after this much
+    /// idle time, so idle driver threads are reaped instead of
+    /// accumulating with connection count.
+    pub h2_idle_timeout: Option<Duration>,
+    /// Use the RFC 7540 §3.2 `h2c` Upgrade handshake instead of prior
+    /// knowledge when opening an h2 connection to an `http://` host
+    /// (interop with servers that only support Upgrade-based h2c). The
+    /// first request is sent as the upgrade request; if the server
+    /// declines, the HTTP/1.1 response is returned directly.
+    pub h2c_upgrade: bool,
 }
 
 impl Default for ClientConfig {
@@ -84,6 +102,11 @@ impl Default for ClientConfig {
             max_header_list: 1 << 20,
             max_body: 16 * 1024 * 1024,
             tls: None,
+            h2_settings_timeout: Some(Duration::from_secs(10)),
+            h2_ping_interval: Some(Duration::from_secs(30)),
+            h2_ping_timeout: Some(Duration::from_secs(15)),
+            h2_idle_timeout: Some(Duration::from_secs(300)),
+            h2c_upgrade: false,
         }
     }
 }
@@ -165,6 +188,7 @@ impl Client {
             version: raw.head.version,
             headers: raw.head.headers,
             body: raw.body,
+            trailers: None,
         })
     }
 
@@ -234,12 +258,18 @@ impl Client {
         let addr = resolve_addr(&url.host, url.port)?;
         let authority = url.authority();
         if self.inner.config.http2 {
+            if self.inner.config.h2c_upgrade && url.scheme == "http" {
+                // RFC 7540 §3.2 Upgrade-based h2c (falls back to HTTP/1.1
+                // when the server declines).
+                return self.execute_h2c_upgrade(url, &authority, addr, req);
+            }
             let raw = self.execute_h2(url, &authority, addr, tls, req, priority)?;
             Ok(Response {
                 status: raw.head.status,
                 version: raw.head.version,
                 headers: raw.head.headers,
                 body: raw.body,
+                trailers: None,
             })
         } else {
             self.execute_h1(url, &authority, addr, tls, req)
@@ -334,32 +364,94 @@ impl Client {
     ) -> Result<crate::client::h2::H2Response> {
         let conn = self.get_h2_conn(authority, addr, tls.as_ref(), &url.host)?;
         let fields = h2::request_fields(&req);
-        // A channel body streams as DATA frames; anything else is sent as
-        // one block with END_STREAM.
         let (tx, rx) = std::sync::mpsc::channel();
-        let cmd = match req.body {
-            Body::Channel(body_rx) => H2Cmd::RequestStream {
-                fields,
-                body: body_rx,
-                priority,
-                reply: tx,
-            },
-            other => {
-                let (body, end_stream) = match other {
-                    Body::Empty => (None, true),
-                    Body::Bytes(b) => (Some(b), true),
-                    Body::Channel(_) => unreachable!(),
-                };
-                H2Cmd::Request {
-                    fields,
-                    body,
-                    end_stream,
-                    priority,
-                    reply: tx,
-                }
-            }
-        };
+        let cmd = build_h2_cmd(fields, req.body, priority, tx);
         self.send_h2_cmd(conn, authority, addr, tls.as_ref(), &url.host, cmd, rx)
+    }
+
+    /// Perform a request over an h2 connection established with the RFC
+    /// 7540 §3.2 `h2c` Upgrade handshake (only for `http://` hosts). A
+    /// pooled, already-upgraded connection is reused when available;
+    /// otherwise a fresh socket is upgraded. If the server declines the
+    /// upgrade, the HTTP/1.1 response is returned directly.
+    fn execute_h2c_upgrade(
+        &self,
+        url: &Url,
+        authority: &str,
+        addr: SocketAddr,
+        req: Request<Body>,
+    ) -> Result<Response<Body>> {
+        // 1. Reuse a pooled, already-upgraded connection when available.
+        let pooled = {
+            let pools = self.inner.h2_pool.lock().unwrap();
+            pools.get(authority).and_then(|list| {
+                list.iter()
+                    .find(|c| c.accepting.load(Ordering::Acquire))
+                    .cloned()
+            })
+        };
+        if let Some(conn) = pooled {
+            let fields = h2::request_fields(&req);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let cmd = build_h2_cmd(fields, req.body, Priority::default(), tx);
+            return self
+                .send_h2_cmd(conn, authority, addr, None, &url.host, cmd, rx)
+                .map(|raw| Response {
+                    status: raw.head.status,
+                    version: raw.head.version,
+                    headers: raw.head.headers,
+                    body: raw.body,
+                    trailers: None,
+                });
+        }
+
+        // 2. No usable connection: perform the Upgrade handshake.
+        let stream = crate::net::connect(&addr, self.inner.config.connect_timeout)?;
+        crate::net::configure(&stream, self.inner.config.read_timeout)?;
+        let settings_b64 = h2::upgrade_settings_b64(&self.inner.config);
+        let wire = h2::build_upgrade_request(
+            &req,
+            authority,
+            &settings_b64,
+            self.inner.config.user_agent.as_deref(),
+        )?;
+        match h2::h2c_upgrade_handshake(&stream, &wire)? {
+            h2::UpgradeOutcome::Upgraded(seed) => {
+                let cs = crate::net::ConnStream::plain(stream);
+                let (tx, rx) = std::sync::mpsc::channel();
+                let conn = h2::start_upgraded(cs, &self.inner.config, seed, tx)?;
+                {
+                    let mut pools = self.inner.h2_pool.lock().unwrap();
+                    let list = pools.entry(authority.to_string()).or_default();
+                    if list.len() < self.inner.config.max_connections_per_host {
+                        list.push(conn);
+                    }
+                }
+                let raw =
+                    rx.recv().map_err(|_| Error::canceled("h2 driver closed the channel"))??;
+                Ok(Response {
+                    status: raw.head.status,
+                    version: raw.head.version,
+                    headers: raw.head.headers,
+                    body: raw.body,
+                    trailers: None,
+                })
+            }
+            h2::UpgradeOutcome::Declined(head, leftover) => {
+                let cs = crate::net::ConnStream::plain(stream);
+                let mut owned =
+                    H1Connection::from_stream_seeded(cs, &self.inner.config, &leftover)?;
+                let resp = owned.finish_response(&self.inner.config, head)?;
+                if owned.is_reusable() {
+                    let mut pool = self.inner.h1_pool.lock().unwrap();
+                    let entry = pool.entry(authority.to_string()).or_default();
+                    if entry.len() < self.inner.config.max_connections_per_host {
+                        entry.push((addr, owned));
+                    }
+                }
+                Ok(resp)
+            }
+        }
     }
 
     /// Send a driver command, retrying once on a fresh connection if the
@@ -447,6 +539,39 @@ impl Client {
         match tls {
             Some(c) => crate::net::ConnStream::tls_client(stream, c, hostname),
             None => Ok(crate::net::ConnStream::plain(stream)),
+        }
+    }
+}
+
+/// Build a driver command from a request's HPACK fields and body. A
+/// channel body streams as DATA frames (`RequestStream`); anything else
+/// is sent as one block with END_STREAM.
+fn build_h2_cmd(
+    fields: Vec<crate::hpack::HeaderField>,
+    body: Body,
+    priority: Priority,
+    tx: std::sync::mpsc::Sender<Result<crate::client::h2::H2Response>>,
+) -> H2Cmd {
+    match body {
+        Body::Channel(body_rx) => H2Cmd::RequestStream {
+            fields,
+            body: body_rx,
+            priority,
+            reply: tx,
+        },
+        other => {
+            let (body, end_stream) = match other {
+                Body::Empty => (None, true),
+                Body::Bytes(b) => (Some(b), true),
+                Body::Channel(_) => unreachable!(),
+            };
+            H2Cmd::Request {
+                fields,
+                body,
+                end_stream,
+                priority,
+                reply: tx,
+            }
         }
     }
 }

@@ -59,6 +59,31 @@ impl H1Connection {
         })
     }
 
+    /// Wrap an already-open transport (e.g. a socket left over from an
+    /// RFC 7540 §3.2 `h2c` Upgrade handshake that the server declined),
+    /// seeding the reader with bytes already read past the response head
+    /// (the start of the body).
+    pub(crate) fn from_stream_seeded(
+        stream: ConnStream,
+        cfg: &ClientConfig,
+        seed: &[u8],
+    ) -> Result<Self> {
+        let _ = stream.configure(cfg.read_timeout);
+        let conn = Arc::new(stream);
+        let mut reader = BufReader::new(conn.clone(), 16 * 1024);
+        if !seed.is_empty() {
+            reader.seed(seed);
+        }
+        Ok(Self {
+            reader,
+            writer: BufWriter::new(conn.clone(), 16 * 1024),
+            stream: conn,
+            scratch: Scratch::new(),
+            version: Version::HTTP_11,
+            reusable: true,
+        })
+    }
+
     /// Whether the connection can be returned to the pool.
     pub fn is_reusable(&self) -> bool {
         self.reusable
@@ -141,8 +166,27 @@ impl H1Connection {
             status = s;
             headers = h1::read_headers_scratch(reader, scratch)?;
         }
+        let head = ResponseHead {
+            status,
+            version,
+            headers,
+        };
+        self.finish_response(cfg, head)
+    }
+
+    /// Read a response body given an already-parsed response head (used
+    /// by the `h2c` Upgrade fallback, where the head was consumed by the
+    /// handshake).
+    pub fn finish_response(
+        &mut self,
+        cfg: &ClientConfig,
+        head: ResponseHead,
+    ) -> Result<Response<Body>> {
+        let status = head.status;
+        let version = head.version;
+        let (reader, scratch) = (&mut self.reader, &mut self.scratch);
         let mut close_delimited = false;
-        let body = match h1::body_length(&headers, None, Some(status))? {
+        let body = match h1::body_length(&head.headers, None, Some(status))? {
             h1::BodyLen::None => {
                 // 204/304/1xx carry no body; 3xx without framing are
                 // treated as empty in practice; anything else without
@@ -172,12 +216,7 @@ impl H1Connection {
             )?),
         };
         self.reusable =
-            !close_delimited && !h1::wants_close(&headers) && version == Version::HTTP_11;
-        let head = ResponseHead {
-            status,
-            version,
-            headers,
-        };
+            !close_delimited && !h1::wants_close(&head.headers) && version == Version::HTTP_11;
         Ok(head.with_body(body))
     }
 }

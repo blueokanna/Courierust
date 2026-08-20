@@ -632,6 +632,13 @@ impl ClientHandshake {
             return Err(TlsError::Certificate("hostname mismatch".into()));
         }
         super::x509::validate_chain(roots, &peer_chain, now)?;
+        // RFC 5280 §4.2.1.12: a leaf with an EKU extension must permit TLS
+        // server authentication.
+        if !super::x509::has_server_auth_eku(&leaf) {
+            return Err(TlsError::Certificate(
+                "leaf certificate lacks TLS serverAuth EKU".into(),
+            ));
+        }
 
         // Verify the CertificateVerify signature.
         verify_cert_verify(&cv, &spki, &cv_hash, false)?;

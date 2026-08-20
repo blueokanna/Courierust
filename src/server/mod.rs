@@ -52,6 +52,17 @@ pub struct ServerConfig {
     pub event_driven: bool,
     /// Number of event-worker threads (0 = auto).
     pub event_workers: usize,
+    /// h2: drop the connection if the peer does not ACK our SETTINGS
+    /// within this long (`SETTINGS_TIMEOUT`, RFC 9113 §6.5.3).
+    pub h2_settings_timeout: Option<Duration>,
+    /// h2: send a keepalive PING after this much inbound silence.
+    pub h2_ping_interval: Option<Duration>,
+    /// h2: drop the connection if no frame at all arrives within this
+    /// long after a keepalive PING was sent (dead-peer detection).
+    pub h2_ping_timeout: Option<Duration>,
+    /// h2: close a connection with no in-flight streams after this much
+    /// idle time, releasing the worker thread it occupied.
+    pub h2_idle_timeout: Option<Duration>,
 }
 
 impl Default for ServerConfig {
@@ -65,6 +76,10 @@ impl Default for ServerConfig {
             tls: None,
             event_driven: cfg!(windows),
             event_workers: 0, // auto
+            h2_settings_timeout: Some(Duration::from_secs(10)),
+            h2_ping_interval: Some(Duration::from_secs(30)),
+            h2_ping_timeout: Some(Duration::from_secs(15)),
+            h2_idle_timeout: Some(Duration::from_secs(300)),
         }
     }
 }
@@ -208,7 +223,11 @@ pub(crate) fn serve_accepted(
             let tls = acceptor.accept(arc.clone(), arc.clone()).map_err(|e| {
                 crate::error::Error::with_message(crate::error::ErrorKind::Other, e.to_string())
             })?;
-            serve_connection(crate::net::ConnStream::tls_server(tls, peer), handler, config)
+            serve_connection(
+                crate::net::ConnStream::tls_server(tls, peer),
+                handler,
+                config,
+            )
         }
         None => serve_connection(crate::net::ConnStream::plain(stream), handler, config),
     }
@@ -221,14 +240,12 @@ pub(crate) fn serve_connection(
     handler: &dyn Handler,
     config: &ServerConfig,
 ) -> crate::Result<()> {
-    // TLS with ALPN: the negotiated protocol is authoritative.
     if let Some(alpn) = stream.alpn() {
         if config.http2 && alpn == b"h2" {
             return h2::serve(&stream, handler, config);
         }
         return h1::serve(&stream, handler, config);
     }
-    // Plain TCP (or TLS without ALPN): sniff the h2 preface.
     let mut prefix = [0u8; 24];
     let n = stream.peek(&mut prefix).unwrap_or(0);
     if config.http2 && n == 24 && crate::h2::connection::is_preface(&prefix) {

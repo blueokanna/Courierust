@@ -17,6 +17,10 @@ pub struct Response<B = Body> {
     pub headers: HeaderMap,
     /// Body.
     pub body: B,
+    /// Trailing header fields (HTTP/2 trailers, RFC 9113 §8.1). Sent
+    /// after the body; must not contain pseudo-headers. HTTP/1.1
+    /// connections ignore this field.
+    pub trailers: Option<HeaderMap>,
 }
 
 impl Response<Body> {
@@ -34,6 +38,7 @@ impl Response<Body> {
             version: Version::HTTP_11,
             headers: HeaderMap::new(),
             body: Body::Empty,
+            trailers: None,
         }
     }
 }
@@ -73,6 +78,7 @@ impl<B> Response<B> {
             version: self.version,
             headers: self.headers,
             body,
+            trailers: self.trailers,
         }
     }
 }
@@ -84,6 +90,7 @@ impl<B: Default> Default for Response<B> {
             version: Version::HTTP_11,
             headers: HeaderMap::new(),
             body: B::default(),
+            trailers: None,
         }
     }
 }
@@ -100,7 +107,9 @@ impl<B: core::fmt::Debug> core::fmt::Debug for Response<B> {
 }
 
 impl Response<Body> {
-    /// Consume, returning the head and the body.
+    /// Consume, returning the head and the body. Note: any trailers are
+    /// dropped (the head type has no trailer slot); use the `trailers`
+    /// field directly when they must be preserved.
     pub fn into_parts(self) -> (ResponseHead, Body) {
         let head = ResponseHead {
             status: self.status,
@@ -139,6 +148,7 @@ impl ResponseHead {
             version: self.version,
             headers: self.headers,
             body,
+            trailers: None,
         }
     }
 }

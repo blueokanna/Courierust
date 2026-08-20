@@ -128,6 +128,9 @@ pub enum Event {
 struct Chunk {
     data: Bytes,
     end_stream: bool,
+    /// When set, this final chunk is delivered as a trailing HEADERS
+    /// block (RFC 9113 §8.1) instead of an empty END_STREAM DATA frame.
+    trailers: Option<HeaderList>,
 }
 
 /// A partially-received header block (HEADERS + CONTINUATION).
@@ -218,6 +221,10 @@ pub struct Connection<R, W> {
     goaway_received: bool,
     peer_last_stream: u32,
     closed: bool,
+    // True until the peer ACKs our SETTINGS. RFC 9113 §6.5.3: a peer
+    // that never acknowledges is a liveness failure; drivers enforce a
+    // wall-clock deadline via [`Connection::settings_ack_pending`].
+    settings_ack_pending: bool,
 }
 
 impl<R: Read, W: Write> Connection<R, W> {
@@ -259,7 +266,50 @@ impl<R: Read, W: Write> Connection<R, W> {
             goaway_received: false,
             peer_last_stream: 0,
             closed: false,
+            settings_ack_pending: true,
         }
+    }
+
+    /// Like [`Connection::new`], but pre-seeds the reader with bytes
+    /// already read from the transport (RFC 7540 §3.2 `h2c` Upgrade: the
+    /// server's SETTINGS may trail the `101` response in the same read).
+    pub fn new_with_seed(reader: R, writer: W, config: Config, seed: &[u8]) -> Self {
+        let mut conn = Self::new(reader, writer, config);
+        conn.reader.seed(seed);
+        conn
+    }
+
+    /// Register stream 1 for an RFC 7540 §3.2 `h2c` Upgrade. The upgraded
+    /// HTTP/1.1 request occupies stream 1:
+    ///
+    /// * **Client** — stream 1 is half-closed locally (the request was
+    ///   already sent as HTTP/1.1); the server's response arrives on it.
+    /// * **Server** — stream 1 is half-closed remotely (the client's
+    ///   request is complete); the response is sent on it.
+    ///
+    /// Must be called before the peer's response/request HEADERS are
+    /// processed.
+    pub fn register_upgrade_stream(&mut self) -> Result<()> {
+        if self.goaway_received {
+            return Err(Error::canceled("peer sent GOAWAY"));
+        }
+        self.streams.reserve_upgrade_stream();
+        let initial = self.local.initial_window_size as i64;
+        let mut s = Stream::new(
+            1,
+            self.peer.initial_window_size as i64,
+            initial,
+            Priority::default(),
+        );
+        if self.config.client {
+            s.state = StreamState::HalfClosedLocal;
+            s.send_done = true;
+        } else {
+            s.state = StreamState::HalfClosedRemote;
+            s.recv_ended = true;
+        }
+        self.streams.insert(s);
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -276,6 +326,14 @@ impl<R: Read, W: Write> Connection<R, W> {
     #[inline]
     pub fn is_closed(&self) -> bool {
         self.closed
+    }
+
+    /// Whether the peer has not yet acknowledged our SETTINGS. Drivers
+    /// use this to enforce a `SETTINGS_TIMEOUT` connection error when the
+    /// peer never ACKs within a reasonable wall-clock window.
+    #[inline]
+    pub fn settings_ack_pending(&self) -> bool {
+        self.settings_ack_pending && !self.goaway_sent
     }
 
     /// Whether no work is pending (no outbound frames, no buffered data,
@@ -336,10 +394,29 @@ impl<R: Read, W: Write> Connection<R, W> {
                 self.closed = true;
                 return Err(e);
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                // Connection/protocol error: deliver the queued GOAWAY to
+                // the peer before tearing down (RFC 9113 §5.4.1), so it
+                // can observe the error code instead of a bare FIN.
+                self.flush_final();
+                return Err(e);
+            }
         };
         self.flush_outbound()?;
         Ok(had_pending || read_any)
+    }
+
+    /// Best-effort flush of queued control frames (e.g. GOAWAY) even after
+    /// the session is marked closed.
+    fn flush_final(&mut self) {
+        while let Some(f) = self.pending_frames.pop_front() {
+            let mut buf = BytesMut::with_capacity(64);
+            f.encode(&mut buf);
+            if self.writer.write_all(buf.as_slice()).is_err() {
+                break;
+            }
+        }
+        let _ = self.writer.flush();
     }
 
     /// Flush pending outbound frames to the transport.
@@ -474,9 +551,39 @@ impl<R: Read, W: Write> Connection<R, W> {
         self.send_queue
             .entry(stream_id)
             .or_default()
-            .push_back(Chunk { data, end_stream });
+            .push_back(Chunk {
+                data,
+                end_stream,
+                trailers: None,
+            });
         self.maybe_schedule(stream_id);
         Ok(data_len)
+    }
+
+    /// Queue a trailing header block for a stream (RFC 9113 §8.1). The
+    /// trailers are sent only after every previously queued DATA chunk on
+    /// the stream has been emitted (they ride in the same flow-controlled
+    /// send queue), and they end the stream. Trailer fields must not
+    /// contain pseudo-headers.
+    pub fn send_trailers(&mut self, stream_id: u32, fields: &HeaderList) -> Result<()> {
+        if self.goaway_sent || self.closed {
+            return Err(Error::canceled("connection closing"));
+        }
+        let stream = self
+            .streams
+            .get_mut(&stream_id)
+            .ok_or_else(|| Error::protocol("send_trailers: unknown stream"))?;
+        if !stream.can_send() {
+            return Err(Error::canceled("stream not writable"));
+        }
+        stream.send_done = true;
+        self.send_queue.entry(stream_id).or_default().push_back(Chunk {
+            data: Bytes::new(),
+            end_stream: true,
+            trailers: Some(fields.clone()),
+        });
+        self.maybe_schedule(stream_id);
+        Ok(())
     }
 
     /// Send RST_STREAM.
@@ -647,7 +754,6 @@ impl<R: Read, W: Write> Connection<R, W> {
                 continue;
             }
             let payload;
-            let chunk_end;
             {
                 let q = match self.send_queue.get_mut(&sid) {
                     Some(q) => q,
@@ -667,30 +773,39 @@ impl<R: Read, W: Write> Connection<R, W> {
                 };
                 let take = core::cmp::min(amount, chunk.data.len());
                 payload = chunk.data.split_to(take);
-                chunk_end = chunk.end_stream;
             }
             // Pop the front chunk once fully consumed and decide whether
-            // the stream ends here.
+            // the stream ends here — possibly with a trailer block.
             let mut end_stream = false;
+            let mut trailers: Option<HeaderList> = None;
             if let Some(q) = self.send_queue.get_mut(&sid) {
                 let front_empty = q.front().map(|c| c.data.is_empty()).unwrap_or(false);
                 if front_empty {
                     let popped = q.pop_front().unwrap();
                     end_stream = popped.end_stream && q.is_empty();
+                    if end_stream {
+                        trailers = popped.trailers;
+                    }
                 }
             }
-            let _ = chunk_end;
             {
                 let s = self.streams.get_mut(&sid).unwrap();
                 s.send_window -= payload.len() as i64;
                 s.send_buffered = s.send_buffered.saturating_sub(payload.len());
             }
             self.conn_send_window.consume(payload.len() as i64);
-            self.pending_frames.push_back(Frame::Data {
-                stream_id: sid,
-                data: payload,
-                end_stream,
-            });
+            // A trailer chunk carries no DATA; it is delivered as a
+            // trailing HEADERS block (END_STREAM) once all data is out.
+            if let Some(fields) = trailers {
+                self.emit_trailer_block(sid, &fields);
+                end_stream = true;
+            } else {
+                self.pending_frames.push_back(Frame::Data {
+                    stream_id: sid,
+                    data: payload,
+                    end_stream,
+                });
+            }
             // Advance the local send state. When both endpoints have
             // finished, the stream record is dropped so open_count tracks
             // only live streams (RFC 9113 §5.1).
@@ -726,6 +841,42 @@ impl<R: Read, W: Write> Connection<R, W> {
             }
         }
         Ok(())
+    }
+
+    /// Encode and queue a trailing HEADERS block (RFC 9113 §8.1), split
+    /// into HEADERS + CONTINUATION frames as needed. The block ends the
+    /// stream.
+    fn emit_trailer_block(&mut self, stream_id: u32, fields: &HeaderList) {
+        let mut block = BytesMut::with_capacity(64);
+        self.encoder.encode(fields, &mut block);
+        let max = self.peer.max_frame_size as usize;
+        if block.len() <= max {
+            self.pending_frames.push_back(Frame::Headers {
+                stream_id,
+                block: Bytes::from(block.into_vec()),
+                end_stream: true,
+                end_headers: true,
+                priority: None,
+            });
+        } else {
+            let head = block.split_to(max);
+            self.pending_frames.push_back(Frame::Headers {
+                stream_id,
+                block: Bytes::from(head.into_vec()),
+                end_stream: true,
+                end_headers: false,
+                priority: None,
+            });
+            while !block.is_empty() {
+                let end = block.len() <= max;
+                let part = block.split_to(core::cmp::min(max, block.len()));
+                self.pending_frames.push_back(Frame::Continuation {
+                    stream_id,
+                    end_headers: end,
+                    block: Bytes::from(part.into_vec()),
+                });
+            }
+        }
     }
 
     fn maybe_schedule(&mut self, stream_id: u32) {
@@ -812,11 +963,22 @@ impl<R: Read, W: Write> Connection<R, W> {
 
         // 3. Complete frame: parse + process, then reset for the next one.
         let header = self.frame.header.take().unwrap();
-        let frame = Frame::parse(
+        let frame = match Frame::parse(
             header,
             self.frame.payload.as_slice(),
             self.local.max_frame_size,
-        )?;
+        ) {
+            Ok(f) => f,
+            // Frame-level connection errors (RFC 9113 §5.4.1): the peer
+            // must learn the error code via GOAWAY, not a bare FIN.
+            Err(e) => {
+                let code = e
+                    .h2_code()
+                    .and_then(ErrorCode::from_u32)
+                    .unwrap_or(ErrorCode::ProtocolError);
+                return self.conn_error(code, &e.to_string()).map(|_| false);
+            }
+        };
         self.frame.header = None;
         self.frame.hdr_len = 0;
         self.frame.payload_len = 0;
@@ -910,6 +1072,16 @@ impl<R: Read, W: Write> Connection<R, W> {
             }
             Frame::Settings { ack, entries } => {
                 if ack {
+                    if !entries.is_empty() {
+                        // RFC 9113 §6.5.3: a SETTINGS ACK must not carry a
+                        // payload. Frame parsing already rejects non-empty
+                        // ACK payloads at length 0, but defend again here.
+                        return self.conn_error(
+                            ErrorCode::FrameSizeError,
+                            "SETTINGS ACK with payload",
+                        );
+                    }
+                    self.settings_ack_pending = false;
                     Ok(())
                 } else {
                     self.on_settings(entries)
@@ -1023,6 +1195,11 @@ impl<R: Read, W: Write> Connection<R, W> {
         let is_new = !self.streams.contains(&sid);
 
         if is_new {
+            // Strict pseudo-header validation (RFC 9113 §8.1.2): a fresh
+            // header block is a request (server side) or a response
+            // (client side). Malformed blocks are connection errors.
+            self.validate_header_block(&fields, !self.config.client, false)?;
+
             // Stream must not already exist in a non-idle state.
             if self.config.client {
                 // Client: a response HEADERS on a stream we never opened.
@@ -1071,9 +1248,13 @@ impl<R: Read, W: Write> Connection<R, W> {
             return Ok(());
         }
 
-        // Existing stream.
-        let stream = self.streams.get_mut(&sid).unwrap();
-        if stream.is_closed() {
+        // Existing stream. Snapshot the flags first so the strict
+        // pseudo-header validation below can borrow `self` mutably.
+        let (is_closed, delivered) = {
+            let s = self.streams.get(&sid).unwrap();
+            (s.is_closed(), s.headers_delivered)
+        };
+        if is_closed {
             // Late frames on closed streams: reset.
             self.pending_frames.push_back(Frame::RstStream {
                 stream_id: sid,
@@ -1081,56 +1262,64 @@ impl<R: Read, W: Write> Connection<R, W> {
             });
             return Ok(());
         }
-        if stream.headers_delivered {
-            // Trailers.
+        if delivered {
+            // Trailers: pseudo-headers MUST NOT appear (RFC 9113 §8.1.2).
+            self.validate_header_block(&fields, false, true)?;
             self.events.push_back(Event::Trailers {
                 stream_id: sid,
                 headers: fields,
             });
-            stream.recv_ended = true;
-            stream.state = match stream.state {
-                StreamState::Open => StreamState::HalfClosedRemote,
-                StreamState::HalfClosedLocal => StreamState::Closed,
-                s => s,
+            let closed = {
+                let s = self.streams.get_mut(&sid).unwrap();
+                s.recv_ended = true;
+                s.state = match s.state {
+                    StreamState::Open => StreamState::HalfClosedRemote,
+                    StreamState::HalfClosedLocal => StreamState::Closed,
+                    s => s,
+                };
+                s.state == StreamState::Closed
             };
-            if stream.state == StreamState::Closed {
+            if closed {
                 self.events
                     .push_back(Event::StreamClosed { stream_id: sid });
                 self.close_stream(sid);
             }
             return Ok(());
         }
-        // First headers on an existing stream.
-        if self.config.client {
-            stream.state = match stream.state {
-                StreamState::Open => {
-                    if p.end_stream {
-                        StreamState::HalfClosedRemote
-                    } else {
-                        StreamState::Open
-                    }
-                }
-                StreamState::HalfClosedLocal => {
-                    // We already ended our side; the peer may still send a
-                    // response body.
-                    if p.end_stream {
-                        StreamState::Closed
-                    } else {
-                        StreamState::HalfClosedLocal
-                    }
-                }
-                _ => {
-                    return self.conn_error(ErrorCode::ProtocolError, "HEADERS in invalid state");
-                }
-            };
-        } else {
-            // Server receiving additional HEADERS on an existing stream:
-            // only trailers allowed, which must end the stream.
+        // First headers on an existing stream: on a server only trailers
+        // may follow a request's headers (already handled above), so
+        // additional HEADERS are a connection error. On a client this is
+        // the response head (informational 1xx aside), which must satisfy
+        // the strict response pseudo-header rules.
+        if !self.config.client {
             return self.conn_error(
                 ErrorCode::ProtocolError,
                 "unexpected HEADERS on existing stream",
             );
         }
+        self.validate_header_block(&fields, false, false)?;
+        let stream = self.streams.get_mut(&sid).unwrap();
+        stream.state = match stream.state {
+            StreamState::Open => {
+                if p.end_stream {
+                    StreamState::HalfClosedRemote
+                } else {
+                    StreamState::Open
+                }
+            }
+            StreamState::HalfClosedLocal => {
+                // We already ended our side; the peer may still send a
+                // response body.
+                if p.end_stream {
+                    StreamState::Closed
+                } else {
+                    StreamState::HalfClosedLocal
+                }
+            }
+            _ => {
+                return self.conn_error(ErrorCode::ProtocolError, "HEADERS in invalid state");
+            }
+        };
         if p.end_stream {
             stream.recv_ended = true;
         }
@@ -1150,6 +1339,136 @@ impl<R: Read, W: Write> Connection<R, W> {
             self.events
                 .push_back(Event::StreamClosed { stream_id: sid });
             self.close_stream(sid);
+        }
+        Ok(())
+    }
+
+    /// Validate an inbound header block against RFC 9113 §8.1.2:
+    ///
+    /// * Pseudo-headers must precede all regular fields.
+    /// * Requests require `:method`, `:scheme` and `:path` (or, for
+    ///   `CONNECT`, exactly `:authority`); responses require exactly one
+    ///   three-digit `:status`.
+    /// * No unknown pseudo-headers, and no cross-contamination of
+    ///   request/response pseudo-headers.
+    /// * Trailers must not contain pseudo-headers at all.
+    ///
+    /// Violations are connection errors (`PROTOCOL_ERROR`).
+    fn validate_header_block(
+        &mut self,
+        fields: &HeaderList,
+        is_request: bool,
+        is_trailer: bool,
+    ) -> Result<()> {
+        let mut saw_regular = false;
+        let mut method: Option<&str> = None;
+        let mut has_scheme = false;
+        let mut path: Option<&str> = None;
+        let mut has_authority = false;
+        let mut has_status = false;
+
+        for f in fields.iter() {
+            if !f.name.is_pseudo() {
+                saw_regular = true;
+                continue;
+            }
+            if saw_regular {
+                return self.conn_error(
+                    ErrorCode::ProtocolError,
+                    "pseudo-header after regular field",
+                );
+            }
+            if is_trailer {
+                return self.conn_error(ErrorCode::ProtocolError, "pseudo-header in trailers");
+            }
+            match f.name.as_str() {
+                ":method" => {
+                    if !is_request {
+                        return self.conn_error(ErrorCode::ProtocolError, ":method in response");
+                    }
+                    method = f.value.to_str().ok();
+                }
+                ":scheme" => {
+                    if !is_request {
+                        return self.conn_error(ErrorCode::ProtocolError, ":scheme in response");
+                    }
+                    has_scheme = true;
+                }
+                ":path" => {
+                    if !is_request {
+                        return self.conn_error(ErrorCode::ProtocolError, ":path in response");
+                    }
+                    path = f.value.to_str().ok();
+                }
+                ":authority" => {
+                    if !is_request {
+                        return self.conn_error(ErrorCode::ProtocolError, ":authority in response");
+                    }
+                    has_authority = true;
+                }
+                ":status" => {
+                    if is_request {
+                        return self.conn_error(ErrorCode::ProtocolError, ":status in request");
+                    }
+                    if has_status {
+                        return self.conn_error(ErrorCode::ProtocolError, "duplicate :status");
+                    }
+                    has_status = true;
+                    let v = f.value.as_bytes();
+                    // Exactly three ASCII digits; first digit 1..=5 gives
+                    // the RFC-defined 100..=599 range.
+                    let ok = v.len() == 3
+                        && v[0].is_ascii_digit()
+                        && v[1].is_ascii_digit()
+                        && v[2].is_ascii_digit()
+                        && v[0] >= b'1'
+                        && v[0] <= b'5';
+                    if !ok {
+                        return self.conn_error(ErrorCode::ProtocolError, "invalid :status value");
+                    }
+                }
+                _ => {
+                    return self.conn_error(ErrorCode::ProtocolError, "unknown pseudo-header");
+                }
+            }
+        }
+        if is_trailer {
+            return Ok(());
+        }
+        if is_request {
+            let is_connect = method == Some("CONNECT");
+            if is_connect {
+                if has_scheme || path.is_some() {
+                    return self.conn_error(
+                        ErrorCode::ProtocolError,
+                        "CONNECT must not carry :scheme or :path",
+                    );
+                }
+                if !has_authority {
+                    return self.conn_error(
+                        ErrorCode::ProtocolError,
+                        "CONNECT requires :authority",
+                    );
+                }
+            } else {
+                if method.is_none() {
+                    return self.conn_error(ErrorCode::ProtocolError, "request missing :method");
+                }
+                if !has_scheme {
+                    return self.conn_error(ErrorCode::ProtocolError, "request missing :scheme");
+                }
+                match path {
+                    None => {
+                        return self.conn_error(ErrorCode::ProtocolError, "request missing :path");
+                    }
+                    Some("") => {
+                        return self.conn_error(ErrorCode::ProtocolError, "empty :path");
+                    }
+                    _ => {}
+                }
+            }
+        } else if !has_status {
+            return self.conn_error(ErrorCode::ProtocolError, "response missing :status");
         }
         Ok(())
     }

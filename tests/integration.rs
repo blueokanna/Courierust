@@ -221,6 +221,101 @@ fn grpc_error_status() {
 }
 
 #[test]
+fn grpc_success_status_delivered_in_trailers() {
+    // A successful call must carry grpc-status in the trailing header
+    // block (the gRPC wire contract), not the initial metadata.
+    let service = |_method: &str, req: Bytes| -> courierust::Result<Bytes> {
+        Ok(Bytes::from(format!("echo:{}", req.to_str().unwrap())))
+    };
+    let gsrv = courierust::grpc::GrpcServer::bind("127.0.0.1:0", service).unwrap();
+    let addr = gsrv.local_addr().unwrap();
+    let _handle = gsrv.serve_background().unwrap();
+
+    let client = GrpcClient::new(&format!("http://{addr}")).unwrap();
+    let mut stream = client
+        .call_with_metadata(
+            "/echo.Echo/Say",
+            Bytes::from_static(b"x"),
+            &courierust::http::header::HeaderMap::new(),
+        )
+        .unwrap();
+    let msg = stream.next_message().unwrap().unwrap();
+    assert_eq!(msg.to_str().unwrap(), "echo:x");
+    // Drain the body; the stream ends with trailers carrying grpc-status.
+    assert!(stream.next_message().unwrap().is_none());
+    let tr = stream.trailers().expect("trailers must be present");
+    assert_eq!(tr.get("grpc-status").unwrap().to_str().unwrap(), "0");
+    assert!(
+        stream.response_headers().get("grpc-status").is_none(),
+        "grpc-status must not leak into initial metadata"
+    );
+}
+
+#[test]
+fn grpc_server_enforces_deadline() {
+    // A handler that overruns the client's grpc-timeout must produce
+    // DEADLINE_EXCEEDED, not a late OK.
+    let service = |_method: &str, _req: Bytes| -> courierust::Result<Bytes> {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        Ok(Bytes::from_static(b"too-late"))
+    };
+    let gsrv = courierust::grpc::GrpcServer::bind("127.0.0.1:0", service).unwrap();
+    let addr = gsrv.local_addr().unwrap();
+    let _handle = gsrv.serve_background().unwrap();
+
+    let client = courierust::grpc::GrpcClient::with_config(
+        courierust::grpc::GrpcClientConfig {
+            base: format!("http://{addr}"),
+            max_message_size: courierust::grpc::DEFAULT_MAX_MESSAGE_SIZE,
+            interceptor: None,
+            timeout: Some(std::time::Duration::from_millis(50)),
+            http_client: Client::with_config(ClientConfig {
+                http2: true,
+                user_agent: None,
+                ..Default::default()
+            }),
+        },
+    )
+    .unwrap();
+    let err = client
+        .call("/echo.Echo/Say", Bytes::from_static(b"x"))
+        .unwrap_err();
+    assert_eq!(
+        err.grpc_code(),
+        Some(courierust::grpc::status::DEADLINE_EXCEEDED)
+    );
+}
+
+#[test]
+fn grpc_server_rejects_malformed_timeout() {
+    let service = |_method: &str, req: Bytes| -> courierust::Result<Bytes> {
+        Ok(Bytes::from(format!("echo:{}", req.to_str().unwrap())))
+    };
+    let gsrv = courierust::grpc::GrpcServer::bind("127.0.0.1:0", service).unwrap();
+    let addr = gsrv.local_addr().unwrap();
+    let _handle = gsrv.serve_background().unwrap();
+
+    let client = GrpcClient::new(&format!("http://{addr}")).unwrap();
+    // Override grpc-timeout with a malformed value via metadata.
+    let mut md = courierust::http::header::HeaderMap::new();
+    md.insert(
+        courierust::http::header::HeaderName::from_lowercase("grpc-timeout"),
+        courierust::http::header::HeaderValue::from_static("5X"),
+    );
+    let mut stream = client
+        .call_with_metadata("/echo.Echo/Say", Bytes::from_static(b"x"), &md)
+        .unwrap();
+    let err = match stream.next_message() {
+        Ok(_) => panic!("malformed grpc-timeout must be rejected"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        err.grpc_code(),
+        Some(courierust::grpc::status::INVALID_ARGUMENT)
+    );
+}
+
+#[test]
 fn keep_alive_reuse() {
     let base = spawn_server(ServerConfig::default(), echo_handler);
     let client = Client::new();

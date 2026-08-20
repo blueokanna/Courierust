@@ -153,6 +153,15 @@ impl StreamMap {
         Some(id)
     }
 
+    /// Reserve stream 1 for an RFC 7540 §3.2 `h2c` Upgrade: the upgraded
+    /// HTTP/1.1 request occupies stream 1, so the next client-initiated
+    /// stream must be 3.
+    pub fn reserve_upgrade_stream(&mut self) {
+        if self.next_client_id == 1 {
+            self.next_client_id = 3;
+        }
+    }
+
     /// The next client-initiated stream id (without allocating).
     #[inline]
     pub fn peek_client_id(&self) -> u32 {
