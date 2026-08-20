@@ -1,16 +1,34 @@
 name: Benchmark
 
 on:
-  workflow_dispatch:
   push:
     branches: [main]
     paths:
+      - '.github/workflows/benchmark.yml'
+      - 'scripts/generate_benchmark_report.sh'
       - 'src/**'
       - 'benches/**'
       - 'Cargo.toml'
+      - 'Cargo.lock'
+  pull_request:
+    paths:
+      - '.github/workflows/benchmark.yml'
+      - 'scripts/generate_benchmark_report.sh'
+      - 'src/**'
+      - 'benches/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+
+concurrency:
+  group: benchmark-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   bench:
@@ -22,17 +40,52 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: benches
-      - name: Run throughput benchmarks
-        id: bench
+      - name: Run benchmarks
+        id: benchmarks
+        shell: bash
         run: |
-          cargo bench --manifest-path benches/Cargo.toml --bench throughput 2>&1 | tee bench.log
-      - name: Run comparison benchmarks (vs hyper / reqwest / tiny_http)
+          set +e
+          set -o pipefail
+
+          cargo bench --manifest-path benches/Cargo.toml --locked --bench throughput 2>&1 | tee throughput.log
+          throughput_status=${PIPESTATUS[0]}
+
+          cargo bench --manifest-path benches/Cargo.toml --locked --bench compare 2>&1 | tee compare.log
+          compare_status=${PIPESTATUS[0]}
+
+          printf 'throughput_exit=%s\n' "$throughput_status" >> "$GITHUB_OUTPUT"
+          printf 'compare_exit=%s\n' "$compare_status" >> "$GITHUB_OUTPUT"
+
+          if [[ "$throughput_status" -ne 0 || "$compare_status" -ne 0 ]]; then
+            exit 1
+          fi
+
+      - name: Generate Github_Action_Benchmark.md
+        if: always()
+        env:
+          BENCHMARK_THROUGHPUT_EXIT: ${{ steps.benchmarks.outputs.throughput_exit }}
+          BENCHMARK_COMPARE_EXIT: ${{ steps.benchmarks.outputs.compare_exit }}
         run: |
-          cargo bench --manifest-path benches/Cargo.toml --bench compare 2>&1 | tee -a bench.log
-      - name: Summarize results
+          bash scripts/generate_benchmark_report.sh \
+            throughput.log \
+            compare.log \
+            Github_Action_Benchmark.md
+
+      - name: Publish benchmark report to the run summary
+        if: always()
+        shell: bash
         run: |
-          echo "## Courierust benchmarks (release, \${{ github.sha }})" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo '```text' >> "$GITHUB_STEP_SUMMARY"
-          grep -E "(req/s| ms |allocs/req)" bench.log >> "$GITHUB_STEP_SUMMARY" || true
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [[ -f Github_Action_Benchmark.md ]]; then
+            cat Github_Action_Benchmark.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload Github_Action_Benchmark.md
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Github_Action_Benchmark
+          path: |
+            Github_Action_Benchmark.md
+            throughput.log
+            compare.log
+          if-no-files-found: error

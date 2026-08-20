@@ -12,7 +12,9 @@ cargo bench --manifest-path benches/Cargo.toml --bench throughput
 cargo bench --manifest-path benches/Cargo.toml --bench compare
 ```
 
-Builds use the `bench` profile (`lto = "thin"`, `codegen-units = 1`). The GitHub Actions `benchmark.yml` runs both on push to `main` and manual dispatch, posting results to the run summary.
+Builds use the `bench` profile (`lto = "thin"`, `codegen-units = 1`). The GitHub Actions `benchmark.yml` runs both on push to `main`, pull requests, and manual dispatch. It posts the full report to the run summary and uploads `Github_Action_Benchmark.md` (plus the raw logs) as the `Github_Action_Benchmark` artifact.
+
+`Github_Action_Benchmark.md` in the repository is a locally generated example in the same format used by the workflow.
 
 ## Self-measurement (`throughput`)
 
