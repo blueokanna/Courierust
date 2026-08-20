@@ -7,6 +7,7 @@
 - [gRPC 使用指南](gRPC-使用指南)
 - [浏览器指纹](浏览器指纹)
 - [no_std 使用](no_std-使用)
+- [示例](示例)
 - [基准测试](基准测试)
 
 ## English
@@ -16,4 +17,5 @@
 - [gRPC](gRPC)
 - [Fingerprints](Fingerprints)
 - [no_std](no_std)
+- [Examples](Examples)
 - [Benchmarks](Benchmarks)

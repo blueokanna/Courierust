@@ -1,0 +1,49 @@
+[package]
+name = "courierust_benchmark"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["blueokanna", "HyphenTeam"]
+description = "no_std HTTP/1+2/gRPC engine with work-stealing, RFC 9218, and JA3/JA4 fingerprinting benchmark"
+readme = "README.md"
+keywords = ["http2", "network", "client", "no-std", "multicore"]
+categories = [
+    "network-programming",
+    "web-programming::http-client",
+    "web-programming::http-server",
+]
+
+[dependencies]
+courierust = { path = "../" }
+
+# Mainstream comparison targets.
+h2 = "0.4"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "http2", "client", "server", "full"] }
+hyper-util = { version = "0.1", features = [
+    "tokio",
+    "server-auto",
+    "client-legacy",
+] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "http2"] }
+tiny_http = "0.12"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net"] }
+
+[[bench]]
+name = "throughput"
+harness = false
+path = "src/throughput.rs"
+
+[[bench]]
+name = "compare"
+harness = false
+path = "src/compare.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1

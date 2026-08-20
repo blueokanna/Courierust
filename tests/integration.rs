@@ -256,3 +256,84 @@ fn redirect_following() {
         "yes"
     );
 }
+
+/// Security: the h2 client must enforce `max_body` on response bodies, so
+/// a malicious peer cannot stream an unbounded body into memory (parity
+/// with the h1 client).
+#[test]
+fn h2_client_enforces_max_body() {
+    let server_cfg = ServerConfig {
+        http2: true,
+        ..Default::default()
+    };
+    let base = spawn_server(server_cfg, |_req| {
+        let (tx, body) = courierust::body::channel();
+        std::thread::spawn(move || {
+            let chunk = vec![b'x'; 64 * 1024];
+            for _ in 0..16 {
+                if tx.send(Bytes::from(chunk.clone())).is_err() {
+                    break; // client aborted the stream
+                }
+            }
+        });
+        let mut resp = courierust::http::response::Response::<Body>::with_status(200.into());
+        resp.body = body;
+        resp
+    });
+
+    let client_cfg = ClientConfig {
+        http2: true,
+        max_body: 1024,
+        ..Default::default()
+    };
+    let client = Client::with_config(client_cfg);
+    let resp = client.get(&format!("{base}/big")).unwrap();
+    let err = resp.body.collect().unwrap_err();
+    assert!(
+        matches!(err.kind, courierust::ErrorKind::Overflow),
+        "expected body overflow, got {err:?}"
+    );
+}
+
+/// Security: credentials must not be forwarded across origins on a
+/// redirect (RFC 9110 credential-leakage guidance).
+#[test]
+fn redirect_strips_credentials_cross_origin() {
+    use std::sync::Mutex;
+
+    let got_auth = Arc::new(Mutex::new(false));
+    let got_auth_b = got_auth.clone();
+
+    // Target server B records whether `Authorization` arrived.
+    let base_b = Arc::new(spawn_server(ServerConfig::default(), move |req| {
+        let has = req.headers.contains_key("authorization");
+        *got_auth_b.lock().unwrap() = has;
+        let mut resp = courierust::http::response::Response::<Body>::with_status(200.into());
+        resp.body = Body::Bytes(Bytes::from(if has { "has" } else { "none" }));
+        resp
+    }));
+
+    // Redirector server A: 302 -> B (a different origin/port).
+    let location = base_b.to_string();
+    let base_a = spawn_server(ServerConfig::default(), move |_req| {
+        let mut resp = courierust::http::response::Response::<Body>::with_status(302.into());
+        resp.headers.insert(
+            courierust::http::header::HeaderName::from_lowercase("location"),
+            courierust::http::header::HeaderValue::from_bytes(location.as_bytes()).unwrap(),
+        );
+        resp
+    });
+
+    let client = Client::new();
+    let mut req = Request::new(Method::GET, "/");
+    req.headers.insert(
+        courierust::http::header::HeaderName::from_lowercase("authorization"),
+        courierust::http::header::HeaderValue::from_static("Bearer secret"),
+    );
+    let resp = client.execute(&format!("{base_a}/"), req).unwrap();
+    assert_eq!(resp.status.as_u16(), 200);
+    assert!(
+        !*got_auth.lock().unwrap(),
+        "authorization leaked across origins on redirect"
+    );
+}

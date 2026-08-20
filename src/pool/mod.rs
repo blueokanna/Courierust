@@ -54,7 +54,7 @@ impl Worker {
             }
             // 1. Local LIFO.
             if let Some(job) = self.local.lock().unwrap().pop_back() {
-                job();
+                run_job(job);
                 continue;
             }
             // 2. Global FIFO.
@@ -62,13 +62,13 @@ impl Worker {
                 let mut g = self.shared.global.lock().unwrap();
                 if let Some(job) = g.pop_front() {
                     drop(g);
-                    job();
+                    run_job(job);
                     continue;
                 }
             }
             // 3. Steal the oldest job from a peer's local queue bottom.
             if let Some(job) = self.steal() {
-                job();
+                run_job(job);
                 continue;
             }
             // 4. Park until new work arrives or shutdown.
@@ -106,6 +106,21 @@ impl Worker {
             .unwrap();
         let stolen = victim.local.lock().unwrap().pop_front();
         stolen
+    }
+}
+
+/// Run a job, containing panics so a panicking job cannot kill the
+/// worker thread — a worker must survive arbitrary handler failures
+/// (including application handlers panicking on crafted input).
+fn run_job(job: Job) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+    if let Err(p) = result {
+        let msg = p
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| p.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".to_string());
+        eprintln!("courierust pool: job panicked: {msg}");
     }
 }
 

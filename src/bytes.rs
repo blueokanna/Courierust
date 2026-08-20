@@ -386,6 +386,12 @@ impl BytesMut {
         self.buf.truncate(len);
     }
 
+    /// Resize to `new_len`, filling new bytes with `value`.
+    #[inline]
+    pub fn resize(&mut self, new_len: usize, value: u8) {
+        self.buf.resize(new_len, value);
+    }
+
     /// Split off the tail starting at `at`.
     #[inline]
     pub fn split_off(&mut self, at: usize) -> BytesMut {
@@ -416,6 +422,13 @@ impl Deref for BytesMut {
     #[inline]
     fn deref(&self) -> &[u8] {
         &self.buf
+    }
+}
+
+impl core::ops::DerefMut for BytesMut {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.buf
     }
 }
 

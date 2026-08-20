@@ -14,20 +14,25 @@ env:
 
 jobs:
   bench:
-    name: throughput (release)
+    name: throughput + compare (release)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run benchmarks
+        with:
+          workspaces: benches
+      - name: Run throughput benchmarks
         id: bench
         run: |
-          cargo bench --bench throughput 2>&1 | tee bench.log
+          cargo bench --manifest-path benches/Cargo.toml --bench throughput 2>&1 | tee bench.log
+      - name: Run comparison benchmarks (vs hyper / reqwest / tiny_http)
+        run: |
+          cargo bench --manifest-path benches/Cargo.toml --bench compare 2>&1 | tee -a bench.log
       - name: Summarize results
         run: |
           echo "## Courierust benchmarks (release, \${{ github.sha }})" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo '```text' >> "$GITHUB_STEP_SUMMARY"
-          grep -E "(req/s| ms )" bench.log >> "$GITHUB_STEP_SUMMARY" || true
+          grep -E "(req/s| ms |allocs/req)" bench.log >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"

@@ -180,7 +180,17 @@ impl Client {
                     _ => orig_method,
                 };
                 let mut new_req = Request::new(method, next.path_and_query.clone());
-                new_req.headers = orig_headers;
+                // Never forward credentials to a different origin: a
+                // malicious server could otherwise redirect a request and
+                // harvest `Authorization` / `Cookie` (RFC 9110 §15.4
+                // credential-leakage guidance).
+                let mut headers = orig_headers;
+                if next.authority() != url.authority() {
+                    for name in ["authorization", "proxy-authorization", "cookie"] {
+                        headers.remove(name);
+                    }
+                }
+                new_req.headers = headers;
                 new_req.body = Body::Empty;
                 return self.execute_with_redirects(&next, new_req, depth + 1);
             }

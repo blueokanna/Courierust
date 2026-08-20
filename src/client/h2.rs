@@ -74,6 +74,8 @@ struct Pending {
     body_rx: Option<Receiver<Result<Bytes>>>,
     /// Trailers accumulator shared with the caller.
     trailers: Arc<std::sync::Mutex<Option<HeaderMap>>>,
+    /// Bytes of response body received so far (enforces `max_body`).
+    body_len: usize,
 }
 
 /// Start an h2 connection driver over `stream`.
@@ -112,35 +114,53 @@ fn driver(stream: TcpStream, rx: Receiver<H2Cmd>, cfg: ClientConfig, accepting: 
             }
         }
 
-        // 2. Poll the connection.
-        let progress = match conn.poll() {
-            Ok(p) => p,
-            Err(e) => {
-                fail_all(&mut pending, e);
+        // 2. Poll the socket only when there is work to do (a command to
+        //    flush or a stream in flight). Idle connections block on the
+        //    command channel instead of burning a read-timeout per loop.
+        if got_cmd || !pending.is_empty() {
+            let _ = match conn.poll() {
+                Ok(p) => p,
+                Err(e) => {
+                    fail_all(&mut pending, e);
+                    break;
+                }
+            };
+            drain_events(
+                &mut conn,
+                &mut pending,
+                &mut goaway,
+                &accepting,
+                cfg.max_body,
+            );
+            if conn.is_closed() {
+                accepting.store(false, std::sync::atomic::Ordering::Release);
+                fail_all(&mut pending, Error::eof());
                 break;
             }
-        };
-
-        // 3. Drain events.
-        drain_events(&mut conn, &mut pending, &mut goaway, &accepting);
-
-        // 4. Liveness.
-        if conn.is_closed() {
-            accepting.store(false, std::sync::atomic::Ordering::Release);
-            fail_all(&mut pending, Error::eof());
-            break;
-        }
-        if pending.is_empty() && !got_cmd && !progress {
-            // Idle with no streams: block for the next command so an idle
-            // connection burns no CPU, while the socket read timeout still
-            // lets unsolicited inbound frames through.
+        } else {
+            // Idle: watch the command channel; poll periodically so
+            // unsolicited inbound (PING / GOAWAY) is still serviced.
             match rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(cmd) => {
                     if !handle_cmd(&mut conn, &mut pending, &mut goaway, cmd) {
                         break;
                     }
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let _ = conn.poll();
+                    drain_events(
+                        &mut conn,
+                        &mut pending,
+                        &mut goaway,
+                        &accepting,
+                        cfg.max_body,
+                    );
+                    if conn.is_closed() {
+                        accepting.store(false, std::sync::atomic::Ordering::Release);
+                        fail_all(&mut pending, Error::eof());
+                        break;
+                    }
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
@@ -193,6 +213,7 @@ fn handle_cmd(
                             body_tx: Some(body_tx),
                             body_rx: Some(body_rx),
                             trailers,
+                            body_len: 0,
                         },
                     );
                 }
@@ -211,6 +232,7 @@ fn drain_events(
     pending: &mut HashMap<u32, Pending>,
     goaway: &mut bool,
     accepting: &Arc<AtomicBool>,
+    max_body: usize,
 ) {
     while let Some(ev) = conn.next_event() {
         match ev {
@@ -263,6 +285,18 @@ fn drain_events(
                 end_stream,
             } => {
                 if let Some(p) = pending.get_mut(&stream_id) {
+                    // Enforce the configured body limit so a malicious
+                    // peer cannot stream an unbounded response body into
+                    // the caller's memory (parity with the h1 client).
+                    p.body_len = p.body_len.saturating_add(data.len());
+                    if p.body_len > max_body {
+                        conn.send_rst(stream_id, ErrorCode::EnhanceYourCalm);
+                        let err = Error::overflow("response body exceeds limit");
+                        let _ = p.body_tx.take().map(|tx| tx.send(Err(err.clone())));
+                        let _ = p.reply.take().map(|r| r.send(Err(err)));
+                        pending.remove(&stream_id);
+                        continue;
+                    }
                     let _ = p.body_tx.as_ref().map(|tx| tx.send(Ok(data)));
                     if end_stream {
                         pending.remove(&stream_id);

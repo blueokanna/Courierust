@@ -1,0 +1,11 @@
+# Rust build artifacts
+/target
+/benches/target
+
+# Editor / OS
+*.swp
+.DS_Store
+Thumbs.db
+
+# Scratch files
+*.log

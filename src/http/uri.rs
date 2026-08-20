@@ -26,8 +26,13 @@ impl PathAndQuery {
             }
             return Ok(Self(Bytes::from(b)));
         }
-        // Absolute-form: must contain "://".
+        // Absolute-form: must contain "://". Control characters are
+        // rejected exactly as in origin-form (a CR/LF embedded in the
+        // target could otherwise split the request line downstream).
         let s = core::str::from_utf8(b).map_err(|_| Error::protocol("non-UTF8 absolute target"))?;
+        if b.iter().any(|&c| c < 0x20 || c == 0x7f) {
+            return Err(Error::protocol("control character in request target"));
+        }
         let (scheme, rest) = s
             .split_once("://")
             .ok_or_else(|| Error::protocol("invalid request target form"))?;

@@ -137,6 +137,42 @@ struct PendingHeaders {
     end_stream: bool,
 }
 
+/// A frame being read across polls.
+///
+/// The transport may deliver the 9-byte frame header and the payload in
+/// separate segments. We never discard a partially-read frame on a
+/// timeout — the header bytes already consumed are kept here and the
+/// read resumes on the next `poll`. Without this, a timeout between
+/// header and payload would misparse payload bytes as a frame header
+/// (frame desync) and kill the connection.
+struct FrameReader {
+    /// Partial frame header (first `hdr_len` bytes valid).
+    hdr: [u8; 9],
+    hdr_len: usize,
+    /// Parsed header once complete.
+    header: Option<FrameHeader>,
+    /// Payload buffer (resized to `payload_len` once the header is known;
+    /// reused across frames so steady-state decoding allocates once).
+    payload: BytesMut,
+    /// Total payload length expected.
+    payload_len: usize,
+    /// How many payload bytes have been read so far.
+    payload_filled: usize,
+}
+
+impl Default for FrameReader {
+    fn default() -> Self {
+        Self {
+            hdr: [0u8; 9],
+            hdr_len: 0,
+            header: None,
+            payload: BytesMut::new(),
+            payload_len: 0,
+            payload_filled: 0,
+        }
+    }
+}
+
 /// HTTP/2 connection session.
 pub struct Connection<R, W> {
     reader: BufReader<R>,
@@ -158,6 +194,9 @@ pub struct Connection<R, W> {
 
     // Inbound header block reassembly
     pending_headers: Option<PendingHeaders>,
+
+    // Inbound frame accumulation (header + payload across polls)
+    frame: FrameReader,
 
     // Streams + scheduling
     streams: StreamMap,
@@ -206,6 +245,7 @@ impl<R: Read, W: Write> Connection<R, W> {
             settings_sent: false,
             pending_frames: VecDeque::new(),
             pending_headers: None,
+            frame: FrameReader::default(),
             streams: StreamMap::new(is_client),
             scheduler: Scheduler::new(quantum),
             scheduled: alloc::collections::BTreeSet::new(),
@@ -717,36 +757,63 @@ impl<R: Read, W: Write> Connection<R, W> {
     // ------------------------------------------------------------------
 
     fn read_and_process_one(&mut self) -> Result<bool> {
-        let mut hdr = [0u8; 9];
-        match self.reader.read_exact_into(&mut hdr) {
-            Ok(()) => {}
-            Err(e) if e.kind == ErrorKind::Timeout || e.kind == ErrorKind::WouldBlock => {
-                return Ok(false)
+        // 1. Frame header (9 bytes), accumulated across polls so a
+        //    partial read is never lost.
+        if self.frame.header.is_none() {
+            let n = self
+                .reader
+                .read_more(&mut self.frame.hdr[self.frame.hdr_len..])?;
+            self.frame.hdr_len += n;
+            if self.frame.hdr_len < 9 {
+                return Ok(false); // header still incomplete
             }
-            Err(e) => return Err(e),
-        }
-        let header = FrameHeader {
-            len: ((hdr[0] as u32) << 16) | ((hdr[1] as u32) << 8) | (hdr[2] as u32),
-            kind: hdr[3],
-            flags: hdr[4],
-            stream_id: u32::from_be_bytes([hdr[5] & 0x7f, hdr[6], hdr[7], hdr[8]]),
-        };
-        if header.len > self.local.max_frame_size {
-            self.send_goaway(ErrorCode::FrameSizeError, b"frame too large");
-            self.closed = true;
-            return Err(Error::h2(
-                ErrorCode::FrameSizeError.as_u32(),
-                "received frame exceeds our max frame size",
-            ));
-        }
-        let payload = match self.reader.read_exact(header.len as usize) {
-            Ok(p) => p,
-            Err(e) if e.kind == ErrorKind::Timeout || e.kind == ErrorKind::WouldBlock => {
-                return Ok(false)
+            let hdr = self.frame.hdr;
+            self.frame.header = Some(FrameHeader {
+                len: ((hdr[0] as u32) << 16) | ((hdr[1] as u32) << 8) | (hdr[2] as u32),
+                kind: hdr[3],
+                flags: hdr[4],
+                stream_id: u32::from_be_bytes([hdr[5] & 0x7f, hdr[6], hdr[7], hdr[8]]),
+            });
+            let h = self.frame.header.as_ref().unwrap();
+            if h.len > self.local.max_frame_size {
+                self.send_goaway(ErrorCode::FrameSizeError, b"frame too large");
+                self.closed = true;
+                return Err(Error::h2(
+                    ErrorCode::FrameSizeError.as_u32(),
+                    "received frame exceeds our max frame size",
+                ));
             }
-            Err(e) => return Err(e),
-        };
-        let frame = Frame::parse(header, &payload, self.local.max_frame_size)?;
+            self.frame.payload_len = h.len as usize;
+            self.frame.payload.clear();
+            self.frame.payload.resize(self.frame.payload_len, 0);
+            self.frame.payload_filled = 0;
+        }
+
+        // 2. Frame payload, accumulated across polls.
+        if self.frame.payload_filled < self.frame.payload_len {
+            let n = {
+                let (reader, frame) = (&mut self.reader, &mut self.frame);
+                let start = frame.payload_filled;
+                let end = frame.payload_len;
+                reader.read_more(&mut frame.payload[start..end])?
+            };
+            self.frame.payload_filled += n;
+            if self.frame.payload_filled < self.frame.payload_len {
+                return Ok(false); // payload still incomplete
+            }
+        }
+
+        // 3. Complete frame: parse + process, then reset for the next one.
+        let header = self.frame.header.take().unwrap();
+        let frame = Frame::parse(
+            header,
+            self.frame.payload.as_slice(),
+            self.local.max_frame_size,
+        )?;
+        self.frame.header = None;
+        self.frame.hdr_len = 0;
+        self.frame.payload_len = 0;
+        self.frame.payload_filled = 0;
         self.process_frame(frame)?;
         Ok(true)
     }
@@ -767,6 +834,16 @@ impl<R: Read, W: Write> Connection<R, W> {
                         return self.conn_error(
                             ErrorCode::ProtocolError,
                             "CONTINUATION on different stream",
+                        );
+                    }
+                    // Bound the accumulated header block: a peer must not
+                    // grow it without limit via endless CONTINUATION
+                    // frames (memory-exhaustion DoS guard).
+                    if pending.block.len() + block.len() > self.local.max_header_list_size as usize
+                    {
+                        return self.conn_error(
+                            ErrorCode::CompressionError,
+                            "header block exceeds advertised limit",
                         );
                     }
                     pending.block.extend_from_slice(block.as_slice());

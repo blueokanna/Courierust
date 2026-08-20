@@ -7,6 +7,7 @@
 use crate::error::{Error, ErrorKind, Result};
 use crate::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
 use std::time::Duration;
 
 impl Read for &TcpStream {
@@ -40,6 +41,29 @@ impl Write for &TcpStream {
             Ok(()) => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+}
+
+// `Arc<TcpStream>` mirrors the `&TcpStream` impls so a connection can
+// share one socket between a reader and a writer without self-referencing
+// (the h1/h2 connections keep both buffers alive for the connection's
+// lifetime).
+impl Read for Arc<TcpStream> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        let mut r: &TcpStream = self;
+        r.read(buf)
+    }
+}
+
+impl Write for Arc<TcpStream> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        let mut w: &TcpStream = self;
+        w.write(buf)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        let mut w: &TcpStream = self;
+        w.flush()
     }
 }
 

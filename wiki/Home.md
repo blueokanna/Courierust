@@ -12,7 +12,8 @@ This wiki is a hands-on guide. Every code sample below is real API usage — cop
 - [gRPC：Service、unary、服务端流、自定义编解码、错误码](gRPC-使用指南)
 - [浏览器指纹：JA3 / JA4 / Chrome HTTP/2 指纹](浏览器指纹)
 - [no_std：只用协议核心（嵌入式 / 内核态）](no_std-使用)
-- [基准测试：怎么跑、数字代表什么](基准测试)
+- [示例：8 个可直接运行的 demo](示例)
+- [基准测试：自测 + 与 hyper/reqwest/tiny_http 对比](基准测试)
 
 ## English tutorials
 
@@ -22,7 +23,8 @@ This wiki is a hands-on guide. Every code sample below is real API usage — cop
 - [gRPC: Service, unary, server-streaming, custom codecs, status](gRPC)
 - [Fingerprints: JA3 / JA4 / Chrome HTTP/2](Fingerprints)
 - [no_std: protocol core only (embedded / kernel)](no_std)
-- [Benchmarks: how to run, what the numbers mean](Benchmarks)
+- [Examples: 8 runnable demos](Examples)
+- [Benchmarks: self + vs hyper/reqwest/tiny_http](Benchmarks)
 
 ## What the crate does
 

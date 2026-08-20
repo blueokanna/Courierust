@@ -57,7 +57,13 @@ pub fn serve(stream: TcpStream, handler: &dyn Handler, config: &ServerConfig) ->
             flush_deferred(&mut conn, &mut deferred)?;
         }
 
-        let _ = conn.poll()?;
+        match conn.poll() {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("DEBUG h2 serve poll err: {:?}", e);
+                return Err(e);
+            }
+        }
 
         while let Some(ev) = conn.next_event() {
             match ev {

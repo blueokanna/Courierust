@@ -1,7 +1,3 @@
-//! HTTP/2 (h2c) end-to-end example: a loopback server and client.
-//!
-//! Run with `cargo run --example diag`.
-
 use courierust::body::Body;
 use courierust::client::{Client, ClientConfig};
 use courierust::http::request::Request;

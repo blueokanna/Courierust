@@ -1,6 +1,3 @@
-//! Minimal client + server demo, exactly as shown in the wiki
-//! "Getting Started" page. Run with `cargo run --example hello`.
-
 use courierust::body::Body;
 use courierust::client::{Client, ClientConfig};
 use courierust::http::request::Request;

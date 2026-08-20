@@ -76,7 +76,12 @@ fn read_int(input: &[u8], pos: &mut usize, n: u8, prefix: u8) -> Result<usize> {
         }
         let b = input[*pos];
         *pos += 1;
-        val += ((b & 0x7f) as usize) << shift;
+        // Checked arithmetic: a hostile integer can exceed usize::MAX
+        // (panic in debug / wrap in release); every caller re-validates
+        // the result, but reject it here so the parser stays exact.
+        val = val
+            .checked_add(((b & 0x7f) as usize) << shift)
+            .ok_or_else(|| Error::overflow("HPACK: integer overflow"))?;
         if b & 0x80 == 0 {
             return Ok(val);
         }
@@ -143,7 +148,7 @@ impl Decoder {
             huff: HuffmanDecoder::new(),
             max_table_size,
             max_header_list_size,
-            max_string_size: core::cmp::max(max_header_list_size * 4, 1 << 20),
+            max_string_size: core::cmp::max(max_header_list_size.saturating_mul(4), 1 << 20),
         }
     }
 
@@ -411,8 +416,28 @@ fn write_table_size_update(size: usize, out: &mut BytesMut) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ErrorKind;
     use crate::hpack::huffman_table::HUFFMAN;
     use alloc::string::String;
+
+    /// A hostile integer that exceeds `usize::MAX` must be rejected with
+    /// an overflow error, never panic (debug) or wrap (release).
+    #[test]
+    fn read_int_overflow_rejected() {
+        // prefix = 0x7f (full 7-bit prefix) then 9 continuation bytes
+        // with all bits set: the running value overflows usize.
+        let input = [0xffu8; 10];
+        let mut pos = 0usize;
+        let r = read_int(&input, &mut pos, 7, 0x7f);
+        assert!(r.is_err());
+        assert!(matches!(
+            r,
+            Err(Error {
+                kind: ErrorKind::Overflow,
+                ..
+            })
+        ));
+    }
 
     fn hex(s: &str) -> Vec<u8> {
         let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();

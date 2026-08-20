@@ -4,7 +4,7 @@
 //! memory pipe, ...) can be adapted in a few lines, keeping the whole
 //! protocol core `no_std`-capable.
 
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorKind, Result};
 use alloc::vec::Vec;
 
 /// A byte source. Returns `Ok(0)` on clean EOF.
@@ -128,6 +128,32 @@ impl<R: Read> BufReader<R> {
         Ok(())
     }
 
+    /// Read as much as possible into `out`, stopping on clean EOF or a
+    /// transport timeout/would-block. Returns the number of bytes
+    /// appended. Unlike [`Self::read_exact_into`], a timeout mid-read does
+    /// not discard the bytes already consumed — the caller keeps the buffer
+    /// and resumes on the next call. This is what makes frame decoding
+    /// atomic across polls (HTTP/2).
+    pub fn read_more(&mut self, out: &mut [u8]) -> Result<usize> {
+        let mut filled = 0;
+        while filled < out.len() {
+            match self.fill_buf() {
+                Ok([]) => break, // clean EOF
+                Ok(b) => {
+                    let take = core::cmp::min(out.len() - filled, b.len());
+                    out[filled..filled + take].copy_from_slice(&b[..take]);
+                    self.consume(take);
+                    filled += take;
+                }
+                Err(e) if e.kind == ErrorKind::Timeout || e.kind == ErrorKind::WouldBlock => {
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(filled)
+    }
+
     /// Read a single byte.
     pub fn read_u8(&mut self) -> Result<u8> {
         let b = self.fill_buf()?;
@@ -171,6 +197,17 @@ impl<R: Read> BufReader<R> {
     /// Returns the bytes read including `delim` (or up to `max`).
     pub fn read_until(&mut self, delim: u8, max: usize) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(64);
+        self.read_until_into(delim, max, &mut out)?;
+        Ok(out)
+    }
+
+    /// Read up to `max` bytes, stopping at (and including) `delim`,
+    /// appending into a caller-provided buffer (cleared first). Reusing
+    /// one buffer across calls keeps steady-state line reading
+    /// allocation-free — this is the hot path for HTTP/1.1 header
+    /// blocks.
+    pub fn read_until_into(&mut self, delim: u8, max: usize, out: &mut Vec<u8>) -> Result<()> {
+        out.clear();
         loop {
             if out.len() >= max {
                 return Err(Error::overflow("read_until exceeded max"));
@@ -179,19 +216,22 @@ impl<R: Read> BufReader<R> {
             if b.is_empty() {
                 return Err(Error::eof());
             }
-            let mut idx = 0;
+            // Scan the buffered window in bulk and extend once, instead
+            // of pushing byte-by-byte.
             let room = max - out.len();
             let scan = core::cmp::min(room, b.len());
-            while idx < scan {
-                let c = b[idx];
-                out.push(c);
-                idx += 1;
-                if c == delim {
-                    self.consume(idx);
-                    return Ok(out);
+            match b[..scan].iter().position(|&c| c == delim) {
+                Some(i) => {
+                    let take = i + 1;
+                    out.extend_from_slice(&b[..take]);
+                    self.consume(take);
+                    return Ok(());
+                }
+                None => {
+                    out.extend_from_slice(&b[..scan]);
+                    self.consume(scan);
                 }
             }
-            self.consume(idx);
         }
     }
 }
@@ -298,6 +338,63 @@ impl Write for VecWriter {
 
     fn flush(&mut self) -> Result<()> {
         Ok(())
+    }
+}
+
+/// A per-connection scratch buffer pool.
+///
+/// This is the crate's core allocation discipline: every hot decode
+/// path (HTTP/1.1 header blocks, bodies, chunk framing) draws its
+/// working buffers from a [`Scratch`] owned by the connection instead of
+/// the global allocator. After warm-up, steady-state message processing
+/// performs **zero allocations** — the buffers are recycled in place.
+///
+/// Keep one `Scratch` per connection (or per worker) and pass it down to
+/// the codec functions that accept `&mut Scratch`.
+#[derive(Default)]
+pub struct Scratch {
+    /// Reused for line-oriented reads ([`BufReader::read_until_into`]).
+    line: Vec<u8>,
+    /// Reused for body accumulation / chunk framing.
+    body: Vec<u8>,
+}
+
+impl Scratch {
+    /// An empty scratch.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Borrow the reusable line buffer (cleared; capacity preserved).
+    #[inline]
+    pub fn line(&mut self) -> &mut Vec<u8> {
+        self.line.clear();
+        &mut self.line
+    }
+
+    /// Borrow the reusable body buffer (cleared; capacity preserved).
+    #[inline]
+    pub fn body(&mut self) -> &mut Vec<u8> {
+        self.body.clear();
+        &mut self.body
+    }
+
+    /// The line buffer capacity (informational).
+    #[inline]
+    pub fn line_capacity(&self) -> usize {
+        self.line.capacity()
+    }
+
+    /// The body buffer capacity (informational).
+    #[inline]
+    pub fn body_capacity(&self) -> usize {
+        self.body.capacity()
+    }
+
+    /// Total bytes currently held by the scratch (informational).
+    #[inline]
+    pub fn held(&self) -> usize {
+        self.line.capacity() + self.body.capacity()
     }
 }
 
