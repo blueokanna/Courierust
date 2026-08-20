@@ -130,12 +130,15 @@ fn main() {
         let p90 = samples[(reqs as f64 * 0.90) as usize]
             .as_secs_f64()
             * 1_000_000.0;
+        let p95 = samples[(reqs as f64 * 0.95) as usize]
+            .as_secs_f64()
+            * 1_000_000.0;
         let p99 = samples[(reqs as f64 * 0.99) as usize]
             .as_secs_f64()
             * 1_000_000.0;
 
         println!(
-            "model={model} idle={idle} workers=2 reqs={reqs} p50_us={p50:.1} p75_us={p75:.1} p90_us={p90:.1} p99_us={p99:.1}",
+            "model={model} idle={idle} workers=2 reqs={reqs} p50_us={p50:.1} p75_us={p75:.1} p90_us={p90:.1} p95_us={p95:.1} p99_us={p99:.1}",
         );
         drop(herd);
     }

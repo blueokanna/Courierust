@@ -3,20 +3,48 @@
 //! gRPC is HTTP/2 + length-prefixed binary messages + `grpc-status`
 //! metadata. This module implements the framing and status handling on
 //! top of [`crate::client::Client`] (h2) and [`crate::server::Server`],
-//! with client-streaming, server-streaming and bidi calls.
+//! with unary, server-streaming, client-streaming and bidi calls on both
+//! the client and the server side.
 //!
 //! Protobuf itself is deliberately out of scope: implement
 //! [`crate::grpc::codec::EncodeMessage`] / [`crate::grpc::codec::DecodeMessage`]
 //! for your message types (or use the raw-bytes API) and plug in your own
-//! protobuf codec.
+//! protobuf codec. There is no `.proto` compiler integration and no
+//! `grpc.reflection` server (both require a protobuf implementation,
+//! which is external by design).
 //!
-//! Honest scope: message compression is `identity` only (gzip requires a
-//! full DEFLATE implementation); `grpc-status` is carried in the response
-//! header block (interoperable with trailer-aware and simple clients);
-//! `dns:///` targets are load-balanced round-robin across resolved
-//! addresses.
+//! Capabilities:
+//!
+//! * **Call shapes** — unary, server-streaming, client-streaming, bidi.
+//! * **Deadlines** — `grpc-timeout` is sent by the client and enforced
+//!   server-side (a malformed value is `INVALID_ARGUMENT`, an expired
+//!   deadline is `DEADLINE_EXCEEDED`).
+//! * **Metadata & interceptors** — arbitrary metadata plus a
+//!   [`Interceptor`] hook on the client.
+//! * **Load balancing** — `dns:///` targets round-robin over resolved
+//!   addresses.
+//! * **Health** — `grpc.health.v1.Health` with `Check` (unary) and
+//!   `Watch` (server-streaming); no reflection.
+//! * **Message size** — the maximum accepted gRPC message size is
+//!   configurable and enforced on both ends:
+//!   [`DEFAULT_MAX_MESSAGE_SIZE`] (4 MiB, the gRPC default) via
+//!   [`GrpcClientConfig::max_message_size`] and
+//!   [`GrpcServer::max_message_size`]. Messages larger than the limit
+//!   are rejected with an overflow error rather than buffered.
+//! * **Compression** — `gzip` and `identity` message compression with
+//!   full negotiation (gRPC A6): the client can compress requests via
+//!   [`GrpcClientConfig::compress`]; the server compresses responses
+//!   when the client's `grpc-accept-encoding` includes `gzip`. The gzip
+//!   codec is implemented from scratch (`compress` module) — decompression
+//!   handles any standard producer's DEFLATE (stored/fixed/dynamic),
+//!   and the decompressed size is bounded by `max_message_size` on both
+//!   ends, so a compressed bomb cannot bypass the size limit.
+//!
+//! Honest scope: the 4 MiB default is a hard per-message ceiling — set
+//! it explicitly (see above) for larger payloads.
 
 pub mod codec;
+pub mod compress;
 pub mod health;
 pub mod status;
 
@@ -110,6 +138,10 @@ pub struct GrpcClientConfig {
     pub interceptor: Option<Arc<dyn Interceptor>>,
     /// Optional default `grpc-timeout` applied to every call.
     pub timeout: Option<Duration>,
+    /// When true, request messages are gzip-compressed and
+    /// `grpc-encoding: gzip` is negotiated (server-side decompression is
+    /// always accepted via `grpc-accept-encoding: gzip, identity`).
+    pub compress: bool,
     /// The HTTP/2 client to drive the transport (set this to provide TLS
     /// settings for `https://` targets).
     pub http_client: Client,
@@ -128,6 +160,8 @@ pub struct GrpcClient {
     cursor: Arc<AtomicUsize>,
     /// Maximum accepted gRPC message size.
     max_message_size: usize,
+    /// Whether request messages are gzip-compressed.
+    compress: bool,
     /// Optional request interceptor.
     interceptor: Option<Arc<dyn Interceptor>>,
     /// Optional default grpc-timeout.
@@ -142,6 +176,7 @@ impl GrpcClient {
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             interceptor: None,
             timeout: None,
+            compress: false,
             http_client: Client::with_config(crate::client::ClientConfig {
                 http2: true,
                 user_agent: None,
@@ -158,6 +193,7 @@ impl GrpcClient {
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             interceptor: None,
             timeout: None,
+            compress: false,
             http_client: client,
         })
     }
@@ -176,6 +212,7 @@ impl GrpcClient {
             addrs,
             cursor: Arc::new(AtomicUsize::new(0)),
             max_message_size: config.max_message_size,
+            compress: config.compress,
             interceptor: config.interceptor,
             timeout: config.timeout,
         })
@@ -228,7 +265,7 @@ impl GrpcClient {
         req: Bytes,
         metadata: &HeaderMap,
     ) -> Result<MessageStream> {
-        let msg = frame_message(&req, false);
+        let msg = frame_outbound(req, self.compress, self.max_message_size)?;
         let request = self.build_request(method, metadata, Body::Bytes(Bytes::from(msg)))?;
         let url = crate::http::uri::Url::parse(&format!("{}{}", self.effective_base(), method))?;
         let resp = self
@@ -269,7 +306,7 @@ impl GrpcClient {
     ) -> Result<MessageStream> {
         // Frame each raw message and stream the frames as the request
         // body (h2 DATA frames, so the peer receives them incrementally).
-        let body = frame_stream(reqs, self.max_message_size)?;
+        let body = frame_stream(reqs, self.max_message_size, self.compress)?;
         let request = self.build_request(method, &HeaderMap::new(), body)?;
         let url = crate::http::uri::Url::parse(&format!("{}{}", self.effective_base(), method))?;
         let resp = self
@@ -298,11 +335,15 @@ impl GrpcClient {
         );
         request.headers.insert(
             HeaderName::from_lowercase("grpc-encoding"),
-            HeaderValue::from_static("identity"),
+            if self.compress {
+                HeaderValue::from_static("gzip")
+            } else {
+                HeaderValue::from_static("identity")
+            },
         );
         request.headers.insert(
             HeaderName::from_lowercase("grpc-accept-encoding"),
-            HeaderValue::from_static("identity"),
+            HeaderValue::from_static("gzip, identity"),
         );
         if let Some(t) = self.timeout {
             let v = grpc_timeout(t);
@@ -366,8 +407,14 @@ fn resolve_dns(base: &str) -> Result<Option<Vec<String>>> {
 /// A stream of decoded gRPC messages (raw payloads, compressed flag
 /// stripped).
 pub struct MessageStream {
-    /// Remaining body bytes.
+    /// The (possibly still streaming) response body.
+    body: Body,
+    /// Bytes received but not yet consumed as a complete message.
     buf: Vec<u8>,
+    /// Whether the body has been fully drained (channel closed / no more
+    /// bytes). Remaining buffered bytes are then either complete frames
+    /// or a truncated final frame.
+    done: bool,
     /// grpc-status extracted from trailers (fallback: headers).
     trailers: Arc<Mutex<Option<HeaderMap>>>,
     /// The response head headers (fallback for grpc-status).
@@ -391,9 +438,10 @@ impl MessageStream {
                 format!("unexpected content-type: {ct}"),
             ));
         }
-        let buf = resp.body.collect()?;
         Ok(Self {
-            buf: buf.to_vec(),
+            body: resp.body,
+            buf: Vec::new(),
+            done: false,
             trailers: resp.trailers,
             head_headers: resp.head.headers,
             max_message_size,
@@ -410,29 +458,55 @@ impl MessageStream {
         self.trailers.lock().unwrap().clone()
     }
 
-    /// Pull the next raw message payload.
+    /// Pull the next raw message payload, blocking until it is available
+    /// (or the stream ends). Returns `None` when the stream is exhausted
+    /// and `grpc-status` is verified.
     pub fn next_message(&mut self) -> Result<Option<Bytes>> {
-        if self.buf.is_empty() {
-            // No more bytes: verify grpc-status.
-            self.finish()?;
-            return Ok(None);
+        loop {
+            // A complete frame already buffered?
+            if self.buf.len() >= 5 {
+                let (compressed, len) = read_frame_header(&self.buf, self.max_message_size)?;
+                if self.buf.len() >= 5 + len {
+                    let payload = self.buf[5..5 + len].to_vec();
+                    self.buf.drain(..5 + len);
+                    return self.decode_payload(compressed, payload);
+                }
+            }
+            if self.done {
+                // Body fully consumed: leftover bytes are a truncated
+                // final frame.
+                if !self.buf.is_empty() {
+                    return Err(Error::protocol("truncated gRPC message"));
+                }
+                self.finish()?;
+                return Ok(None);
+            }
+            // Refill from the body (blocking).
+            match &self.body {
+                Body::Channel(rx) => match rx.recv() {
+                    Ok(Ok(chunk)) => self.buf.extend_from_slice(&chunk),
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => self.done = true,
+                },
+                Body::Empty => self.done = true,
+                Body::Bytes(b) => {
+                    self.buf.extend_from_slice(b);
+                    self.body = Body::Empty;
+                    self.done = true;
+                }
+            }
         }
-        let (compressed, len) = read_frame_header(&self.buf, self.max_message_size)?;
-        let header_len = 5;
-        if self.buf.len() < header_len + len {
-            return Err(Error::protocol("truncated gRPC message"));
+    }
+
+    /// Decode one message payload, honoring the compressed flag (gzip,
+    /// per-message streams). The decompressed size is bounded by
+    /// `max_message_size` (a compression bomb is rejected).
+    fn decode_payload(&self, compressed: bool, payload: Vec<u8>) -> Result<Option<Bytes>> {
+        if compressed {
+            let raw = compress::gunzip(&payload, self.max_message_size)?;
+            return Ok(Some(Bytes::from(raw)));
         }
-        let payload = &self.buf[header_len..header_len + len];
-        let out = if compressed {
-            return Err(Error::grpc(
-                status::UNIMPLEMENTED,
-                "compressed gRPC messages not supported (identity only)",
-            ));
-        } else {
-            Bytes::from(payload)
-        };
-        self.buf.drain(..header_len + len);
-        Ok(Some(out))
+        Ok(Some(Bytes::from(payload)))
     }
 
     fn finish(&self) -> Result<()> {
@@ -489,10 +563,26 @@ pub fn frame_message(payload: &[u8], compressed: bool) -> Vec<u8> {
     out
 }
 
+/// Frame a raw outbound message, gzip-compressing it first when
+/// requested. Enforces the message-size cap on the *uncompressed* size
+/// (compression must not be used to smuggle oversized messages).
+fn frame_outbound(msg: Bytes, compress: bool, max_message_size: usize) -> Result<Vec<u8>> {
+    if msg.len() > max_message_size {
+        return Err(Error::overflow("gRPC message too large"));
+    }
+    if compress {
+        let gz = compress::gzip(&msg);
+        Ok(frame_message(&gz, true))
+    } else {
+        Ok(frame_message(&msg, false))
+    }
+}
+
 /// Wrap a stream of raw messages into a stream of gRPC frames.
 fn frame_stream(
     raw: std::sync::mpsc::Receiver<Result<Bytes>>,
     max_message_size: usize,
+    compress: bool,
 ) -> Result<Body> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
@@ -500,16 +590,10 @@ fn frame_stream(
         .spawn(move || {
             while let Ok(msg) = raw.recv() {
                 let frame = match msg {
-                    Ok(m) => {
-                        if m.len() > max_message_size {
-                            let _ = tx.send(Err(Error::overflow("gRPC message too large")));
-                            break;
-                        }
-                        Ok(Bytes::from(frame_message(&m, false)))
-                    }
+                    Ok(m) => frame_outbound(m, compress, max_message_size),
                     Err(e) => Err(e),
                 };
-                if tx.send(frame).is_err() {
+                if tx.send(frame.map(Bytes::from)).is_err() {
                     break;
                 }
             }
@@ -616,9 +700,19 @@ impl GrpcServer {
         addr: impl std::net::ToSocketAddrs,
         service: impl StreamingService,
     ) -> std::io::Result<Self> {
+        Self::bind_streaming_with_config(addr, service, ServerConfig::default())
+    }
+
+    /// Bind a gRPC server with a streaming service over a custom HTTP
+    /// server configuration (worker-pool size, timeouts, TLS, ...).
+    pub fn bind_streaming_with_config(
+        addr: impl std::net::ToSocketAddrs,
+        service: impl StreamingService,
+        http_cfg: ServerConfig,
+    ) -> std::io::Result<Self> {
         let cfg = ServerConfig {
             http2: true,
-            ..Default::default()
+            ..http_cfg
         };
         let server = Server::bind_with_config(addr, cfg)?;
         Ok(Self {
@@ -662,6 +756,12 @@ impl GrpcServer {
     }
 }
 
+/// Adapt a unary service to the streaming dispatch (used by
+/// [`GrpcServer::bind`]).
+pub fn unary(service: impl Service) -> impl StreamingService {
+    UnaryAdapter(Arc::new(service))
+}
+
 /// Adapt a unary service to the streaming dispatch.
 struct UnaryAdapter(Arc<dyn Service>);
 
@@ -692,12 +792,11 @@ fn decode_messages(raw: &[u8], max: usize) -> Result<Vec<Result<Bytes>>> {
         }
         let payload = &raw[start..start + len];
         if compressed {
-            return Err(Error::grpc(
-                status::UNIMPLEMENTED,
-                "compressed requests not supported (identity only)",
-            ));
+            let plain = compress::gunzip(payload, max)?;
+            out.push(Ok(Bytes::from(plain)));
+        } else {
+            out.push(Ok(Bytes::from(payload)));
         }
-        out.push(Ok(Bytes::from(payload)));
         pos = start + len;
     }
     Ok(out)
@@ -821,6 +920,19 @@ impl Handler for GrpcHandler {
             return grpc_error_response(status::DEADLINE_EXCEEDED, "deadline exceeded");
         }
 
+        // Compression negotiation (gRPC A6): compress responses with gzip
+        // only when the client declared it can accept it.
+        let accept_gzip = req
+            .headers
+            .get("grpc-accept-encoding")
+            .map(|v| v.to_str().unwrap_or(""))
+            .map(|v| {
+                v.to_ascii_lowercase()
+                    .split(',')
+                    .any(|c| c.trim() == "gzip")
+            })
+            .unwrap_or(false);
+
         // Decode all request messages from the buffered body.
         let raw = match req.body.collect() {
             Ok(b) => b.to_vec(),
@@ -836,74 +948,165 @@ impl Handler for GrpcHandler {
             }
         };
 
-        // The service sends *raw* messages to `msg_tx`; a framing thread
-        // wraps each in the gRPC frame and forwards to the response
-        // channel, so messages stream to the peer incrementally.
+        // The service runs on its own thread so that a server-streaming
+        // call (which may never return, e.g. health `Watch`) does not
+        // block the connection's worker. The service sends *raw* messages
+        // to `msg_tx`; a framing thread wraps each in a gRPC frame and
+        // forwards it to the response body channel, so messages stream to
+        // the peer incrementally.
+        //
+        // `handle()` returns as soon as the call either (a) produced its
+        // first response message (a streaming call: the response head is
+        // decided then and `grpc-status` rides in the trailing block) or
+        // (b) finished without producing a message (a finite call: its
+        // final status is known and reported exactly, including error
+        // codes). Fast-fail conditions above are still reported before
+        // any of this.
         let (msg_tx, msg_rx) = std::sync::mpsc::channel();
         let msg_sender = crate::body::BodySender::from_sender(msg_tx);
         let (body_tx, body) = crate::body::channel();
         let max = self.max_message_size;
+        // Signals `Started` on the first forwarded message. Both threads
+        // drop their clones on exit, so `recv()` disconnecting means the
+        // call completed without streaming.
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        // Carries the service's final outcome for finite calls.
+        let (result_tx, result_rx) =
+            std::sync::mpsc::channel::<std::result::Result<(), (u32, String)>>();
+
+        let started_tx2 = started_tx.clone();
         let _ = std::thread::Builder::new()
-            .name("courierust-grpc-serve".into())
+            .name("courierust-grpc-frame".into())
             .spawn(move || {
+                let mut first = true;
                 while let Ok(m) = msg_rx.recv() {
+                    if first {
+                        let _ = started_tx2.send(());
+                        first = false;
+                    }
                     let frame = match m {
-                        Ok(raw) => {
-                            if raw.len() > max {
-                                let _ = body_tx.send_result(Err(Error::overflow("gRPC message too large")));
-                                break;
-                            }
-                            Ok(Bytes::from(frame_message(&raw, false)))
-                        }
+                        Ok(raw) => frame_outbound(raw, accept_gzip, max),
                         Err(e) => Err(e),
                     };
-                    if body_tx.send_result(frame).is_err() {
+                    if body_tx.send_result(frame.map(Bytes::from)).is_err() {
                         break;
                     }
                 }
             });
 
-        let result = {
-            let mut iter = DeadlineIter {
-                inner: messages.into_iter(),
-                deadline: &deadline,
-            };
-            self.service.serve(&method, &mut iter, &msg_sender)
-        };
-        match result {
-            Ok(()) => {
-                // A synchronous handler may have overrun the deadline;
-                // surface DEADLINE_EXCEEDED rather than a late OK.
-                if deadline.expired() {
+        let service = self.service.clone();
+        let method2 = method.clone();
+        // The original `started_tx` is moved into the serve thread: it is
+        // dropped only when that thread ends, so `started_rx` disconnects
+        // exactly when the call finishes (used to distinguish a finite
+        // call with no messages from a streaming one).
+        let started_tx3 = started_tx;
+        // `deadline` is moved into the serve closure; snapshot the
+        // instant first so `handle()` can still wait with a timeout.
+        let deadline_instant = deadline.0;
+        let _ = std::thread::Builder::new()
+            .name("courierust-grpc-serve".into())
+            .spawn(move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut iter = DeadlineIter {
+                        inner: messages.into_iter(),
+                        deadline: &deadline,
+                    };
+                    let r = service.serve(&method2, &mut iter, &msg_sender);
+                    r.map_err(|e| (e.grpc_code().unwrap_or(status::INTERNAL), e.to_string()))
+                }));
+                let mapped = match outcome {
+                    Ok(r) => r,
+                    Err(_) => Err((
+                        status::INTERNAL,
+                        "service handler panicked".to_string(),
+                    )),
+                };
+                let _ = result_tx.send(mapped);
+                // Dropping `started_tx3` (and, on the way out, the
+                // framing thread's clone once the message channel closes)
+                // lets `handle()` see the call finished.
+                drop(started_tx3);
+            });
+
+        let wait = match deadline_instant {
+            Some(d) => {
+                let now = std::time::Instant::now();
+                if d <= now {
                     return grpc_error_response(status::DEADLINE_EXCEEDED, "deadline exceeded");
                 }
-                let mut resp = Response::<Body>::with_status(200.into());
-                resp.headers.insert(
-                    HeaderName::from_lowercase("content-type"),
-                    HeaderValue::from_static(CONTENT_TYPE),
-                );
-                resp.headers.insert(
-                    HeaderName::from_lowercase("grpc-encoding"),
-                    HeaderValue::from_static("identity"),
-                );
-                // `grpc-status` is carried in the trailing header block
-                // (the gRPC wire contract), not the initial metadata; the
-                // body streams and the trailers end the stream.
-                let mut tr = HeaderMap::new();
-                tr.insert(
-                    HeaderName::from_lowercase("grpc-status"),
-                    HeaderValue::from_static("0"),
-                );
-                resp.trailers = Some(tr);
-                resp.body = body;
-                resp
+                match started_rx.recv_timeout(d - now) {
+                    Ok(()) => WaitOutcome::Started,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        WaitOutcome::DeadlineExceeded
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        WaitOutcome::Finished
+                    }
+                }
             }
-            Err(e) => {
-                let code = e.grpc_code().unwrap_or(status::INTERNAL);
-                grpc_error_response(code, &e.to_string())
+            None => {
+                if started_rx.recv().is_ok() {
+                    WaitOutcome::Started
+                } else {
+                    WaitOutcome::Finished
+                }
+            }
+        };
+
+        // A response carrying `grpc-status: 0` in the trailing block.
+        let streaming_response = |body: Body| {
+            let mut resp = Response::<Body>::with_status(200.into());
+            resp.headers.insert(
+                HeaderName::from_lowercase("content-type"),
+                HeaderValue::from_static(CONTENT_TYPE),
+            );
+            resp.headers.insert(
+                HeaderName::from_lowercase("grpc-encoding"),
+                if accept_gzip {
+                    HeaderValue::from_static("gzip")
+                } else {
+                    HeaderValue::from_static("identity")
+                },
+            );
+            let mut tr = HeaderMap::new();
+            tr.insert(
+                HeaderName::from_lowercase("grpc-status"),
+                HeaderValue::from_static("0"),
+            );
+            resp.trailers = Some(tr);
+            resp.body = body;
+            resp
+        };
+
+        match wait {
+            // First message produced: the call is streaming.
+            WaitOutcome::Started => streaming_response(body),
+            // All senders gone: the call finished without streaming, so
+            // its exact outcome is known.
+            WaitOutcome::Finished => match result_rx.recv() {
+                Ok(Ok(())) => streaming_response(body),
+                Ok(Err((code, msg))) => grpc_error_response(code, &msg),
+                Err(_) => grpc_error_response(status::INTERNAL, "service thread exited"),
+            },
+            WaitOutcome::DeadlineExceeded => {
+                grpc_error_response(status::DEADLINE_EXCEEDED, "deadline exceeded")
             }
         }
     }
+}
+
+/// The outcome of waiting for a gRPC call to either stream its first
+/// message or complete.
+#[derive(Debug)]
+enum WaitOutcome {
+    /// The call produced its first response message: it is streaming.
+    Started,
+    /// The call completed without producing a message; its final status
+    /// is available on the result channel.
+    Finished,
+    /// The call deadline elapsed before the first message.
+    DeadlineExceeded,
 }
 
 /// Build a gRPC error response.

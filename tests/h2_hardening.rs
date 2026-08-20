@@ -141,6 +141,7 @@ fn spawn_h2_server(max_header_list: usize) -> SocketAddr {
     let config = ServerConfig {
         http2: true,
         event_driven: false,
+        threads: 1,
         max_header_list,
         ..Default::default()
     };
@@ -386,6 +387,7 @@ fn h2c_upgrade_roundtrip_and_reuse() {
         ServerConfig {
             http2: true,
             event_driven: false,
+            threads: 1,
             ..Default::default()
         },
     )
@@ -443,6 +445,7 @@ fn h2c_upgrade_declined_falls_back_to_h1() {
         ServerConfig {
             http2: false,
             event_driven: false,
+            threads: 1,
             ..Default::default()
         },
     )
@@ -565,4 +568,443 @@ fn h2_client_keepalive_detects_dead_peer() {
         started.elapsed() < Duration::from_secs(5),
         "dead-peer detection must fire promptly"
     );
+}
+
+// ---------------------------------------------------------------------
+// Content-Length / framing enforcement (RFC 9113 §8.1.2.6, §8.2.2)
+// ---------------------------------------------------------------------
+
+/// A literal-without-indexing HPACK field with a Huffman-encoded value
+/// (used to inject malformed Huffman streams into a header block).
+fn hpack_huff_value(name: &str, value_huff: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x00]; // literal without indexing, new name
+    out.push(name.len() as u8);
+    out.extend_from_slice(name.as_bytes());
+    out.push(0x80 | (value_huff.len() as u8)); // Huffman flag
+    out.extend_from_slice(value_huff);
+    out
+}
+
+/// Read frames until an `RST_STREAM` on `stream_id`; returns the error
+/// code (or `None` if the peer closes first).
+fn wait_rst(peer: &mut RawH2Peer, stream_id: u32, timeout: Duration) -> Option<u32> {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        match peer.read_frame() {
+            Some((0x3, _, sid, payload)) if sid == stream_id => {
+                if payload.len() >= 4 {
+                    return Some(u32::from_be_bytes([
+                        payload[0], payload[1], payload[2], payload[3],
+                    ]));
+                }
+                return None;
+            }
+            Some(_) => continue,
+            None => return None,
+        }
+    }
+    None
+}
+
+/// A standard GET request header block.
+fn get_block() -> Vec<u8> {
+    hpack(&[
+        hdr(":method", "GET"),
+        hdr(":path", "/"),
+        hdr(":scheme", "http"),
+    ])
+}
+
+#[test]
+fn h2_rejects_conflicting_content_length() {
+    // Two different content-length values are a request-smuggling vector
+    // (CWE-444) and a connection error (RFC 9113 §8.1.2.6).
+    let addr = spawn_h2_server(1 << 20);
+    let mut peer = RawH2Peer::connect(addr).unwrap();
+    peer.send_preface_and_settings();
+    let block = hpack(&[
+        hdr(":method", "POST"),
+        hdr(":path", "/"),
+        hdr(":scheme", "http"),
+        hdr("content-length", "5"),
+        hdr("content-length", "6"),
+    ]);
+    peer.send_frame(0x1, 0x4, 1, &block);
+    let code = peer.wait_goaway(Duration::from_secs(5));
+    assert_eq!(code, Some(0x1), "expected PROTOCOL_ERROR GOAWAY");
+}
+
+#[test]
+fn h2_rejects_content_length_mismatch_stream_error() {
+    // A request declaring content-length: 10 but sending only 5 bytes is
+    // a STREAM error (RFC 9113 §5.4.2): the stream is reset with
+    // PROTOCOL_ERROR, and the connection must stay usable.
+    let addr = spawn_h2_server(1 << 20);
+    let mut peer = RawH2Peer::connect(addr).unwrap();
+    peer.send_preface_and_settings();
+    let block = hpack(&[
+        hdr(":method", "POST"),
+        hdr(":path", "/"),
+        hdr(":scheme", "http"),
+        hdr("content-length", "10"),
+    ]);
+    peer.send_frame(0x1, 0x4, 1, &block); // HEADERS, no END_STREAM
+    peer.send_frame(0x0, 0x1, 1, b"hello"); // 5 bytes + END_STREAM
+    let rst = wait_rst(&mut peer, 1, Duration::from_secs(5));
+    assert_eq!(rst, Some(0x1), "expected PROTOCOL_ERROR RST_STREAM");
+
+    // The connection must still be usable: a fresh, valid request (with
+    // END_STREAM on the HEADERS, since it has no body) is answered
+    // normally.
+    peer.send_frame(0x1, 0x5, 3, &get_block()); // END_HEADERS | END_STREAM
+    let mut saw_response = false;
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        match peer.read_frame() {
+            Some((0x1, _, 3, _)) => {
+                saw_response = true;
+                break;
+            }
+            Some((0x4, _, 0, _)) => continue, // SETTINGS ACK
+            Some((0x0, _, 3, _)) => {
+                saw_response = true;
+                break;
+            }
+            Some(_) => continue,
+            None => break,
+        }
+    }
+    assert!(saw_response, "connection must survive a stream error");
+}
+
+#[test]
+fn h2_rejects_transfer_encoding() {
+    // transfer-encoding is forbidden in HTTP/2 (RFC 9113 §8.2.2); it is
+    // an HTTP/1.1 hop-by-hop smuggling vector.
+    let addr = spawn_h2_server(1 << 20);
+    let mut peer = RawH2Peer::connect(addr).unwrap();
+    peer.send_preface_and_settings();
+    let block = hpack(&[
+        hdr(":method", "GET"),
+        hdr(":path", "/"),
+        hdr(":scheme", "http"),
+        hdr("transfer-encoding", "chunked"),
+    ]);
+    peer.send_frame(0x1, 0x4, 1, &block);
+    let code = peer.wait_goaway(Duration::from_secs(5));
+    assert_eq!(code, Some(0x1), "expected PROTOCOL_ERROR GOAWAY");
+}
+
+#[test]
+fn h2_rejects_connection_specific_header() {
+    // Connection-specific fields (RFC 9113 §8.2.2) must be rejected.
+    let addr = spawn_h2_server(1 << 20);
+    let mut peer = RawH2Peer::connect(addr).unwrap();
+    peer.send_preface_and_settings();
+    let block = hpack(&[
+        hdr(":method", "GET"),
+        hdr(":path", "/"),
+        hdr(":scheme", "http"),
+        hdr("connection", "keep-alive"),
+    ]);
+    peer.send_frame(0x1, 0x4, 1, &block);
+    let code = peer.wait_goaway(Duration::from_secs(5));
+    assert_eq!(code, Some(0x1), "expected PROTOCOL_ERROR GOAWAY");
+}
+
+#[test]
+fn h2_rejects_te_with_non_trailers_value() {
+    // `te` is only legal with the value `trailers` (RFC 9113 §8.2.2).
+    let addr = spawn_h2_server(1 << 20);
+    let mut peer = RawH2Peer::connect(addr).unwrap();
+    peer.send_preface_and_settings();
+    let block = hpack(&[
+        hdr(":method", "GET"),
+        hdr(":path", "/"),
+        hdr(":scheme", "http"),
+        hdr("te", "gzip"),
+    ]);
+    peer.send_frame(0x1, 0x4, 1, &block);
+    let code = peer.wait_goaway(Duration::from_secs(5));
+    assert_eq!(code, Some(0x1), "expected PROTOCOL_ERROR GOAWAY");
+}
+
+#[test]
+fn h2_rejects_content_length_in_trailers() {
+    // Framing fields must not appear in trailers (RFC 9113 §8.1).
+    let addr = spawn_h2_server(1 << 20);
+    let mut peer = RawH2Peer::connect(addr).unwrap();
+    peer.send_preface_and_settings();
+    // Valid request body, then trailers carrying content-length.
+    let block = hpack(&[
+        hdr(":method", "POST"),
+        hdr(":path", "/"),
+        hdr(":scheme", "http"),
+    ]);
+    peer.send_frame(0x1, 0x4, 1, &block); // HEADERS, no END_STREAM
+    peer.send_frame(0x0, 0x0, 1, b"abc"); // DATA, no END_STREAM
+    let trailer = hpack(&[hdr("content-length", "3")]);
+    peer.send_frame(0x1, 0x4, 1, &trailer); // trailers + END_HEADERS
+    let code = peer.wait_goaway(Duration::from_secs(5));
+    assert_eq!(code, Some(0x1), "expected PROTOCOL_ERROR GOAWAY");
+}
+
+// ---------------------------------------------------------------------
+// HPACK Huffman malformed streams
+// ---------------------------------------------------------------------
+
+#[test]
+fn h2_rejects_truncated_huffman() {
+    // A Huffman-encoded header value whose final code is cut short is a
+    // COMPRESSION_ERROR (RFC 7541 §5.2).
+    let addr = spawn_h2_server(1 << 20);
+    let mut peer = RawH2Peer::connect(addr).unwrap();
+    peer.send_preface_and_settings();
+    let full = {
+        let mut v = Vec::new();
+        courierust::hpack::huffman::encode(b"hello", &mut v);
+        v
+    };
+    assert!(full.len() > 2, "huffman('hello') must span >2 bytes");
+    let mut block = get_block();
+    block.extend_from_slice(&hpack_huff_value("x-huff", &full[..2]));
+    peer.send_frame(0x1, 0x4, 1, &block);
+    let code = peer.wait_goaway(Duration::from_secs(5));
+    assert_eq!(code, Some(0x9), "expected COMPRESSION_ERROR GOAWAY");
+}
+
+#[test]
+fn h2_rejects_huffman_eos() {
+    // A Huffman stream containing the EOS symbol (30 ones) is invalid.
+    let addr = spawn_h2_server(1 << 20);
+    let mut peer = RawH2Peer::connect(addr).unwrap();
+    peer.send_preface_and_settings();
+    let mut block = get_block();
+    block.extend_from_slice(&hpack_huff_value("x-huff", &[0xff, 0xff, 0xff, 0xff]));
+    peer.send_frame(0x1, 0x4, 1, &block);
+    let code = peer.wait_goaway(Duration::from_secs(5));
+    assert_eq!(code, Some(0x9), "expected COMPRESSION_ERROR GOAWAY");
+}
+
+// ---------------------------------------------------------------------
+// Flow control / SETTINGS
+// ---------------------------------------------------------------------
+
+#[test]
+fn h2_rejects_window_update_overflow() {
+    // A connection-level WINDOW_UPDATE that would push the window past
+    // 2^31-1 is a FLOW_CONTROL_ERROR (RFC 9113 §6.9.1).
+    let addr = spawn_h2_server(1 << 20);
+    let mut peer = RawH2Peer::connect(addr).unwrap();
+    peer.send_preface_and_settings();
+    // 65535 (initial) + 0x7fffffff > 2^31 - 1.
+    peer.send_frame(0x8, 0, 0, &0x7fff_ffffu32.to_be_bytes());
+    let code = peer.wait_goaway(Duration::from_secs(5));
+    assert_eq!(code, Some(0x3), "expected FLOW_CONTROL_ERROR GOAWAY");
+}
+
+#[test]
+fn h2_rejects_data_exceeding_flow_window() {
+    // Sending DATA beyond the advertised flow-control window is a
+    // FLOW_CONTROL_ERROR (RFC 9113 §6.9).
+    let addr = spawn_h2_server(1 << 20);
+    let mut peer = RawH2Peer::connect(addr).unwrap();
+    peer.send_preface_and_settings();
+    peer.send_frame(0x1, 0x4, 1, &get_block()); // open stream 1
+    let chunk = vec![b'x'; 16384];
+    for _ in 0..5 {
+        peer.send_frame(0x0, 0x0, 1, &chunk); // 5 × 16 KiB > 64 KiB conn window
+    }
+    let code = peer.wait_goaway(Duration::from_secs(5));
+    assert_eq!(code, Some(0x3), "expected FLOW_CONTROL_ERROR GOAWAY");
+}
+
+#[test]
+fn h2_rejects_settings_ack_with_payload() {
+    // A SETTINGS ACK must have an empty payload (RFC 9113 §6.5.3).
+    let addr = spawn_h2_server(1 << 20);
+    let mut peer = RawH2Peer::connect(addr).unwrap();
+    peer.send_preface_and_settings();
+    peer.send_frame(0x4, 0x1, 0, &[0u8; 6]); // ACK flag + 6-byte payload
+    let code = peer.wait_goaway(Duration::from_secs(5));
+    assert_eq!(code, Some(0x6), "expected FRAME_SIZE_ERROR GOAWAY");
+}
+
+// ---------------------------------------------------------------------
+// Concurrent stream limits
+// ---------------------------------------------------------------------
+
+#[test]
+fn h2_rejects_excessive_concurrent_streams() {
+    // A server advertising SETTINGS_MAX_CONCURRENT_STREAMS=2 must reset
+    // the 3rd concurrent stream with REFUSED_STREAM (RFC 9113 §5.1.2).
+    let server = Server::bind_with_config(
+        "127.0.0.1:0",
+        ServerConfig {
+            http2: true,
+            event_driven: false,
+            threads: 1,
+            h2_max_concurrent_streams: 2,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let addr = server.local_addr().unwrap();
+    let handle = server
+        .serve_background(|_req: courierust::http::request::Request<Body>| {
+            // Never completes (no END_STREAM from the peer), so streams 1
+            // and 3 stay open.
+            let mut resp = courierust::http::response::Response::<Body>::with_status(200.into());
+            resp.body = Body::Bytes(Bytes::from_static(b"ok"));
+            resp
+        })
+        .unwrap();
+    std::mem::forget(handle);
+
+    let mut peer = RawH2Peer::connect(addr).unwrap();
+    peer.send_preface_and_settings();
+    // Two concurrent streams held open.
+    peer.send_frame(0x1, 0x4, 1, &get_block());
+    peer.send_frame(0x1, 0x4, 3, &get_block());
+    // The third exceeds the limit.
+    peer.send_frame(0x1, 0x4, 5, &get_block());
+    let rst = wait_rst(&mut peer, 5, Duration::from_secs(5));
+    assert_eq!(rst, Some(0x7), "expected REFUSED_STREAM RST_STREAM");
+}
+
+#[test]
+fn h2_client_respects_peer_concurrent_stream_limit() {
+    // The client must never exceed the peer's advertised
+    // SETTINGS_MAX_CONCURRENT_STREAMS: excess requests wait for a free
+    // stream slot instead of being opened on the connection.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_seen = Arc::new(AtomicUsize::new(0));
+
+    let server = Server::bind_with_config(
+        "127.0.0.1:0",
+        ServerConfig {
+            http2: true,
+            event_driven: false,
+            threads: 1,
+            h2_max_concurrent_streams: 2,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let addr = server.local_addr().unwrap();
+    let active2 = active.clone();
+    let max2 = max_seen.clone();
+    let handle = server
+        .serve_background(move |_req: courierust::http::request::Request<Body>| {
+            let now = active2.fetch_add(1, Ordering::SeqCst) + 1;
+            max2.fetch_max(now, Ordering::SeqCst);
+            // Hold the stream open briefly so the client's deferral is
+            // actually exercised (2 streams are in flight at any time).
+            std::thread::sleep(Duration::from_millis(60));
+            active2.fetch_sub(1, Ordering::SeqCst);
+            let mut resp = courierust::http::response::Response::<Body>::with_status(200.into());
+            resp.body = Body::Bytes(Bytes::from_static(b"ok"));
+            resp
+        })
+        .unwrap();
+    std::mem::forget(handle);
+
+    let client = Client::with_config(ClientConfig {
+        http2: true,
+        max_connections_per_host: 1, // force all requests onto one connection
+        connect_timeout: Some(Duration::from_secs(5)),
+        read_timeout: Some(Duration::from_secs(10)),
+        ..Default::default()
+    });
+    let base = format!("http://{addr}");
+    let mut handles = Vec::new();
+    for _ in 0..6 {
+        let c = client.clone();
+        let b = base.clone();
+        handles.push(std::thread::spawn(move || {
+            let req = courierust::http::request::Request::<Body>::new(Method::GET, "/bench");
+            let resp = c.execute(&format!("{b}/bench"), req).unwrap();
+            assert_eq!(resp.status.as_u16(), 200);
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    let seen = max_seen.load(Ordering::SeqCst);
+    assert!(
+        seen <= 2,
+        "client exceeded the peer's concurrent-stream limit (max seen {seen})"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Client-side content-length enforcement
+// ---------------------------------------------------------------------
+
+#[test]
+fn h2_client_rejects_content_length_mismatch_response() {
+    // A response declaring content-length: 100 but carrying only 2 bytes
+    // must be surfaced as an error to the client.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (sock, _) = listener.accept().unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut peer = RawH2Peer { stream: sock };
+        assert!(peer.read_preface());
+        let _ = peer.read_frame(); // client SETTINGS
+        peer.send_frame(0x4, 0, 0, &[]); // our SETTINGS
+        // Wait for the request.
+        loop {
+            match peer.read_frame() {
+                Some((0x1, _, 1, _)) => break,
+                Some((0x4, _, 0, _)) => continue,
+                Some(_) => continue,
+                None => panic!("client closed before request"),
+            }
+        }
+        // Response: content-length 100, body "hi" (2 bytes) + END_STREAM.
+        let block = hpack(&[
+            hdr(":status", "200"),
+            hdr("content-length", "100"),
+        ]);
+        peer.send_frame(0x1, 0x4, 1, &block); // HEADERS, no END_STREAM
+        peer.send_frame(0x0, 0x1, 1, b"hi"); // DATA + END_STREAM
+        // Keep reading so the connection stays open long enough for the
+        // client to observe the mismatch.
+        for _ in 0..200 {
+            if peer.read_frame().is_none() {
+                break;
+            }
+        }
+    });
+
+    let cfg = ClientConfig {
+        http2: true,
+        connect_timeout: Some(Duration::from_secs(5)),
+        read_timeout: Some(Duration::from_secs(5)),
+        h2_settings_timeout: Some(Duration::from_secs(5)),
+        h2_ping_interval: None,
+        h2_ping_timeout: None,
+        h2_idle_timeout: None,
+        ..Default::default()
+    };
+    let client = Client::with_config(cfg);
+    let result = client.get(&format!("http://{addr}/"));
+    // The mismatch is detected when the body ends, so it surfaces as a
+    // body-read error even though the response head was already
+    // delivered.
+    match result {
+        Ok(resp) => {
+            let body_result = resp.body.collect();
+            assert!(
+                body_result.is_err(),
+                "client must reject a response whose content-length does not match the body"
+            );
+        }
+        Err(_) => {} // surfaced at the head is also acceptable
+    }
 }

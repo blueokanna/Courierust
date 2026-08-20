@@ -160,6 +160,13 @@ fn serve_loop(
                     req_bodies.remove(&stream_id);
                     deferred.remove(&stream_id);
                 }
+                Event::StreamError { stream_id, .. } => {
+                    // A locally-detected stream error (e.g. a
+                    // content-length mismatch in the request): drop the
+                    // request state. The connection stays usable.
+                    req_bodies.remove(&stream_id);
+                    deferred.remove(&stream_id);
+                }
                 Event::GoAway { .. } => {
                     peer_goaway = true;
                 }
@@ -260,7 +267,7 @@ fn server_config(config: &ServerConfig) -> H2Config {
         ..Default::default()
     };
     c.local_settings.max_header_list_size = config.max_header_list as u32;
-    c.local_settings.max_concurrent_streams = 1024;
+    c.local_settings.max_concurrent_streams = config.h2_max_concurrent_streams;
     if c.local_settings.initial_window_size < 256 * 1024 {
         c.local_settings.initial_window_size = 256 * 1024;
     }

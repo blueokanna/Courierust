@@ -116,7 +116,10 @@ fn read_string(
     *pos += len;
     if huffman {
         let mut out = Vec::with_capacity(len);
-        huff.decode(raw, &mut out)
+        // RFC 7541 Huffman expands by at most ~1.6×, so 2× the encoded
+        // length is a hard cap on the decoded string; exceeding it is a
+        // decompression-bomb guard, not a protocol error.
+        huff.decode(raw, &mut out, len.saturating_mul(2))
             .map_err(|e| Error::protocol(format!("HPACK: Huffman decode error: {e:?}")))?;
         Ok(Bytes::from(out))
     } else {

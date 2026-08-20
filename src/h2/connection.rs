@@ -45,6 +45,11 @@ pub struct Config {
     pub auto_release_credit: bool,
 }
 
+/// Maximum flow-control window, 2^31-1 octets (RFC 9113 §6.9.1). A
+/// window must never exceed this; WINDOW_UPDATEs that would push it past
+/// the ceiling are a connection error of type FLOW_CONTROL_ERROR.
+pub(crate) const MAX_FLOW_WINDOW: i64 = 0x7fff_ffff;
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -93,6 +98,17 @@ pub enum Event {
         stream_id: u32,
         /// Error code.
         error_code: ErrorCode,
+    },
+    /// A stream-level error detected locally (RFC 9113 §5.4.2). The
+    /// session sent `RST_STREAM` and terminated the stream; this is NOT a
+    /// connection error, so the rest of the connection stays usable.
+    StreamError {
+        /// Stream id.
+        stream_id: u32,
+        /// Error code sent in the `RST_STREAM`.
+        error_code: ErrorCode,
+        /// Human-readable reason.
+        message: alloc::string::String,
     },
     /// `GOAWAY` received.
     GoAway {
@@ -258,8 +274,8 @@ impl<R: Read, W: Write> Connection<R, W> {
             scheduled: alloc::collections::BTreeSet::new(),
             send_queue: BTreeMap::new(),
             pending_priority: BTreeMap::new(),
-            conn_send_window: FlowWindow::new(conn_window, i64::from(u32::MAX)),
-            conn_recv_window: FlowWindow::new(conn_window, i64::from(u32::MAX)),
+            conn_send_window: FlowWindow::new(conn_window, MAX_FLOW_WINDOW),
+            conn_recv_window: FlowWindow::new(conn_window, MAX_FLOW_WINDOW),
             conn_pending_release: 0,
             events: VecDeque::new(),
             goaway_sent: false,
@@ -440,11 +456,21 @@ impl<R: Read, W: Write> Connection<R, W> {
         self.encoder.encode(fields, &mut block);
         let max = self.peer.max_frame_size as usize;
 
+        // The request method determines whether the response on this
+        // stream may carry a body (HEAD / CONNECT responses must not,
+        // RFC 9113 §8.1), which feeds `content-length` enforcement.
+        let method = fields
+            .iter()
+            .find(|f| f.name.as_str() == ":method")
+            .and_then(|f| f.value.to_str().ok())
+            .unwrap_or("");
+
         let now_closed = {
             let stream = self
                 .streams
                 .get_mut(&stream_id)
                 .ok_or_else(|| Error::protocol("send_headers: unknown stream"))?;
+            stream.body_expected = method != "HEAD" && method != "CONNECT";
             if stream.state == StreamState::Idle {
                 stream.state = if end_stream {
                     StreamState::HalfClosedLocal
@@ -1228,6 +1254,12 @@ impl<R: Read, W: Write> Connection<R, W> {
                 .pending_priority
                 .remove(&sid)
                 .unwrap_or_else(|| Priority::parse_headers(&fields).unwrap_or_default());
+            let cl = self.parse_content_length(&fields)?;
+            let method = fields
+                .iter()
+                .find(|f| f.name.as_str() == ":method")
+                .and_then(|f| f.value.to_str().ok())
+                .unwrap_or("");
             let mut s = Stream::new(sid, self.peer.initial_window_size as i64, initial, priority);
             s.state = if p.end_stream {
                 StreamState::HalfClosedRemote
@@ -1238,7 +1270,19 @@ impl<R: Read, W: Write> Connection<R, W> {
                 s.recv_ended = true;
             }
             s.headers_delivered = true;
+            // RFC 9113 §8.1.2.6: track the expected body length so a
+            // mismatched request body is rejected at stream end.
+            s.content_length = cl;
+            s.body_expected = method != "HEAD" && method != "CONNECT";
             self.streams.insert(s);
+            if p.end_stream {
+                // A request whose headers claim END_STREAM (no body) but
+                // declare a nonzero content-length is malformed.
+                self.verify_content_length(sid);
+                if !self.streams.contains(&sid) {
+                    return Ok(());
+                }
+            }
             self.events.push_back(Event::Headers {
                 stream_id: sid,
                 headers: fields,
@@ -1263,8 +1307,18 @@ impl<R: Read, W: Write> Connection<R, W> {
             return Ok(());
         }
         if delivered {
-            // Trailers: pseudo-headers MUST NOT appear (RFC 9113 §8.1.2).
+            // Trailers: pseudo-headers MUST NOT appear (RFC 9113 §8.1.2),
+            // and framing fields (content-length, transfer-encoding,
+            // connection-specific) are forbidden (RFC 9113 §8.1).
             self.validate_header_block(&fields, false, true)?;
+            // A content-length that disagrees with the actual body length
+            // is a stream error (RFC 9113 §8.1.2.6). Verify BEFORE
+            // delivering the trailers so callers never observe a "valid"
+            // trailer block on a stream that is actually malformed.
+            self.verify_content_length(sid);
+            if !self.streams.contains(&sid) {
+                return Ok(());
+            }
             self.events.push_back(Event::Trailers {
                 stream_id: sid,
                 headers: fields,
@@ -1298,44 +1352,72 @@ impl<R: Read, W: Write> Connection<R, W> {
             );
         }
         self.validate_header_block(&fields, false, false)?;
-        let stream = self.streams.get_mut(&sid).unwrap();
-        stream.state = match stream.state {
-            StreamState::Open => {
-                if p.end_stream {
-                    StreamState::HalfClosedRemote
-                } else {
-                    StreamState::Open
+        // RFC 9113 §8.1.2.6: parse the response content-length and the
+        // status so the body count can be enforced. 1xx / 204 / 304
+        // responses never carry a body.
+        let cl = self.parse_content_length(&fields)?;
+        let status = fields
+            .iter()
+            .find(|f| f.name.as_str() == ":status")
+            .and_then(|f| f.value.to_str().ok())
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(200);
+        let status_expects_body = !(100..=199).contains(&status) && status != 204 && status != 304;
+        let priority;
+        {
+            let stream = self.streams.get_mut(&sid).unwrap();
+            stream.content_length = cl;
+            // The request method (HEAD/CONNECT) may already rule out a
+            // body; the status can rule one out too.
+            stream.body_expected = stream.body_expected && status_expects_body;
+            stream.state = match stream.state {
+                StreamState::Open => {
+                    if p.end_stream {
+                        StreamState::HalfClosedRemote
+                    } else {
+                        StreamState::Open
+                    }
                 }
-            }
-            StreamState::HalfClosedLocal => {
-                // We already ended our side; the peer may still send a
-                // response body.
-                if p.end_stream {
-                    StreamState::Closed
-                } else {
-                    StreamState::HalfClosedLocal
+                StreamState::HalfClosedLocal => {
+                    // We already ended our side; the peer may still send
+                    // a response body.
+                    if p.end_stream {
+                        StreamState::Closed
+                    } else {
+                        StreamState::HalfClosedLocal
+                    }
                 }
+                _ => {
+                    return self.conn_error(ErrorCode::ProtocolError, "HEADERS in invalid state");
+                }
+            };
+            if p.end_stream {
+                stream.recv_ended = true;
             }
-            _ => {
-                return self.conn_error(ErrorCode::ProtocolError, "HEADERS in invalid state");
-            }
-        };
-        if p.end_stream {
-            stream.recv_ended = true;
+            priority = self
+                .pending_priority
+                .remove(&sid)
+                .unwrap_or(stream.priority);
+            stream.priority = priority;
+            stream.headers_delivered = true;
         }
-        let priority = self
-            .pending_priority
-            .remove(&sid)
-            .unwrap_or(stream.priority);
-        stream.priority = priority;
-        stream.headers_delivered = true;
+        // Verify content-length before delivering the head: a mismatch
+        // (e.g. a bodyless response declaring a nonzero content-length)
+        // is a stream error surfaced via RST + StreamError, and the
+        // response head must not be delivered as if it were valid.
+        if p.end_stream {
+            self.verify_content_length(sid);
+            if !self.streams.contains(&sid) {
+                return Ok(());
+            }
+        }
         self.events.push_back(Event::Headers {
             stream_id: sid,
             headers: fields,
             end_stream: p.end_stream,
             priority,
         });
-        if stream.state == StreamState::Closed {
+        if self.streams.get(&sid).map_or(false, |s| s.is_closed()) {
             self.events
                 .push_back(Event::StreamClosed { stream_id: sid });
             self.close_stream(sid);
@@ -1370,6 +1452,40 @@ impl<R: Read, W: Write> Connection<R, W> {
         for f in fields.iter() {
             if !f.name.is_pseudo() {
                 saw_regular = true;
+                let n = f.name.as_str();
+                // Connection-specific fields are forbidden in HTTP/2
+                // (RFC 9113 §8.2.2): they are hop-by-hop in HTTP/1.1 and
+                // a request-smuggling vector if forwarded (CWE-444).
+                if matches!(
+                    n,
+                    "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding" | "upgrade"
+                ) {
+                    return self.conn_error(
+                        ErrorCode::ProtocolError,
+                        "connection-specific header in HTTP/2",
+                    );
+                }
+                // RFC 9113 §8.2.2: the `te` field is allowed only with
+                // the value `trailers` (gRPC relies on this).
+                if n == "te" {
+                    let v = f.value.to_str().unwrap_or("");
+                    if !v.eq_ignore_ascii_case("trailers") {
+                        return self.conn_error(
+                            ErrorCode::ProtocolError,
+                            "TE header must be 'trailers'",
+                        );
+                    }
+                }
+                // RFC 9113 §8.1: framing fields must not appear in
+                // trailers (content-length smuggling vector).
+                if is_trailer
+                    && matches!(n, "content-length" | "host" | "trailer" | "te")
+                {
+                    return self.conn_error(
+                        ErrorCode::ProtocolError,
+                        "framing field in trailers",
+                    );
+                }
                 continue;
             }
             if saw_regular {
@@ -1478,6 +1594,22 @@ impl<R: Read, W: Write> Connection<R, W> {
             return self.conn_error(ErrorCode::ProtocolError, "DATA on unknown stream");
         }
         let len = data.len() as i64;
+        // DATA on a bodyless message (HEAD/CONNECT request, or a
+        // 1xx/204/304 response) is a stream error (RFC 9113 §8.1).
+        let bodyless = self
+            .streams
+            .get(&stream_id)
+            .map(|s| !s.body_expected)
+            .unwrap_or(false);
+        if bodyless {
+            self.stream_error(
+                stream_id,
+                ErrorCode::ProtocolError,
+                "DATA on bodyless message",
+            );
+            return Ok(());
+        }
+        let mut len_overflow = false;
         {
             let s = self.streams.get_mut(&stream_id).unwrap();
             if !s.can_recv() {
@@ -1492,6 +1624,10 @@ impl<R: Read, W: Write> Connection<R, W> {
             }
             s.recv_window -= len;
             s.recv_unreleased += len;
+            match s.recv_body_len.checked_add(data.len() as u64) {
+                Some(n) => s.recv_body_len = n,
+                None => len_overflow = true,
+            }
             if end_stream {
                 s.recv_ended = true;
                 s.state = match s.state {
@@ -1501,10 +1637,29 @@ impl<R: Read, W: Write> Connection<R, W> {
                 };
             }
         }
+        if len_overflow {
+            self.stream_error(
+                stream_id,
+                ErrorCode::ProtocolError,
+                "content-length counter overflow",
+            );
+            return Ok(());
+        }
         if self.conn_recv_window.available() < len {
             return self.conn_error(ErrorCode::FlowControlError, "connection window exceeded");
         }
         self.conn_recv_window.consume(len);
+        // Detect a content-length mismatch BEFORE delivering the final
+        // DATA to the application: the stream error (RST + StreamError)
+        // is then the only signal, so callers never observe a "valid"
+        // short body.
+        if end_stream {
+            self.verify_content_length(stream_id);
+            if !self.streams.contains(&stream_id) {
+                // verify_content_length reset the stream.
+                return Ok(());
+            }
+        }
         self.events.push_back(Event::Data {
             stream_id,
             data,
@@ -1599,7 +1754,7 @@ impl<R: Read, W: Write> Connection<R, W> {
                 None => return Ok(()), // late update on a closed stream
             };
             let next = s.send_window.saturating_add(increment as i64);
-            if next > i64::from(u32::MAX) {
+            if next > MAX_FLOW_WINDOW {
                 return self.conn_error(ErrorCode::FlowControlError, "stream window overflow");
             }
             s.send_window = next;
@@ -1611,9 +1766,87 @@ impl<R: Read, W: Write> Connection<R, W> {
     /// Register a connection error: send GOAWAY, mark closed, and return
     /// an error carrying the code.
     fn conn_error(&mut self, code: ErrorCode, msg: &str) -> Result<()> {
+        Err(self.protocol_err(code, msg))
+    }
+
+    /// Send GOAWAY, mark the connection closed, and return the error
+    /// value. Unlike [`Self::conn_error`] this returns the [`Error`]
+    /// directly, so it can be embedded in other error paths.
+    fn protocol_err(&mut self, code: ErrorCode, msg: &str) -> Error {
         self.send_goaway(code, msg.as_bytes());
         self.closed = true;
-        Err(Error::h2(code.as_u32(), msg.to_string()))
+        Error::h2(code.as_u32(), msg.to_string())
+    }
+
+    /// Surface a stream-level error (RFC 9113 §5.4.2): send `RST_STREAM`,
+    /// notify the application via [`Event::StreamError`], and terminate
+    /// the stream. The connection itself stays usable.
+    fn stream_error(&mut self, stream_id: u32, code: ErrorCode, msg: &str) {
+        if !self.streams.contains(&stream_id) || self.closed {
+            return;
+        }
+        self.pending_frames.push_back(Frame::RstStream {
+            stream_id,
+            error_code: code,
+        });
+        self.events.push_back(Event::StreamError {
+            stream_id,
+            error_code: code,
+            message: alloc::string::String::from(msg),
+        });
+        self.close_stream(stream_id);
+    }
+
+    /// Parse a message's `content-length` (RFC 9113 §8.1.2.6). Multiple
+    /// fields with identical values are tolerated (RFC 9110 §8.6);
+    /// differing or malformed values are a connection error (they are a
+    /// request-smuggling vector, CWE-444).
+    fn parse_content_length(&mut self, fields: &HeaderList) -> Result<Option<u64>> {
+        let mut value: Option<u64> = None;
+        for f in fields {
+            if f.name.as_str() != "content-length" {
+                continue;
+            }
+            let text = f.value.to_str().map_err(|_| {
+                self.protocol_err(ErrorCode::ProtocolError, "invalid content-length")
+            })?;
+            let n: u64 = text.parse().map_err(|_| {
+                self.protocol_err(ErrorCode::ProtocolError, "invalid content-length")
+            })?;
+            match value {
+                None => value = Some(n),
+                Some(prev) if prev != n => {
+                    return Err(self.protocol_err(
+                        ErrorCode::ProtocolError,
+                        "conflicting content-length",
+                    ))
+                }
+                _ => {}
+            }
+        }
+        Ok(value)
+    }
+
+    /// Enforce RFC 9113 §8.1.2.6: a message whose `content-length` does
+    /// not match the octets actually received (at stream end) is a
+    /// stream error. Also enforces that bodyless messages carry no body
+    /// and a zero `content-length`.
+    fn verify_content_length(&mut self, stream_id: u32) {
+        let bad = match self.streams.get(&stream_id) {
+            Some(s) if s.body_expected => match s.content_length {
+                Some(expected) => s.recv_body_len != expected,
+                None => false,
+            },
+            Some(s) => s.content_length.map_or(false, |c| c != 0),
+            None => false,
+        };
+        if bad {
+            self.stream_error(
+                stream_id,
+                ErrorCode::ProtocolError,
+                "content-length does not match body",
+            );
+        }
     }
 
     fn close_stream(&mut self, stream_id: u32) {

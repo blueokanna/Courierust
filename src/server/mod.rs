@@ -63,6 +63,10 @@ pub struct ServerConfig {
     /// h2: close a connection with no in-flight streams after this much
     /// idle time, releasing the worker thread it occupied.
     pub h2_idle_timeout: Option<Duration>,
+    /// h2: `SETTINGS_MAX_CONCURRENT_STREAMS` this server advertises
+    /// (RFC 9113 §6.5.2; 0 = unlimited). Streams beyond this limit are
+    /// rejected with `REFUSED_STREAM`.
+    pub h2_max_concurrent_streams: u32,
 }
 
 impl Default for ServerConfig {
@@ -80,6 +84,7 @@ impl Default for ServerConfig {
             h2_ping_interval: Some(Duration::from_secs(30)),
             h2_ping_timeout: Some(Duration::from_secs(15)),
             h2_idle_timeout: Some(Duration::from_secs(300)),
+            h2_max_concurrent_streams: 1024,
         }
     }
 }

@@ -47,6 +47,16 @@ pub struct Stream {
     /// Whether a header block has already been delivered for this
     /// stream (subsequent blocks are trailers).
     pub headers_delivered: bool,
+    /// Expected message-body length from the message's `content-length`
+    /// header (RFC 9113 §8.1.2.6). `None` when absent or not applicable.
+    pub content_length: Option<u64>,
+    /// Bytes of `DATA` payload received so far on this stream.
+    pub recv_body_len: u64,
+    /// Whether the message on this stream is expected to carry a body
+    /// (false for HEAD/CONNECT requests and 1xx/204/304 responses).
+    /// DATA on a bodyless message is a stream error; a `content-length`
+    /// that does not match the data count is a stream error.
+    pub body_expected: bool,
 }
 
 impl Stream {
@@ -63,6 +73,9 @@ impl Stream {
             recv_ended: false,
             recv_unreleased: 0,
             headers_delivered: false,
+            content_length: None,
+            recv_body_len: 0,
+            body_expected: true,
         }
     }
 

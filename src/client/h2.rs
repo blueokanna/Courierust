@@ -15,7 +15,7 @@ use crate::http::response::ResponseHead;
 use crate::http::status::StatusCode;
 use crate::http::version::Version;
 use crate::net::ConnStream;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -100,6 +100,25 @@ struct StreamBody {
     pending_chunk: Option<Bytes>,
 }
 
+/// Maximum number of commands waiting for a free stream slot on one
+/// connection. Bounds memory when the peer's
+/// `SETTINGS_MAX_CONCURRENT_STREAMS` budget stays exhausted for a long
+/// time (e.g. many long-lived streams); beyond this the request fails
+/// with `REFUSED_STREAM` instead of queueing without bound.
+const MAX_DEFERRED: usize = 1024;
+
+/// Whether the peer's `SETTINGS_MAX_CONCURRENT_STREAMS` budget is
+/// exhausted. A limit of 0 means unlimited (RFC 9113 §6.5.2). `pending`
+/// tracks every client-initiated stream whose response has not yet fully
+/// arrived, which is exactly the client's concurrent-stream count.
+fn stream_limit_reached(
+    conn: &Connection<&ConnStream, &ConnStream>,
+    pending: &HashMap<u32, Pending>,
+) -> bool {
+    let limit = conn.peer_settings().max_concurrent_streams as usize;
+    limit != 0 && pending.len() >= limit
+}
+
 /// Start an h2 connection driver over `stream` (plain TCP or TLS).
 pub(crate) fn start(stream: ConnStream, cfg: &ClientConfig) -> Result<H2Conn> {
     start_inner(stream, cfg, Vec::new(), None)
@@ -156,6 +175,10 @@ fn driver(
     let mut pending: HashMap<u32, Pending> = HashMap::new();
     let mut stream_bodies: HashMap<u32, StreamBody> = HashMap::new();
     let mut goaway = false;
+    // Commands that could not run yet because the peer's
+    // SETTINGS_MAX_CONCURRENT_STREAMS budget is exhausted. Retried after
+    // each poll once a stream slot frees up.
+    let mut deferred: VecDeque<H2Cmd> = VecDeque::new();
 
     // RFC 7540 §3.2 upgrade: stream 1 already exists (half-closed local)
     // and its response must be delivered to the caller. Arm a pending
@@ -185,7 +208,18 @@ fn driver(
     let _ = conn.poll();
 
     loop {
-        // 1. Drain commands.
+        // 1. Drain commands (deferred first: they only wait because a
+        // stream slot was unavailable, and a slot may have just freed).
+        if !retry_deferred(
+            &mut conn,
+            &mut pending,
+            &mut stream_bodies,
+            &mut goaway,
+            &mut deferred,
+        ) {
+            cleanup(&mut conn, &mut pending, &mut stream_bodies);
+            return;
+        }
         let mut got_cmd = false;
         while let Ok(cmd) = rx.try_recv() {
             got_cmd = true;
@@ -194,6 +228,7 @@ fn driver(
                 &mut pending,
                 &mut stream_bodies,
                 &mut goaway,
+                &mut deferred,
                 cmd,
             ) {
                 cleanup(&mut conn, &mut pending, &mut stream_bodies);
@@ -201,7 +236,13 @@ fn driver(
             }
         }
 
-        let has_work = got_cmd || !pending.is_empty() || !stream_bodies.is_empty();
+        // A deferred command still counts as work: the only way a stream
+        // slot frees is by polling (streams closing), so the driver must
+        // not park in recv_timeout while one is pending.
+        let has_work = got_cmd
+            || !deferred.is_empty()
+            || !pending.is_empty()
+            || !stream_bodies.is_empty();
         if has_work {
             match conn.poll() {
                 Ok(true) => last_rx = std::time::Instant::now(),
@@ -220,6 +261,18 @@ fn driver(
                 cfg.max_body,
             );
             drain_stream_bodies(&mut conn, &mut stream_bodies);
+            // Streams may have closed during the poll; retry deferred
+            // commands while the budget allows.
+            if !retry_deferred(
+                &mut conn,
+                &mut pending,
+                &mut stream_bodies,
+                &mut goaway,
+                &mut deferred,
+            ) {
+                cleanup(&mut conn, &mut pending, &mut stream_bodies);
+                return;
+            }
             if conn.is_closed() {
                 accepting.store(false, std::sync::atomic::Ordering::Release);
                 fail_all(&mut pending, Error::eof());
@@ -245,6 +298,7 @@ fn driver(
                         &mut pending,
                         &mut stream_bodies,
                         &mut goaway,
+                        &mut deferred,
                         cmd,
                     ) {
                         break;
@@ -268,6 +322,15 @@ fn driver(
                         cfg.max_body,
                     );
                     drain_stream_bodies(&mut conn, &mut stream_bodies);
+                    if !retry_deferred(
+                        &mut conn,
+                        &mut pending,
+                        &mut stream_bodies,
+                        &mut goaway,
+                        &mut deferred,
+                    ) {
+                        break;
+                    }
                     if conn.is_closed() {
                         accepting.store(false, std::sync::atomic::Ordering::Release);
                         fail_all(&mut pending, Error::eof());
@@ -380,6 +443,7 @@ fn handle_cmd(
     pending: &mut HashMap<u32, Pending>,
     stream_bodies: &mut HashMap<u32, StreamBody>,
     goaway: &mut bool,
+    deferred: &mut VecDeque<H2Cmd>,
     cmd: H2Cmd,
 ) -> bool {
     match cmd {
@@ -396,6 +460,25 @@ fn handle_cmd(
         } => {
             if *goaway {
                 let _ = reply.send(Err(Error::canceled("connection received GOAWAY")));
+                return true;
+            }
+            // Respect the peer's SETTINGS_MAX_CONCURRENT_STREAMS (RFC
+            // 9113 §5.1.2): never exceed the budget the peer advertised.
+            if stream_limit_reached(conn, pending) {
+                if deferred.len() < MAX_DEFERRED {
+                    deferred.push_back(H2Cmd::Request {
+                        fields,
+                        body,
+                        end_stream,
+                        priority,
+                        reply,
+                    });
+                } else {
+                    let _ = reply.send(Err(Error::h2(
+                        ErrorCode::RefusedStream.as_u32(),
+                        "peer SETTINGS_MAX_CONCURRENT_STREAMS exhausted",
+                    )));
+                }
                 return true;
             }
             match conn.open_request(priority) {
@@ -440,6 +523,22 @@ fn handle_cmd(
                 let _ = reply.send(Err(Error::canceled("connection received GOAWAY")));
                 return true;
             }
+            if stream_limit_reached(conn, pending) {
+                if deferred.len() < MAX_DEFERRED {
+                    deferred.push_back(H2Cmd::RequestStream {
+                        fields,
+                        body,
+                        priority,
+                        reply,
+                    });
+                } else {
+                    let _ = reply.send(Err(Error::h2(
+                        ErrorCode::RefusedStream.as_u32(),
+                        "peer SETTINGS_MAX_CONCURRENT_STREAMS exhausted",
+                    )));
+                }
+                return true;
+            }
             match conn.open_request(priority) {
                 Ok(sid) => {
                     let (body_tx, body_rx) = channel::<Result<Bytes>>();
@@ -474,6 +573,28 @@ fn handle_cmd(
             true
         }
     }
+}
+
+/// Retry commands that were deferred because the peer's concurrent-stream
+/// budget was exhausted. Stops as soon as the budget is full again.
+/// Returns `false` if the driver must shut down.
+fn retry_deferred(
+    conn: &mut Connection<&ConnStream, &ConnStream>,
+    pending: &mut HashMap<u32, Pending>,
+    stream_bodies: &mut HashMap<u32, StreamBody>,
+    goaway: &mut bool,
+    deferred: &mut VecDeque<H2Cmd>,
+) -> bool {
+    while let Some(cmd) = deferred.pop_front() {
+        if stream_limit_reached(conn, pending) {
+            deferred.push_front(cmd);
+            return true;
+        }
+        if !handle_cmd(conn, pending, stream_bodies, goaway, deferred, cmd) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Feed streaming request-body chunks into the connection, respecting
@@ -628,6 +749,23 @@ fn drain_events(
                     let _ = p.reply.map(|r| {
                         r.send(Err(Error::h2(error_code.as_u32(), "stream reset by peer")))
                     });
+                }
+            }
+            Event::StreamError {
+                stream_id,
+                error_code,
+                message,
+            } => {
+                // A locally-detected stream error (e.g. content-length
+                // mismatch): surface it to the caller and drop the
+                // stream. The connection itself stays usable. If the
+                // response head was already delivered (so `reply` was
+                // consumed), the error still reaches the caller through
+                // the streaming body channel.
+                if let Some(p) = pending.remove(&stream_id) {
+                    let err = Error::h2(error_code.as_u32(), message.as_str());
+                    let _ = p.body_tx.map(|tx| tx.send(Err(err.clone())));
+                    let _ = p.reply.map(|r| r.send(Err(err)));
                 }
             }
             Event::GoAway {

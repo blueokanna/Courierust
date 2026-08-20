@@ -41,10 +41,20 @@ impl Default for TlsSettings {
         Self {
             roots: crate::tls::RootStore::new(),
             verify: true,
-            alpn: Vec::new(),
-            now: 0,
+            // Default ALPN matches the default `ClientConfig::http2`
+            // (false): speak HTTP/1.1 over TLS unless told otherwise.
+            alpn: vec![b"http/1.1".to_vec()],
+            now: unix_now(),
         }
     }
+}
+
+/// Current Unix time in seconds (for certificate validity checks).
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Client configuration.
@@ -139,6 +149,22 @@ impl Client {
     /// A client with default settings.
     pub fn new() -> Self {
         Self::with_config(ClientConfig::default())
+    }
+
+    /// A client with HTTPS enabled, trusting `roots` for server
+    /// certificate validation. HTTP/2 is preferred (ALPN `h2`, falling
+    /// back to `http/1.1` when the server only supports it).
+    pub fn with_tls_roots(roots: crate::tls::RootStore) -> Self {
+        Self::with_config(ClientConfig {
+            http2: true,
+            tls: Some(TlsSettings {
+                roots,
+                verify: true,
+                alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+                now: unix_now(),
+            }),
+            ..Default::default()
+        })
     }
 
     /// A client with custom settings.
@@ -537,7 +563,21 @@ impl Client {
     ) -> Result<crate::net::ConnStream> {
         let stream = crate::net::connect(&addr, self.inner.config.connect_timeout)?;
         match tls {
-            Some(c) => crate::net::ConnStream::tls_client(stream, c, hostname),
+            Some(c) => {
+                let conn = crate::net::ConnStream::tls_client(stream, c, hostname)?;
+                // The peer's ALPN choice must agree with speaking
+                // HTTP/2: a server that negotiated `http/1.1` cannot be
+                // driven with the h2 codec (silent mismatch would hang).
+                if let Some(alpn) = conn.alpn() {
+                    if alpn.as_slice() != b"h2" {
+                        return Err(Error::protocol(format!(
+                            "server negotiated {:?}, not h2; set ClientConfig.tls.alpn to offer h2",
+                            String::from_utf8_lossy(&alpn)
+                        )));
+                    }
+                }
+                Ok(conn)
+            }
             None => Ok(crate::net::ConnStream::plain(stream)),
         }
     }

@@ -7,15 +7,25 @@
 //! message HealthCheckRequest  { string service = 1; }
 //! message HealthCheckResponse { ServingStatus status = 1; }
 //! ```
+//!
+//! Both methods are implemented: `Check` (unary) and `Watch`
+//! (server-streaming). `Watch` streams the current status immediately,
+//! then a fresh status whenever it changes, and stays open until the
+//! client disconnects (or the service is dropped).
 
 use crate::body::BodySender;
 use crate::bytes::Bytes;
 use crate::error::{Error, Result};
 use crate::grpc::status;
 use crate::grpc::StreamingService;
+use std::collections::HashMap;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 /// The health Check method path.
 pub const CHECK_METHOD: &str = "/grpc.health.v1.Health/Check";
+/// The health Watch method path (server-streaming).
+pub const WATCH_METHOD: &str = "/grpc.health.v1.Health/Watch";
 
 /// `ServingStatus` enum values (grpc.health.v1).
 pub mod serving_status {
@@ -105,14 +115,25 @@ pub fn encode_response(serving: i32) -> Vec<u8> {
     out
 }
 
+/// Shared, mutable health state. `version` is bumped on every change so
+/// `Watch` callers can cheaply detect that a new status is available.
+struct HealthState {
+    overall: i32,
+    services: HashMap<String, i32>,
+    version: u64,
+}
+
 /// A `grpc.health.v1.Health` service.
 ///
 /// Tracks an overall status plus optional per-service statuses. The
 /// `Check` method returns `SERVING` for known services, `SERVICE_UNKNOWN`
 /// for unknown ones, and the overall status for the empty service name.
+/// The `Watch` method streams the status and pushes updates whenever it
+/// changes; a `Watch` call occupies the connection's worker for as long
+/// as it is open (the crate's documented per-connection worker model).
+#[derive(Clone)]
 pub struct HealthService {
-    overall: i32,
-    services: std::collections::HashMap<String, i32>,
+    state: Arc<(Mutex<HealthState>, Condvar)>,
 }
 
 impl Default for HealthService {
@@ -125,21 +146,65 @@ impl HealthService {
     /// A health service with overall status `SERVING` and no services.
     pub fn new() -> Self {
         Self {
-            overall: serving_status::SERVING,
-            services: std::collections::HashMap::new(),
+            state: Arc::new((
+                Mutex::new(HealthState {
+                    overall: serving_status::SERVING,
+                    services: HashMap::new(),
+                    version: 0,
+                }),
+                Condvar::new(),
+            )),
         }
     }
 
     /// Set the overall serving status (returned for the empty service).
-    pub fn set_overall(mut self, s: i32) -> Self {
-        self.overall = s;
+    pub fn set_overall(self, s: i32) -> Self {
+        let mut state = self.state.0.lock().unwrap();
+        state.overall = s;
+        state.version = state.version.wrapping_add(1);
+        self.state.1.notify_all();
+        drop(state);
         self
     }
 
     /// Register a service and its serving status.
-    pub fn set_service(mut self, service: &str, s: i32) -> Self {
-        self.services.insert(service.to_string(), s);
+    pub fn set_service(self, service: &str, s: i32) -> Self {
+        let mut state = self.state.0.lock().unwrap();
+        state.services.insert(service.to_string(), s);
+        state.version = state.version.wrapping_add(1);
+        self.state.1.notify_all();
+        drop(state);
         self
+    }
+
+    /// Update the overall status at runtime (wakes any `Watch` callers).
+    pub fn update_overall(&self, s: i32) {
+        let mut state = self.state.0.lock().unwrap();
+        state.overall = s;
+        state.version = state.version.wrapping_add(1);
+        self.state.1.notify_all();
+    }
+
+    /// Update a service's status at runtime (wakes any `Watch` callers).
+    pub fn update_service(&self, service: &str, s: i32) {
+        let mut state = self.state.0.lock().unwrap();
+        state.services.insert(service.to_string(), s);
+        state.version = state.version.wrapping_add(1);
+        self.state.1.notify_all();
+    }
+
+    /// The current status for a service name (empty = overall).
+    fn status(&self, service: &str) -> i32 {
+        let state = self.state.0.lock().unwrap();
+        if service.is_empty() {
+            state.overall
+        } else {
+            state
+                .services
+                .get(service)
+                .copied()
+                .unwrap_or(serving_status::SERVICE_UNKNOWN)
+        }
     }
 }
 
@@ -150,24 +215,63 @@ impl StreamingService for HealthService {
         reqs: &mut dyn Iterator<Item = Result<Bytes>>,
         tx: &BodySender,
     ) -> Result<()> {
-        if method != CHECK_METHOD {
-            return Err(Error::grpc(
+        match method {
+            CHECK_METHOD => {
+                let req = reqs.next().transpose()?.unwrap_or_default();
+                let service = decode_request(&req)
+                    .map_err(|e| Error::grpc(status::INVALID_ARGUMENT, e.to_string()))?;
+                tx.send(Bytes::from(encode_response(self.status(&service))))?;
+                Ok(())
+            }
+            WATCH_METHOD => {
+                let req = reqs.next().transpose()?.unwrap_or_default();
+                let service = decode_request(&req)
+                    .map_err(|e| Error::grpc(status::INVALID_ARGUMENT, e.to_string()))?;
+                self.watch(&service, tx)
+            }
+            _ => Err(Error::grpc(
                 status::UNIMPLEMENTED,
                 format!("{method} is not a health method"),
-            ));
+            )),
         }
-        let req = reqs.next().transpose()?.unwrap_or_default();
-        let service =
-            decode_request(&req).map_err(|e| Error::grpc(status::INVALID_ARGUMENT, e.to_string()))?;
-        let st = if service.is_empty() {
-            self.overall
-        } else {
-            self.services
-                .get(&service)
-                .copied()
-                .unwrap_or(serving_status::SERVICE_UNKNOWN)
-        };
-        tx.send(Bytes::from(encode_response(st)))?;
-        Ok(())
+    }
+}
+
+impl HealthService {
+    /// Server-streaming `Watch`: send the current status immediately,
+    /// then push a fresh status on every change, until the client
+    /// disconnects (detected when the response channel closes).
+    fn watch(&self, service: &str, tx: &BodySender) -> Result<()> {
+        let mut last_version = u64::MAX; // force the first send
+        loop {
+            let (st, version) = {
+                let state = self.state.0.lock().unwrap();
+                let st = if service.is_empty() {
+                    state.overall
+                } else {
+                    state
+                        .services
+                        .get(service)
+                        .copied()
+                        .unwrap_or(serving_status::SERVICE_UNKNOWN)
+                };
+                (st, state.version)
+            };
+            if version != last_version {
+                if tx.send(Bytes::from(encode_response(st))).is_err() {
+                    // The client disconnected: end the stream cleanly.
+                    return Ok(());
+                }
+                last_version = version;
+            }
+            // Wait for a status change; the timeout also lets this loop
+            // observe a client disconnect (via the send above).
+            let guard = self.state.0.lock().unwrap();
+            let _ = self
+                .state
+                .1
+                .wait_timeout(guard, Duration::from_millis(500))
+                .unwrap();
+        }
     }
 }

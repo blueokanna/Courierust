@@ -45,7 +45,20 @@ impl H1Connection {
         let stream = net::connect(&addr, cfg.connect_timeout)?;
         net::configure(&stream, cfg.read_timeout)?;
         let conn = match tls {
-            Some(c) => ConnStream::tls_client(stream, c, hostname)?,
+            Some(c) => {
+                let conn = ConnStream::tls_client(stream, c, hostname)?;
+                // If the peer picked `h2` via ALPN, speaking HTTP/1.1 on
+                // this connection is a protocol mismatch; fail loudly
+                // instead of hanging on a stream the server will reject.
+                if let Some(alpn) = conn.alpn() {
+                    if alpn.as_slice() == b"h2" {
+                        return Err(Error::protocol(
+                            "server negotiated h2 via ALPN, but the client is configured for HTTP/1.1",
+                        ));
+                    }
+                }
+                conn
+            }
             None => ConnStream::plain(stream),
         };
         let conn = Arc::new(conn);

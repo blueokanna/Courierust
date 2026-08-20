@@ -13,7 +13,7 @@
 常见的 Rust HTTP 生态（hyper / h2 / h3 等）能力很强，但依赖树很深，且往往把 `no_std`、多核亲和、以及「客户端看起来像什么浏览器」这类问题留给使用者自己解决。这个仓库的目标是：
 
 - 协议层与平台完全解耦：核心代码不碰 `std`，`std` 只负责线程、TCP 和时钟；
-- 多核是真的多核：连接池按 worker 分片、HTTP/2 连接跨 worker 分发、任务用工作窃取调度，而不是一把大锁串起来；
+- 多核是真的多核（在模型范围内）：连接池按 worker 分片、HTTP/2 连接跨 worker 分发、任务用工作窃取调度，而不是一把大锁串起来。**worker 占用按连接计**：一条 HTTP/2 连接上的任意多个流（慢流、SSE、gRPC 服务端流）只占同一个 worker，流之间互不阻塞。诚实的推论是：大量**连接**仍需足够 worker，纯明文 HTTP/1.1 才可用 Windows 事件驱动模式（见限制）。
 - 协议细节按 RFC 实现并对照公开测试向量验证过，不是「能跑就行」的玩具。
 
 ## 特性
@@ -210,16 +210,17 @@ courierust = { version = "0.1", default-features = false }
 
 `--no-default-features` 构建只编译协议核心，可用于嵌入式 / 内核态。网络层需要 `std` feature（默认开启）。
 
-## 诚实的边界
+## 设计限制
 
 这个仓库刻意不做的，以及你接手前应该知道的：
 
 - **没有 HTTP/3 / QUIC**。零外部依赖意味着没有可用的 QUIC 实现（QUIC 需要用户态 UDP 栈 + TLS 1.3——TLS 部分已有，传输层没有）。
-- **TLS 暂无 PSK / 0-RTT 恢复 / session ticket / key update**。每次都做完整 1-RTT 握手；对端发来的 NewSessionTicket 会被忽略。
+- **TLS 暂无 PSK / 0-RTT 恢复 / session ticket / key update，也无双向 mTLS**。每次都做完整 1-RTT 握手；对端发来的 NewSessionTicket 会被忽略；服务端不请求客户端证书。
 - **事件驱动服务器仅限 Windows 且只处理 HTTP/1.1**。Windows 上 `ServerConfig::event_driven`（默认开启）把空闲明文 HTTP 连接挂在轮询器上，少量 worker 即可服务大量 idle keep-alive / SSE / 长轮询连接；TLS 与 HTTP/2 连接仍走阻塞池模型。非 Windows 平台回退到每连接一任务的池模型。
 - **请求体流式上传目前只在 HTTP/2 下可靠**（h2 天然分帧）。HTTP/1.1 的请求体要么一次性给全（`Body::Bytes`），要么你自己拼 chunked。
-- **gRPC 不含 protobuf**。消息编解码需要你实现 codec trait 或接你自己的 protobuf 生成代码。
-- **长时间阻塞的同步 handler 会占住一个 worker**（事件驱动与否都一样）——任何同步服务器的通病；流式场景用 channel 响应体。
+- **gRPC 不含 protobuf、`.proto` 代码生成与 `grpc.reflection`**。消息编解码需要你实现 codec trait 或接你自己的 protobuf 生成代码；reflection 需要 protobuf 模式清单，属外部职责。
+- **长时间阻塞的同步 handler 会占住一个 worker**（事件驱动与否都一样）——任何同步服务器的通病；流式场景用 channel 响应体。worker 占用**按连接而非按流**：一条连接上的任意空闲流只占同一个 worker，慢流不阻塞同连接其他流——两者均有集成测试覆盖。
+- **HTTPS 是一等公民**：客户端与服务端内置从零实现的 TLS 1.3；`https://` 需要自备根证书库（无内置 CA）。**ALPN 强制一致**：配置 h2 的客户端连到协商出 `http/1.1` 的服务器（或反之）会得到明确错误而非静默协议错乱。
 - 客户端重定向、keep-alive 复用等策略以「正确」为先，未做激进调优。
 
 ## 目录结构
@@ -243,10 +244,28 @@ src/
 └── grpc/        # gRPC 帧 + 状态 + codec trait                       [std]
 ```
 
+## 基准测试
+
+`benches/` 是一个自包含基准套件（不依赖 criterion），每个用例都输出吞吐与完整延迟尾部分布——**P50 / P75 / P90 / P95 / P99**：
+
+- HTTP/1.1 keep-alive，顺序与多 worker 并行；
+- HTTP/2 多 worker 多路复用；
+- HTTPS（TLS 1.3 + h2）经本仓库自带 TLS 栈的端到端；
+- RFC 9218 优先级调度；
+- 并发模型对比（空闲连接群 vs worker 池）与慢发送者群基准。
+
+```bash
+cargo bench --manifest-path benches/Cargo.toml --bench throughput
+cargo bench --manifest-path benches/Cargo.toml --bench concurrency
+```
+
+每条 `RESULT|...` 都带 `p50_us` … `p99_us`，报告脚本（`scripts/generate_benchmark_report.sh`）可生成分位表。这些是 loopback 测量；WAN / TLS / 真实 handler 的数字取决于你的部署——这正是套件要报完整尾部而非单一均值的原因。
+
 ## 测试
 
-- 单元测试 104 个：覆盖 HPACK 全部 RFC 向量（C.2/C.3/C.4/C.6）、Huffman 编解码、帧编解码、状态机、流控、WUCS 调度、JA3/JA4 公开记录比对、指纹解析、TLS 1.3 握手与 RFC 8448 密钥调度、X.25519/Ed25519/ECDSA/RSA 原语。
-- 集成测试 42 个：真实 TCP 环回上的 h1/h2/HTTPS 请求往返、keep-alive 复用、chunked、重定向、h2 并发多路复用、流式响应、gRPC unary/服务端流/客户端流/双向流与错误状态/trailers/deadline 执行、RFC 7540 §3.2 `h2c` Upgrade、TLS 信任拒绝，另有 16 个恶意帧加固测试（超长帧、畸形 SETTINGS/PING/WINDOW_UPDATE、HPACK 头表压缩炸弹、伪头顺序、`h2c` 存活检测：SETTINGS_TIMEOUT 与 keepalive 死对端检测）。
+- 单元测试 115 个：覆盖 HPACK 全部 RFC 向量（C.2/C.3/C.4/C.6）、Huffman 编解码（含解码输出上限）、帧编解码、状态机、流控、WUCS 调度、JA3/JA4 公开记录比对、指纹解析、TLS 1.3 握手与 RFC 8448 密钥调度、X.25519/Ed25519/ECDSA/RSA 原语，以及 DEFLATE/gzip 编解码（往返、CRC-32 向量、损坏拒绝、输出上限、与 Python zlib 输出交叉验证）。
+- 集成测试 36 个：真实 TCP 环回上的 h1/h2/HTTPS 请求往返、keep-alive 复用、chunked、重定向、h2 并发多路复用、流式响应、gRPC unary/服务端流/客户端流/双向流与错误状态/trailers/deadline 执行、gzip 往返、`grpc.health.v1.Health` `Check` + `Watch`、RFC 7540 §3.2 `h2c` Upgrade、TLS 信任拒绝 + 畸形 TLS 输入存活、ALPN 一致强制，以及两个并发证明（慢流不阻塞同连接其他流；大量空闲流按连接而非按流占 worker）。
+- 加固测试 30 个：恶意帧输入（超长帧、畸形 SETTINGS/PING/WINDOW_UPDATE、流控窗口溢出、HPACK 头表与 Huffman 炸弹、截断/EOS Huffman、伪头顺序、`content-length` 不一致、非法 `transfer-encoding`/`connection` 系头、两端 `SETTINGS_MAX_CONCURRENT_STREAMS` 强制、`h2c` 存活检测：SETTINGS_TIMEOUT 与 keepalive 死对端检测）。
 
 ```bash
 cargo test                 # 全部测试

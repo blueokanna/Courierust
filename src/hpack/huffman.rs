@@ -21,6 +21,9 @@ pub enum DecodeError {
     Eos,
     /// Trailing padding is not all-ones (RFC 7541 §5.2).
     InvalidPadding,
+    /// The decoded output exceeded the caller-supplied cap (a Huffman
+    /// decompression-bomb guard; the caller bounds `out` allocation).
+    OutputLimit,
 }
 
 #[derive(Clone, Copy)]
@@ -49,9 +52,18 @@ impl HuffmanDecoder {
     }
 
     /// Decode `src` into `out`, returning the number of bytes appended.
-    pub fn decode(&self, src: &[u8], out: &mut Vec<u8>) -> Result<usize, DecodeError> {
+    /// `max_out` caps the total length of `out` after decoding; exceeding
+    /// it yields [`DecodeError::OutputLimit`] (guards against Huffman
+    /// decompression bombs, since the encoded length alone does not bound
+    /// the decoded size).
+    pub fn decode(
+        &self,
+        src: &[u8],
+        out: &mut Vec<u8>,
+        max_out: usize,
+    ) -> Result<usize, DecodeError> {
         let start = out.len();
-        decode_with(&self.levels, src, out)?;
+        decode_with(&self.levels, src, out, max_out)?;
         Ok(out.len() - start)
     }
 }
@@ -128,13 +140,19 @@ pub fn encode(src: &[u8], out: &mut Vec<u8>) -> usize {
 /// Convenience wrapper that builds a fresh decoder; the hot path should
 /// hold a [`HuffmanDecoder`] and call it directly.
 pub fn decode(src: &[u8], out: &mut Vec<u8>) -> Result<usize, DecodeError> {
-    HuffmanDecoder::new().decode(src, out)
+    // Safe default cap: RFC 7541 Huffman expands by at most ~1.6× (each
+    // output symbol is ≥ 5 bits, codes ≤ 30 bits), so 2× the encoded
+    // length bounds any valid decode. Callers with a tighter budget pass
+    // their own cap via [`HuffmanDecoder::decode`].
+    let max_out = src.len().saturating_mul(2).max(1024);
+    HuffmanDecoder::new().decode(src, out, max_out)
 }
 
 fn decode_with(
     levels: &[Box<[Entry; 256]>],
     src: &[u8],
     out: &mut Vec<u8>,
+    max_out: usize,
 ) -> Result<(), DecodeError> {
     let total_bits = src.len() * 8;
     let mut br = BitReader::new(src);
@@ -173,6 +191,9 @@ fn decode_with(
                 }
                 if sym as usize == EOS_SYMBOL {
                     return Err(DecodeError::Eos);
+                }
+                if out.len() >= max_out {
+                    return Err(DecodeError::OutputLimit);
                 }
                 out.push(sym as u8);
                 if code_end > consumed {
@@ -340,6 +361,25 @@ mod tests {
         // A single byte 0xff has 8 leading ones: prefix of EOS => InvalidCode
         let mut out2 = Vec::new();
         assert!(decode(&[0xff], &mut out2).is_err());
+    }
+
+    #[test]
+    fn decode_honors_output_cap() {
+        // A caller-supplied cap tighter than the decoded size must abort
+        // with OutputLimit (decompression-bomb guard).
+        let mut enc = Vec::new();
+        encode(b"www.example.com", &mut enc);
+        let mut out = Vec::new();
+        // The full decode needs 14 bytes; a cap of 4 must fail.
+        let err = HuffmanDecoder::new().decode(&enc, &mut out, 4);
+        assert_eq!(err, Err(DecodeError::OutputLimit));
+        assert!(out.len() <= 4, "output must not grow past the cap");
+        // A generous cap succeeds.
+        let mut out2 = Vec::new();
+        HuffmanDecoder::new()
+            .decode(&enc, &mut out2, 1024)
+            .unwrap();
+        assert_eq!(out2, b"www.example.com");
     }
 
     #[test]

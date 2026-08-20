@@ -13,7 +13,7 @@ None of this wraps an existing library. Frame codecs, HPACK header compression, 
 The mainstream Rust HTTP ecosystem (hyper / h2 / h3 and friends) is excellent, but the dependency trees run deep, and things like `no_std` support, core affinity, and "what does this client look like to a server" are left as your problem. This crate is built around three constraints:
 
 - **The protocol layer never touches `std`.** `std` only provides threads, TCP, and clocks.
-- **Multi-core is real.** Connection pools are sharded per worker, HTTP/2 connections are spread across workers, and jobs move through a work-stealing scheduler — not one big lock.
+- **Multi-core is real — within the model.** Connection pools are sharded per worker, HTTP/2 connections are spread across workers, and jobs move through a work-stealing scheduler — not one big lock. Worker occupancy is **per connection**: a single HTTP/2 connection with many streams (or a slow stream, or SSE) holds exactly one worker, so a connection's streams never multiply worker usage and never block each other. The honest corollary is that a herd of *connections* needs either many workers or the Windows event-driven mode for plain HTTP/1.1 (see Limitations).
 - **The wire details are implemented against the RFCs and verified against published test vectors**, not "good enough to pass a smoke test."
 
 ## Features
@@ -44,7 +44,7 @@ The mainstream Rust HTTP ecosystem (hyper / h2 / h3 and friends) is excellent, b
   - HTTP/2 connections also sharded per worker with round-robin distribution and multiplexing;
   - Redirect following (301/302/303 → GET), timeouts, `User-Agent`, etc.
 - **Server** (`server`): each accepted connection becomes a pool job, so connection handling scales across cores.
-- **gRPC** (`grpc`): HTTP/2 + length-prefixed message framing + `grpc-status` / `grpc-message` handling. Protobuf is deliberately left to you — implement `EncodeMessage` / `DecodeMessage` for your types, or use the raw-bytes API.
+- **gRPC** (`grpc`): HTTP/2 + length-prefixed message framing + `grpc-status` / `grpc-message` handling, with unary, server-streaming, client-streaming and bidi calls on both sides. `gzip` message compression is implemented from scratch (RFC 1951/1952: full DEFLATE decompression for any producer, fixed-Huffman LZ77 compression) and negotiated per gRPC A6. Deadlines (`grpc-timeout`) are enforced server-side, metadata and interceptors are supported, `dns:///` targets round-robin, and the `grpc.health.v1.Health` service provides `Check` and `Watch`. Protobuf is deliberately left to you — implement `EncodeMessage` / `DecodeMessage` for your types, or use the raw-bytes API.
 - **Streaming bodies** (`body`): channel-backed `Body::Channel` lets handlers push response chunks from another thread.
 
 ## The parts that actually took work: multi-core and scheduling
@@ -213,16 +213,17 @@ courierust = { version = "0.1", default-features = false }
 
 Building with `--no-default-features` compiles only the protocol core, suitable for embedded / kernel contexts. The networking layer needs the `std` feature (the default).
 
-## Honest limitations
+## Limitations
 
 Things this crate deliberately does *not* do, so you know before you commit:
 
 - **No HTTP/3 / QUIC.** No external deps means no usable QUIC implementation (and QUIC needs a userspace UDP stack plus TLS 1.3; the TLS half exists, the transport does not).
-- **TLS: no PSK / 0-RTT resumption / session tickets / key update yet.** A full 1-RTT handshake happens every time; NewSessionTicket from a peer is ignored.
+- **TLS: no PSK / 0-RTT resumption / session tickets / key update yet, and no mutual TLS.** A full 1-RTT handshake happens every time; NewSessionTicket from a peer is ignored; the server does not request client certificates.
 - **Event-driven server is Windows-only and HTTP/1.1-only.** On Windows, `ServerConfig::event_driven` (default on) parks idle plain-HTTP connections on a poller so a small worker pool serves many idle keep-alive / SSE / long-poll connections; TLS and HTTP/2 connections still use the blocking pool model. On non-Windows platforms the per-connection pool model is used.
 - **Streaming request bodies are only reliable over HTTP/2** (h2 frames naturally). Over HTTP/1.1, either send the whole body at once (`Body::Bytes`) or build chunked framing yourself.
-- **gRPC does not include protobuf.** You implement the codec traits or wire in your own protobuf-generated code.
-- **A synchronous handler that blocks for a long time holds a worker** (event-driven or not) — exactly as with any synchronous server; use channel response bodies for streaming.
+- **gRPC does not include protobuf, `.proto` code generation, or `grpc.reflection`.** You implement the codec traits or wire in your own protobuf-generated code; reflection needs a protobuf schema inventory, which is external by design.
+- **A synchronous handler that blocks for a long time holds a worker** (event-driven or not) — exactly as with any synchronous server; use channel response bodies for streaming. Worker occupancy is **per-connection, not per-stream**: on one HTTP/2 connection, any number of idle streams (SSE / long-poll / gRPC server-streaming) occupy the same single worker, and a slow stream never blocks its connection's other streams — both are covered by integration tests. A large herd of *connections* still needs either many workers or the Windows event-driven mode for plain HTTP/1.1.
+- **HTTPS is first-class**: the client and server ship a from-scratch TLS 1.3 implementation; `https://` needs a root store (supply your own — there is no bundled CA set). ALPN is enforced: a client configured for h2 speaking to a server that negotiates `http/1.1` (or vice versa) fails with a clear error instead of a silent protocol mismatch.
 - Redirects, keep-alive reuse, and friends prioritize correctness over aggressive tuning.
 
 ## Layout
@@ -246,10 +247,28 @@ src/
 └── grpc/        # gRPC framing + status + codec traits                           [std]
 ```
 
+## Benchmarks
+
+The `benches/` package is a self-contained suite (no `criterion` required) that reports throughput and the full latency tail — **P50 / P75 / P90 / P95 / P99** for every case:
+
+- HTTP/1.1 keep-alive, sequential and multi-worker parallel;
+- HTTP/2 multiplexing across many workers;
+- HTTPS (TLS 1.3 + h2) end to end through the crate's own TLS stack;
+- RFC 9218 priority scheduling;
+- a concurrency model comparison (idle-connection herd vs. worker pool) and a slow-sender herd benchmark.
+
+```bash
+cargo bench --manifest-path benches/Cargo.toml --bench throughput
+cargo bench --manifest-path benches/Cargo.toml --bench concurrency
+```
+
+Every `RESULT|...` line carries `p50_us` … `p99_us`, and the report script (`scripts/generate_benchmark_report.sh`) turns them into a percentile table. These are loopback measurements; WAN / TLS / real-handler numbers depend on your deployment, which is exactly why the suite reports the full tail rather than a single mean.
+
 ## Tests
 
-- 104 unit tests: all HPACK RFC vectors (C.2/C.3/C.4/C.6), Huffman encode/decode, frame codec, state machine, flow control, WUCS scheduling, JA3/JA4 comparison against published records, fingerprint parsing, TLS 1.3 handshake + RFC 8448 key schedule, X.25519/Ed25519/ECDSA/RSA primitives.
-- 42 integration tests: real loopback TCP round trips for h1/h2/HTTPS, keep-alive reuse, chunked, redirects, h2 concurrent multiplexing, streaming responses, gRPC unary/server/client/bidi streaming + error status + trailers + deadline enforcement, RFC 7540 §3.2 `h2c` Upgrade, TLS trust rejection, plus a hardening suite of 16 hostile-frame tests (oversized frames, malformed SETTINGS/PING/WINDOW_UPDATE, HPACK header-list bombs, pseudo-header ordering, `h2c` liveness: SETTINGS_TIMEOUT and keepalive dead-peer detection).
+- 115 unit tests: all HPACK RFC vectors (C.2/C.3/C.4/C.6), Huffman encode/decode (plus a decode output cap), frame codec, state machine, flow control, WUCS scheduling, JA3/JA4 comparison against published records, fingerprint parsing, TLS 1.3 handshake + RFC 8448 key schedule, X.25519/Ed25519/ECDSA/RSA primitives, and the DEFLATE/gzip codec (round-trips, CRC-32 vectors, corruption rejection, output-cap enforcement, and cross-checked against Python zlib output).
+- 36 integration tests: real loopback TCP round trips for h1/h2/HTTPS, keep-alive reuse, chunked, redirects, h2 concurrent multiplexing, streaming responses, gRPC unary/server/client/bidi streaming + error status + trailers + deadline enforcement + gzip round-trip, `grpc.health.v1.Health` `Check` + `Watch`, RFC 7540 §3.2 `h2c` Upgrade, TLS trust rejection + malformed-TLS-input survival, ALPN agreement enforcement, and two concurrency proofs (a slow stream does not block its connection's other streams; many idle streams consume one worker, not one per stream).
+- 30 hardening tests: hostile-frame inputs (oversized frames, malformed SETTINGS/PING/WINDOW_UPDATE, flow-control window overflow, HPACK header-list and Huffman bombs, truncated/EOS Huffman, pseudo-header ordering, `content-length` mismatches, forbidden `transfer-encoding`/`connection`-specific headers, `SETTINGS_MAX_CONCURRENT_STREAMS` enforcement on both ends, `h2c` liveness: SETTINGS_TIMEOUT and keepalive dead-peer detection).
 
 ```bash
 cargo test                 # everything

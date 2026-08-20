@@ -13,6 +13,7 @@ use courierust::h2::priority::Priority;
 use courierust::http::request::Request;
 use courierust::http::response::Response;
 use courierust::server::{Server, ServerConfig};
+use courierust::tls as crate_tls;
 use metrics::{run_concurrent, run_sequential, Timing, MAX_SAMPLES};
 use std::sync::Arc;
 use std::time::Instant;
@@ -78,7 +79,13 @@ fn assert_courierust_response(response: Response<Body>, expected_bytes: usize) {
 }
 
 fn courierust_get(client: &Client, base_url: &str, path: &str, expected_bytes: usize) {
-    let response = client.execute(base_url, Request::get(path)).unwrap();
+    // `Request::get` yields the (Clone) no_std body; convert to the std
+    // streaming body for the network layer. `path` is a runtime `&str`,
+    // so build an owned `PathAndQuery` (only `&'static str` converts
+    // implicitly).
+    let pq = courierust::http::uri::PathAndQuery::from_bytes(path.as_bytes()).unwrap();
+    let req = courierust::http::request::Request::get(pq).with_body(Body::Empty);
+    let response = client.execute(base_url, req).unwrap();
     assert_courierust_response(response, expected_bytes);
 }
 
@@ -226,9 +233,9 @@ fn bench_h2_priority(requests: usize, server_threads: usize) {
         urgency: 7,
         incremental: false,
     };
-    let request = Request::get("/priority");
+    let request = courierust::http::request::Request::get("/priority");
     let _ = client
-        .execute_priority(&base_url, request.clone(), high)
+        .execute_priority(&base_url, request.clone().with_body(Body::Empty), high)
         .unwrap();
 
     let rounds = requests.min(32);
@@ -241,13 +248,13 @@ fn bench_h2_priority(requests: usize, server_threads: usize) {
             let base_url = base_url.clone();
             let request = request.clone();
             low_requests.push(std::thread::spawn(move || {
-                let _ = client.execute_priority(&base_url, request, low);
+                let _ = client.execute_priority(&base_url, request.with_body(Body::Empty), low);
             }));
         }
 
         let high_started = Instant::now();
         let response = client
-            .execute_priority(&base_url, request.clone(), high)
+            .execute_priority(&base_url, request.clone().with_body(Body::Empty), high)
             .unwrap();
         assert_eq!(response.status.as_u16(), 200);
         latencies.push(high_started.elapsed());
@@ -269,6 +276,90 @@ fn bench_h2_priority(requests: usize, server_threads: usize) {
         "priority",
         EMPTY,
         32,
+        timing,
+    );
+}
+
+/// Load the test identity (self-signed Ed25519, CN=localhost) and return
+/// it. The DER files live under `tests/certs/`.
+fn load_test_identity() -> (crate_tls::Identity, crate_tls::RootStore) {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let cert_path = std::path::Path::new(&manifest).join("../tests/certs/server_cert.der");
+    let key_path = std::path::Path::new(&manifest).join("../tests/certs/server_key.der");
+    let cert = std::fs::read(&cert_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", cert_path.display()));
+    let key = std::fs::read(&key_path).unwrap_or_else(|e| panic!("read {}: {e}", key_path.display()));
+    let identity = crate_tls::Identity {
+        cert_chain: vec![cert.clone()],
+        private_key: key,
+        is_rsa: false,
+    };
+    let mut roots = crate_tls::RootStore::new();
+    roots.add_der(cert);
+    (identity, roots)
+}
+
+/// HTTPS (TLS 1.3 + h2) throughput and latency, end to end through the
+/// crate's own TLS stack — the "real protocol, real crypto" case that
+/// loopback h2c benchmarks cannot speak to.
+fn bench_https(requests: usize, payload: Payload, server_threads: usize) {
+    use courierust::server::TlsSettings as ServerTls;
+    use courierust::client::TlsSettings as ClientTls;
+
+    let (identity, roots) = load_test_identity();
+    let body = payload_bytes(payload);
+    let server = Server::bind_with_config(
+        "127.0.0.1:0",
+        ServerConfig {
+            http2: true,
+            threads: server_threads,
+            tls: Some(ServerTls {
+                identity,
+                alpn: vec![b"h2".to_vec()],
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let address = server.local_addr().unwrap();
+    let handle = server
+        .serve_background(move |_request: Request<Body>| {
+            Response::<Body>::with_status(200.into()).with_body(Body::Bytes(body.clone()))
+        })
+        .unwrap();
+    std::mem::forget(handle);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let client = Client::with_config(ClientConfig {
+        http2: true,
+        max_connections_per_host: 1,
+        tls: Some(ClientTls {
+            roots,
+            verify: true,
+            alpn: vec![b"h2".to_vec()],
+            now,
+        }),
+        ..Default::default()
+    });
+    let base_url = format!("https://{address}");
+    courierust_get(&client, &base_url, "/bench", payload.bytes);
+
+    let timing = run_sequential(
+        requests,
+        MAX_SAMPLES,
+        || courierust_get(&client, &base_url, "/bench", payload.bytes),
+        || {},
+        || 0,
+    );
+    print_result(
+        "https_h2_sequential",
+        "https+h2",
+        "sequential",
+        payload,
+        1,
         timing,
     );
 }
@@ -297,6 +388,11 @@ fn main() {
                 bench_h2_multiplex(payload, requests, workers, server_threads);
             }
         }
+    }
+
+    // HTTPS: the full TLS 1.3 handshake + record protection, then h2.
+    for payload in [EMPTY, ONE_KIB, SIXTY_FOUR_KIB] {
+        bench_https(requests.min(2000), payload, server_threads);
     }
 
     bench_h2_priority(requests, server_threads);
