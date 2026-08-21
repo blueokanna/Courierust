@@ -14,7 +14,7 @@
 | `courierust_bytes` / `courierust_io` | 字节缓冲、Read/Write trait |
 | `courierust_error` | 统一错误类型 |
 
-需要 `std`（在默认 feature 后面）的：`courierust_pool`、`courierust_net`、`courierust_body`、`courierust_client`、`courierust_server`、`courierust_h1`、`courierust_grpc`。
+需要 `std`（在默认 feature 后面）的：`courierust_pool`、`courierust_net`、`courierust_tls`、`courierust_body`、`courierust_client`、`courierust_server`、`courierust_h1`、`courierust_grpc`。
 
 ## 开启方式
 

@@ -237,6 +237,7 @@ src/
 ├── courierust_bytes/       # 字节缓冲（BytesMut）                              [no_std]
 ├── courierust_io/          # Read/Write trait（no_std 版）                     [no_std]
 ├── courierust_error/       # 统一错误类型
+├── courierust_tls/         # TLS 1.3（RFC 8446）：握手、记录层、X.509、HTTPS    [std]
 ├── courierust_pool/        # 工作窃取线程池                                    [std]
 ├── courierust_net/         # TCP → io trait 适配                               [std]
 ├── courierust_body/        # 流式响应体（channel）                             [std]
@@ -284,7 +285,7 @@ cargo fuzz run h2_frame --fuzz-dir fuzz -- -runs=10000
 
 ## 测试
 
-- 单元测试 121 个：覆盖 HPACK 全部 RFC 向量（C.2/C.3/C.4/C.6）、Huffman 编解码（含解码输出上限）、帧编解码、状态机、流控、WUCS 调度、JA3/JA4 公开记录比对、指纹解析、TLS 1.3 握手与 RFC 8448 密钥调度、X.25519/Ed25519/ECDSA/RSA 原语、DEFLATE/gzip 编解码（往返、CRC-32 向量、损坏拒绝、输出上限、与 Python zlib 输出交叉验证），以及轮询器 self-pipe（唤醒描述符）语义。
+- 单元测试 133 个：覆盖 HPACK 全部 RFC 向量（C.2/C.3/C.4/C.6）、Huffman 编解码（含解码输出上限）、帧编解码、状态机、流控、WUCS 调度、JA3/JA4 公开记录比对、指纹解析、TLS 1.3 握手与 RFC 8448 密钥调度、X.25519/Ed25519/ECDSA/RSA 原语、DEFLATE/gzip 编解码（往返、CRC-32 向量、损坏拒绝、输出上限、与 Python zlib 输出交叉验证），以及轮询器 self-pipe（唤醒描述符）语义。
 - 集成测试 45 个：真实 TCP 环回上的 h1/h2/HTTPS 请求往返、keep-alive 复用、chunked、重定向、h2 并发多路复用、流式响应、大体积流控往返、gRPC unary/服务端流/客户端流/双向流与错误状态/trailers/deadline 执行、gzip 往返、`grpc.health.v1.Health` `Check` + `Watch`、RFC 7540 §3.2 `h2c` Upgrade、TLS 信任拒绝 + 畸形 TLS 输入存活 + `verify:false` + 主机名不匹配拒绝 + ALPN 一致强制，以及并发证明（慢流不阻塞同连接其他流；大量空闲流按连接而非按流占 worker；空闲连接羊群不阻塞新请求；事件调度器回收 slow-loris 并执行 `max_connections`；服务端流式响应按短节奏冲刷；单条 h2 连接并发突发不饥饿）。
 - 加固测试 30 个：恶意帧输入（超长帧、畸形 SETTINGS/PING/WINDOW_UPDATE、流控窗口溢出、HPACK 头表与 Huffman 炸弹、截断/EOS Huffman、伪头顺序、`content-length` 不一致、非法 `transfer-encoding`/`connection` 系头、两端 `SETTINGS_MAX_CONCURRENT_STREAMS` 强制、`h2c` 存活检测：SETTINGS_TIMEOUT 与 keepalive 死对端检测）。
 

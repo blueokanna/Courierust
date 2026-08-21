@@ -4,7 +4,7 @@ version = "1.0.0"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["blueokanna", "HyphenTeam"]
-description = "no_std HTTP/1+2/gRPC engine with work-stealing, RFC 9218, and JA3/JA4 fingerprinting."
+description = "no_std HTTP and gRPC engine with work-stealing, RFC 9218, and JA3/JA4 fingerprinting."
 homepage = "https://github.com/blueokanna/Courierust"
 repository = "https://github.com/blueokanna/Courierust"
 readme = "README.md"
@@ -14,7 +14,7 @@ categories = [
     "web-programming::http-client",
     "web-programming::http-server",
 ]
-exclude = ["**/target", "**/*.log", "**/temp_tls_test", "**/scripts"]
+exclude = ["**/target", "**/*.log", "**/*.err"]
 
 [features]
 default = ["std"]

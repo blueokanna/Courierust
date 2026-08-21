@@ -1,12 +1,12 @@
 # Getting Started
 
-This page gets a client and a server talking over loopback in five minutes. All code is real, runnable API usage — nothing here is pseudocode.
+This page gets a client and a server talking over loopback in five minutes.
 
 ## 1. Add the dependency
 
 ```toml
 [dependencies]
-courierust = "0.1"
+courierust = "1.0.0"
 ```
 
 The default `std` feature pulls in the client, server, pool, and gRPC layers. If you only want the `no_std` protocol core, see [no_std](no_std).

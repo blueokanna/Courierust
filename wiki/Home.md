@@ -1,8 +1,8 @@
 # Courierust
 
-A self-contained HTTP/1.1 + HTTP/2 + gRPC stack for Rust with **zero third-party dependencies**. The protocol core (`courierust_http`, `courierust_hpack`, `courierust_h2`, `courierust_fingerprint`, `courierust_crypto`) compiles under `no_std + alloc`; the `std` layer adds a work-stealing thread pool, a multi-core client, a server, and gRPC. All public modules carry the `courierust_` prefix so none of them collide with third-party crates of the same short name.
+A self-contained HTTP/1.1 + HTTP/2 + gRPC stack for Rust with **zero third-party dependencies**. The protocol core (`courierust_http`, `courierust_hpack`, `courierust_h2`, `courierust_fingerprint`, `courierust_crypto`, `courierust_bytes`, `courierust_io`, `courierust_error`) compiles under `no_std + alloc`; the `std` layer adds a work-stealing thread pool, a multi-core client, a server, a built-in TLS 1.3 stack, and gRPC. All public modules carry the `courierust_` prefix so none of them collide with third-party crates of the same short name.
 
-This wiki is a hands-on guide. Every code sample below is real API usage — copy it, paste it, run it.
+Every code sample below is real, runnable API usage.
 
 ## 中文教程
 
@@ -12,7 +12,7 @@ This wiki is a hands-on guide. Every code sample below is real API usage — cop
 - [gRPC：Service、unary、服务端流、自定义编解码、错误码](gRPC-使用指南)
 - [浏览器指纹：JA3 / JA4 / Chrome HTTP/2 指纹](浏览器指纹)
 - [no_std：只用协议核心（嵌入式 / 内核态）](no_std-使用)
-- [示例：8 个可直接运行的 demo](示例)
+- [示例：9 个可直接运行的 demo](示例)
 - [基准测试：自测、跨库对比与互操作验证](基准测试)
 
 ## English tutorials
@@ -23,7 +23,7 @@ This wiki is a hands-on guide. Every code sample below is real API usage — cop
 - [gRPC: Service, unary, server-streaming, custom codecs, status](gRPC)
 - [Fingerprints: JA3 / JA4 / Chrome HTTP/2](Fingerprints)
 - [no_std: protocol core only (embedded / kernel)](no_std)
-- [Examples: 8 runnable demos](Examples)
+- [Examples: 9 runnable demos](Examples)
 - [Benchmarks: self, cross-library comparison, and interop validation](Benchmarks)
 
 ## What the crate does

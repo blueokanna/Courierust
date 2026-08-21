@@ -14,7 +14,7 @@ The protocol core compiles for `no_std + alloc` with **zero** dependencies. This
 | `courierust_bytes` / `courierust_io` | byte buffers, Read/Write traits |
 | `courierust_error` | unified error type |
 
-What requires `std` (behind the default feature): `courierust_pool`, `courierust_net`, `courierust_body`, `courierust_client`, `courierust_server`, `courierust_h1`, `courierust_grpc`.
+What requires `std` (behind the default feature): `courierust_pool`, `courierust_net`, `courierust_tls`, `courierust_body`, `courierust_client`, `courierust_server`, `courierust_h1`, `courierust_grpc`.
 
 ## Enable it
 
