@@ -1,13 +1,20 @@
-//! Event-driven HTTP/1.1 server (Windows).
+//! Event-driven HTTP/1.1 server (every platform).
 //!
 //! The classic "one pool job per connection" model burns a worker thread
 //! for every idle keep-alive / SSE / long-poll connection, so a handful
 //! of slow clients can exhaust a fixed pool. This module replaces that
 //! with an I/O event loop:
 //!
-//! * A dedicated **event-loop thread** owns a [`crate::courierust_net::poller::Poller`]
-//!   (`WSAPoll`) and parks *idle* connections — a connection with no data
-//!   to read or write consumes **zero** worker threads.
+//! * A dedicated **accept thread** accepts sockets and hands them (in
+//!   non-blocking mode) to the event loop. It never reads, peeks, sleeps
+//!   or classifies, so a slow client can never stall the accept path.
+//! * A dedicated **event-loop thread** owns a
+//!   [`crate::courierust_net::poller::Poller`] (Winsock `select` on
+//!   Windows, POSIX `poll` elsewhere) and parks *idle* connections — a
+//!   connection with no data to read or write consumes **zero** worker
+//!   threads. The event loop classifies each new connection (TLS / h2 /
+//!   h1) from its first bytes with a non-blocking peek, so even
+//!   classification never holds a worker.
 //! * When a connection becomes readable, the event loop hands it to one
 //!   of a small set of **event workers**. Each worker runs an
 //!   **incremental request parser** that resumes exactly where it left
@@ -15,13 +22,14 @@
 //!   holding a worker.
 //! * After the response is written the connection returns to the poller
 //!   for the next request (keep-alive), again consuming no worker.
+//! * Connections that make no progress for [`ServerConfig::idle_timeout`]
+//!   are closed, bounding the resources a herd of idle / slow-loris
+//!   connections can consume.
 //!
 //! Honest scope: TLS and HTTP/2 connections still use the blocking pool
 //! model; the event loop handles plain HTTP/1.1. A synchronous handler
 //! that blocks for a long time still occupies a worker — exactly as with
 //! any synchronous server (async handler support is future work).
-
-#![cfg(windows)]
 
 use crate::courierust_body::Body;
 use crate::courierust_bytes::Bytes;
@@ -31,14 +39,14 @@ use crate::courierust_http::header::{HeaderMap, HeaderName, HeaderValue};
 use crate::courierust_http::request::Request;
 use crate::courierust_http::response::Response;
 use crate::courierust_http::version::Version;
-use crate::courierust_net::poller::Poller;
+use crate::courierust_net::poller::{fd_of, Fd, Poller};
 use crate::courierust_server::{Handler, ServerConfig};
 use std::collections::HashMap;
 use std::net::TcpStream;
-use std::os::windows::io::{AsRawSocket, RawSocket};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 /// Per-line / per-header-block limits (mirror the blocking server).
 const MAX_LINE: usize = 64 * 1024;
@@ -47,12 +55,9 @@ const MAX_HEADER_BLOCK: usize = 1024 * 1024;
 
 /// Control messages sent to the event loop.
 enum EventMsg {
-    /// (Re-)register a connection's socket with the poller.
-    Register {
-        id: usize,
-        fd: RawSocket,
-        want_write: bool,
-    },
+    NewConn { id: usize, stream: TcpStream },
+    Register { id: usize, fd: Fd, want_write: bool },
+    Closed { id: usize },
 }
 
 /// How a worker wants the connection handled next.
@@ -64,6 +69,47 @@ enum StepOutcome {
     NeedWrite,
     /// Close the connection.
     Close,
+}
+
+/// The protocol class of a fresh connection, decided from its first
+/// bytes without consuming them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    /// A TLS handshake record (content type 0x16) — blocking TLS path.
+    Tls,
+    /// The exact 24-byte HTTP/2 client preface — blocking h2 path.
+    H2,
+    /// Anything else — event-driven HTTP/1.1.
+    H1,
+    /// The bytes so far are a prefix of the h2 preface; park for more.
+    NeedMore,
+    /// The peer closed before sending anything.
+    Closed,
+}
+
+/// The HTTP/2 client connection preface (RFC 9113 §3.5).
+const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// Classify a connection from its first `buf` bytes (peeked, not
+/// consumed). TLS is identified by its first record's content type
+/// (0x16 = handshake); h2 by the exact client preface; everything else
+/// is HTTP/1.1. A prefix of the preface is parked (`NeedMore`) so a
+/// slow h2 preface is not mistaken for h1.
+fn classify(buf: &[u8]) -> Class {
+    if buf.is_empty() {
+        return Class::Closed;
+    }
+    if buf[0] == 0x16 {
+        return Class::Tls;
+    }
+    let n = buf.len().min(H2_PREFACE.len());
+    if &buf[..n] != &H2_PREFACE[..n] {
+        return Class::H1;
+    }
+    if buf.len() < H2_PREFACE.len() {
+        return Class::NeedMore;
+    }
+    Class::H2
 }
 
 // ---------------------------------------------------------------------
@@ -199,7 +245,6 @@ impl IncrRequest {
             if self.parse_step()? {
                 continue;
             }
-            // Need more data from the socket.
             self.compact();
             if !self.fill(socket)? {
                 return Ok(None);
@@ -233,7 +278,6 @@ impl IncrRequest {
                     }
                     let trimmed = courierust_h1::trim_crlf(&self.line);
                     if trimmed.is_empty() {
-                        // End of headers: determine body framing.
                         let rl = courierust_h1::parse_request_line(&self.req_line)?;
                         let bl = courierust_h1::body_length(&self.headers, Some(&rl.method), None)?;
                         self.phase = match bl {
@@ -325,8 +369,6 @@ impl IncrRequest {
                 Ok(true)
             }
             ChunkState::Crlf => {
-                // Consume the CRLF (or lone LF) after chunk data only when
-                // it is fully present.
                 let avail = self.buf.len() - self.pos;
                 if avail >= 2 {
                     if &self.buf[self.pos..self.pos + 2] == b"\r\n" {
@@ -345,7 +387,6 @@ impl IncrRequest {
                     ch.state = ChunkState::Size;
                     Ok(true)
                 } else {
-                    // A lone '\r' waiting for its '\n', or no data yet.
                     Ok(false)
                 }
             }
@@ -545,8 +586,6 @@ fn build_response(resp: Response<Body>, config: &ServerConfig) -> Result<(Vec<u8
         Body::Empty => {}
         Body::Bytes(b) => wire.extend_from_slice(&b),
         Body::Channel(rx) => {
-            // Drain the channel synchronously (chunked framing). A long
-            // idle stream therefore holds a worker — documented.
             let timeout = config.read_timeout;
             loop {
                 let chunk = match timeout {
@@ -590,18 +629,26 @@ pub(crate) fn serve_event(
 ) -> std::io::Result<()> {
     let (msg_tx, msg_rx) = channel::<EventMsg>();
     let (ready_tx, ready_rx): (Sender<usize>, Receiver<usize>) = channel();
-    // mpsc is single-consumer; workers share the receiver under a mutex
-    // (only one worker is ever inside `recv` at a time).
     let ready_rx = Arc::new(std::sync::Mutex::new(ready_rx));
     let registry: Arc<std::sync::Mutex<HashMap<usize, EventConn>>> =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
 
-    // Event loop thread.
-    let loop_ready_tx = ready_tx.clone();
+    // Event loop thread (owns the poller + pending/activity state).
+    let loop_handler = handler.clone();
+    let loop_config = config.clone();
+    let loop_pool = pool.clone();
+    let loop_registry = registry.clone();
     let event_thread = thread::Builder::new()
         .name("courierust-event".into())
         .spawn(move || {
-            event_loop(msg_rx, loop_ready_tx);
+            event_loop(
+                msg_rx,
+                ready_tx,
+                loop_handler,
+                loop_config,
+                loop_pool,
+                loop_registry,
+            );
         })?;
 
     // Event worker threads.
@@ -628,20 +675,16 @@ pub(crate) fn serve_event(
         );
     }
 
-    // Acceptor thread.
-    let a_registry = registry.clone();
+    // Acceptor thread: accept and hand the raw socket to the event loop.
+    // It never reads, peeks, sleeps or classifies, so a slow client can
+    // never stall the accept path.
     let a_msg_tx = msg_tx.clone();
-    let a_handler = handler.clone();
-    let a_config = config.clone();
-    let a_pool = pool.clone();
     let accept_thread = thread::Builder::new()
         .name("courierust-accept".into())
         .spawn(move || {
-            accept_loop(listener, a_registry, a_msg_tx, a_handler, &a_config, a_pool);
+            accept_loop(listener, a_msg_tx);
         })?;
 
-    // Park: the listener's incoming() loop never returns; block on the
-    // accept thread (which ends only if the listener errors).
     let _ = accept_thread.join();
     let _ = event_thread.join();
     for h in worker_handles {
@@ -650,27 +693,185 @@ pub(crate) fn serve_event(
     Ok(())
 }
 
-/// The event loop: polls sockets and dispatches ready connections.
-fn event_loop(msg_rx: Receiver<EventMsg>, ready_tx: Sender<usize>) {
+/// Apply one control message to the poller / pending / activity state.
+/// Used by both the message-drain path and the block-on-channel path, so
+/// a message consumed from the channel is never dropped.
+fn handle_msg(
+    msg: EventMsg,
+    poller: &mut Poller,
+    pending: &mut HashMap<usize, TcpStream>,
+    activity: &mut HashMap<usize, Instant>,
+) {
+    match msg {
+        EventMsg::NewConn { id, stream } => {
+            // The accept thread hands us a blocking socket; the event
+            // loop requires non-blocking mode.
+            if stream.set_nonblocking(true).is_err() {
+                return;
+            }
+            let fd = fd_of(&stream);
+            pending.insert(id, stream);
+            activity.insert(id, Instant::now());
+            poller.register(id, fd, false);
+        }
+        EventMsg::Register { id, fd, want_write } => {
+            activity.insert(id, Instant::now());
+            poller.register(id, fd, want_write);
+        }
+        EventMsg::Closed { id } => {
+            activity.remove(&id);
+        }
+    }
+}
+
+/// The event loop: polls sockets, classifies new connections, and
+/// dispatches ready HTTP/1.1 connections to workers.
+fn event_loop(
+    msg_rx: Receiver<EventMsg>,
+    ready_tx: Sender<usize>,
+    handler: Arc<dyn Handler>,
+    config: ServerConfig,
+    pool: Arc<crate::courierust_pool::ThreadPool>,
+    registry: Arc<std::sync::Mutex<HashMap<usize, EventConn>>>,
+) {
     let mut poller = Poller::new();
+    let mut pending: HashMap<usize, TcpStream> = HashMap::new();
+    let mut activity: HashMap<usize, Instant> = HashMap::new();
+
+    let poll_timeout = (config.event_poll_timeout_ms.max(5)).min(1000) as i32;
+    let idle_timeout = config.idle_timeout;
+
     loop {
-        // Drain control messages (new connections / re-registrations).
+        // 1. Drain control messages (new connections / re-registrations /
+        //    closures).
         loop {
             match msg_rx.try_recv() {
-                Ok(EventMsg::Register { id, fd, want_write }) => {
-                    poller.register(id, fd, want_write);
-                }
+                Ok(msg) => handle_msg(msg, &mut poller, &mut pending, &mut activity),
                 Err(TryRecvError::Disconnected) => return,
                 Err(TryRecvError::Empty) => break,
             }
         }
-        let ready = match poller.wait(25) {
+
+        // 2. With nothing registered, block for a message instead of
+        //    busy-spinning the poller (which would otherwise return an
+        //    empty ready set immediately). The received message must be
+        //    handled here — it has already been consumed from the
+        //    channel and would otherwise be lost.
+        if poller.is_empty() {
+            match msg_rx.recv() {
+                Ok(msg) => handle_msg(msg, &mut poller, &mut pending, &mut activity),
+                Err(_) => return,
+            }
+            continue;
+        }
+
+        let wait_ms = match idle_timeout {
+            Some(t) => {
+                let now = Instant::now();
+                let next = activity
+                    .values()
+                    .map(|at| {
+                        t.checked_sub(now.duration_since(*at))
+                            .unwrap_or(Duration::ZERO)
+                    })
+                    .min()
+                    .unwrap_or(Duration::from_secs(3600));
+                next.as_millis().min(poll_timeout as u128).max(1) as i32
+            }
+            None => poll_timeout,
+        };
+        let ready = match poller.wait(wait_ms) {
             Ok(r) => r,
             Err(_) => continue,
         };
+
         for id in ready {
             poller.unregister(id);
-            let _ = ready_tx.send(id);
+            activity.insert(id, Instant::now());
+            if let Some(stream) = pending.remove(&id) {
+                let mut prefix = [0u8; 24];
+                let n = match stream.peek(&mut prefix) {
+                    Ok(n) => n,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Spurious wake: park again.
+                        let fd = fd_of(&stream);
+                        pending.insert(id, stream);
+                        poller.register(id, fd, false);
+                        continue;
+                    }
+                    Err(_) => {
+                        activity.remove(&id);
+                        continue;
+                    }
+                };
+                if n == 0 {
+                    // Peer closed before sending anything.
+                    activity.remove(&id);
+                    continue;
+                }
+                match classify(&prefix[..n]) {
+                    Class::Tls => {
+                        let _ = stream.set_nonblocking(false);
+                        let h = handler.clone();
+                        let c = config.clone();
+                        let p = pool.clone();
+                        p.spawn(move || {
+                            let _ = crate::courierust_server::serve_accepted(stream, &*h, &c);
+                        });
+                        activity.remove(&id);
+                    }
+                    Class::H2 => {
+                        let _ = stream.set_nonblocking(false);
+                        let h = handler.clone();
+                        let c = config.clone();
+                        let p = pool.clone();
+                        p.spawn(move || {
+                            let _ = crate::courierust_server::serve_connection(
+                                crate::courierust_net::ConnStream::plain(stream),
+                                &*h,
+                                &c,
+                            );
+                        });
+                        activity.remove(&id);
+                    }
+                    Class::H1 => {
+                        let conn = EventConn::new(stream, config.max_body);
+                        registry.lock().unwrap().insert(id, conn);
+                        let _ = ready_tx.send(id);
+                    }
+                    Class::NeedMore => {
+                        let fd = fd_of(&stream);
+                        pending.insert(id, stream);
+                        poller.register(id, fd, false);
+                    }
+                    Class::Closed => {
+                        activity.remove(&id);
+                    }
+                }
+            } else {
+                // An HTTP/1.1 connection (or a stale id — the worker
+                // drops it defensively).
+                let _ = ready_tx.send(id);
+            }
+        }
+
+        if let Some(t) = idle_timeout {
+            let now = Instant::now();
+            let mut expired = Vec::new();
+            for (&id, &at) in &activity {
+                if now.duration_since(at) < t {
+                    continue;
+                }
+                if pending.contains_key(&id) || registry.lock().unwrap().contains_key(&id) {
+                    expired.push(id);
+                }
+            }
+            for id in expired {
+                poller.unregister(id);
+                pending.remove(&id);
+                registry.lock().unwrap().remove(&id);
+                activity.remove(&id);
+            }
         }
     }
 }
@@ -692,100 +893,36 @@ fn event_worker(
             Some(c) => c,
             None => continue,
         };
-        let outcome = match conn.step(handler, config) {
-            Ok(o) => o,
-            Err(_) => StepOutcome::Close,
+        let step =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| conn.step(handler, config)));
+        let outcome = match step {
+            Ok(Ok(o)) => o,
+            _ => StepOutcome::Close,
         };
         match outcome {
             StepOutcome::Idle | StepOutcome::NeedWrite => {
-                let fd = conn.socket.as_raw_socket();
+                let fd = fd_of(&conn.socket);
                 let want_write = matches!(outcome, StepOutcome::NeedWrite);
                 registry.lock().unwrap().insert(id, conn);
                 let _ = msg_tx.send(EventMsg::Register { id, fd, want_write });
             }
             StepOutcome::Close => {
-                // Dropped; the poller no longer references it.
+                let _ = msg_tx.send(EventMsg::Closed { id });
             }
         }
     }
 }
 
-/// Accept loop: classify each connection and dispatch.
-fn accept_loop(
-    listener: std::net::TcpListener,
-    registry: Arc<std::sync::Mutex<HashMap<usize, EventConn>>>,
-    msg_tx: Sender<EventMsg>,
-    handler: Arc<dyn Handler>,
-    config: &ServerConfig,
-    pool: Arc<crate::courierust_pool::ThreadPool>,
-) {
+/// Accept loop: accept sockets and hand them to the event loop in
+/// non-blocking mode. It never reads, peeks, sleeps or classifies, so a
+/// slow client can never stall the accept path (which would starve every
+/// later connection to this listener).
+fn accept_loop(listener: std::net::TcpListener, msg_tx: Sender<EventMsg>) {
     let mut next_id = 1usize;
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        // Classify by peeking the first bytes. We deliberately avoid
-        // std's socket read-timeout (SO_RCVTIMEO) here: on Windows it
-        // is unreliable under load and can block far beyond the requested
-        // timeout, wedging the single accept thread and starving every
-        // later connection to this listener. Instead we use an explicit
-        // non-blocking peek with bounded sleeps, which can never block
-        // indefinitely.
-        let _ = stream.set_nonblocking(true);
-        let mut prefix = [0u8; 24];
-        let mut n = stream.peek(&mut prefix).unwrap_or(0);
-        if n == 0 {
-            // Servers that can speak h2/TLS must wait long enough for the
-            // peer's writer thread to be scheduled under load; plain
-            // h1-only servers use a short wait so a batch of idle
-            // connections (which send nothing) does not stall the accept
-            // loop for seconds.
-            let retries = if config.http2 || config.tls.is_some() {
-                80 // up to 2 s total
-            } else {
-                2 // up to 50 ms total
-            };
-            for _ in 0..retries {
-                std::thread::sleep(std::time::Duration::from_millis(25));
-                n = stream.peek(&mut prefix).unwrap_or(0);
-                if n > 0 {
-                    break;
-                }
-            }
-        }
-        let _ = stream.set_nonblocking(false);
-        let is_tls = n >= 1 && prefix[0] == 0x16;
-        let is_h2 = n >= 24 && crate::courierust_h2::connection::is_preface(&prefix);
-        if is_tls || is_h2 {
-            // Hand off to the blocking pool model.
-            let h = handler.clone();
-            let c = config.clone();
-            let p = pool.clone();
-            p.spawn(move || {
-                if is_tls {
-                    let _ = crate::courierust_server::serve_accepted(stream, &*h, &c);
-                } else {
-                    let _ = crate::courierust_server::serve_connection(
-                        crate::courierust_net::ConnStream::plain(stream),
-                        &*h,
-                        &c,
-                    );
-                }
-            });
-            continue;
-        }
-        // Plain HTTP/1.1: register with the event loop.
-        if let Err(e) = stream.set_nonblocking(true) {
-            let _ = e;
-            continue;
-        }
         let id = next_id;
         next_id += 1;
-        let conn = EventConn::new(stream, config.max_body);
-        let fd = conn.socket.as_raw_socket();
-        registry.lock().unwrap().insert(id, conn);
-        let _ = msg_tx.send(EventMsg::Register {
-            id,
-            fd,
-            want_write: false,
-        });
+        let _ = msg_tx.send(EventMsg::NewConn { id, stream });
     }
 }

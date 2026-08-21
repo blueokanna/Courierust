@@ -1,14 +1,18 @@
-//! HTTP server: each accepted connection becomes a job on the
-//! work-stealing pool, so connection handling scales across cores.
+//! HTTP server.
 //!
-//! On Windows an optional **event-driven** mode parks idle connections on
-//! a `WSAPoll` poller instead of holding a worker thread (see
-//! [`ServerConfig::event_driven`]).
+//! By default connections are handled by an **event-driven** scheduler: a
+//! dedicated accept thread hands sockets to an I/O event loop which parks
+//! idle / partial / slow connections on a readiness poller instead of
+//! holding a worker thread, so a herd of slow clients cannot exhaust the
+//! pool (see [`ServerConfig::event_driven`]). The work-stealing pool runs
+//! HTTP/1.1 request handlers and the blocking TLS / HTTP/2 connection
+//! loops. Setting [`ServerConfig::event_driven`] to `false` restores the
+//! legacy one-blocking-pool-job-per-connection model for comparison and
+//! debugging.
 
 pub mod h1;
 pub mod h2;
 
-#[cfg(windows)]
 pub(crate) mod event;
 
 use crate::courierust_body::Body;
@@ -45,13 +49,23 @@ pub struct ServerConfig {
     pub threads: usize,
     /// Optional TLS identity; when set, the server accepts HTTPS.
     pub tls: Option<TlsSettings>,
-    /// Use the event-driven connection scheduler (Windows). Plain
-    /// HTTP/1.1 connections park on a `WSAPoll` poller when idle instead
-    /// of holding a worker thread; TLS and HTTP/2 connections still use
-    /// the pool model.
+    /// Use the event-driven connection scheduler (default on every
+    /// platform). Plain HTTP/1.1 connections park on a readiness poller
+    /// when idle instead of holding a worker thread; TLS and HTTP/2
+    /// connections still run on the blocking pool. When `false`, the
+    /// legacy one-blocking-pool-job-per-connection model is used (a herd
+    /// of idle connections can then exhaust the pool).
     pub event_driven: bool,
     /// Number of event-worker threads (0 = auto).
     pub event_workers: usize,
+    /// How often the event loop re-polls for readiness (milliseconds).
+    /// Lower values cut first-byte latency at the cost of more wakeups;
+    /// 0 falls back to a 5 ms default.
+    pub event_poll_timeout_ms: u64,
+    /// Close an HTTP/1.1 connection that has been parked (no bytes in
+    /// either direction) for this long. Bounds the resources a herd of
+    /// idle / slow-loris connections can consume. `None` disables it.
+    pub idle_timeout: Option<Duration>,
     /// h2: drop the connection if the peer does not ACK our SETTINGS
     /// within this long (`SETTINGS_TIMEOUT`, RFC 9113 §6.5.3).
     pub h2_settings_timeout: Option<Duration>,
@@ -85,8 +99,10 @@ impl Default for ServerConfig {
             http2: true,
             threads: 0, // 0 = auto (logical cores)
             tls: None,
-            event_driven: cfg!(windows),
-            event_workers: 0, // auto
+            event_driven: true,
+            event_workers: 0,
+            event_poll_timeout_ms: 5,
+            idle_timeout: Some(Duration::from_secs(300)),
             h2_settings_timeout: Some(Duration::from_secs(10)),
             h2_ping_interval: Some(Duration::from_secs(30)),
             h2_ping_timeout: Some(Duration::from_secs(15)),
@@ -170,7 +186,6 @@ impl Server {
         let handler = Arc::new(handler);
         let config = self.config;
         let pool = self.pool;
-        #[cfg(windows)]
         if config.event_driven {
             return event::serve_event(self.listener, handler, config, pool);
         }

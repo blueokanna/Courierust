@@ -14,7 +14,7 @@ categories = [
     "web-programming::http-client",
     "web-programming::http-server",
 ]
-exclude = ["**/target"]
+exclude = ["**/target", "**/*.log"]
 
 [features]
 default = ["std"]

@@ -1,10 +1,11 @@
 //! Slow-connection and idle-connection evidence for the server scheduler.
 //!
 //! The benchmark uses incomplete HTTP/1.1 headers to create connections that
-//! are connected but cannot yet be dispatched to the handler. On Windows the
-//! event-driven scheduler should keep these connections out of the worker
-//! pool. On other platforms the blocking pool behaviour is measured and
-//! reported explicitly; it is not mislabeled as event-driven evidence.
+//! are connected but cannot yet be dispatched to the handler. The default
+//! event-driven scheduler (all platforms) keeps these connections out of the
+//! worker pool, so the probe completes. The `pool` case forces the legacy
+//! one-blocking-job-per-connection model and is reported explicitly; it is
+//! the diagnostic that shows *why* the event-driven scheduler is the default.
 
 use courierust::courierust_body::Body;
 use courierust::courierust_bytes::Bytes;
@@ -88,6 +89,9 @@ fn open_partial_herd(addr: SocketAddr, count: usize) -> Vec<TcpStream> {
             .set_write_timeout(Some(PROBE_TIMEOUT))
             .expect("set partial write timeout");
         stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("set partial read timeout");
+        stream
             .write_all(b"GET /slow HTTP/1.1\r\nHost: benchmark\r\n")
             .unwrap_or_else(|e| panic!("write partial connection {index}: {e}"));
         herd.push(stream);
@@ -112,13 +116,13 @@ fn probe(addr: SocketAddr) -> Result<Duration, String> {
 }
 
 fn run_idle_case(model: &'static str, idle: usize) {
-    let event_enabled = cfg!(windows) && model == "event";
+    let event_driven = model == "event";
     let server = Server::bind_with_config(
         "127.0.0.1:0",
         ServerConfig {
             http2: false,
             threads: 2,
-            event_driven: event_enabled,
+            event_driven,
             event_workers: 2,
             ..Default::default()
         },
@@ -132,12 +136,12 @@ fn run_idle_case(model: &'static str, idle: usize) {
     let result = probe(addr);
     match result {
         Ok(elapsed) => println!(
-            "CONCURRENCY|case=idle_partial_herd|model={model}|platform={}|status=probe_ok|event_enabled={event_enabled}|connections={idle}|worker_threads=2|probe_us={:.2}",
+            "CONCURRENCY|case=idle_partial_herd|model={model}|platform={}|status=probe_ok|event_enabled={event_driven}|connections={idle}|worker_threads=2|probe_us={:.2}",
             std::env::consts::OS,
             elapsed.as_secs_f64() * 1_000_000.0,
         ),
         Err(error) => println!(
-            "CONCURRENCY|case=idle_partial_herd|model={model}|platform={}|status=probe_blocked|event_enabled={event_enabled}|connections={idle}|worker_threads=2|probe_us=na|error={}",
+            "CONCURRENCY|case=idle_partial_herd|model={model}|platform={}|status=probe_blocked|event_enabled={event_driven}|connections={idle}|worker_threads=2|probe_us=na|error={}",
             std::env::consts::OS,
             error.replace('|', "/"),
         ),
@@ -146,13 +150,13 @@ fn run_idle_case(model: &'static str, idle: usize) {
 }
 
 fn run_slow_sender_case(count: usize) {
-    let event_enabled = cfg!(windows);
+    let event_driven = true;
     let server = Server::bind_with_config(
         "127.0.0.1:0",
         ServerConfig {
             http2: false,
             threads: 2,
-            event_driven: event_enabled,
+            event_driven,
             event_workers: 2,
             ..Default::default()
         },
@@ -171,8 +175,8 @@ fn run_slow_sender_case(count: usize) {
         }
     }
     println!(
-        "CONCURRENCY|case=slow_sender_herd|model={}|platform={}|status={}|event_enabled={event_enabled}|connections={count}|worker_threads=2|completed={completed}|wall_ms={:.2}",
-        if event_enabled { "event" } else { "pool" },
+        "CONCURRENCY|case=slow_sender_herd|model={}|platform={}|status={}|event_enabled={event_driven}|connections={count}|worker_threads=2|completed={completed}|wall_ms={:.2}",
+        if event_driven { "event" } else { "pool" },
         std::env::consts::OS,
         if completed == count { "ok" } else { "partial" },
         started.elapsed().as_secs_f64() * 1000.0,
@@ -181,12 +185,8 @@ fn run_slow_sender_case(count: usize) {
 
 fn main() {
     let idle = env_usize("COURIERUST_IDLE_CONNS", IDLE_CONNS);
-    if cfg!(windows) {
-        run_idle_case("event", idle);
-        run_idle_case("pool", idle);
-    } else {
-        run_idle_case("pool", idle);
-    }
+    run_idle_case("event", idle);
+    run_idle_case("pool", idle);
     run_slow_sender_case(env_usize("COURIERUST_SLOW_CONNS", SLOW_CONNS));
     println!("CONCURRENCY|suite=complete");
 }

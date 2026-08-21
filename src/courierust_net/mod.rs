@@ -10,7 +10,6 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(windows)]
 pub(crate) mod poller;
 
 impl Read for &TcpStream {
