@@ -107,8 +107,9 @@ pub(crate) fn peek_complete_hs<'a>(buf: &'a [u8]) -> Option<HsMessage<'a>> {
 pub(crate) fn has_complete_finished(buf: &[u8]) -> bool {
     let mut off = 0;
     while off + 4 <= buf.len() {
-        let len =
-            ((buf[off + 1] as usize) << 16) | ((buf[off + 2] as usize) << 8) | buf[off + 3] as usize;
+        let len = ((buf[off + 1] as usize) << 16)
+            | ((buf[off + 2] as usize) << 8)
+            | buf[off + 3] as usize;
         if off + 4 + len > buf.len() {
             return false; // trailing message is incomplete
         }
