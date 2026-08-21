@@ -36,18 +36,28 @@ NGINX_BIN="${NGINX:-nginx}"
 : > "$LOGFILE"
 
 # Locate a bench binary: prefer `$BENCH_DIR/<name>`, else the newest
-# `$BENCH_DIR/deps/<name>-*` (the output location of `cargo bench
-# --no-run`, whose artifact names carry a hash).
+# *executable* `$BENCH_DIR/deps/<name>-*` (the output location of
+# `cargo bench --no-run`, whose artifact names carry a hash). Only
+# regular executable files count: `cargo` also writes a `<name>-<hash>.d`
+# dep-info file alongside the binary, and running that text file would
+# silently kill the spawned server (the `no_listen` failures this script
+# originally produced).
 find_bin() {
-  local name="$1"
+  local name="$1" f
   if [[ -x "$BENCH_DIR/$name" ]]; then
     printf '%s\n' "$BENCH_DIR/$name"
     return 0
   fi
-  ls -t "$BENCH_DIR"/deps/${name}-* 2>/dev/null | head -1
+  while IFS= read -r f; do
+    if [[ -f "$f" && -x "$f" ]]; then
+      printf '%s\n' "$f"
+      return 0
+    fi
+  done < <(ls -t "$BENCH_DIR"/deps/${name}-* 2>/dev/null)
+  return 1
 }
-TLS_INTEROP_BIN="$(find_bin tls_interop)"
-NETWORK_BIN="$(find_bin network)"
+TLS_INTEROP_BIN="$(find_bin tls_interop || true)"
+NETWORK_BIN="$(find_bin network || true)"
 if [[ -z "$TLS_INTEROP_BIN" || -z "$NETWORK_BIN" ]]; then
   echo "error: built tls_interop/network bench binaries not found under $BENCH_DIR" >&2
   exit 1
@@ -80,18 +90,20 @@ wait_port() {
 }
 
 # ---------------------------------------------------------------------
-# 0. Throwaway CA + server certificate (RSA 2048, SAN localhost).
-#    Both OpenSSL and curl/nginx must accept the leaf, so it is signed by
-#    a real CA rather than being self-signed.
-# ---------------------------------------------------------------------
-"$OPENSSL_BIN" req -x509 -newkey rsa:2048 -keyout ca.key -out ca.pem \
-  -days 2 -nodes -subj "/CN=Courierust CI CA" >/dev/null 2>&1
-"$OPENSSL_BIN" req -newkey rsa:2048 -keyout server.key -out server.csr \
-  -nodes -subj "/CN=localhost" >/dev/null 2>&1
-"$OPENSSL_BIN" x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial \
-  -out server.pem -days 2 \
-  -extfile <(printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n') \
-  >/dev/null 2>&1
+# 0. Throwaway Ed25519 identity.
+#    A single self-signed Ed25519 cert doubles as the server identity AND
+#    the trust root (SAN localhost + 127.0.0.1, serverAuth EKU, CA:TRUE)
+#    — byte-for-byte the same shape as the certificate the integration
+#    tests use, so the certificate chain / signature / EKU paths this
+#    script exercises are exactly the ones already covered by `cargo
+#    test`. (The previous RSA CA+leaf form worked with OpenSSL/curl, but
+#    exercised an untested RSA-cert path in the crate.)
+"$OPENSSL_BIN" req -x509 -newkey ed25519 -keyout server.key -out server.pem \
+  -days 2 -nodes -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+  -addext "extendedKeyUsage=serverAuth" \
+  -addext "basicConstraints=critical,CA:TRUE" >/dev/null 2>&1
+cp server.pem ca.pem
 "$OPENSSL_BIN" x509 -in ca.pem -outform DER -out ca.der
 "$OPENSSL_BIN" x509 -in server.pem -outform DER -out server_cert.der
 "$OPENSSL_BIN" pkcs8 -topk8 -nocrypt -in server.key -outform DER -out server_key.der
@@ -111,10 +123,14 @@ if wait_port "$PORT_A"; then
     cat tls_s_server.log
     record "TLSINTEROP|role=client|peer=openssl_s_server|protocol=h1|status=ok"
   else
+    echo "--- openssl s_server client log ---"
+    cat tls_s_server.log 2>/dev/null || true
     record "TLSINTEROP|role=client|peer=openssl_s_server|protocol=h1|status=failed"
     mark_fail
   fi
 else
+  echo "--- openssl s_server did not listen; log ---"
+  cat s_server.log 2>/dev/null || true
   record "TLSINTEROP|role=client|peer=openssl_s_server|protocol=h1|status=no_listen"
   mark_fail
 fi
@@ -142,6 +158,8 @@ if wait_port "$PORT_B"; then
   if [[ "$HTTP" == "200" ]]; then
     record "TLSINTEROP|role=server|peer=curl|protocol=h1|status=ok|http=200"
   else
+    echo "--- curl h1 error ---"
+    cat curl_err.txt 2>/dev/null || true
     record "TLSINTEROP|role=server|peer=curl|protocol=h1|status=failed|http=${HTTP:-none}"
     mark_fail
   fi
@@ -151,6 +169,8 @@ if wait_port "$PORT_B"; then
   if [[ "$HTTP2" == "200" ]]; then
     record "TLSINTEROP|role=server|peer=curl_http2|protocol=h2|status=ok|http=200"
   else
+    echo "--- curl h2 error ---"
+    cat curl2_err.txt 2>/dev/null || true
     record "TLSINTEROP|role=server|peer=curl_http2|protocol=h2|status=failed|http=${HTTP2:-none}"
     mark_fail
   fi
@@ -165,6 +185,8 @@ if wait_port "$PORT_B"; then
     mark_fail
   fi
 else
+  echo "--- courierust network server did not listen; log ---"
+  cat tls_server.log 2>/dev/null || true
   record "TLSINTEROP|role=server|peer=curl|protocol=h1|status=no_listen"
   record "TLSINTEROP|role=server|peer=openssl_s_client|protocol=alpn|status=no_listen"
   mark_fail
@@ -204,10 +226,14 @@ EOF
       cat tls_nginx.log
       record "TLSINTEROP|role=client|peer=nginx|protocol=h2|status=ok"
     else
+      echo "--- courierust client vs nginx log ---"
+      cat tls_nginx.log 2>/dev/null || true
       record "TLSINTEROP|role=client|peer=nginx|protocol=h2|status=failed"
       mark_fail
     fi
   else
+    echo "--- nginx did not listen; log ---"
+    cat nginx_start.log nginx_error.log 2>/dev/null || true
     record "TLSINTEROP|role=client|peer=nginx|protocol=h2|status=no_listen"
     mark_fail
   fi
