@@ -1052,14 +1052,17 @@ fn cleanup(
 }
 
 /// Convert a header list into the HPACK fields for an h2 request.
-pub fn request_fields(req: &crate::courierust_http::request::Request<Body>) -> Vec<HeaderField> {
+pub fn request_fields(
+    req: &crate::courierust_http::request::Request<Body>,
+    scheme: &str,
+) -> Vec<HeaderField> {
     let head = crate::courierust_http::request::RequestHead {
         method: req.method.clone(),
         uri: req.uri.clone(),
         version: req.version,
         headers: req.headers.clone(),
     };
-    head.to_h2_fields()
+    head.to_h2_fields(scheme)
 }
 
 /// A helper for the driver: build the pseudo-header set manually if needed.

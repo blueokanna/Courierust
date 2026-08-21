@@ -406,7 +406,7 @@ impl Client {
         priority: Priority,
     ) -> Result<crate::courierust_client::h2::H2Response> {
         let conn = self.get_h2_conn(authority, addr, tls.as_ref(), &url.host)?;
-        let fields = h2::request_fields(&req);
+        let fields = h2::request_fields(&req, &url.scheme);
         let (tx, rx) = std::sync::mpsc::channel();
         let cmd = build_h2_cmd(fields, req.body, priority, tx);
         self.send_h2_cmd(conn, authority, addr, tls.as_ref(), &url.host, cmd, rx)
@@ -444,7 +444,7 @@ impl Client {
             })
         };
         if let Some(conn) = pooled {
-            let fields = h2::request_fields(&req);
+            let fields = h2::request_fields(&req, &url.scheme);
             let (tx, rx) = std::sync::mpsc::channel();
             let cmd = build_h2_cmd(fields, req.body, Priority::default(), tx);
             return self

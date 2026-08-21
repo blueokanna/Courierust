@@ -145,8 +145,11 @@ impl RequestHead {
     }
 
     /// Extract the pseudo-header block for HTTP/2, validating that the
-    /// required pseudo-headers are present.
-    pub fn to_h2_fields(&self) -> crate::courierust_hpack::HeaderList {
+    /// required pseudo-headers are present. `scheme` is the connection's
+    /// URI scheme (`http` or `https`); RFC 9113 §8.1.2.3 requires the
+    /// `:scheme` pseudo-header to match the transport, and nginx rejects
+    /// a TLS connection that claims `http`.
+    pub fn to_h2_fields(&self, scheme: &str) -> crate::courierust_hpack::HeaderList {
         let mut fields = crate::courierust_hpack::HeaderList::with_capacity(self.headers.len() + 4);
         fields.push(crate::courierust_hpack::HeaderField::new(
             HeaderName::from_lowercase(":method"),
@@ -167,10 +170,13 @@ impl RequestHead {
                 auth.clone(),
             ));
         }
-        // A single scheme pseudo-header (the stack is http-only by default).
+        // A single scheme pseudo-header matching the actual transport
+        // (http for plain, https for TLS).
+        let is_https = scheme.eq_ignore_ascii_case("https");
         fields.push(crate::courierust_hpack::HeaderField::new(
             HeaderName::from_lowercase(":scheme"),
-            HeaderValue::from_static("http"),
+            HeaderValue::from_bytes(if is_https { b"https" } else { b"http" })
+                .unwrap_or_else(|_| HeaderValue::from_static("http")),
         ));
         for (n, v) in self.headers.iter() {
             if n.as_str() == "authority"

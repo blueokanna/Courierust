@@ -13,7 +13,7 @@ use crate::courierust_h2::error::ErrorCode;
 use crate::courierust_h2::flow::FlowWindow;
 use crate::courierust_h2::frame::{self, Frame, FrameHeader};
 use crate::courierust_h2::priority::{Priority, Scheduler};
-use crate::courierust_h2::settings::{Setting, Settings};
+use crate::courierust_h2::settings::{Setting, Settings, SETTINGS_ENABLE_PUSH};
 use crate::courierust_h2::stream::{Stream, StreamMap, StreamState};
 use crate::courierust_hpack::{Decoder, Encoder, HeaderList};
 use crate::courierust_io::{BufReader, BufWriter, Read, Write};
@@ -733,7 +733,13 @@ impl<R: Read, W: Write> Connection<R, W> {
     }
 
     fn queue_settings(&mut self) {
-        let entries = self.local.to_vec();
+        let mut entries = self.local.to_vec();
+        // RFC 9113 §6.5.2: a server MUST NOT send ENABLE_PUSH (only
+        // clients use it to disable server push). nghttp2/curl reject a
+        // server SETTINGS carrying it.
+        if !self.config.client {
+            entries.retain(|s| s.id != SETTINGS_ENABLE_PUSH);
+        }
         self.pending_frames.push_back(Frame::Settings {
             ack: false,
             entries,
@@ -1068,7 +1074,15 @@ impl<R: Read, W: Write> Connection<R, W> {
                 error_code,
             } => {
                 if !self.streams.contains(&stream_id) {
-                    return self.conn_error(ErrorCode::ProtocolError, "RST_STREAM on idle stream");
+                    // RFC 9113 §5.1: RST_STREAM on an idle stream (one
+                    // that was never opened) is a PROTOCOL_ERROR, but
+                    // RST_STREAM for a stream we already closed is a
+                    // normal race and MUST be ignored.
+                    if stream_id > self.streams.last_peer_id() {
+                        return self
+                            .conn_error(ErrorCode::ProtocolError, "RST_STREAM on idle stream");
+                    }
+                    return Ok(());
                 }
                 self.events.push_back(Event::Rst {
                     stream_id,
