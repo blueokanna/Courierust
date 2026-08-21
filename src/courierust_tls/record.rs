@@ -62,13 +62,14 @@ pub(crate) fn seal_record(
     content_type: u8,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, TlsError> {
-    if plaintext.len() + 2 > MAX_RECORD_PAYLOAD {
+    if plaintext.len() + 1 > MAX_RECORD_PAYLOAD {
         return Err(TlsError::Protocol("record too large".into()));
     }
-    // TLSInnerPlaintext = content || padding(0) || type
-    let mut inner = Vec::with_capacity(plaintext.len() + 2);
+    // RFC 8446 §5.2: TLSInnerPlaintext = content || type || zeros.
+    // The content type trails the content and any padding is all-zero
+    // bytes after it. We send no padding: inner = content || type.
+    let mut inner = Vec::with_capacity(plaintext.len() + 1);
     inner.extend_from_slice(plaintext);
-    inner.push(0); // zero padding length
     inner.push(content_type);
 
     let nonce = build_nonce(&keys.iv, seq);
@@ -112,18 +113,36 @@ pub(crate) fn open_record(
         return Err(TlsError::Protocol("bad record length".into()));
     }
     let nonce = build_nonce(&keys.iv, seq);
-    let inner = suite
+    let mut inner = suite
         .open(&keys.key[..suite.key_len()], &nonce, header, encrypted)
         .ok_or(TlsError::Alert {
             level: 2,        // fatal
             description: 20, // bad_record_mac
         })?;
-    if inner.len() < 2 {
+    if inner.is_empty() {
         return Err(TlsError::Protocol("record too short".into()));
     }
-    // TLSInnerPlaintext = content || padding(zeros) || padding_len || type
-    let n = inner.len();
-    let content_type = inner[n - 1];
+    // RFC 8446 §5.2: TLSInnerPlaintext = content || type || zeros.
+    // The content type is the last non-zero byte: padding (if any) is a
+    // run of zero bytes that trails the type. Scan backward from the end
+    // for the first non-zero byte; everything after it is padding and is
+    // zero by construction of the scan.
+    let mut n = inner.len();
+    let content_type;
+    loop {
+        if n == 0 {
+            // The record contained only zero bytes: no content type.
+            return Err(TlsError::Alert {
+                level: 2,
+                description: 20, // bad_record_mac
+            });
+        }
+        n -= 1;
+        if inner[n] != 0 {
+            content_type = inner[n];
+            break;
+        }
+    }
     if !matches!(
         content_type,
         CONTENT_CHANGE_CIPHER_SPEC | CONTENT_ALERT | CONTENT_HANDSHAKE | CONTENT_APPLICATION_DATA
@@ -133,22 +152,11 @@ pub(crate) fn open_record(
             description: 10, // unexpected_message
         });
     }
-    let pad_len = inner[n - 2] as usize;
-    if pad_len > n - 2 {
-        return Err(TlsError::Alert {
-            level: 2,
-            description: 20, // bad_record_mac
-        });
-    }
-    let content_len = n - 2 - pad_len;
-    if inner[content_len..n - 2].iter().any(|&b| b != 0) {
-        return Err(TlsError::Alert {
-            level: 2,
-            description: 20, // bad_record_mac
-        });
-    }
-    let plaintext = inner[..content_len].to_vec();
-    Ok((content_type, plaintext))
+    // Reuse the decrypted buffer: truncate away the type/padding bytes
+    // instead of copying the plaintext a second time (saves one
+    // allocation + memcpy per record on the hot path).
+    inner.truncate(n);
+    Ok((content_type, inner))
 }
 
 #[cfg(test)]

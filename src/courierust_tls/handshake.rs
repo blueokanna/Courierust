@@ -95,6 +95,31 @@ pub(crate) fn peek_complete_hs<'a>(buf: &'a [u8]) -> Option<HsMessage<'a>> {
     parse_hs(buf).filter(|m| 4 + m.body.len() <= buf.len())
 }
 
+/// Whether `buf` contains a complete `Finished` handshake message.
+///
+/// In a 1-RTT handshake the Finished is the final message of the peer's
+/// first flight, so "a complete Finished is buffered" is the right
+/// condition for [`TlsIo::read_encrypted_handshake`] to stop: it must
+/// keep consuming records until the whole flight is present (a server
+/// may fragment EncryptedExtensions / Certificate / CertificateVerify /
+/// Finished across several records). Walks complete messages only, so a
+/// partial trailing message simply means "keep reading".
+pub(crate) fn has_complete_finished(buf: &[u8]) -> bool {
+    let mut off = 0;
+    while off + 4 <= buf.len() {
+        let len =
+            ((buf[off + 1] as usize) << 16) | ((buf[off + 2] as usize) << 8) | buf[off + 3] as usize;
+        if off + 4 + len > buf.len() {
+            return false; // trailing message is incomplete
+        }
+        if buf[off] == HS_FINISHED {
+            return true;
+        }
+        off += 4 + len;
+    }
+    false
+}
+
 /// Read a u8/u16/u24 from a cursor.
 struct Cur<'a> {
     data: &'a [u8],
@@ -282,6 +307,8 @@ struct ServerHelloInfo {
     random: [u8; 32],
     suite: CipherSuite,
     key_share: [u8; 32],
+    /// The echoed legacy_session_id (must equal the one we sent).
+    session_id: Vec<u8>,
 }
 
 fn parse_server_hello(body: &[u8]) -> TlsResult<ServerHelloInfo> {
@@ -299,8 +326,10 @@ fn parse_server_hello(body: &[u8]) -> TlsResult<ServerHelloInfo> {
     if sid_len > 32 {
         return Err(TlsError::Protocol("bad SH session id".into()));
     }
-    c.take(sid_len)
-        .ok_or_else(|| TlsError::Protocol("bad SH".into()))?;
+    let session_id = c
+        .take(sid_len)
+        .ok_or_else(|| TlsError::Protocol("bad SH".into()))?
+        .to_vec();
     let suite_wire = c.u16().ok_or_else(|| TlsError::Protocol("bad SH".into()))?;
     let suite = CipherSuite::from_wire(suite_wire)
         .ok_or_else(|| TlsError::Protocol("unsupported suite".into()))?;
@@ -353,6 +382,7 @@ fn parse_server_hello(body: &[u8]) -> TlsResult<ServerHelloInfo> {
         random,
         suite,
         key_share: key_share.unwrap(),
+        session_id,
     })
 }
 
@@ -615,13 +645,25 @@ impl ClientHandshake {
         let ch = build_client_hello(&random, &pub_key, &self.alpn, self.server_name.as_deref());
         io.write_plaintext_record(CONTENT_HANDSHAKE, &ch)?;
 
-        let mut transcript = Transcript::new(CipherSuite::TlsAes128GcmSha256.hash());
-        transcript.update(&ch);
-
-        // 2. ServerHello
+        // 2. ServerHello. The transcript is created *after* the suite is
+        //    known: RFC 8446 §4.4.1 uses the negotiated suite's hash for
+        //    every message, including the ClientHello. Creating it with
+        //    SHA-256 up front is wrong when the server picks
+        //    TLS_AES_256_GCM_SHA384 (OpenSSL's default preference), which
+        //    would make both sides derive different handshake keys and
+        //    fail with bad_record_mac.
         let (_, sh_body) = io.read_plaintext_handshake()?;
         let sh = parse_server_hello(&sh_body)?;
-        transcript.update(&encode_hs(HS_SERVER_HELLO, &sh_body));
+        // RFC 8446 §4.1.3: the echoed session id must match the one we
+        // sent (we send an empty one).
+        if !sh.session_id.is_empty() {
+            return Err(TlsError::Protocol("ServerHello session id mismatch".into()));
+        }
+
+        let mut transcript = Transcript::new(sh.suite.hash());
+        transcript.update(&ch);
+        let sh_msg = encode_hs(HS_SERVER_HELLO, &sh_body);
+        transcript.update(&sh_msg);
 
         // 3. ECDHE + key schedule
         let shared = x25519::x25519(&priv_key, &sh.key_share);
@@ -802,7 +844,7 @@ impl ServerHandshake {
         let shared = x25519::x25519(&s_priv, &ch.key_share);
         let mut random = [0u8; 32];
         fill_entropy(&mut random)?;
-        let sh = build_server_hello(&random, &s_pub, ch.suite);
+        let sh = build_server_hello(&random, &s_pub, ch.suite, &ch.session_id);
         io.write_plaintext_record(CONTENT_HANDSHAKE, &sh)?;
         let sh_body = sh[4..].to_vec();
         transcript.update(&encode_hs(HS_SERVER_HELLO, &sh_body));
@@ -945,6 +987,10 @@ struct ClientHelloInfo {
     server_name: Option<String>,
     /// ALPN protocols offered by the client.
     alpn: Vec<Vec<u8>>,
+    /// The client's legacy_session_id (RFC 8446 §4.1.3: the server MUST
+    /// echo it verbatim in the ServerHello, or a conforming client will
+    /// abort with illegal_parameter).
+    session_id: Vec<u8>,
 }
 
 fn parse_client_hello(body: &[u8]) -> TlsResult<ClientHelloInfo> {
@@ -957,8 +1003,10 @@ fn parse_client_hello(body: &[u8]) -> TlsResult<ClientHelloInfo> {
     if sid_len > 32 {
         return Err(TlsError::Protocol("bad CH sid".into()));
     }
-    c.take(sid_len)
-        .ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
+    let session_id = c
+        .take(sid_len)
+        .ok_or_else(|| TlsError::Protocol("bad CH".into()))?
+        .to_vec();
     // cipher suites
     let suites_len = c.u16().ok_or_else(|| TlsError::Protocol("bad CH".into()))? as usize;
     if suites_len < 2 || !suites_len.is_multiple_of(2) {
@@ -1070,21 +1118,26 @@ fn parse_client_hello(body: &[u8]) -> TlsResult<ClientHelloInfo> {
     Ok(ClientHelloInfo {
         suite,
         key_share: key_share.unwrap(),
+        session_id,
         server_name,
         alpn: client_alpn,
     })
 }
 
 /// Build a ServerHello (full message) for the given suite and key share.
+/// The client's `session_id` is echoed verbatim (RFC 8446 §4.1.3).
 pub(crate) fn build_server_hello(
     random: &[u8; 32],
     key_share: &[u8; 32],
     suite: CipherSuite,
+    session_id: &[u8],
 ) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&[0x03, 0x03]);
     body.extend_from_slice(random);
-    body.push(0); // legacy_session_id (empty)
+    // legacy_session_id_echo: must match the client's session id.
+    body.push(session_id.len() as u8);
+    body.extend_from_slice(session_id);
     body.extend_from_slice(&suite.wire().to_be_bytes());
     body.push(0); // compression null
 

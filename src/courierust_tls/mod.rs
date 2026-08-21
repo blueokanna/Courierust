@@ -206,7 +206,9 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsIo<R, W> 
         Ok((payload[0], payload[4..].to_vec()))
     }
 
-    /// Write an encrypted record.
+    /// Write an encrypted record and flush it to the transport. Used for
+    /// handshake flights and alerts, where the peer is waiting on the
+    /// bytes before it can continue.
     pub(crate) fn write_encrypted_record(
         &mut self,
         suite: key_schedule::CipherSuite,
@@ -218,6 +220,23 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsIo<R, W> 
         let rec = seal_record(suite, keys, seq, content_type, payload)?;
         self.writer.write_all(&rec).map_err(TlsError::from)?;
         self.writer.flush().map_err(TlsError::from)
+    }
+
+    /// Write an encrypted record into the internal buffer *without*
+    /// flushing. Bulk application data uses this and flushes once per
+    /// batch ([`crate::courierust_tls::TlsStream::write_all`]) so a large
+    /// body costs one syscall per buffer-full instead of one per
+    /// ~16 KiB record.
+    pub(crate) fn write_encrypted_record_buffered(
+        &mut self,
+        suite: key_schedule::CipherSuite,
+        keys: &key_schedule::TrafficKeys,
+        content_type: u8,
+        payload: &[u8],
+    ) -> TlsResult<()> {
+        let seq = self.write_seq.next()?;
+        let rec = seal_record(suite, keys, seq, content_type, payload)?;
+        self.writer.write_all(&rec).map_err(TlsError::from)
     }
 
     pub(crate) fn read_encrypted_handshake(
@@ -236,6 +255,12 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsIo<R, W> 
                 return Err(TlsError::Protocol("record too large".into()));
             }
             let encrypted = self.reader.read_exact(len).map_err(TlsError::from)?;
+            if header[0] == record::CONTENT_CHANGE_CIPHER_SPEC {
+                if len != 1 || encrypted.first() != Some(&1) {
+                    return Err(TlsError::Protocol("malformed ChangeCipherSpec".into()));
+                }
+                continue;
+            }
             let seq = self.read_seq.next()?;
             let (ct, payload) = open_record(suite, keys, seq, &header, &encrypted)?;
             if ct == CONTENT_HANDSHAKE {
@@ -245,7 +270,10 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsIo<R, W> 
                     ));
                 }
                 plain.extend_from_slice(&payload);
-                if handshake::peek_complete_hs(&plain).is_some() {
+                // A peer may fragment its flight across many records; only
+                // stop once the whole flight (ending in Finished) is
+                // buffered.
+                if handshake::has_complete_finished(&plain) {
                     return Ok(plain);
                 }
             }
@@ -293,7 +321,12 @@ pub struct TlsStream<R, W> {
     server_name: Option<String>,
     peer_certificate: Option<Vec<u8>>,
     closed: bool,
+    /// A decrypted record awaiting delivery to the caller.
     pending: Vec<u8>,
+    /// Read offset into `pending`. Keeping a cursor instead of draining
+    /// the front of the Vec avoids an O(n²) memmove when a caller reads
+    /// a large record in small chunks.
+    pending_pos: usize,
     /// Resumable inbound record read (see [`RecState`]).
     rec: RecState,
 }
@@ -330,11 +363,10 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
         if self.closed {
             return Err(TlsError::Protocol("connection closed".into()));
         }
-        // Split into record-sized chunks.
         let mut off = 0;
         while off < data.len() {
             let take = core::cmp::min(data.len() - off, record::MAX_RECORD_PAYLOAD - 2);
-            self.io.write_encrypted_record(
+            self.io.write_encrypted_record_buffered(
                 self.suite,
                 &self.write_keys,
                 record::CONTENT_APPLICATION_DATA,
@@ -342,6 +374,7 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
             )?;
             off += take;
         }
+        self.io.writer.flush().map_err(TlsError::from)?;
         Ok(())
     }
 
@@ -363,6 +396,12 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
                 return Err(TlsError::Protocol("record too large".into()));
             }
             let (header, encrypted) = self.read_record_payload()?;
+            if header[0] == record::CONTENT_CHANGE_CIPHER_SPEC {
+                if encrypted.len() != 1 || encrypted[0] != 1 {
+                    return Err(TlsError::Protocol("malformed ChangeCipherSpec".into()));
+                }
+                continue;
+            }
             let seq = self.io.read_seq.next()?;
             let (ct, payload) = open_record(self.suite, &self.read_keys, seq, &header, &encrypted)?;
             match ct {
@@ -385,6 +424,9 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
                             ));
                         }
                     }
+                }
+                record::CONTENT_CHANGE_CIPHER_SPEC => {
+                    continue;
                 }
                 _ => {
                     return Err(TlsError::Protocol("unexpected record type".into()));
@@ -509,7 +551,7 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> crate::couri
     for TlsStream<R, W>
 {
     fn read(&mut self, buf: &mut [u8]) -> crate::courierust_error::Result<usize> {
-        if self.pending.is_empty() {
+        if self.pending_pos >= self.pending.len() {
             self.pending = match self.read_record() {
                 Ok(p) => p,
                 Err(TlsError::Timeout) => {
@@ -524,13 +566,15 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> crate::couri
                     ))
                 }
             };
+            self.pending_pos = 0;
             if self.pending.is_empty() {
                 return Ok(0);
             }
         }
-        let n = core::cmp::min(buf.len(), self.pending.len());
-        buf[..n].copy_from_slice(&self.pending[..n]);
-        self.pending.drain(..n);
+        let avail = self.pending.len() - self.pending_pos;
+        let n = core::cmp::min(buf.len(), avail);
+        buf[..n].copy_from_slice(&self.pending[self.pending_pos..self.pending_pos + n]);
+        self.pending_pos += n;
         Ok(n)
     }
 }
@@ -549,7 +593,12 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> crate::couri
     }
 
     fn flush(&mut self) -> crate::courierust_error::Result<()> {
-        Ok(())
+        self.io.writer.flush().map_err(|e| {
+            crate::courierust_error::Error::with_message(
+                crate::courierust_error::ErrorKind::Other,
+                e.to_string(),
+            )
+        })
     }
 }
 
@@ -622,6 +671,7 @@ impl TlsConnector {
             peer_certificate: result.peer_cert,
             closed: false,
             pending: Vec::new(),
+            pending_pos: 0,
             rec: RecState::Idle,
         })
     }
@@ -678,6 +728,7 @@ impl TlsAcceptor {
             peer_certificate: result.peer_cert,
             closed: false,
             pending: Vec::new(),
+            pending_pos: 0,
             rec: RecState::Idle,
         })
     }

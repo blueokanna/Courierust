@@ -40,6 +40,11 @@ pub fn seal(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], plaintext: &[u8]) -> V
 
 /// Compute the Poly1305 tag over `aad` and `ciphertext` per RFC 8439.
 fn compute_tag(one_time_key: &[u8; 32], aad: &[u8], ct: &[u8]) -> [u8; TAG_LEN] {
+    // Save the original lengths first: the loop below advances the `aad`
+    // slice, so reading `aad.len()` afterwards would give the remainder
+    // (a real bug for AAD >= 16 bytes).
+    let aad_len = aad.len();
+    let ct_len = ct.len();
     let mut mac = Poly1305::new(one_time_key);
     let mut block = [0u8; 16];
     let mut aad = aad;
@@ -64,8 +69,8 @@ fn compute_tag(one_time_key: &[u8; 32], aad: &[u8], ct: &[u8]) -> [u8; TAG_LEN] 
         block[..ct_slice.len()].copy_from_slice(ct_slice);
         mac.update(&block);
     }
-    mac.update(&(aad.len() as u64).to_le_bytes());
-    mac.update(&(ct.len() as u64).to_le_bytes());
+    mac.update(&(aad_len as u64).to_le_bytes());
+    mac.update(&(ct_len as u64).to_le_bytes());
     mac.finish()
 }
 

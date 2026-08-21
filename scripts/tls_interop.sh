@@ -25,7 +25,14 @@ set -euo pipefail
 
 BENCH_DIR="${1:-benches/target/release}"
 LOGFILE="${2:-tls_interop.log}"
-# Resolve to an absolute path before we cd into the temp dir.
+# Resolve BOTH to absolute paths before we cd into the temp dir below —
+# otherwise the relative `$BENCH_DIR/deps/<name>` paths that `find_bin`
+# returns would resolve against the temp dir and every spawned binary
+# would fail with "No such file or directory".
+case "$BENCH_DIR" in
+  /*) : ;;
+  *) BENCH_DIR="$PWD/$BENCH_DIR" ;;
+esac
 case "$LOGFILE" in
   /*) : ;;
   *) LOGFILE="$PWD/$LOGFILE" ;;
@@ -33,6 +40,13 @@ esac
 OPENSSL_BIN="${OPENSSL:-openssl}"
 CURL_BIN="${CURL:-curl}"
 NGINX_BIN="${NGINX:-nginx}"
+# Some environments (e.g. Windows machines with a stale OPENSSL_CONF
+# pointing at a missing file) ship a broken openssl.cnf. Fall back to the
+# compiled-in default so certificate generation cannot fail for that
+# reason.
+if [[ -n "${OPENSSL_CONF:-}" && ! -f "$OPENSSL_CONF" ]]; then
+  unset OPENSSL_CONF
+fi
 : > "$LOGFILE"
 
 # Locate a bench binary: prefer `$BENCH_DIR/<name>`, else the newest
@@ -49,6 +63,13 @@ find_bin() {
     return 0
   fi
   while IFS= read -r f; do
+    # Skip build-metadata artifacts that `cargo` writes next to the
+    # binary (dep-info, PDB debug info, rlib/rmeta/so/object files): on
+    # Windows the filesystem reports them as executable, so `-x` alone is
+    # not enough.
+    case "$f" in
+      *.d|*.pdb|*.rlib|*.rmeta|*.so|*.dll|*.dylib|*.o) continue ;;
+    esac
     if [[ -f "$f" && -x "$f" ]]; then
       printf '%s\n' "$f"
       return 0
@@ -60,8 +81,24 @@ TLS_INTEROP_BIN="$(find_bin tls_interop || true)"
 NETWORK_BIN="$(find_bin network || true)"
 if [[ -z "$TLS_INTEROP_BIN" || -z "$NETWORK_BIN" ]]; then
   echo "error: built tls_interop/network bench binaries not found under $BENCH_DIR" >&2
+  echo "searched: $BENCH_DIR/<name> and $BENCH_DIR/deps/<name>-*" >&2
+  echo "deps dir listing:" >&2
+  ls -la "$BENCH_DIR/deps/" 2>/dev/null | grep -E 'tls_interop|network' || true
   exit 1
 fi
+# Re-verify at *use* time and log what was picked, so a wrong artifact
+# (or one that vanished after a cache prune) is visible in CI instead of
+# a bare "No such file or directory".
+require_bin() {
+  local path="$1" role="$2"
+  if [[ ! -f "$path" || ! -x "$path" ]]; then
+    echo "error: $role binary not usable: $path" >&2
+    exit 1
+  fi
+  echo "TLSINTEROP|binary|$role|$path"
+}
+require_bin "$TLS_INTEROP_BIN" "tls_interop"
+require_bin "$NETWORK_BIN" "network"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
