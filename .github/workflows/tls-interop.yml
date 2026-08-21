@@ -55,8 +55,12 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq nginx
           nginx -v
+      # Build-only: `cargo bench` without `--no-run` would *execute* the
+      # benches, and the `network` bench's client mode panics without a
+      # target URL. The binaries land in target/release/deps/<name>-<hash>;
+      # scripts/tls_interop.sh locates them automatically.
       - name: Build the interop binaries (release)
-        run: cargo bench --manifest-path benches/Cargo.toml --locked --bench tls_interop --bench network
+        run: cargo bench --manifest-path benches/Cargo.toml --locked --bench tls_interop --bench network --no-run
       - name: Run TLS interop (OpenSSL s_server, curl, s_client, nginx)
         shell: bash
         run: |

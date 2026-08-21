@@ -87,7 +87,7 @@ impl H2Conn {
     pub(crate) fn release(&self) {
         let _ = self
             .reservations
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                 Some(value.saturating_sub(1))
             });
     }

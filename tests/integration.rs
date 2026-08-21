@@ -1089,38 +1089,90 @@ fn https_redirect_preserves_scheme() {
 // not hold workers
 // ---------------------------------------------------------------------
 
-/// Read one complete raw HTTP/1.1 response (head + Content-Length body)
-/// from a socket.
-fn read_raw_response(stream: &mut std::net::TcpStream) -> String {
-    use std::io::Read;
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 4096];
-    let mut head_end = None;
-    while head_end.is_none() {
-        let n = stream.read(&mut tmp).unwrap();
-        assert!(n > 0, "unexpected EOF while reading response head");
-        buf.extend_from_slice(&tmp[..n]);
-        head_end = find_subslice(&buf, b"\r\n\r\n");
+/// A raw TCP client with persistent read buffering.
+///
+/// `read_response` must not discard bytes that arrive in the same TCP
+/// segment as an earlier response: a naive "read head + body" helper
+/// consumes the pipelined tail into its scratch buffer and then blocks
+/// forever waiting for the next response (the server already sent it).
+/// Keeping the leftover here makes reading multiple pipelined responses
+/// on one connection deterministic across platforms and scheduling.
+struct RawConn {
+    stream: std::net::TcpStream,
+    /// Bytes read from the socket but not yet returned to the caller.
+    leftover: Vec<u8>,
+    /// Consume cursor into `leftover` (compacted once it grows).
+    pos: usize,
+}
+
+impl RawConn {
+    fn new(stream: std::net::TcpStream) -> Self {
+        // A read timeout turns a server stall into a fast test failure
+        // instead of a multi-minute hang.
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+        Self {
+            stream,
+            leftover: Vec::new(),
+            pos: 0,
+        }
     }
-    let he = head_end.unwrap() + 4;
-    let head = String::from_utf8_lossy(&buf[..he]);
-    let cl = head
-        .lines()
-        .find_map(|l| {
-            let (k, v) = l.split_once(':')?;
-            if k.eq_ignore_ascii_case("content-length") {
-                v.trim().parse::<usize>().ok()
-            } else {
-                None
+
+    fn stream(&mut self) -> &mut std::net::TcpStream {
+        &mut self.stream
+    }
+
+    /// Read one complete HTTP/1.1 response (head + Content-Length body).
+    fn read_response(&mut self) -> String {
+        loop {
+            if let Some((head_end, cl)) = self.find_response() {
+                let total = head_end + cl;
+                while self.leftover.len() - self.pos < total {
+                    self.fill();
+                }
+                let s =
+                    String::from_utf8_lossy(&self.leftover[self.pos..self.pos + total]).to_string();
+                self.pos += total;
+                self.compact();
+                return s;
             }
-        })
-        .unwrap_or(0);
-    while buf.len() < he + cl {
-        let n = stream.read(&mut tmp).unwrap();
-        assert!(n > 0, "unexpected EOF while reading response body");
-        buf.extend_from_slice(&tmp[..n]);
+            self.fill();
+        }
     }
-    String::from_utf8_lossy(&buf[..he + cl]).to_string()
+
+    /// Locate the response head end and Content-Length in the buffered
+    /// (unconsumed) data.
+    fn find_response(&self) -> Option<(usize, usize)> {
+        let buf = &self.leftover[self.pos..];
+        let he = find_subslice(buf, b"\r\n\r\n")? + 4;
+        let head = String::from_utf8_lossy(&buf[..he]);
+        let cl = head
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                if k.eq_ignore_ascii_case("content-length") {
+                    v.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        Some((he, cl))
+    }
+
+    fn fill(&mut self) {
+        use std::io::Read;
+        let mut tmp = [0u8; 4096];
+        let n = self.stream.read(&mut tmp).unwrap();
+        assert!(n > 0, "unexpected EOF while reading response");
+        self.leftover.extend_from_slice(&tmp[..n]);
+    }
+
+    fn compact(&mut self) {
+        if self.pos >= 64 * 1024 {
+            self.leftover.drain(..self.pos);
+            self.pos = 0;
+        }
+    }
 }
 
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -1154,14 +1206,15 @@ fn event_many_idle_connections_do_not_block_workers() {
         resp
     });
     let addr = base.trim_start_matches("http://").to_string();
-    let mut idle: Vec<TcpStream> = Vec::new();
+    let mut idle: Vec<RawConn> = Vec::new();
     for _ in 0..60 {
-        let mut s = TcpStream::connect(&addr).unwrap();
-        s.write_all(b"GET /idle HTTP/1.1\r\nHost: x\r\n\r\n")
+        let mut c = RawConn::new(TcpStream::connect(&addr).unwrap());
+        c.stream()
+            .write_all(b"GET /idle HTTP/1.1\r\nHost: x\r\n\r\n")
             .unwrap();
-        let resp = read_raw_response(&mut s);
+        let resp = c.read_response();
         assert!(resp.starts_with("HTTP/1.1 200"), "got {resp}");
-        idle.push(s); // hold open: idle keep-alive
+        idle.push(c); // hold open: idle keep-alive
     }
 
     let client = Client::new();
@@ -1174,10 +1227,11 @@ fn event_many_idle_connections_do_not_block_workers() {
         t0.elapsed()
     );
 
-    for s in idle.iter_mut() {
-        s.write_all(b"GET /again HTTP/1.1\r\nHost: x\r\n\r\n")
+    for c in idle.iter_mut() {
+        c.stream()
+            .write_all(b"GET /again HTTP/1.1\r\nHost: x\r\n\r\n")
             .unwrap();
-        let resp = read_raw_response(s);
+        let resp = c.read_response();
         assert!(resp.starts_with("HTTP/1.1 200"), "got {resp}");
     }
 }
@@ -1223,11 +1277,13 @@ fn event_keepalive_sequential_requests_do_not_stall() {
         resp
     });
     let addr = base.trim_start_matches("http://").to_string();
-    let mut s = TcpStream::connect(&addr).unwrap();
+    let mut c = RawConn::new(TcpStream::connect(&addr).unwrap());
     let t0 = std::time::Instant::now();
     for _ in 0..200 {
-        s.write_all(b"GET /k HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
-        let resp = read_raw_response(&mut s);
+        c.stream()
+            .write_all(b"GET /k HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap();
+        let resp = c.read_response();
         assert!(resp.starts_with("HTTP/1.1 200"), "got {resp}");
     }
     assert!(
@@ -1390,13 +1446,15 @@ fn event_slow_sender_resumes_partial_request() {
     });
     let addr = base.trim_start_matches("http://").to_string();
 
-    let mut s = TcpStream::connect(&addr).unwrap();
+    let mut c = RawConn::new(TcpStream::connect(&addr).unwrap());
     // Send a partial request, then stall well beyond any poll timeout.
-    s.write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\n").unwrap();
+    c.stream()
+        .write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\n")
+        .unwrap();
     std::thread::sleep(Duration::from_millis(300));
     let t0 = Instant::now();
-    s.write_all(b"\r\n").unwrap(); // complete the headers
-    let resp = read_raw_response(&mut s);
+    c.stream().write_all(b"\r\n").unwrap(); // complete the headers
+    let resp = c.read_response();
     assert!(resp.starts_with("HTTP/1.1 200"), "got {resp}");
 
     assert!(t0.elapsed() < Duration::from_secs(10));
@@ -1433,11 +1491,12 @@ fn event_pipelining() {
     });
     let addr = base.trim_start_matches("http://").to_string();
 
-    let mut s = TcpStream::connect(&addr).unwrap();
-    s.write_all(b"GET /one HTTP/1.1\r\nHost: x\r\n\r\nGET /two HTTP/1.1\r\nHost: x\r\n\r\n")
+    let mut c = RawConn::new(TcpStream::connect(&addr).unwrap());
+    c.stream()
+        .write_all(b"GET /one HTTP/1.1\r\nHost: x\r\n\r\nGET /two HTTP/1.1\r\nHost: x\r\n\r\n")
         .unwrap();
-    let r1 = read_raw_response(&mut s);
-    let r2 = read_raw_response(&mut s);
+    let r1 = c.read_response();
+    let r2 = c.read_response();
     assert!(r1.contains("/one"), "got {r1}");
     assert!(r2.contains("/two"), "got {r2}");
 }

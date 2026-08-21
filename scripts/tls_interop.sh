@@ -35,6 +35,24 @@ CURL_BIN="${CURL:-curl}"
 NGINX_BIN="${NGINX:-nginx}"
 : > "$LOGFILE"
 
+# Locate a bench binary: prefer `$BENCH_DIR/<name>`, else the newest
+# `$BENCH_DIR/deps/<name>-*` (the output location of `cargo bench
+# --no-run`, whose artifact names carry a hash).
+find_bin() {
+  local name="$1"
+  if [[ -x "$BENCH_DIR/$name" ]]; then
+    printf '%s\n' "$BENCH_DIR/$name"
+    return 0
+  fi
+  ls -t "$BENCH_DIR"/deps/${name}-* 2>/dev/null | head -1
+}
+TLS_INTEROP_BIN="$(find_bin tls_interop)"
+NETWORK_BIN="$(find_bin network)"
+if [[ -z "$TLS_INTEROP_BIN" || -z "$NETWORK_BIN" ]]; then
+  echo "error: built tls_interop/network bench binaries not found under $BENCH_DIR" >&2
+  exit 1
+fi
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 cd "$WORK"
@@ -89,7 +107,7 @@ if wait_port "$PORT_A"; then
   if COURIERUST_TLS_URL="https://localhost:$PORT_A/" \
      COURIERUST_TLS_ROOT="$WORK/ca.der" \
      COURIERUST_TLS_PROTO="h1" \
-     "$BENCH_DIR/tls_interop" > tls_s_server.log 2>&1; then
+     "$TLS_INTEROP_BIN" > tls_s_server.log 2>&1; then
     cat tls_s_server.log
     record "TLSINTEROP|role=client|peer=openssl_s_server|protocol=h1|status=ok"
   else
@@ -114,7 +132,7 @@ COURIERUST_NETWORK_HTTP2=1 \
 COURIERUST_NETWORK_CERT_DER="$WORK/server_cert.der" \
 COURIERUST_NETWORK_KEY_DER="$WORK/server_key.der" \
 COURIERUST_NETWORK_PAYLOAD=64 \
-  "$BENCH_DIR/network" > tls_server.log 2>&1 &
+  "$NETWORK_BIN" > tls_server.log 2>&1 &
 SRV_PID=$!
 
 if wait_port "$PORT_B"; then
@@ -182,7 +200,7 @@ EOF
     if COURIERUST_TLS_URL="https://localhost:$PORT_C/" \
        COURIERUST_TLS_ROOT="$WORK/ca.der" \
        COURIERUST_TLS_PROTO="h2" \
-       "$BENCH_DIR/tls_interop" > tls_nginx.log 2>&1; then
+       "$TLS_INTEROP_BIN" > tls_nginx.log 2>&1; then
       cat tls_nginx.log
       record "TLSINTEROP|role=client|peer=nginx|protocol=h2|status=ok"
     else
