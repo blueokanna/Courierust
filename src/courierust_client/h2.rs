@@ -1052,9 +1052,15 @@ fn cleanup(
 }
 
 /// Convert a header list into the HPACK fields for an h2 request.
+///
+/// `scheme` is the transport scheme (`http`/`https`); `authority` is the
+/// request URI's authority (`host:port`), used as the `:authority`
+/// pseudo-header when the request itself carries no `authority`/`host`
+/// header (RFC 9113 §8.3.1 — nginx rejects requests without it).
 pub fn request_fields(
     req: &crate::courierust_http::request::Request<Body>,
     scheme: &str,
+    authority: &str,
 ) -> Vec<HeaderField> {
     let head = crate::courierust_http::request::RequestHead {
         method: req.method.clone(),
@@ -1062,7 +1068,7 @@ pub fn request_fields(
         version: req.version,
         headers: req.headers.clone(),
     };
-    head.to_h2_fields(scheme)
+    head.to_h2_fields(scheme, Some(authority))
 }
 
 /// A helper for the driver: build the pseudo-header set manually if needed.

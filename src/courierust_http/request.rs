@@ -148,8 +148,17 @@ impl RequestHead {
     /// required pseudo-headers are present. `scheme` is the connection's
     /// URI scheme (`http` or `https`); RFC 9113 §8.1.2.3 requires the
     /// `:scheme` pseudo-header to match the transport, and nginx rejects
-    /// a TLS connection that claims `http`.
-    pub fn to_h2_fields(&self, scheme: &str) -> crate::courierust_hpack::HeaderList {
+    /// a TLS connection that claims `http`. `authority` is the request
+    /// URI's authority (`host:port`) and is used as the `:authority`
+    /// pseudo-header when the request carries no `authority`/`host`
+    /// header — RFC 9113 §8.3.1 requires `:authority` whenever the
+    /// target URI has an authority component, and nginx returns 400
+    /// when it is absent.
+    pub fn to_h2_fields(
+        &self,
+        scheme: &str,
+        authority: Option<&str>,
+    ) -> crate::courierust_hpack::HeaderList {
         let mut fields = crate::courierust_hpack::HeaderList::with_capacity(self.headers.len() + 4);
         fields.push(crate::courierust_hpack::HeaderField::new(
             HeaderName::from_lowercase(":method"),
@@ -160,18 +169,18 @@ impl RequestHead {
             HeaderValue::from_bytes(self.uri.as_bytes())
                 .unwrap_or_else(|_| HeaderValue::from_static("/")),
         ));
-        if let Some(auth) = self
+        let auth = self
             .headers
             .get("authority")
             .or_else(|| self.headers.get("host"))
-        {
+            .cloned()
+            .or_else(|| authority.and_then(|a| HeaderValue::from_bytes(a.as_bytes()).ok()));
+        if let Some(auth) = auth {
             fields.push(crate::courierust_hpack::HeaderField::new(
                 HeaderName::from_lowercase(":authority"),
-                auth.clone(),
+                auth,
             ));
         }
-        // A single scheme pseudo-header matching the actual transport
-        // (http for plain, https for TLS).
         let is_https = scheme.eq_ignore_ascii_case("https");
         fields.push(crate::courierust_hpack::HeaderField::new(
             HeaderName::from_lowercase(":scheme"),
@@ -195,5 +204,64 @@ impl RequestHead {
             ));
         }
         fields
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn name_of(f: &crate::courierust_hpack::HeaderField) -> &str {
+        f.name.as_str()
+    }
+
+    fn value_of(f: &crate::courierust_hpack::HeaderField) -> &str {
+        f.value.to_str().unwrap_or("")
+    }
+
+    /// RFC 9113 §8.3.1: a request whose target URI has an authority
+    /// component MUST carry `:authority`. A request built without a
+    /// `host`/`authority` header (e.g. `Request::new`) must fall back to
+    /// the URI authority — nginx rejects the request with 400 otherwise.
+    #[test]
+    fn h2_fields_use_uri_authority_fallback() {
+        let req = Request::<Body>::new(Method::GET, "/");
+        let head: RequestHead = req.into_parts().0;
+        let fields = head.to_h2_fields("https", Some("localhost:8443"));
+        let scheme = fields
+            .iter()
+            .find(|f| name_of(f) == ":scheme")
+            .expect(":scheme present");
+        assert_eq!(value_of(scheme), "https");
+        let auth = fields
+            .iter()
+            .find(|f| name_of(f) == ":authority")
+            .expect(":authority present from URI fallback");
+        assert_eq!(value_of(auth), "localhost:8443");
+    }
+
+    /// An explicit `authority`/`host` header must win over the URI
+    /// authority, and hop-by-hop headers are dropped (§8.1.2.2).
+    #[test]
+    fn h2_fields_prefer_explicit_authority_and_drop_hop_by_hop() {
+        let mut req = Request::<Body>::new(Method::GET, "/");
+        req.headers.insert(
+            HeaderName::from_lowercase("host"),
+            HeaderValue::from_static("explicit.example"),
+        );
+        req.headers.insert(
+            HeaderName::from_lowercase("connection"),
+            HeaderValue::from_static("keep-alive"),
+        );
+        let head: RequestHead = req.into_parts().0;
+        let fields = head.to_h2_fields("http", Some("uri.example:8080"));
+        let auth = fields
+            .iter()
+            .find(|f| name_of(f) == ":authority")
+            .expect(":authority present");
+        assert_eq!(value_of(auth), "explicit.example");
+        assert!(!fields.iter().any(|f| name_of(f) == "connection"));
+        assert!(!fields.iter().any(|f| name_of(f) == "host"));
+        assert!(fields.iter().any(|f| name_of(f) == ":scheme"));
     }
 }
