@@ -95,11 +95,12 @@ fn print_result(
     mode: &str,
     payload: Payload,
     workers: usize,
+    server_threads: usize,
     mut timing: Timing,
 ) {
     timing.sort_samples();
     println!(
-        "RESULT|suite=throughput|case={case}|protocol={protocol}|mode={mode}|payload={}|bytes={}|workers={workers}|requests={}|elapsed_ms={:.3}|rps={:.1}|response_mbps={:.3}|p50_us={}|p75_us={}|p90_us={}|p95_us={}|p99_us={}|samples={}",
+        "RESULT|suite=throughput|case={case}|protocol={protocol}|mode={mode}|payload={}|bytes={}|workers={workers}|server_threads={server_threads}|requests={}|elapsed_ms={:.3}|rps={:.1}|response_mbps={:.3}|p50_us={}|p75_us={}|p90_us={}|p95_us={}|p99_us={}|samples={}",
         payload.name,
         payload.bytes,
         timing.requests,
@@ -124,10 +125,22 @@ fn bench_h1_sequential(payload: Payload, requests: usize, server_threads: usize)
     let timing = run_sequential(requests, MAX_SAMPLES, || {
         courierust_get(&client, &base_url, "/bench", payload.bytes)
     });
-    print_result("h1_sequential", "h1", "sequential", payload, 1, timing);
+    print_result(
+        "h1_sequential",
+        "h1",
+        "sequential",
+        payload,
+        1,
+        server_threads,
+        timing,
+    );
 }
 
 fn bench_h1_parallel(payload: Payload, requests: usize, workers: usize, server_threads: usize) {
+    // On blocking server platforms, one idle keep-alive connection occupies
+    // one server worker. Keep enough workers for the client herd or the
+    // sequential warm-up below can deadlock before measurement starts.
+    let server_threads = server_threads.max(workers);
     let address = spawn_server(payload_bytes(payload), false, server_threads);
     let base_url = Arc::new(format!("http://{address}"));
     let clients = Arc::new((0..workers).map(|_| Client::new()).collect::<Vec<_>>());
@@ -147,6 +160,7 @@ fn bench_h1_parallel(payload: Payload, requests: usize, workers: usize, server_t
         "parallel",
         payload,
         workers,
+        server_threads,
         timing,
     );
 }
@@ -172,6 +186,7 @@ fn bench_h2_multiplex(payload: Payload, requests: usize, workers: usize, server_
         "multiplex",
         payload,
         workers,
+        server_threads,
         timing,
     );
 }
@@ -252,6 +267,7 @@ fn bench_https(requests: usize, payload: Payload, server_threads: usize) {
         "sequential",
         payload,
         1,
+        server_threads,
         timing,
     );
 }

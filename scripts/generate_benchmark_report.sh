@@ -41,20 +41,21 @@ write_throughput_table() {
     local line
 
     if [[ -z "$lines" ]]; then
-        printf '| _No benchmark result captured_ | | | | | | | | | | | | | |\n'
+        printf '| _No benchmark result captured_ | | | | | | | | | | | | | | |\n'
         return
     fi
 
-    printf '| Case | Protocol | Mode | Payload | Workers | Requests | RPS | Resp MB/s | P50 us | P75 us | P90 us | P95 us | P99 us | Samples |\n'
-    printf '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n'
+    printf '| Case | Protocol | Mode | Payload | Workers | Server threads | Requests | RPS | Resp MB/s | P50 us | P75 us | P90 us | P95 us | P99 us | Samples |\n'
+    printf '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n'
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
-        printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
+        printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
             "$(result_field "$line" case)" \
             "$(result_field "$line" protocol)" \
             "$(result_field "$line" mode)" \
             "$(result_field "$line" payload)" \
             "$(result_field "$line" workers)" \
+            "$(result_field "$line" server_threads)" \
             "$(result_field "$line" requests)" \
             "$(result_field "$line" rps)" \
             "$(result_field "$line" response_mbps)" \

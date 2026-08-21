@@ -27,7 +27,7 @@ The benchmark profile uses thin LTO and one code-generation unit. Each suite exi
 | `h2_multiplex_w*` | h2c prior knowledge | One pooled HTTP/2 connection at 1, 8, and 32 workers |
 | `https_h2_sequential` | TLS 1.3 plus HTTP/2 | Certificate verification, ALPN, and encrypted request/response path |
 
-Each result records RPS, response throughput, and P50/P75/P90/P95/P99 request latency. `BENCH_REQUESTS` and `BENCH_SERVER_THREADS` can override the default request count and server worker count.
+Each result records RPS, response throughput, P50/P75/P90/P95/P99 request latency, and the actual server thread count. `BENCH_REQUESTS` and `BENCH_SERVER_THREADS` can override the default request count and server worker count. HTTP/1.1 parallel cases raise the effective server thread count to at least the client worker count because the Linux blocking server model reserves one worker per idle keep-alive connection.
 
 ## Cross-library comparison
 
@@ -45,6 +45,6 @@ The `raw_tcp_floor` row is only a transport reference for a four-byte echo. It i
 
 ## Reading Results
 
-Results are emitted as `RESULT|...` records for machine parsing and include protocol, payload, workers, request count, RPS, response MB/s, percentile latency, and sample count. Compare only rows with the same protocol, payload, worker count, and layer. Loopback measurements are sensitive to runner CPU allocation, kernel scheduling, and background load; use them for controlled comparisons on the same runner, not as universal performance claims.
+Results are emitted as `RESULT|...` records for machine parsing and include protocol, payload, client workers, server threads, request count, RPS, response MB/s, percentile latency, and sample count. Compare only rows with the same protocol, payload, worker count, server thread count, and layer. Loopback measurements are sensitive to runner CPU allocation, kernel scheduling, and background load; use them for controlled comparisons on the same runner, not as universal performance claims.
 
 `interop` emits `INTEROP|...` records. A failure or timeout is a compatibility regression and fails CI regardless of performance numbers.
