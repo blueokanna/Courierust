@@ -17,7 +17,7 @@ use crate::courierust_http::version::Version;
 use crate::courierust_net::ConnStream;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -75,6 +75,26 @@ pub struct H2Conn {
     /// Whether the connection still accepts new streams (flipped by the
     /// driver on GOAWAY / close).
     pub accepting: Arc<std::sync::atomic::AtomicBool>,
+    /// Number of requests currently reserved for dispatch on this driver.
+    reservations: Arc<AtomicUsize>,
+}
+
+impl H2Conn {
+    pub(crate) fn reserve(&self) {
+        self.reservations.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn release(&self) {
+        let _ = self
+            .reservations
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                Some(value.saturating_sub(1))
+            });
+    }
+
+    pub(crate) fn reservations(&self) -> usize {
+        self.reservations.load(Ordering::Acquire)
+    }
 }
 
 /// A stream awaiting its response.
@@ -148,6 +168,7 @@ fn start_inner(
     let cfg = cfg.clone();
     let accepting = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let accepting2 = accepting.clone();
+    let reservations = Arc::new(AtomicUsize::new(0));
     thread::Builder::new()
         .name("courierust-h2-driver".into())
         .spawn(move || driver(stream, rx, cfg, accepting2, seed, upgrade_reply))?;
@@ -155,6 +176,7 @@ fn start_inner(
         tx,
         peer,
         accepting,
+        reservations,
     })
 }
 
@@ -175,15 +197,8 @@ fn driver(
     let mut pending: HashMap<u32, Pending> = HashMap::new();
     let mut stream_bodies: HashMap<u32, StreamBody> = HashMap::new();
     let mut goaway = false;
-    // Commands that could not run yet because the peer's
-    // SETTINGS_MAX_CONCURRENT_STREAMS budget is exhausted. Retried after
-    // each poll once a stream slot frees up.
     let mut deferred: VecDeque<H2Cmd> = VecDeque::new();
 
-    // RFC 7540 §3.2 upgrade: stream 1 already exists (half-closed local)
-    // and its response must be delivered to the caller. Arm a pending
-    // entry so the driver loop treats the connection as busy until the
-    // response arrives.
     if let Some(reply) = upgrade_reply {
         if conn.register_upgrade_stream().is_ok() {
             let (body_tx, body_rx) = channel::<Result<Bytes>>();
@@ -236,13 +251,10 @@ fn driver(
             }
         }
 
-        // A deferred command still counts as work: the only way a stream
-        // slot frees is by polling (streams closing), so the driver must
-        // not park in recv_timeout while one is pending.
         let has_work =
             got_cmd || !deferred.is_empty() || !pending.is_empty() || !stream_bodies.is_empty();
         if has_work {
-            match conn.poll() {
+            match conn.poll_available(64) {
                 Ok(true) => last_rx = std::time::Instant::now(),
                 Ok(false) => {}
                 Err(e) => {
@@ -259,8 +271,6 @@ fn driver(
                 cfg.max_body,
             );
             drain_stream_bodies(&mut conn, &mut stream_bodies);
-            // Streams may have closed during the poll; retry deferred
-            // commands while the budget allows.
             if !retry_deferred(
                 &mut conn,
                 &mut pending,
@@ -303,7 +313,7 @@ fn driver(
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    match conn.poll() {
+                    match conn.poll_available(64) {
                         Ok(true) => last_rx = std::time::Instant::now(),
                         Ok(false) => {}
                         Err(e) => {
@@ -460,8 +470,6 @@ fn handle_cmd(
                 let _ = reply.send(Err(Error::canceled("connection received GOAWAY")));
                 return true;
             }
-            // Respect the peer's SETTINGS_MAX_CONCURRENT_STREAMS (RFC
-            // 9113 §5.1.2): never exceed the budget the peer advertised.
             if stream_limit_reached(conn, pending) {
                 if deferred.len() < MAX_DEFERRED {
                     deferred.push_back(H2Cmd::Request {
@@ -964,8 +972,7 @@ pub(crate) fn build_upgrade_request(
     Ok(out)
 }
 
-/// Parse a complete HTTP/1.1 response head (status line + headers,
-/// including the trailing CRLFCRLF) into its components.
+/// Parse a complete HTTP/1.1 response head into its components
 fn parse_head_headers(head: &[u8]) -> Result<(StatusCode, Version, HeaderMap)> {
     let end =
         find_subslice(head, b"\r\n").ok_or_else(|| Error::protocol("malformed response head"))?;
@@ -1049,8 +1056,7 @@ pub fn request_fields(req: &crate::courierust_http::request::Request<Body>) -> V
     head.to_h2_fields()
 }
 
-/// A helper for the driver: build the pseudo-header set manually if
-/// needed.
+/// A helper for the driver: build the pseudo-header set manually if needed.
 #[allow(dead_code)]
 fn _field(name: &str, value: &str) -> HeaderField {
     HeaderField::new(

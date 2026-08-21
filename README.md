@@ -13,7 +13,7 @@ None of this wraps an existing library. Frame codecs, HPACK header compression, 
 The mainstream Rust HTTP ecosystem (hyper / h2 / h3 and friends) is excellent, but the dependency trees run deep, and things like `no_std` support, core affinity, and "what does this client look like to a server" are left as your problem. This crate is built around three constraints:
 
 - **The protocol layer never touches `std`.** `std` only provides threads, TCP, and clocks.
-- **Multi-core is real — within the model.** Connection pools are sharded per worker, HTTP/2 connections are spread across workers, and jobs move through a work-stealing scheduler — not one big lock. Worker occupancy is **per connection**: a single HTTP/2 connection with many streams (or a slow stream, or SSE) holds exactly one worker, so a connection's streams never multiply worker usage and never block each other. The honest corollary is that a herd of *connections* needs either many workers or the Windows event-driven mode for plain HTTP/1.1 (see Limitations).
+- **Multi-core is explicit — within the model.** Server connections are dispatched through a work-stealing pool. Client pools are shared by authority, and HTTP/2 requests are multiplexed by a dedicated driver per connection; set `max_connections_per_host` when independent connections are needed for load distribution. Worker occupancy is **per connection**: a single HTTP/2 connection with many streams (or a slow stream, or SSE) holds exactly one server worker, so a connection's streams never multiply worker usage and never block each other. The honest corollary is that a herd of *connections* needs either many workers or the Windows event-driven mode for plain HTTP/1.1 (see Limitations).
 - **The wire details are implemented against the RFCs and verified against published test vectors**, not "good enough to pass a smoke test."
 
 ## Features
@@ -40,8 +40,8 @@ The mainstream Rust HTTP ecosystem (hyper / h2 / h3 and friends) is excellent, b
 
 - **Work-stealing thread pool** (`courierust_pool`): per-worker LIFO cache + global FIFO steal queue; jobs can spawn jobs; stealing prefers the worker idle the longest.
 - **Client** (`courierust_client`):
-  - HTTP/1.1 keep-alive connection pool grouped by authority and sharded per worker (per-shard locks instead of a global mutex);
-  - HTTP/2 connections also sharded per worker with round-robin distribution and multiplexing;
+  - HTTP/1.1 keep-alive connection pool grouped by authority with bounded reuse;
+  - HTTP/2 connections multiplex streams through dedicated drivers and can be capped per authority;
   - Redirect following (301/302/303 → GET), timeouts, `User-Agent`, etc.
 - **Server** (`courierust_server`): each accepted connection becomes a pool job, so connection handling scales across cores.
 - **gRPC** (`courierust_grpc`): HTTP/2 + length-prefixed message framing + `grpc-status` / `grpc-message` handling, with unary, server-streaming, client-streaming and bidi calls on both sides. `gzip` message compression is implemented from scratch (RFC 1951/1952: full DEFLATE decompression for any producer, fixed-Huffman LZ77 compression) and negotiated per gRPC A6. Deadlines (`grpc-timeout`) are enforced server-side, metadata and interceptors are supported, `dns:///` targets round-robin, and the `grpc.health.v1.Health` service provides `Check` and `Watch`. Protobuf is deliberately left to you — implement `EncodeMessage` / `DecodeMessage` for your types, or use the raw-bytes API.
@@ -65,9 +65,9 @@ A `Priority { urgency, incremental }` can be parsed from the `Priority` header /
 
 The naive implementation replies with a `WINDOW_UPDATE` per frame, and control-frame overhead adds up. BCR accumulates received data and returns credit in batches, cutting control frames by roughly an order of magnitude.
 
-### Sharded connection pools
+### Connection ownership and scheduling
 
-The client pool is not one `HashMap` under a global lock. Each worker holds its own shard; HTTP/2 connections are distributed round-robin across workers. Requests rarely contend across workers, so scaling tracks core count instead of lock contention.
+Each client connection owns its codec buffers and, for HTTP/2, one driver thread that serializes wire access while multiplexing streams. Pool bookkeeping is bounded by authority and `max_connections_per_host`; it is not a promise that one HTTP/2 connection scales linearly with caller threads. Use the concurrency benchmark and the full latency tail before choosing a connection count for a deployment.
 
 ## Quick start
 
@@ -261,12 +261,18 @@ The `benches/` package is a self-contained suite (no `criterion` required) that 
 - RFC 9218 priority scheduling;
 - a concurrency model comparison (idle-connection herd vs. worker pool) and a slow-sender herd benchmark.
 
+The benchmark workflow also records TLS end-to-end results, optional remote-host results from the `network` bench, and `cargo-fuzz` parser runs. The repository keeps the generated [Github_Action_Benchmark.md](Github_Action_Benchmark.md) report. Rows marked `invalid` remain in the raw evidence but are excluded from performance conclusions; in particular, Reqwest blocking + h2c + 64 KiB is invalid because its fixed ~41 ms wait is a harness/configuration anomaly.
+
 ```bash
 cargo bench --manifest-path benches/Cargo.toml --bench throughput
 cargo bench --manifest-path benches/Cargo.toml --bench concurrency
+cargo bench --manifest-path benches/Cargo.toml --bench network
+cargo fuzz run h2_frame --fuzz-dir fuzz -- -runs=10000
 ```
 
 Every `RESULT|...` line carries `p50_us` … `p99_us`, and the report script (`scripts/generate_benchmark_report.sh`) turns them into a percentile table. These are loopback measurements; WAN / TLS / real-handler numbers depend on your deployment, which is exactly why the suite reports the full tail rather than a single mean.
+
+The h2c client data is workload-specific, not a claim of universal leadership. The 1 KiB single-worker result is only a small comparison point; multi-worker results must be read with their connection policy and tail latency. The anomalous Reqwest 64 KiB h2c rows are invalid evidence and must not be used to claim a large Courierust advantage.
 
 ## Interop evidence
 

@@ -1,6 +1,6 @@
 # Fingerprints
 
-Servers that care about bot traffic fingerprint the **TLS ClientHello** (JA3 / JA4) and the **HTTP/2 handshake** (SETTINGS values + order, header ordering). Courierust has no TLS dependency, so the handshake itself is your TLS library's job — but the fingerprint *parameters* are yours, and this crate gives them to you, with self-contained MD5/SHA-256 so nothing external is needed.
+Servers that care about bot traffic fingerprint the **TLS ClientHello** (JA3 / JA4) and the **HTTP/2 handshake** (SETTINGS values + order, header ordering). Courierust includes a self-contained TLS 1.3 implementation for its built-in client/server, and this module exposes the fingerprint parameters plus self-contained MD5/SHA-256. You can also feed the same parameters to an external TLS library when that is required by your deployment.
 
 ## JA3
 
@@ -71,12 +71,12 @@ let ordered = courierust::courierust_fingerprint::h2::order_headers_chrome(&fiel
 
 The fingerprint fields are all public and configurable (`header_table_size`, `enable_push`, `max_concurrent_streams`, `initial_window_size`, `max_header_list_size`, `connection_window_update`, `sort_headers`), so you can match a specific Chrome build. Chromium tweaks these occasionally — keep them in sync with the build you're impersonating.
 
-## Wiring it to a real TLS stack
+## Wiring it to TLS
 
-Because the codec is generic over `courierust::courierust_io::Read` / `courierust::courierust_io::Write`, you can:
+For the built-in client, configure `ClientConfig::tls` with a `RootStore` and call an `https://` URL. For a custom transport, the codec is generic over `courierust::courierust_io::Read` / `courierust::courierust_io::Write`, so you can:
 
 1. Build a `TlsProfile` (Chrome's, or yours).
-2. Hand the ClientHello parameters to your TLS library (rustls, native-tls, or an FFI to OpenSSL/BoringSSL).
+2. Hand the ClientHello parameters to your TLS library (rustls, native-tls, or an FFI to OpenSSL/BoringSSL), or use Courierust's built-in TLS 1.3 connector.
 3. Wrap the resulting `TlsStream` in the crate's io traits and drive `h2::Connection` / the client over it.
 
 The HTTP/2 side is covered directly: use `ChromeH2Fingerprint::h2_config()` as the connection config and `order_headers_chrome()` on your outbound header blocks.

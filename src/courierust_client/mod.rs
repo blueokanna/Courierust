@@ -125,10 +125,8 @@ struct ClientInner {
     config: ClientConfig,
     /// Idle h1 keep-alive connections per authority.
     h1_pool: Mutex<HashMap<String, Vec<(SocketAddr, H1Connection)>>>,
-    /// Live h2 connections per authority (indexed round-robin).
+    /// Live h2 connections per authority, selected by dispatch reservations.
     h2_pool: Mutex<HashMap<String, Vec<H2Conn>>>,
-    /// Round-robin cursor per authority.
-    h2_cursor: Mutex<HashMap<String, usize>>,
     /// Global request sequence (instrumentation).
     seq: AtomicUsize,
 }
@@ -174,7 +172,6 @@ impl Client {
                 config,
                 h1_pool: Mutex::new(HashMap::new()),
                 h2_pool: Mutex::new(HashMap::new()),
-                h2_cursor: Mutex::new(HashMap::new()),
                 seq: AtomicUsize::new(0),
             }),
         }
@@ -422,11 +419,21 @@ impl Client {
     ) -> Result<Response<Body>> {
         // 1. Reuse a pooled, already-upgraded connection when available.
         let pooled = {
-            let pools = self.inner.h2_pool.lock().unwrap();
-            pools.get(authority).and_then(|list| {
-                list.iter()
-                    .find(|c| c.accepting.load(Ordering::Acquire))
-                    .cloned()
+            let mut pools = self.inner.h2_pool.lock().unwrap();
+            pools.get_mut(authority).and_then(|list| {
+                list.retain(|c| c.accepting.load(Ordering::Acquire));
+                let max_connections = self.inner.config.max_connections_per_host.max(1);
+                let conn = list
+                    .iter()
+                    .filter(|c| c.accepting.load(Ordering::Acquire))
+                    .min_by_key(|c| c.reservations())
+                    .cloned()?;
+                if conn.reservations() == 0 || list.len() >= max_connections {
+                    conn.reserve();
+                    Some(conn)
+                } else {
+                    None
+                }
             })
         };
         if let Some(conn) = pooled {
@@ -459,16 +466,21 @@ impl Client {
                 let cs = crate::courierust_net::ConnStream::plain(stream);
                 let (tx, rx) = std::sync::mpsc::channel();
                 let conn = h2::start_upgraded(cs, &self.inner.config, seed, tx)?;
+                conn.reserve();
                 {
                     let mut pools = self.inner.h2_pool.lock().unwrap();
                     let list = pools.entry(authority.to_string()).or_default();
-                    if list.len() < self.inner.config.max_connections_per_host {
-                        list.push(conn);
+                    list.retain(|c| c.accepting.load(Ordering::Acquire));
+                    if list.len() < self.inner.config.max_connections_per_host.max(1) {
+                        list.push(conn.clone());
                     }
                 }
                 let raw = rx
                     .recv()
-                    .map_err(|_| Error::canceled("h2 driver closed the channel"))??;
+                    .map_err(|_| Error::canceled("h2 driver closed the channel"))
+                    .and_then(|result| result);
+                conn.release();
+                let raw = raw?;
                 Ok(Response {
                     status: raw.head.status,
                     version: raw.head.version,
@@ -512,20 +524,30 @@ impl Client {
         rx: std::sync::mpsc::Receiver<Result<crate::courierust_client::h2::H2Response>>,
     ) -> Result<crate::courierust_client::h2::H2Response> {
         match conn.tx.send(cmd) {
-            Ok(()) => rx
-                .recv()
-                .map_err(|_| Error::canceled("h2 driver closed the channel"))?,
+            Ok(()) => {
+                let result = rx
+                    .recv()
+                    .map_err(|_| Error::canceled("h2 driver closed the channel"))
+                    .and_then(|result| result);
+                conn.release();
+                result
+            }
             Err(std::sync::mpsc::SendError(cmd)) => {
                 // The driver is gone; open a fresh connection and retry.
+                conn.release();
                 let fresh = self.open_h2_conn(authority, addr, tls, hostname)?;
+                fresh.reserve();
                 let (tx2, rx2) = std::sync::mpsc::channel();
                 let cmd2 = retarget_reply(cmd, tx2);
-                fresh
-                    .tx
-                    .send(cmd2)
-                    .map_err(|_| Error::canceled("h2 driver is gone"))?;
-                rx2.recv()
-                    .map_err(|_| Error::canceled("h2 driver closed the channel"))?
+                let result = match fresh.tx.send(cmd2) {
+                    Ok(()) => rx2
+                        .recv()
+                        .map_err(|_| Error::canceled("h2 driver closed the channel"))
+                        .and_then(|result| result),
+                    Err(_) => Err(Error::canceled("h2 driver is gone")),
+                };
+                fresh.release();
+                result
             }
         }
     }
@@ -539,23 +561,46 @@ impl Client {
     ) -> Result<H2Conn> {
         let mut pools = self.inner.h2_pool.lock().unwrap();
         let list = pools.entry(authority.to_string()).or_default();
-        // Reuse a live connection.
-        if let Some(c) = list.iter().find(|c| c.accepting.load(Ordering::Acquire)) {
-            return Ok(c.clone());
+        // A driver that has received GOAWAY or lost its transport must not
+        // consume a pool slot. Dropping the pool's sender also lets the
+        // driver finish its cleanup once all request-owned clones are gone.
+        list.retain(|c| c.accepting.load(Ordering::Acquire));
+        let max_connections = self.inner.config.max_connections_per_host.max(1);
+        let least_loaded = list
+            .iter()
+            .filter(|c| c.accepting.load(Ordering::Acquire))
+            .min_by_key(|c| c.reservations())
+            .cloned();
+
+        // Reserve a connection before releasing the pool lock. This makes
+        // concurrent callers visible to the next selector and allows the
+        // configured pool to grow under real contention without opening
+        // extra connections for ordinary sequential reuse.
+        if let Some(conn) = least_loaded {
+            if conn.reservations() == 0 || list.len() >= max_connections {
+                conn.reserve();
+                return Ok(conn);
+            }
         }
-        // Open a new one (up to the per-host cap; beyond it, multiplex on
-        // an existing connection).
-        if list.len() < self.inner.config.max_connections_per_host {
+
+        if list.len() < max_connections {
             let stream = self.open_h2_stream(addr, tls, hostname)?;
             let conn = h2::start(stream, &self.inner.config)?;
+            conn.reserve();
             list.push(conn.clone());
             return Ok(conn);
         }
-        let mut cursors = self.inner.h2_cursor.lock().unwrap();
-        let cur = cursors.entry(authority.to_string()).or_insert(0);
-        let idx = *cur % list.len();
-        *cur += 1;
-        Ok(list[idx].clone())
+
+        // `max_connections` is at least one, so this is only reachable when
+        // a connection changed state between selection and reservation.
+        let conn = list
+            .iter()
+            .filter(|c| c.accepting.load(Ordering::Acquire))
+            .min_by_key(|c| c.reservations())
+            .cloned()
+            .ok_or_else(|| Error::canceled("no accepting h2 connection"))?;
+        conn.reserve();
+        Ok(conn)
     }
 
     fn open_h2_conn(
@@ -569,7 +614,10 @@ impl Client {
         let conn = h2::start(stream, &self.inner.config)?;
         let mut pools = self.inner.h2_pool.lock().unwrap();
         let list = pools.entry(authority.to_string()).or_default();
-        list.push(conn.clone());
+        list.retain(|c| c.accepting.load(Ordering::Acquire));
+        if list.len() < self.inner.config.max_connections_per_host.max(1) {
+            list.push(conn.clone());
+        }
         Ok(conn)
     }
 

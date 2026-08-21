@@ -47,6 +47,11 @@ name = "interop"
 harness = false
 path = "src/interop.rs"
 
+[[bench]]
+name = "network"
+harness = false
+path = "src/network.rs"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

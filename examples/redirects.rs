@@ -12,7 +12,6 @@ use courierust::courierust_server::{Server, ServerConfig};
 use std::sync::Arc;
 
 fn main() -> courierust::Result<()> {
-    // A mini "short link" server: /start 302 -> /mid -> /end.
     let server_cfg = ServerConfig::default();
     let server = Server::bind_with_config("127.0.0.1:0", server_cfg)?;
     let addr = server.local_addr()?;

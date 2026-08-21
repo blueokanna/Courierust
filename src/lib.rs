@@ -15,9 +15,9 @@
 //! Design highlights:
 //!
 //! * **Multi-core parallelism** — a work-stealing thread pool with
-//!   per-worker LIFO caches and a global FIFO steal queue; client
-//!   connection pools are sharded per worker and HTTP/2 connections are
-//!   distributed across workers, so throughput scales with core count.
+//!   per-worker LIFO caches and a global FIFO steal queue; client pools are
+//!   shared per authority, and HTTP/2 requests are assigned to the least
+//!   reserved accepting driver up to `max_connections_per_host`.
 //! * **RFC 9218 client priority frames** (`PRIORITY_UPDATE`, frame type
 //!   `0x10`) with a Weighted-Urgency Calendar Scheduler (WUCS): eight
 //!   urgency buckets combined with Deficit Round Robin anti-starvation

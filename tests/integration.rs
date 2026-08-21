@@ -208,6 +208,9 @@ fn h2_concurrent_streams_multiplex() {
 
     let client_cfg = ClientConfig {
         http2: true,
+        // This test verifies multiplexing on one driver. Multiple client
+        // connections would occupy the server's single connection worker.
+        max_connections_per_host: 1,
         h2_settings_timeout: Some(std::time::Duration::from_secs(60)),
         h2_ping_interval: None,
         h2_ping_timeout: None,

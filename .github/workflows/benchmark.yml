@@ -8,6 +8,7 @@ on:
       - 'scripts/generate_benchmark_report.sh'
       - 'src/**'
       - 'benches/**'
+      - 'fuzz/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
   pull_request:
@@ -16,6 +17,7 @@ on:
       - 'scripts/generate_benchmark_report.sh'
       - 'src/**'
       - 'benches/**'
+      - 'fuzz/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
   workflow_dispatch:
@@ -43,6 +45,8 @@ jobs:
       - name: Run benchmarks + interop validation
         id: benchmarks
         shell: bash
+        env:
+          COURIERUST_NETWORK_URL: ${{ secrets.COURIERUST_REMOTE_URL }}
         run: |
           suite_failed=0
 
@@ -78,24 +82,69 @@ jobs:
             cargo bench --manifest-path benches/Cargo.toml --locked --bench throughput
           run_suite compare compare.log \
             cargo bench --manifest-path benches/Cargo.toml --locked --bench compare
+          run_suite concurrency concurrency.log \
+            cargo bench --manifest-path benches/Cargo.toml --locked --bench concurrency
           run_suite interop interop.log \
             cargo bench --manifest-path benches/Cargo.toml --locked --bench interop
+
+          if [[ -n "${COURIERUST_NETWORK_URL:-}" ]]; then
+            run_suite network network.log \
+              cargo bench --manifest-path benches/Cargo.toml --locked --bench network
+          else
+            printf 'NETWORK|role=client|status=not_configured|target_scope=remote|reason=COURIERUST_REMOTE_URL_not_set\n' > network.log
+            printf 'network_exit=not-configured\n' >> "$GITHUB_OUTPUT"
+          fi
 
           if [[ "$suite_failed" -ne 0 ]]; then
             exit 1
           fi
+
+      - name: Run fuzz targets
+        id: fuzz
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          fuzz_failed=0
+          : > fuzz.log
+          rustup toolchain install nightly --profile minimal
+          cargo +nightly install cargo-fuzz --locked
+          for target in h2_frame hpack_block; do
+            started=$(date +%s)
+            cargo +nightly fuzz run --fuzz-dir fuzz "$target" -- -runs=10000 -max_len=16384 >> fuzz.log 2>&1
+            command_status=$?
+            duration=$(( $(date +%s) - started ))
+            if [[ "$command_status" -eq 0 ]]; then
+              status=ok
+            else
+              status=failed
+              fuzz_failed=1
+            fi
+            printf 'FUZZ|target=%s|status=%s|runs=10000|duration_s=%s|corpus=fuzz/corpus/%s|reason=command_exit_%s\n' \
+              "$target" "$status" "$duration" "$target" "$command_status" >> fuzz.log
+          done
+          cat fuzz.log
+          printf 'fuzz_exit=%s\n' "$fuzz_failed" >> "$GITHUB_OUTPUT"
+          exit "$fuzz_failed"
 
       - name: Generate Github_Action_Benchmark.md
         if: always()
         env:
           BENCHMARK_THROUGHPUT_EXIT: ${{ steps.benchmarks.outputs.throughput_exit }}
           BENCHMARK_COMPARE_EXIT: ${{ steps.benchmarks.outputs.compare_exit }}
+          BENCHMARK_CONCURRENCY_EXIT: ${{ steps.benchmarks.outputs.concurrency_exit }}
           BENCHMARK_INTEROP_EXIT: ${{ steps.benchmarks.outputs.interop_exit }}
+          BENCHMARK_NETWORK_EXIT: ${{ steps.benchmarks.outputs.network_exit }}
+          BENCHMARK_FUZZ_EXIT: ${{ steps.fuzz.outputs.fuzz_exit }}
+          COURIERUST_REMOTE_URL: ${{ secrets.COURIERUST_REMOTE_URL }}
         run: |
           bash scripts/generate_benchmark_report.sh \
             throughput.log \
             compare.log \
+            concurrency.log \
             interop.log \
+            network.log \
+            fuzz.log \
             Github_Action_Benchmark.md
 
       - name: Publish benchmark report to the run summary
@@ -115,5 +164,44 @@ jobs:
             Github_Action_Benchmark.md
             throughput.log
             compare.log
+            concurrency.log
             interop.log
+            network.log
+            fuzz.log
           if-no-files-found: error
+
+  publish-report:
+    name: Publish benchmark report
+    needs: bench
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.bench.result != 'cancelled'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Download generated report
+        uses: actions/download-artifact@v4
+        with:
+          name: Github_Action_Benchmark
+          path: .benchmark-report
+      - name: Commit benchmark report
+        shell: bash
+        run: |
+          report=$(find .benchmark-report -type f -name 'Github_Action_Benchmark.md' -print -quit)
+          if [[ -z "$report" ]]; then
+            echo "Generated report was not found in the artifact" >&2
+            exit 1
+          fi
+          cp "$report" Github_Action_Benchmark.md
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Github_Action_Benchmark.md
+          if git diff --cached --quiet; then
+            echo "Benchmark report is unchanged"
+            exit 0
+          fi
+          git commit -m "Update benchmark evidence report"
+          git push origin HEAD:main

@@ -3,10 +3,10 @@
 //! code that runs in `no_std` environments. (For a real transport you
 //! would keep an internal leftover buffer on partial reads; the messages
 //! here are small enough to fit in the 4 KiB pipe buffer.)
-//!
-//! Run with `cargo run --example protocol_core`.
 
 use courierust::courierust_bytes::BytesMut;
+use courierust::courierust_crypto::md5::md5_hex;
+use courierust::courierust_crypto::sha256::sha256_hex;
 use courierust::courierust_h2::connection::{Config as H2Config, Connection};
 use courierust::courierust_h2::priority::Priority;
 use courierust::courierust_hpack::{Decoder, Encoder, HeaderField};
@@ -50,7 +50,6 @@ impl courierust::courierust_io::Write for Sink {
 }
 
 fn main() -> courierust::Result<()> {
-    // ---- HPACK round trip ----
     let mut enc = Encoder::new();
     let mut dec = Decoder::new(4096, 1 << 20);
     let fields = vec![
@@ -77,10 +76,6 @@ fn main() -> courierust::Result<()> {
     );
     assert_eq!(decoded.len(), fields.len());
 
-    // ---- HTTP/2 connection over a memory pipe ----
-    // Connection wraps the transport in its own buffers internally, so
-    // any type implementing the crate's io traits works — here an
-    // in-memory pipe, in production a TCP or TLS stream.
     let (a2b, a2b_rx) = mpsc::channel::<Vec<u8>>();
     let (b2a, b2a_rx) = mpsc::channel::<Vec<u8>>();
     let reader = Pipe { rx: b2a_rx }; // inbound: peer -> us
@@ -101,9 +96,8 @@ fn main() -> courierust::Result<()> {
         courierust::courierust_bytes::Bytes::from_static(b"hello"),
         true,
     )?;
-    conn.flush()?; // writes preface + SETTINGS + HEADERS + DATA into a2b
+    conn.flush()?;
 
-    // Confirm the bytes actually left the client into the pipe.
     let sent = a2b_rx
         .try_recv()
         .expect("outbound bytes should be in the pipe");
@@ -111,11 +105,8 @@ fn main() -> courierust::Result<()> {
         "h2: stream {sid} open, {} outbound bytes written",
         sent.len()
     );
-    let _ = b2a; // the peer side (would feed b2a_rx) is not exercised here
+    let _ = b2a;
 
-    // ---- hashes used by the fingerprint builders ----
-    use courierust::courierust_crypto::md5::md5_hex;
-    use courierust::courierust_crypto::sha256::sha256_hex;
     println!("md5(hello)    = {}", md5_hex(b"hello"));
     println!("sha256(hello) = {}", sha256_hex(b"hello"));
 

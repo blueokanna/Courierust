@@ -12,7 +12,6 @@ use courierust::courierust_server::{Server, ServerConfig};
 use std::time::Duration;
 
 fn main() -> courierust::Result<()> {
-    // A server that streams 10 numbered events, one per 50ms.
     let server_cfg = ServerConfig {
         http2: true,
         ..Default::default()
@@ -43,10 +42,6 @@ fn main() -> courierust::Result<()> {
         resp
     })?;
 
-    // HTTP/2 client; consume the stream incrementally. A `Channel` body
-    // is a public variant, so we can drain its receiver directly: recv()
-    // returns each chunk as it is produced and ends when the producer
-    // drops the sender.
     let client_cfg = ClientConfig {
         http2: true,
         ..Default::default()

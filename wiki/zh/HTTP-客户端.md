@@ -1,6 +1,6 @@
 # HTTP 客户端
 
-客户端在多核下是“天然并行”的：HTTP/1.1 keep-alive 连接按 authority 分组、**按 worker 线程分片**（每个分片各持一把锁），HTTP/2 连接跨 worker 分发并多路复用。不同线程的请求几乎不互相抢锁。
+客户端按 authority 共享有上限的连接池。HTTP/2 请求由每条连接独立的 driver 负责多路复用，并按当前 reservation 数选择负载最小的连接；`max_connections_per_host` 控制并发压力下可打开的独立 driver 数量。这是按连接感知的并发模型，不承诺单条 HTTP/2 连接会随调用线程线性扩展。
 
 ## 配置
 
@@ -138,5 +138,6 @@ match client.get("http://127.0.0.1:9/") {
 
 ## 你需要知道的限制
 
-- **没有内置 TLS**。内置连接器只认 `http://`。要 HTTPS，把任意 TLS 流包上 `courierust::courierust_io::Read`/`io::Write` 再驱动编解码（ClientHello 参数见[浏览器指纹](浏览器指纹)）。
-- **流式请求体仅 HTTP/2 可靠**。`Client::execute` 会把 `Body::Channel` 请求体先完整读进内存再发送；真正的上传流式是后续扩展。
+- **配置后支持 HTTPS**。客户端默认 `tls: None`，因此默认会拒绝 `https://`；通过 `ClientConfig::tls` 提供 `RootStore`，或使用 `Client::with_tls_roots` 启用内置 TLS 1.3。crate 不内置 CA 根证书。ALPN 必须与 `ClientConfig::http2` 一致：HTTP/2 使用 `h2`，HTTP/1.1 使用 `http/1.1`。
+- **HTTP/2 并发取决于连接策略**。每条连接由一个 driver 负责复用多个 stream；需要独立 HTTP/2 driver 时提高 `max_connections_per_host`，并针对实际配置观察完整延迟尾部。
+- **流式请求体仅 HTTP/2 支持**。`Client::execute` 会把 `Body::Channel` 请求体先完整读进内存再发送；真正的客户端上传流式使用 `execute_h2_stream`。

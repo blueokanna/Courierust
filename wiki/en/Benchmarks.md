@@ -1,9 +1,11 @@
 # Benchmarks
 
-The `benches/` workspace provides three release-profile executables:
+The `benches/` workspace provides release-profile executables:
 
 - `throughput`: Courierust HTTP/1.1 keep-alive, parallel HTTP/1.1, h2c multiplexing, and HTTPS plus HTTP/2.
 - `compare`: paired loopback comparisons with hyper and reqwest.
+- `concurrency`: incomplete-header and slow-sender connection pressure against the server scheduler.
+- `network`: an explicit cross-machine client/server endpoint; it never labels loopback as remote evidence.
 - `interop`: protocol correctness checks against hyper, hyper-util, and reqwest. It is a validation suite, not a performance benchmark.
 
 Run the same suites used by GitHub Actions:
@@ -11,6 +13,7 @@ Run the same suites used by GitHub Actions:
 ```bash
 cargo bench --manifest-path benches/Cargo.toml --locked --bench throughput
 cargo bench --manifest-path benches/Cargo.toml --locked --bench compare
+cargo bench --manifest-path benches/Cargo.toml --locked --bench concurrency
 cargo bench --manifest-path benches/Cargo.toml --locked --bench interop
 ```
 
@@ -43,8 +46,16 @@ Every configuration is repeated an even number of times. The execution order alt
 
 The `raw_tcp_floor` row is only a transport reference for a four-byte echo. It is not an HTTP comparison row and must not be used to claim a percentage of HTTP performance. The harness intentionally does not publish process-wide allocation counts because server threads, runtimes, logging, and the harness itself make that number non-attributable to one client or server implementation.
 
+The blocking Reqwest + h2c + 64 KiB rows are emitted with `status=invalid`. The fixed approximately 41 ms result appears against both Hyper and Courierust and is treated as a Reqwest/harness wait anomaly, not as performance evidence. The h2c client rows are workload-specific: a single worker does not establish universal leadership, and an 8-worker result must be read together with the connection policy and tail latency.
+
+`network` requires two separately operated hosts. Start the server with `COURIERUST_NETWORK_ROLE=server` and `COURIERUST_NETWORK_BIND=0.0.0.0:8080`, then set the client's `COURIERUST_NETWORK_URL` to that host. Use `COURIERUST_NETWORK_TLS=true` plus DER certificate/key paths for HTTPS. The generated report marks the case `not_configured` when no remote URL is supplied; no cross-machine number is invented.
+
+`concurrency` records incomplete HTTP/1.1 headers and slow senders. It reports the platform and whether the Windows event-driven path was enabled, so a Linux blocking-pool result is not presented as Windows event-loop evidence.
+
 ## Reading Results
 
 Results are emitted as `RESULT|...` records for machine parsing and include protocol, payload, client workers, server threads, request count, RPS, response MB/s, percentile latency, and sample count. Compare only rows with the same protocol, payload, worker count, server thread count, and layer. Loopback measurements are sensitive to runner CPU allocation, kernel scheduling, and background load; use them for controlled comparisons on the same runner, not as universal performance claims.
 
 `interop` emits `INTEROP|...` records. A failure or timeout is a compatibility regression and fails CI regardless of performance numbers.
+
+The workflow also runs the `h2_frame` and `hpack_block` `cargo-fuzz` targets. The generated `Github_Action_Benchmark.md` is committed to the repository on successful main-branch pushes and is available from the repository itself, not only from the Actions summary or artifact.

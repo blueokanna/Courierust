@@ -35,9 +35,9 @@ This wiki is a hands-on guide. Every code sample below is real API usage — cop
 | Priorities (RFC 9218) | `PRIORITY_UPDATE` + a WUCS scheduler (O(1), anti-starvation) |
 | HPACK (RFC 7541) | table-driven Huffman, static/dynamic tables, RFC vectors verified |
 | Fingerprints | JA3 / JA4 / Chrome HTTP/2 profile (self-contained MD5/SHA-256) |
-| Multi-core | work-stealing pool, per-worker sharded connection pools |
+| Multi-core | work-stealing server pool, bounded client connection pools |
 | gRPC | framing + status + codec traits (protobuf itself is plug-in) |
-| TLS | **not built in** — h2c / h1.1 directly, or drive the codec over any TLS stream |
+| TLS | built-in TLS 1.3 for client/server HTTPS; external transports are also supported |
 
 ## Repository
 

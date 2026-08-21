@@ -34,8 +34,6 @@ pub fn hmac(d: &mut dyn Digest, key: &[u8], data: &[u8]) -> Vec<u8> {
 
 /// HKDF-Extract (RFC 5869 §2.2).
 pub fn extract(d: &mut dyn Digest, salt: &[u8], ikm: &[u8]) -> Vec<u8> {
-    // The salt is used as the HMAC key; an empty salt is zero-filled to
-    // one block (RFC 5869 §2.2). `hmac` already zero-pads short keys.
     hmac(d, salt, ikm)
 }
 
@@ -46,7 +44,6 @@ pub fn expand(d: &mut dyn Digest, prk: &[u8], info: &[u8], len: usize) -> Vec<u8
     let mut t: Vec<u8> = Vec::new();
     let mut counter: u8 = 1;
     while out.len() < len {
-        // T(i) = HMAC(PRK, T(i-1) || info || i)
         let mut msg = Vec::with_capacity(t.len() + info.len() + 1);
         msg.extend_from_slice(&t);
         msg.extend_from_slice(info);
@@ -56,7 +53,6 @@ pub fn expand(d: &mut dyn Digest, prk: &[u8], info: &[u8], len: usize) -> Vec<u8
         out.extend_from_slice(&t[..take]);
         counter = counter.wrapping_add(1);
         if counter == 0 {
-            // Wrapped: more than 255 blocks requested.
             break;
         }
     }
@@ -71,7 +67,6 @@ pub fn expand_label(
     context: &[u8],
     len: usize,
 ) -> Vec<u8> {
-    // length(2) || label_len(1) || "tls13 " + label || context_len(1) || context
     let label_with_prefix = b"tls13 ";
     let mut info =
         Vec::with_capacity(2 + 1 + label_with_prefix.len() + label.len() + 1 + context.len());
@@ -99,7 +94,6 @@ mod tests {
 
     #[test]
     fn hmac_sha256_rfc4231() {
-        // RFC 4231 Test Case 2 (single block key).
         let key = b"Jefe";
         let data = b"what do ya want for nothing?";
         let mut d = Sha256::new();
@@ -112,7 +106,6 @@ mod tests {
 
     #[test]
     fn hkdf_sha256_rfc5869() {
-        // RFC 5869 Test Case 1.
         let ikm = [
             0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
             0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
@@ -136,8 +129,6 @@ mod tests {
 
     #[test]
     fn hkdf_expand_label_known() {
-        // Verify the label assembly against a manually-constructed info
-        // passed through the RFC 5869 `expand` (already vector-tested).
         let secret = [0u8; 32];
         let mut d = Sha256::new();
         let out = expand_label(&mut d, &secret, b"key", b"", 32);

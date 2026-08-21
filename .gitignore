@@ -1,6 +1,7 @@
 # Rust build artifacts
 /target
 /benches/target
+/fuzz/target
 
 # Editor / OS
 *.swp

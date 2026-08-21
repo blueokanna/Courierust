@@ -41,6 +41,9 @@ struct ResultMetadata {
     payload: Payload,
     workers: usize,
     repetitions: usize,
+    server_threads: usize,
+    pool_policy: &'static str,
+    pool_value: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -132,16 +135,16 @@ fn hyper_server(protocol: Protocol, payload: Payload) -> SocketAddr {
                 let body = body.clone();
                 let service = service_fn(move |_request: hyper::Request<Incoming>| {
                     let body = body.clone();
-                    async move {
-                        Ok::<_, Infallible>(hyper::Response::new(Full::new(body)))
-                    }
+                    async move { Ok::<_, Infallible>(hyper::Response::new(Full::new(body))) }
                 });
                 let builder = match protocol {
                     Protocol::H1 => AutoBuilder::new(TokioExecutor::new()).http1_only(),
                     Protocol::H2c => AutoBuilder::new(TokioExecutor::new()).http2_only(),
                 };
                 tokio::spawn(async move {
-                    let _ = builder.serve_connection(TokioIo::new(stream), service).await;
+                    let _ = builder
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
                 });
             }
         });
@@ -163,7 +166,7 @@ fn run_courierust_client(
 ) -> Timing {
     let client = Client::with_config(ClientConfig {
         http2: protocol.uses_http2(),
-        max_connections_per_host: if protocol.uses_http2() { 1 } else { workers },
+        max_connections_per_host: workers.max(1),
         ..Default::default()
     });
     let url = format!("http://{address}/benchmark");
@@ -240,10 +243,24 @@ fn print_result(metadata: ResultMetadata, mut timing: Timing) {
         payload,
         workers,
         repetitions,
+        server_threads,
+        pool_policy,
+        pool_value,
     } = metadata;
+    let (status, reason) = if matches!(protocol, Protocol::H2c)
+        && client == "reqwest"
+        && payload.bytes == SIXTY_FOUR_KIB.bytes
+    {
+        (
+            "invalid",
+            "reqwest_blocking_h2c_64k_fixed_wait_not_performance_evidence",
+        )
+    } else {
+        ("valid", "-")
+    };
     timing.sort_samples();
     println!(
-        "RESULT|suite=compare|case={case}|layer={layer}|protocol={}|client={client}|server={server}|payload={}|bytes={}|workers={workers}|repetitions={repetitions}|requests={}|elapsed_ms={:.3}|rps={:.1}|response_mbps={:.3}|p50_us={}|p75_us={}|p90_us={}|p95_us={}|p99_us={}|samples={}",
+        "RESULT|suite=compare|case={case}|layer={layer}|protocol={}|client={client}|server={server}|payload={}|bytes={}|workers={workers}|server_threads={server_threads}|pool_policy={pool_policy}|pool_value={pool_value}|repetitions={repetitions}|status={status}|reason={reason}|requests={}|elapsed_ms={:.3}|rps={:.1}|response_mbps={:.3}|p50_us={}|p75_us={}|p90_us={}|p95_us={}|p99_us={}|samples={}",
         protocol.name(),
         payload.name,
         payload.bytes,
@@ -339,6 +356,9 @@ fn raw_tcp_floor(requests: usize) {
             },
             workers: 1,
             repetitions: 1,
+            server_threads: 1,
+            pool_policy: "raw_tcp",
+            pool_value: 1,
         },
         timing,
     );
@@ -369,6 +389,9 @@ fn compare_clients(
             payload,
             workers,
             repetitions,
+            server_threads: 4,
+            pool_policy: "courierust_max_connections_per_host",
+            pool_value: workers.max(1),
         },
         courierust_timing,
     );
@@ -383,6 +406,9 @@ fn compare_clients(
             payload,
             workers,
             repetitions,
+            server_threads: 4,
+            pool_policy: "reqwest_pool_max_idle_per_host",
+            pool_value: workers.max(1),
         },
         reqwest_timing,
     );
@@ -411,6 +437,9 @@ fn compare_servers(
             payload,
             workers: 1,
             repetitions,
+            server_threads: 4,
+            pool_policy: "reqwest_pool_max_idle_per_host",
+            pool_value: 1,
         },
         courierust_timing,
     );
@@ -425,6 +454,9 @@ fn compare_servers(
             payload,
             workers: 1,
             repetitions,
+            server_threads: 4,
+            pool_policy: "reqwest_pool_max_idle_per_host",
+            pool_value: 1,
         },
         hyper_timing,
     );

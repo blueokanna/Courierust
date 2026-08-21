@@ -39,7 +39,6 @@ mod os {
     use std::fs::File;
     use std::io::Read;
 
-    /// Fill `buf` from `/dev/urandom`.
     pub fn fill(buf: &mut [u8]) -> bool {
         let mut f = match File::open("/dev/urandom") {
             Ok(f) => f,
@@ -75,7 +74,6 @@ pub struct ChaChaRng {
     key: [u8; 32],
     nonce: [u8; 12],
     counter: u32,
-    /// Blocks generated since the last reseed.
     since_reseed: u64,
 }
 
@@ -117,7 +115,6 @@ impl ChaChaRng {
     fn reseed(&mut self) {
         let mut fresh = [0u8; 44];
         if fill_random(&mut fresh) {
-            // Mix the new entropy into the existing key with ChaCha20.
             self.fill_blocks_raw(&mut fresh, self.counter.wrapping_add(1));
         }
         self.key.copy_from_slice(&fresh[..32]);
@@ -142,8 +139,6 @@ impl ChaChaRng {
 
     /// Fill `out` with random bytes.
     pub fn fill(&mut self, out: &mut [u8]) {
-        // Reseed every 32 KiB of output (512 blocks) to bound the
-        // exposure of any single key.
         const RESEED_BLOCKS: u64 = 512;
         let mut offset = 0usize;
         while offset < out.len() {

@@ -104,7 +104,7 @@ fn serve_loop(
             flush_deferred(conn, deferred)?;
         }
 
-        match conn.poll() {
+        match conn.poll_available(64) {
             Ok(true) => last_rx = std::time::Instant::now(),
             Ok(false) => {}
             Err(e) => return Err(e),
@@ -161,9 +161,6 @@ fn serve_loop(
                     deferred.remove(&stream_id);
                 }
                 Event::StreamError { stream_id, .. } => {
-                    // A locally-detected stream error (e.g. a
-                    // content-length mismatch in the request): drop the
-                    // request state. The connection stays usable.
                     req_bodies.remove(&stream_id);
                     deferred.remove(&stream_id);
                 }
@@ -263,11 +260,6 @@ fn apply_liveness(
 fn server_config(config: &ServerConfig) -> H2Config {
     let mut c = H2Config {
         client: false,
-        // Return receive credit to the peer as request-body DATA frames
-        // arrive (batched by `Connection::release_data`). Memory stays
-        // bounded by `ServerConfig::max_body`, which the serve loop
-        // enforces while buffering each request body. Configurable so a
-        // strict window (no automatic replenishment) can be enforced.
         auto_release_credit: config.auto_release_credit,
         ..Default::default()
     };
@@ -347,8 +339,6 @@ fn send_response(
     let has_trailers = trailers.is_some();
     match kind {
         K::Empty => {
-            // With trailers the head does not end the stream; the trailer
-            // block does. Without them, HEADERS carry END_STREAM.
             conn.send_headers(sid, &fields, !has_trailers)?;
             if let Some(t) = trailers {
                 conn.send_trailers(sid, &t)?;
@@ -413,8 +403,6 @@ fn flush_deferred(
     for (sid, d) in deferred.iter_mut() {
         loop {
             if d.ending {
-                // Finish the stream: trailers when present, otherwise an
-                // empty END_STREAM DATA frame.
                 let res = match &d.trailers {
                     Some(t) => conn.send_trailers(*sid, t),
                     None => conn.send_data(*sid, Bytes::new(), true).map(|_| ()),

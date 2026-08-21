@@ -13,7 +13,7 @@
 常见的 Rust HTTP 生态（hyper / h2 / h3 等）能力很强，但依赖树很深，且往往把 `no_std`、多核亲和、以及「客户端看起来像什么浏览器」这类问题留给使用者自己解决。这个仓库的目标是：
 
 - 协议层与平台完全解耦：核心代码不碰 `std`，`std` 只负责线程、TCP 和时钟；
-- 多核是真的多核（在模型范围内）：连接池按 worker 分片、HTTP/2 连接跨 worker 分发、任务用工作窃取调度，而不是一把大锁串起来。**worker 占用按连接计**：一条 HTTP/2 连接上的任意多个流（慢流、SSE、gRPC 服务端流）只占同一个 worker，流之间互不阻塞。诚实的推论是：大量**连接**仍需足够 worker，纯明文 HTTP/1.1 才可用 Windows 事件驱动模式（见限制）。
+- 多核是真的多核（在模型范围内）：服务端连接通过工作窃取池调度；客户端连接池按 authority 共享，HTTP/2 请求按 reservation 选择负载最小的 driver，并由 `max_connections_per_host` 控制独立连接上限。**worker 占用按连接计**：一条 HTTP/2 连接上的任意多个流（慢流、SSE、gRPC 服务端流）只占同一个 worker，流之间互不阻塞。诚实的推论是：大量**连接**仍需足够 worker，纯明文 HTTP/1.1 才可用 Windows 事件驱动模式（见限制）。
 - 协议细节按 RFC 实现并对照公开测试向量验证过，不是「能跑就行」的玩具。
 
 ## 特性
@@ -40,8 +40,8 @@
 
 - **工作窃取线程池**（`courierust_pool`）：每个 worker 一条本地 LIFO 栈 + 全局 FIFO 窃取队列；任务可嵌套提交，窃取时优先挑空闲最久的 worker。
 - **客户端**（`courierust_client`）：
-  - HTTP/1.1 keep-alive 连接池按 authority 分组，按 worker 分片（各自持锁，避免全局争用）；
-  - HTTP/2 连接同样按 worker 分片 + 轮询分发，多路复用；
+  - HTTP/1.1 keep-alive 连接池按 authority 分组并有上限；
+  - HTTP/2 连接由独立 driver 多路复用，按 reservation 选择负载最小的连接并受 `max_connections_per_host` 限制；
   - 重定向跟随（301/302/303 自动转 GET）、超时、`User-Agent` 等配置项。
 - **服务器**（`courierust_server`）：每个 accept 的连接作为任务投递到工作窃取池，连接处理跨核并行。
 - **gRPC**（`courierust_grpc`）：HTTP/2 + 长度前缀消息帧 + `grpc-status`/`grpc-message` 处理；protobuf 编解码刻意留给你（实现 `EncodeMessage` / `DecodeMessage`，或直接用字节 API）。
@@ -65,9 +65,9 @@ RFC 9218 用 8 个 urgency 级别替代了旧版依赖树。我们把它实现�
 
 传统实现每收一帧就回一个 `WINDOW_UPDATE`，控制帧开销占比可观。BCR 把已收数据批量累积，攒够一批再回一次信用，控制帧数量降一个量级。
 
-### 连接池分片
+### 连接池所有权与调度
 
-客户端连接池不是一把全局锁下的 `HashMap`，而是每个 worker 一份分片、各自持锁；HTTP/2 连接按 worker 轮询分发。请求基本不跨 worker 抢锁，扩展性随核数走。
+每条客户端连接拥有自己的 codec 缓冲区；HTTP/2 连接还拥有一个串行化 wire 访问并复用 stream 的 driver。连接池按 authority 管理，reservation 反映正在 dispatch 的请求，`max_connections_per_host` 是独立连接上限。单条 HTTP/2 连接不会因为调用线程增加就线性扩展，应结合并发基准和延迟尾部选择连接数。
 
 ## 快速上手
 
@@ -256,9 +256,18 @@ src/
 - RFC 9218 优先级调度；
 - 并发模型对比（空闲连接群 vs worker 池）与慢发送者群基准。
 
+Workflow 还记录跨机 endpoint、慢连接压力和 `cargo-fuzz` parser 运行结果。生成的
+`Github_Action_Benchmark.md` 会在 main 分支 push 后提交到仓库本身，不只存在于
+Actions 摘要或 artifact 中。Reqwest blocking + h2c + 64 KiB 行会保留原始结果但标记
+为 `invalid`：两种服务端都出现的固定约 41 ms 等待不是性能证据。h2c 结果只适用于
+对应连接策略和负载，不能据此宣称全面领先。
+
 ```bash
 cargo bench --manifest-path benches/Cargo.toml --bench throughput
 cargo bench --manifest-path benches/Cargo.toml --bench concurrency
+cargo bench --manifest-path benches/Cargo.toml --bench interop
+cargo bench --manifest-path benches/Cargo.toml --bench network
+cargo fuzz run h2_frame --fuzz-dir fuzz -- -runs=10000
 ```
 
 每条 `RESULT|...` 都带 `p50_us` … `p99_us`，报告脚本（`scripts/generate_benchmark_report.sh`）可生成分位表。这些是 loopback 测量；WAN / TLS / 真实 handler 的数字取决于你的部署——这正是套件要报完整尾部而非单一均值的原因。

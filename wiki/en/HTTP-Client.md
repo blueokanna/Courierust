@@ -1,6 +1,6 @@
 # HTTP Client
 
-The client is multi-core by construction: HTTP/1.1 keep-alive connections are pooled per authority and **sharded per worker thread** (each shard has its own lock), and HTTP/2 connections are distributed across workers and multiplexed. Requests from different threads rarely contend.
+The client shares bounded pools per authority. HTTP/2 requests are multiplexed by a dedicated driver per connection and assigned by current dispatch reservations; `max_connections_per_host` controls how many independent drivers may be opened under contention. This is connection-aware concurrency, not a promise that one HTTP/2 connection scales linearly with caller threads.
 
 ## Configuration
 
@@ -137,5 +137,6 @@ match client.get("http://127.0.0.1:9/") {
 
 ## What you should know
 
-- **No TLS.** The built-in connector speaks `http://` only. To use HTTPS, wrap any TLS stream in `courierust::courierust_io::Read`/`io::Write` and drive the codec yourself (see [Fingerprints](Fingerprints) for the ClientHello parameters to hand to your TLS library).
-- **Streaming request bodies are HTTP/2-only.** `Client::execute` materializes a `Body::Channel` request body into memory before sending; true upload streaming is a future extension.
+- **HTTPS uses the built-in TLS 1.3 implementation when configured.** The default client has `tls: None` and rejects `https://`; provide a `RootStore` through `ClientConfig::tls` or use `Client::with_tls_roots`. There is no bundled CA set. ALPN must agree with `ClientConfig::http2` (`h2` for HTTP/2, `http/1.1` otherwise).
+- **HTTP/2 concurrency is connection-policy dependent.** Requests are multiplexed by one driver per connection. Set `max_connections_per_host` above one when independent HTTP/2 drivers are needed for caller-level parallelism; benchmark the full latency tail for the selected value.
+- **Streaming request bodies are HTTP/2-only.** `Client::execute` materializes a `Body::Channel` request body into memory before sending; use `execute_h2_stream` for true client-streaming uploads.

@@ -1,0 +1,26 @@
+[package]
+name = "courierust-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+courierust = { path = "..", default-features = false }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "h2_frame"
+path = "fuzz_targets/h2_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hpack_block"
+path = "fuzz_targets/hpack_block.rs"
+test = false
+doc = false
+bench = false

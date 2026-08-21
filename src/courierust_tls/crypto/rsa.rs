@@ -8,8 +8,7 @@
 use super::hash::{BoxDigest, Digest, Sha256, Sha384};
 use alloc::vec::Vec;
 
-/// Big-endian unsigned integer with `u64` limbs (little-endian limb
-/// order internally).
+/// Big-endian unsigned integer with `u64` limbs
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BigInt {
     /// Limbs, least significant first.
@@ -666,30 +665,24 @@ pub(crate) fn sign_pss(
         hash.update(message);
         hash.finalize()
     };
-    // Random salt from the OS entropy source.
+
     let mut salt = vec![0u8; salt_len];
     super::rng::fill_random(&mut salt);
 
-    // H = Hash(0x00*8 || mHash || salt)
     hash.update(&[0u8; 8]);
     hash.update(&m_hash);
     hash.update(&salt);
     let h = hash.finalize();
 
-    // DB = PS(zeros) || 0x01 || salt
     let ps_len = em_len - h_len - salt_len - 2;
     let mut db = vec![0u8; ps_len + 1 + salt_len];
     db[ps_len] = 0x01;
     db[ps_len + 1..].copy_from_slice(&salt);
 
-    // dbMask = MGF1(H, emLen - hLen - 1)
     let db_mask = mgf1(hash, &h, em_len - h_len - 1);
     let mut masked_db: Vec<u8> = db.iter().zip(db_mask.iter()).map(|(a, b)| a ^ b).collect();
-    // emBits = 8*emLen - 1: clear the leftmost bit of DB (RFC 8017
-    // §9.1.1 step 11). This also guarantees OS2IP(EM) < n.
     masked_db[0] &= 0x7f;
 
-    // EM = maskedDB || H || 0xbc (RFC 8017 §9.1.1 step 12).
     let mut em = vec![0u8; em_len];
     em[..masked_db.len()].copy_from_slice(&masked_db);
     em[masked_db.len()..em_len - 1].copy_from_slice(&h);
@@ -708,10 +701,6 @@ pub(crate) fn sign_pss(
 mod tests {
     use super::*;
 
-    /// A known-good RSA-2048 PKCS#1 v1.5 SHA-256 signature verification.
-    /// Modulus and signature are self-generated: we test the big-number
-    /// machinery against a small hand-verifiable key first, then check
-    /// the modular arithmetic properties directly.
     #[test]
     fn rsa_small_key_sign_verify() {
         // n = 3233, e = 17, d = 2753. m = 42: s = 42^2753 mod 3233 = 3065

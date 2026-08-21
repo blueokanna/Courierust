@@ -1,28 +1,24 @@
-//! Concurrency benchmark: does a herd of idle keep-alive connections
-//! degrade request latency?
+//! Slow-connection and idle-connection evidence for the server scheduler.
 //!
-//! The event-driven server parks idle connections on a poller (zero
-//! workers), so with only two event workers the request P50/P99 should
-//! stay flat as idle connections grow. The per-connection pool model
-//! instead burns one worker per idle connection, so a small pool stalls
-//! once the herd exceeds it.
-//!
-//! Run: `cargo bench --bench concurrency` (or
-//! `cargo run --release --bench concurrency`).
+//! The benchmark uses incomplete HTTP/1.1 headers to create connections that
+//! are connected but cannot yet be dispatched to the handler. On Windows the
+//! event-driven scheduler should keep these connections out of the worker
+//! pool. On other platforms the blocking pool behaviour is measured and
+//! reported explicitly; it is not mislabeled as event-driven evidence.
 
 use courierust::courierust_body::Body;
 use courierust::courierust_bytes::Bytes;
-use courierust::courierust_client::{Client, ClientConfig};
+use courierust::courierust_http::header::{HeaderName, HeaderValue};
 use courierust::courierust_http::request::Request;
 use courierust::courierust_http::response::Response;
 use courierust::courierust_server::{Server, ServerConfig};
-use std::io::{Read as _, Write as _};
-use std::net::TcpStream;
-use std::sync::Arc;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
 const IDLE_CONNS: usize = 200;
-const REQS: usize = 400;
+const SLOW_CONNS: usize = 16;
+const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -35,132 +31,162 @@ fn env_usize(name: &str, default: usize) -> usize {
 fn handler(_req: Request<Body>) -> Response<Body> {
     let mut resp = Response::with_status(200.into());
     resp.headers.insert(
-        courierust::courierust_http::header::HeaderName::from_lowercase("content-length"),
-        courierust::courierust_http::header::HeaderValue::from_static("2"),
+        HeaderName::from_lowercase("content-length"),
+        HeaderValue::from_static("2"),
     );
     resp.body = Body::Bytes(Bytes::from_static(b"ok"));
     resp
 }
 
-fn read_full_response(stream: &mut TcpStream) {
-    let mut buf = Vec::new();
+fn read_full_response(stream: &mut TcpStream) -> std::io::Result<()> {
+    let mut buf = Vec::with_capacity(256);
     let mut tmp = [0u8; 4096];
-    let mut head_end = None;
-    while head_end.is_none() {
-        let n = stream.read(&mut tmp).unwrap();
+    let header_end = loop {
+        let n = stream.read(&mut tmp)?;
         if n == 0 {
-            panic!("eof");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "peer closed before response headers",
+            ));
         }
         buf.extend_from_slice(&tmp[..n]);
-        head_end = buf.windows(4).position(|w| w == b"\r\n\r\n");
-    }
-    let he = head_end.unwrap() + 4;
-    let head = String::from_utf8_lossy(&buf[..he]);
-    let cl: usize = head
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+    };
+    let header = String::from_utf8_lossy(&buf[..header_end]);
+    let content_length = header
         .lines()
-        .find_map(|l| {
-            let (k, v) = l.split_once(':')?;
-            if k.eq_ignore_ascii_case("content-length") {
-                v.trim().parse().ok()
-            } else {
-                None
-            }
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
         })
         .unwrap_or(0);
-    while buf.len() < he + cl {
-        let n = stream.read(&mut tmp).unwrap();
+    while buf.len() < header_end + content_length {
+        let n = stream.read(&mut tmp)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "peer closed before response body",
+            ));
+        }
         buf.extend_from_slice(&tmp[..n]);
     }
+    Ok(())
 }
 
-/// Open `n` keep-alive connections that send one request each and stay
-/// idle.
-fn open_idle_herd(addr: std::net::SocketAddr, n: usize) -> Vec<TcpStream> {
-    let mut herd = Vec::with_capacity(n);
-    for _ in 0..n {
-        let mut s = TcpStream::connect(addr).unwrap();
-        s.write_all(b"GET /idle HTTP/1.1\r\nHost: x\r\n\r\n")
-            .unwrap();
-        read_full_response(&mut s);
-        herd.push(s);
+/// Open connections with a complete request line but no terminating CRLF.
+/// They are intentionally slow readers from the server's perspective.
+fn open_partial_herd(addr: SocketAddr, count: usize) -> Vec<TcpStream> {
+    let mut herd = Vec::with_capacity(count);
+    for index in 0..count {
+        let mut stream = TcpStream::connect(addr)
+            .unwrap_or_else(|e| panic!("connect partial connection {index}: {e}"));
+        stream
+            .set_write_timeout(Some(PROBE_TIMEOUT))
+            .expect("set partial write timeout");
+        stream
+            .write_all(b"GET /slow HTTP/1.1\r\nHost: benchmark\r\n")
+            .unwrap_or_else(|e| panic!("write partial connection {index}: {e}"));
+        herd.push(stream);
     }
     herd
 }
 
-fn main() {
-    let idle = env_usize("COURIERUST_IDLE_CONNS", IDLE_CONNS);
-    let reqs = env_usize("COURIERUST_REQS", REQS);
+fn probe(addr: SocketAddr) -> Result<Duration, String> {
+    let started = Instant::now();
+    let mut stream = TcpStream::connect(addr).map_err(|e| format!("connect: {e}"))?;
+    stream
+        .set_read_timeout(Some(PROBE_TIMEOUT))
+        .map_err(|e| format!("set read timeout: {e}"))?;
+    stream
+        .set_write_timeout(Some(PROBE_TIMEOUT))
+        .map_err(|e| format!("set write timeout: {e}"))?;
+    stream
+        .write_all(b"GET /fast HTTP/1.1\r\nHost: benchmark\r\n\r\n")
+        .map_err(|e| format!("write: {e}"))?;
+    read_full_response(&mut stream).map_err(|e| format!("read: {e}"))?;
+    Ok(started.elapsed())
+}
 
-    for model in ["event", "pool"] {
-        let server_cfg = ServerConfig {
+fn run_idle_case(model: &'static str, idle: usize) {
+    let event_enabled = cfg!(windows) && model == "event";
+    let server = Server::bind_with_config(
+        "127.0.0.1:0",
+        ServerConfig {
             http2: false,
             threads: 2,
-            event_driven: model == "event",
+            event_driven: event_enabled,
             event_workers: 2,
             ..Default::default()
-        };
-        let server = Server::bind_with_config("127.0.0.1:0", server_cfg).unwrap();
-        let addr = server.local_addr().unwrap();
-        let _handle = server.serve_background(handler).unwrap();
-        let mut warm = TcpStream::connect(addr).unwrap();
-        warm.write_all(b"GET /warm HTTP/1.1\r\nHost: x\r\n\r\n")
-            .unwrap();
-        read_full_response(&mut warm);
-        drop(warm);
+        },
+    )
+    .expect("bind concurrency server");
+    let addr = server.local_addr().expect("concurrency server address");
+    let _handle = server
+        .serve_background(handler)
+        .expect("start concurrency server");
+    let herd = open_partial_herd(addr, idle);
+    let result = probe(addr);
+    match result {
+        Ok(elapsed) => println!(
+            "CONCURRENCY|case=idle_partial_herd|model={model}|platform={}|status=probe_ok|event_enabled={event_enabled}|connections={idle}|worker_threads=2|probe_us={:.2}",
+            std::env::consts::OS,
+            elapsed.as_secs_f64() * 1_000_000.0,
+        ),
+        Err(error) => println!(
+            "CONCURRENCY|case=idle_partial_herd|model={model}|platform={}|status=probe_blocked|event_enabled={event_enabled}|connections={idle}|worker_threads=2|probe_us=na|error={}",
+            std::env::consts::OS,
+            error.replace('|', "/"),
+        ),
+    }
+    drop(herd);
+}
 
-        let herd = open_idle_herd(addr, idle);
-        let client = Client::with_config(ClientConfig {
-            max_connections_per_host: 1,
+fn run_slow_sender_case(count: usize) {
+    let event_enabled = cfg!(windows);
+    let server = Server::bind_with_config(
+        "127.0.0.1:0",
+        ServerConfig {
+            http2: false,
+            threads: 2,
+            event_driven: event_enabled,
+            event_workers: 2,
             ..Default::default()
-        });
-        let mut samples = Vec::with_capacity(reqs);
-        for _ in 0..reqs {
-            let t0 = Instant::now();
-            let resp = client.get(&format!("http://{addr}/r")).unwrap();
-            assert_eq!(resp.status.as_u16(), 200);
-            samples.push(t0.elapsed());
+        },
+    )
+    .expect("bind slow sender server");
+    let addr = server.local_addr().expect("slow sender server address");
+    let _handle = server
+        .serve_background(handler)
+        .expect("start slow sender server");
+    let mut herd = open_partial_herd(addr, count);
+    let started = Instant::now();
+    let mut completed = 0usize;
+    for stream in &mut herd {
+        if stream.write_all(b"\r\n").is_ok() && read_full_response(stream).is_ok() {
+            completed += 1;
         }
-        samples.sort_unstable();
-        let p50 = samples[reqs / 2].as_secs_f64() * 1_000_000.0;
-        let p75 = samples[(reqs as f64 * 0.75) as usize].as_secs_f64() * 1_000_000.0;
-        let p90 = samples[(reqs as f64 * 0.90) as usize].as_secs_f64() * 1_000_000.0;
-        let p95 = samples[(reqs as f64 * 0.95) as usize].as_secs_f64() * 1_000_000.0;
-        let p99 = samples[(reqs as f64 * 0.99) as usize].as_secs_f64() * 1_000_000.0;
-
-        println!(
-            "model={model} idle={idle} workers=2 reqs={reqs} p50_us={p50:.1} p75_us={p75:.1} p90_us={p90:.1} p95_us={p95:.1} p99_us={p99:.1}",
-        );
-        drop(herd);
-    }
-
-    let slow_idle = env_usize("COURIERUST_SLOW_CONNS", 16);
-    let server_cfg = ServerConfig {
-        http2: false,
-        threads: 2,
-        event_driven: true,
-        event_workers: 2,
-        ..Default::default()
-    };
-    let server = Server::bind_with_config("127.0.0.1:0", server_cfg).unwrap();
-    let addr = server.local_addr().unwrap();
-    let _handle = server.serve_background(handler).unwrap();
-    let mut slow: Vec<TcpStream> = Vec::new();
-    for _ in 0..slow_idle {
-        let mut s = TcpStream::connect(addr).unwrap();
-        s.write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\n").unwrap();
-        slow.push(s);
-    }
-    let t0 = Instant::now();
-    let mut done = 0;
-    for s in slow.iter_mut() {
-        s.write_all(b"\r\n").unwrap();
-        read_full_response(s);
-        done += 1;
     }
     println!(
-        "event slow-sender herd: slow={slow_idle} workers=2 completed={done} wall_ms={:.1}",
-        t0.elapsed().as_secs_f64() * 1000.0
+        "CONCURRENCY|case=slow_sender_herd|model={}|platform={}|status={}|event_enabled={event_enabled}|connections={count}|worker_threads=2|completed={completed}|wall_ms={:.2}",
+        if event_enabled { "event" } else { "pool" },
+        std::env::consts::OS,
+        if completed == count { "ok" } else { "partial" },
+        started.elapsed().as_secs_f64() * 1000.0,
     );
-    let _ = Arc::new(());
-    let _ = Duration::from_secs(0);
+}
+
+fn main() {
+    let idle = env_usize("COURIERUST_IDLE_CONNS", IDLE_CONNS);
+    if cfg!(windows) {
+        run_idle_case("event", idle);
+        run_idle_case("pool", idle);
+    } else {
+        run_idle_case("pool", idle);
+    }
+    run_slow_sender_case(env_usize("COURIERUST_SLOW_CONNS", SLOW_CONNS));
+    println!("CONCURRENCY|suite=complete");
 }

@@ -395,29 +395,44 @@ impl<R: Read, W: Write> Connection<R, W> {
     /// read or outbound frames were flushed). Transport timeouts /
     /// would-block are treated as "no data yet" and return `Ok(false)`.
     pub fn poll(&mut self) -> Result<bool> {
+        self.poll_available(1)
+    }
+
+    /// Flush outbound data and process up to `max_frames` complete inbound
+    /// frames that are already available on the transport.
+    ///
+    /// The old driver contract processed exactly one frame per call. That
+    /// made a multiplexed connection pay a full read/timeout/flush cycle for
+    /// every SETTINGS, HEADERS, and DATA frame, even when the peer had
+    /// already written the whole response. Batching is deliberately bounded
+    /// so a busy peer cannot starve command handling or response dispatch.
+    /// A transport timeout ends the batch; it is not a connection error.
+    pub fn poll_available(&mut self, max_frames: usize) -> Result<bool> {
         if self.closed {
             return Ok(false);
         }
         let had_pending = !self.pending_frames.is_empty();
         self.flush_outbound()?;
-        let read_any = match self.read_and_process_one() {
-            Ok(r) => r,
-            Err(e) if e.kind == ErrorKind::Timeout => false,
-            // A clean EOF (peer closed) ends the session: mark it closed
-            // so `is_closed()` reports it and drivers stop treating the
-            // connection as reusable.
-            Err(e) if e.kind == ErrorKind::UnexpectedEof => {
-                self.closed = true;
-                return Err(e);
+        let mut read_any = false;
+        for _ in 0..max_frames.max(1) {
+            match self.read_and_process_one() {
+                Ok(true) => read_any = true,
+                Ok(false) => break,
+                Err(e) if e.kind == ErrorKind::Timeout => break,
+                Err(e) if e.kind == ErrorKind::UnexpectedEof => {
+                    self.closed = true;
+                    return Err(e);
+                }
+                Err(e) => {
+                    self.flush_final();
+                    return Err(e);
+                }
             }
-            Err(e) => {
-                // Connection/protocol error: deliver the queued GOAWAY to
-                // the peer before tearing down (RFC 9113 §5.4.1), so it
-                // can observe the error code instead of a bare FIN.
-                self.flush_final();
-                return Err(e);
+            if self.reader.buffered() < 9 && self.frame.header.is_none() && self.frame.hdr_len == 0
+            {
+                break;
             }
-        };
+        }
         self.flush_outbound()?;
         Ok(had_pending || read_any)
     }
@@ -455,10 +470,6 @@ impl<R: Read, W: Write> Connection<R, W> {
         let mut block = BytesMut::with_capacity(64);
         self.encoder.encode(fields, &mut block);
         let max = self.peer.max_frame_size as usize;
-
-        // The request method determines whether the response on this
-        // stream may carry a body (HEAD / CONNECT responses must not,
-        // RFC 9113 §8.1), which feeds `content-length` enforcement.
         let method = fields
             .iter()
             .find(|f| f.name.as_str() == ":method")
@@ -487,10 +498,7 @@ impl<R: Read, W: Write> Connection<R, W> {
             stream.send_done = end_stream;
             stream.state == StreamState::Closed
         };
-        // Both endpoints are done (e.g. a server response whose HEADERS
-        // carry END_STREAM): drop the record now so open_count tracks
-        // truly-open streams (RFC 9113 §5.1) instead of growing without
-        // bound.
+
         if now_closed {
             self.events.push_back(Event::StreamClosed { stream_id });
             self.close_stream(stream_id);
@@ -671,17 +679,9 @@ impl<R: Read, W: Write> Connection<R, W> {
     /// WINDOW_UPDATE frames.
     pub fn release_data(&mut self, stream_id: u32, n: usize) {
         let n = n as i64;
-        // Batch credit back at half-window granularity so the local
-        // window is never exhausted between receiving data and emitting
-        // the WINDOW_UPDATE (a single max-size frame must always fit).
         let stream_release_threshold = (self.local.initial_window_size as i64 / 2).max(16 * 1024);
         let mut emit_stream = 0i64;
         if let Some(s) = self.streams.get_mut(&stream_id) {
-            // `recv_unreleased` was incremented by the DATA handler; grant
-            // the peer credit back in batches and reflect it in the local
-            // window only when the WINDOW_UPDATE is actually emitted, so
-            // `recv_window` stays the real enforcement limit (RFC 9113
-            // §6.9).
             if s.recv_unreleased >= stream_release_threshold {
                 emit_stream = s.recv_unreleased;
                 s.recv_unreleased = 0;
@@ -697,7 +697,7 @@ impl<R: Read, W: Write> Connection<R, W> {
                 increment: emit_stream.min(i64::from(u32::MAX)) as u32,
             });
         }
-        // Connection-level credit, batched at half the 64 KiB window.
+
         self.conn_pending_release += n;
         let conn_threshold = 32 * 1024i64;
         if self.conn_pending_release >= conn_threshold {
@@ -724,8 +724,6 @@ impl<R: Read, W: Write> Connection<R, W> {
             self.preface_pending = false;
         }
         if !self.settings_sent {
-            // Send our SETTINGS once (client: right after the preface;
-            // server: immediately).
             self.queue_settings();
             self.settings_sent = true;
         }
@@ -748,8 +746,7 @@ impl<R: Read, W: Write> Connection<R, W> {
         });
     }
 
-    /// Emit DATA frames for scheduled streams, bounded per flush for
-    /// fairness.
+    /// Emit DATA frames for scheduled streams, bounded per flush for fairness
     fn emit_data_frames(&mut self) -> Result<()> {
         if self.conn_send_window.available() <= 0 {
             return Ok(());
@@ -761,9 +758,7 @@ impl<R: Read, W: Write> Connection<R, W> {
                 Some(s) => s,
                 None => break,
             };
-            // `next` popped the stream from the scheduler queue; mark it
-            // unscheduled so `maybe_schedule` can re-queue it if it still
-            // has data.
+
             self.scheduled.remove(&sid);
             let can_send = {
                 let s = match self.streams.get(&sid) {
@@ -773,8 +768,6 @@ impl<R: Read, W: Write> Connection<R, W> {
                         continue;
                     }
                 };
-                // Buffered data is always drainable while credit remains,
-                // even after `send_done`.
                 s.send_window > 0
             };
             if !can_send {
@@ -782,7 +775,6 @@ impl<R: Read, W: Write> Connection<R, W> {
                 self.scheduled.remove(&sid);
                 continue;
             }
-            // Amount we may emit for this stream this round.
             let stream_window = self.streams.get(&sid).map(|s| s.send_window).unwrap_or(0);
             let amount = stream_window
                 .min(self.conn_send_window.available())
@@ -814,8 +806,7 @@ impl<R: Read, W: Write> Connection<R, W> {
                 let take = core::cmp::min(amount, chunk.data.len());
                 payload = chunk.data.split_to(take);
             }
-            // Pop the front chunk once fully consumed and decide whether
-            // the stream ends here — possibly with a trailer block.
+
             let mut end_stream = false;
             let mut trailers: Option<HeaderList> = None;
             if let Some(q) = self.send_queue.get_mut(&sid) {
@@ -834,8 +825,6 @@ impl<R: Read, W: Write> Connection<R, W> {
                 s.send_buffered = s.send_buffered.saturating_sub(payload.len());
             }
             self.conn_send_window.consume(payload.len() as i64);
-            // A trailer chunk carries no DATA; it is delivered as a
-            // trailing HEADERS block (END_STREAM) once all data is out.
             if let Some(fields) = trailers {
                 self.emit_trailer_block(sid, &fields);
                 end_stream = true;
@@ -846,9 +835,7 @@ impl<R: Read, W: Write> Connection<R, W> {
                     end_stream,
                 });
             }
-            // Advance the local send state. When both endpoints have
-            // finished, the stream record is dropped so open_count tracks
-            // only live streams (RFC 9113 §5.1).
+
             if end_stream {
                 let remote_done = self
                     .streams
@@ -866,7 +853,7 @@ impl<R: Read, W: Write> Connection<R, W> {
                     s.state = StreamState::HalfClosedLocal;
                 }
             }
-            // Reschedule if the stream still has data and credit.
+
             let stream = self.streams.get(&sid).unwrap();
             let exhausted = self
                 .send_queue
@@ -883,9 +870,7 @@ impl<R: Read, W: Write> Connection<R, W> {
         Ok(())
     }
 
-    /// Encode and queue a trailing HEADERS block (RFC 9113 §8.1), split
-    /// into HEADERS + CONTINUATION frames as needed. The block ends the
-    /// stream.
+    /// Encode and queue a trailing HEADERS block for the given stream
     fn emit_trailer_block(&mut self, stream_id: u32, fields: &HeaderList) {
         let mut block = BytesMut::with_capacity(64);
         self.encoder.encode(fields, &mut block);
@@ -955,8 +940,6 @@ impl<R: Read, W: Write> Connection<R, W> {
     // ------------------------------------------------------------------
 
     fn read_and_process_one(&mut self) -> Result<bool> {
-        // 1. Frame header (9 bytes), accumulated across polls so a
-        //    partial read is never lost.
         if self.frame.header.is_none() {
             let n = self
                 .reader
@@ -987,7 +970,6 @@ impl<R: Read, W: Write> Connection<R, W> {
             self.frame.payload_filled = 0;
         }
 
-        // 2. Frame payload, accumulated across polls.
         if self.frame.payload_filled < self.frame.payload_len {
             let n = {
                 let (reader, frame) = (&mut self.reader, &mut self.frame);
@@ -1001,7 +983,6 @@ impl<R: Read, W: Write> Connection<R, W> {
             }
         }
 
-        // 3. Complete frame: parse + process, then reset for the next one.
         let header = self.frame.header.take().unwrap();
         let frame = match Frame::parse(
             header,
@@ -1009,8 +990,6 @@ impl<R: Read, W: Write> Connection<R, W> {
             self.local.max_frame_size,
         ) {
             Ok(f) => f,
-            // Frame-level connection errors (RFC 9113 §5.4.1): the peer
-            // must learn the error code via GOAWAY, not a bare FIN.
             Err(e) => {
                 let code = e
                     .h2_code()
@@ -1028,9 +1007,6 @@ impl<R: Read, W: Write> Connection<R, W> {
     }
 
     fn process_frame(&mut self, frame: Frame) -> Result<()> {
-        // Header-block reassembly: once a HEADERS/PUSH_PROMISE without
-        // END_HEADERS is seen, only CONTINUATION on the same stream may
-        // follow (RFC 9113 §6.10).
         if self.pending_headers.is_some() {
             match frame {
                 Frame::Continuation {
@@ -1045,9 +1021,6 @@ impl<R: Read, W: Write> Connection<R, W> {
                             "CONTINUATION on different stream",
                         );
                     }
-                    // Bound the accumulated header block: a peer must not
-                    // grow it without limit via endless CONTINUATION
-                    // frames (memory-exhaustion DoS guard).
                     if pending.block.len() + block.len() > self.local.max_header_list_size as usize
                     {
                         return self.conn_error(
@@ -1113,9 +1086,6 @@ impl<R: Read, W: Write> Connection<R, W> {
             Frame::Settings { ack, entries } => {
                 if ack {
                     if !entries.is_empty() {
-                        // RFC 9113 §6.5.3: a SETTINGS ACK must not carry a
-                        // payload. Frame parsing already rejects non-empty
-                        // ACK payloads at length 0, but defend again here.
                         return self
                             .conn_error(ErrorCode::FrameSizeError, "SETTINGS ACK with payload");
                     }
@@ -1171,8 +1141,6 @@ impl<R: Read, W: Write> Connection<R, W> {
                 stream_id,
                 priority: _p,
             } => {
-                // RFC 7540 stream priority is deprecated (RFC 9218 §2);
-                // we honor PRIORITY_UPDATE / the Priority header instead.
                 let _ = stream_id;
                 Ok(())
             }
@@ -1210,8 +1178,6 @@ impl<R: Read, W: Write> Connection<R, W> {
                 Ok(())
             }
             Frame::PushPromise { .. } => {
-                // ENABLE_PUSH is 0 for clients; receiving PUSH_PROMISE is
-                // a connection error.
                 self.conn_error(ErrorCode::ProtocolError, "unexpected PUSH_PROMISE")
             }
             Frame::Continuation { .. } => self.conn_error(
@@ -1233,17 +1199,11 @@ impl<R: Read, W: Write> Connection<R, W> {
         let is_new = !self.streams.contains(&sid);
 
         if is_new {
-            // Strict pseudo-header validation (RFC 9113 §8.1.2): a fresh
-            // header block is a request (server side) or a response
-            // (client side). Malformed blocks are connection errors.
             self.validate_header_block(&fields, !self.config.client, false)?;
 
-            // Stream must not already exist in a non-idle state.
             if self.config.client {
-                // Client: a response HEADERS on a stream we never opened.
                 return self.conn_error(ErrorCode::ProtocolError, "response on unknown stream");
             }
-            // Server: validate monotonic stream id.
             if !self.streams.accept_peer_id(sid) {
                 return self.conn_error(ErrorCode::ProtocolError, "non-monotonic stream id");
             }
@@ -1282,14 +1242,10 @@ impl<R: Read, W: Write> Connection<R, W> {
                 s.recv_ended = true;
             }
             s.headers_delivered = true;
-            // RFC 9113 §8.1.2.6: track the expected body length so a
-            // mismatched request body is rejected at stream end.
             s.content_length = cl;
             s.body_expected = method != "HEAD" && method != "CONNECT";
             self.streams.insert(s);
             if p.end_stream {
-                // A request whose headers claim END_STREAM (no body) but
-                // declare a nonzero content-length is malformed.
                 self.verify_content_length(sid);
                 if !self.streams.contains(&sid) {
                     return Ok(());
@@ -1304,8 +1260,6 @@ impl<R: Read, W: Write> Connection<R, W> {
             return Ok(());
         }
 
-        // Existing stream. Snapshot the flags first so the strict
-        // pseudo-header validation below can borrow `self` mutably.
         let (is_closed, delivered) = {
             let s = self.streams.get(&sid).unwrap();
             (s.is_closed(), s.headers_delivered)
@@ -1319,14 +1273,7 @@ impl<R: Read, W: Write> Connection<R, W> {
             return Ok(());
         }
         if delivered {
-            // Trailers: pseudo-headers MUST NOT appear (RFC 9113 §8.1.2),
-            // and framing fields (content-length, transfer-encoding,
-            // connection-specific) are forbidden (RFC 9113 §8.1).
             self.validate_header_block(&fields, false, true)?;
-            // A content-length that disagrees with the actual body length
-            // is a stream error (RFC 9113 §8.1.2.6). Verify BEFORE
-            // delivering the trailers so callers never observe a "valid"
-            // trailer block on a stream that is actually malformed.
             self.verify_content_length(sid);
             if !self.streams.contains(&sid) {
                 return Ok(());
@@ -1352,11 +1299,6 @@ impl<R: Read, W: Write> Connection<R, W> {
             }
             return Ok(());
         }
-        // First headers on an existing stream: on a server only trailers
-        // may follow a request's headers (already handled above), so
-        // additional HEADERS are a connection error. On a client this is
-        // the response head (informational 1xx aside), which must satisfy
-        // the strict response pseudo-header rules.
         if !self.config.client {
             return self.conn_error(
                 ErrorCode::ProtocolError,
@@ -1364,9 +1306,6 @@ impl<R: Read, W: Write> Connection<R, W> {
             );
         }
         self.validate_header_block(&fields, false, false)?;
-        // RFC 9113 §8.1.2.6: parse the response content-length and the
-        // status so the body count can be enforced. 1xx / 204 / 304
-        // responses never carry a body.
         let cl = self.parse_content_length(&fields)?;
         let status = fields
             .iter()
@@ -1379,8 +1318,6 @@ impl<R: Read, W: Write> Connection<R, W> {
         {
             let stream = self.streams.get_mut(&sid).unwrap();
             stream.content_length = cl;
-            // The request method (HEAD/CONNECT) may already rule out a
-            // body; the status can rule one out too.
             stream.body_expected = stream.body_expected && status_expects_body;
             stream.state = match stream.state {
                 StreamState::Open => {
@@ -1391,8 +1328,6 @@ impl<R: Read, W: Write> Connection<R, W> {
                     }
                 }
                 StreamState::HalfClosedLocal => {
-                    // We already ended our side; the peer may still send
-                    // a response body.
                     if p.end_stream {
                         StreamState::Closed
                     } else {
@@ -1413,10 +1348,6 @@ impl<R: Read, W: Write> Connection<R, W> {
             stream.priority = priority;
             stream.headers_delivered = true;
         }
-        // Verify content-length before delivering the head: a mismatch
-        // (e.g. a bodyless response declaring a nonzero content-length)
-        // is a stream error surfaced via RST + StreamError, and the
-        // response head must not be delivered as if it were valid.
         if p.end_stream {
             self.verify_content_length(sid);
             if !self.streams.contains(&sid) {
@@ -1465,9 +1396,6 @@ impl<R: Read, W: Write> Connection<R, W> {
             if !f.name.is_pseudo() {
                 saw_regular = true;
                 let n = f.name.as_str();
-                // Connection-specific fields are forbidden in HTTP/2
-                // (RFC 9113 §8.2.2): they are hop-by-hop in HTTP/1.1 and
-                // a request-smuggling vector if forwarded (CWE-444).
                 if matches!(
                     n,
                     "connection"
@@ -1481,8 +1409,6 @@ impl<R: Read, W: Write> Connection<R, W> {
                         "connection-specific header in HTTP/2",
                     );
                 }
-                // RFC 9113 §8.2.2: the `te` field is allowed only with
-                // the value `trailers` (gRPC relies on this).
                 if n == "te" {
                     let v = f.value.to_str().unwrap_or("");
                     if !v.eq_ignore_ascii_case("trailers") {
@@ -1490,8 +1416,6 @@ impl<R: Read, W: Write> Connection<R, W> {
                             .conn_error(ErrorCode::ProtocolError, "TE header must be 'trailers'");
                     }
                 }
-                // RFC 9113 §8.1: framing fields must not appear in
-                // trailers (content-length smuggling vector).
                 if is_trailer && matches!(n, "content-length" | "host" | "trailer" | "te") {
                     return self.conn_error(ErrorCode::ProtocolError, "framing field in trailers");
                 }
@@ -1540,8 +1464,6 @@ impl<R: Read, W: Write> Connection<R, W> {
                     }
                     has_status = true;
                     let v = f.value.as_bytes();
-                    // Exactly three ASCII digits; first digit 1..=5 gives
-                    // the RFC-defined 100..=599 range.
                     let ok = v.len() == 3
                         && v[0].is_ascii_digit()
                         && v[1].is_ascii_digit()
@@ -1601,8 +1523,6 @@ impl<R: Read, W: Write> Connection<R, W> {
             return self.conn_error(ErrorCode::ProtocolError, "DATA on unknown stream");
         }
         let len = data.len() as i64;
-        // DATA on a bodyless message (HEAD/CONNECT request, or a
-        // 1xx/204/304 response) is a stream error (RFC 9113 §8.1).
         let bodyless = self
             .streams
             .get(&stream_id)
@@ -1656,10 +1576,6 @@ impl<R: Read, W: Write> Connection<R, W> {
             return self.conn_error(ErrorCode::FlowControlError, "connection window exceeded");
         }
         self.conn_recv_window.consume(len);
-        // Detect a content-length mismatch BEFORE delivering the final
-        // DATA to the application: the stream error (RST + StreamError)
-        // is then the only signal, so callers never observe a "valid"
-        // short body.
         if end_stream {
             self.verify_content_length(stream_id);
             if !self.streams.contains(&stream_id) {
@@ -1694,8 +1610,7 @@ impl<R: Read, W: Write> Connection<R, W> {
         if let Err(e) = new_settings.apply(&entries) {
             return self.conn_error(ErrorCode::ProtocolError, &e.to_string());
         }
-        // SETTINGS_ENABLE_PUSH: only meaningful from the server side.
-        // SETTINGS_NO_RFC7540_PRIORITIES must not change after first frame.
+
         if self.peer.no_rfc7540_priorities != new_settings.no_rfc7540_priorities
             && self.peer.no_rfc7540_priorities != 0
         {
@@ -1704,7 +1619,6 @@ impl<R: Read, W: Write> Connection<R, W> {
                 "SETTINGS_NO_RFC7540_PRIORITIES changed",
             );
         }
-        // Apply the HPACK table size the peer allows us to use.
         self.encoder
             .set_peer_table_size(new_settings.header_table_size as usize);
         // Apply INITIAL_WINDOW_SIZE delta to every stream's send window.
@@ -1728,12 +1642,6 @@ impl<R: Read, W: Write> Connection<R, W> {
         });
         self.events
             .push_back(Event::PeerSettings(self.peer.clone()));
-        // Reschedule streams whose send window grew. `can_send()` is not
-        // the right filter here: it is false once `send_done` is set,
-        // which happens when the final chunk is *queued* (END_STREAM)
-        // while its bytes are still buffered. A stream is schedulable
-        // whenever it still has buffered data (RFC 9113 §5.2: flow
-        // control applies to the queued bytes).
         let ids: Vec<u32> = self
             .streams
             .iter()
@@ -1751,9 +1659,7 @@ impl<R: Read, W: Write> Connection<R, W> {
             if !self.conn_send_window.increase(increment) {
                 return self.conn_error(ErrorCode::FlowControlError, "connection window overflow");
             }
-            // Re-schedule streams with buffered data (see the comment in
-            // `on_settings`: `can_send()` would wrongly exclude streams
-            // whose END_STREAM chunk is queued behind buffered bytes).
+
             let ids: Vec<u32> = self
                 .streams
                 .iter()
@@ -1910,8 +1816,6 @@ impl<R: Read, W: Write> Connection<R, W> {
             let take = core::cmp::min(24 - filled, b.len());
             buf[filled..filled + take].copy_from_slice(&b[..take]);
             filled += take;
-            // Only consume if the prefix matches so far; otherwise leave
-            // the data for the HTTP/1 layer.
             if !frame::CLIENT_PREFACE.starts_with(&buf[..filled]) {
                 break;
             }
@@ -1926,6 +1830,21 @@ mod tests {
     use super::*;
     use crate::courierust_hpack::HeaderField;
     use crate::courierust_http::header::{HeaderName, HeaderValue};
+
+    struct OneRead {
+        data: Vec<u8>,
+        used: bool,
+    }
+
+    impl Read for OneRead {
+        fn read(&mut self, out: &mut [u8]) -> Result<usize> {
+            assert!(!self.used, "batch poll attempted a second transport read");
+            self.used = true;
+            let n = core::cmp::min(out.len(), self.data.len());
+            out[..n].copy_from_slice(&self.data[..n]);
+            Ok(n)
+        }
+    }
 
     fn hf(name: &str, value: &str) -> HeaderField {
         HeaderField::new(
@@ -1946,5 +1865,23 @@ mod tests {
         );
         let none = vec![hf("x-a", "b")];
         assert_eq!(Priority::parse_headers(&none), None);
+    }
+
+    #[test]
+    fn batch_poll_does_not_read_past_buffered_frames() {
+        let mut wire = BytesMut::new();
+        Frame::Settings {
+            ack: true,
+            entries: Vec::new(),
+        }
+        .encode(&mut wire);
+        let reader = OneRead {
+            data: wire.into_vec(),
+            used: false,
+        };
+        let writer = crate::courierust_io::VecWriter(Vec::new());
+        let mut conn = Connection::new(reader, writer, Config::default());
+
+        assert!(conn.poll_available(64).unwrap());
     }
 }
