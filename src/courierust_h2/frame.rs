@@ -337,8 +337,10 @@ impl Frame {
                         "SETTINGS length % 6 != 0",
                     ));
                 }
-                let mut entries = Vec::with_capacity(payload.len() / 6);
-                for c in payload.chunks_exact(6) {
+                let (chunks, remainder) = payload.as_chunks::<6>();
+                debug_assert!(remainder.is_empty());
+                let mut entries = Vec::with_capacity(chunks.len());
+                for c in chunks {
                     let id = u16::from_be_bytes([c[0], c[1]]);
                     let value = u32::from_be_bytes([c[2], c[3], c[4], c[5]]);
                     entries.push(Setting { id, value });

@@ -13,7 +13,7 @@ This wiki is a hands-on guide. Every code sample below is real API usage — cop
 - [浏览器指纹：JA3 / JA4 / Chrome HTTP/2 指纹](浏览器指纹)
 - [no_std：只用协议核心（嵌入式 / 内核态）](no_std-使用)
 - [示例：8 个可直接运行的 demo](示例)
-- [基准测试：自测 + 与 hyper/reqwest/tiny_http 对比](基准测试)
+- [基准测试：自测、跨库对比与互操作验证](基准测试)
 
 ## English tutorials
 
@@ -24,7 +24,7 @@ This wiki is a hands-on guide. Every code sample below is real API usage — cop
 - [Fingerprints: JA3 / JA4 / Chrome HTTP/2](Fingerprints)
 - [no_std: protocol core only (embedded / kernel)](no_std)
 - [Examples: 8 runnable demos](Examples)
-- [Benchmarks: self + vs hyper/reqwest/tiny_http](Benchmarks)
+- [Benchmarks: self, cross-library comparison, and interop validation](Benchmarks)
 
 ## What the crate does
 

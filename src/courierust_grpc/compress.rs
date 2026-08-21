@@ -182,8 +182,7 @@ impl BitWriter {
         }
     }
 
-    /// Write `n` bits (the low `n` bits of `value`), LSB-first. This is
-    /// how DEFLATE encodes plain integers (block headers, extra bits).
+    /// Write the low `n` bits of `value` LSB-first (DEFLATE integer format)
     fn write_bits(&mut self, value: u32, n: u32) {
         debug_assert!(n <= 32);
         self.acc |= value << self.nbits;
@@ -195,8 +194,7 @@ impl BitWriter {
         }
     }
 
-    /// Write an `n`-bit Huffman code MSB-first (RFC 1951 §3.1.1 packs
-    /// codes starting at their most significant bit).
+    /// Write `n`-bit Huffman code MSB-first per RFC 1951.
     fn write_bits_msb(&mut self, value: u32, n: u32) {
         let mut rev = 0u32;
         for i in 0..n {
@@ -223,8 +221,7 @@ struct DecodeTable {
     count: [u16; 16],
     /// offset[len] = start index into `symbol` for codes of length `len`.
     offset: [u16; 16],
-    /// Symbols grouped by code length (ascending symbol order within a
-    /// length), in the order the canonical codes are assigned.
+    /// Symbols grouped by code length (ascending within length) in canonical order
     symbol: [u16; 288],
 }
 
@@ -237,9 +234,7 @@ impl DecodeTable {
         }
     }
 
-    /// Build a table from code lengths. `allow_incomplete` permits a
-    /// table with no codes (or a single code) — legal for the distance
-    /// alphabet when no distances are used (RFC 1951 §3.2.7).
+    /// Build table from code lengths. `allow_incomplete` permits ≤1 code
     fn build(lens: &[u8], allow_incomplete: bool) -> Result<Self> {
         let mut table = Self::empty();
         for &l in lens {
@@ -251,7 +246,7 @@ impl DecodeTable {
             }
             table.count[l as usize] += 1;
         }
-        // Over-subscription check (Kraft inequality, RFC 1951 §3.2.2).
+
         let mut left: i32 = 1;
         for len in 1..=15 {
             left <<= 1;
@@ -260,12 +255,7 @@ impl DecodeTable {
                 return Err(Error::protocol("deflate: over-subscribed code"));
             }
         }
-        // An incomplete table is legal only for the distance alphabet:
-        // the fixed distance table itself uses 30 of the 32 possible
-        // 5-bit codes, and a dynamic distance table may be incomplete
-        // (unused codes simply never appear in a well-formed stream and
-        // error at decode time). Literal/length and code-length tables
-        // must be complete (RFC 1951 §3.2.7).
+
         if left != 0 && !allow_incomplete {
             return Err(Error::protocol("deflate: incomplete code"));
         }
@@ -493,11 +483,7 @@ fn inflate_block(
 // DEFLATE compression (fixed Huffman + LZ77)
 // ---------------------------------------------------------------------
 
-/// Hash chain match finder over the DEFLATE distance window. The
-/// standard distance table's largest code (29) spans 24577..=28672, so
-/// the effective match window is 28672 bytes — not the 32 KiB the
-/// protocol is named after (larger distances have no code and would
-/// produce an invalid stream).
+/// Hash chain match finder capped at DEFLATE's 28,672-byte window
 const WINDOW: usize = 28_672;
 const HASH_BITS: u32 = 15;
 const HASH_SIZE: usize = 1 << HASH_BITS;
@@ -514,8 +500,6 @@ fn hash3(a: u8, b: u8, c: u8) -> usize {
 /// [`inflate`]) can inflate.
 pub fn deflate(data: &[u8]) -> Vec<u8> {
     let mut w = BitWriter::new();
-    // Hash chains: `head[h]` = most recent position with hash `h`;
-    // `prev[pos]` = the position before `pos` with the same hash.
     let mut head = vec![usize::MAX; HASH_SIZE];
     let mut prev = vec![usize::MAX; data.len().max(1)];
     let mut i = 0usize;
@@ -554,10 +538,6 @@ pub fn deflate(data: &[u8]) -> Vec<u8> {
         }
 
         if best_len >= MIN_MATCH {
-            // The distance code table has gaps (e.g. 5121..6144 has no
-            // code): a match at such a distance cannot be encoded, so it
-            // degrades to literals rather than producing an invalid
-            // stream.
             if let Some((dcode, dextra, dbase)) = distance_code(best_dist) {
                 let (code, extra, base) = length_code(best_len).unwrap();
                 write_fixed_length(&mut w, code, extra, (best_len - base as usize) as u32);
@@ -636,8 +616,7 @@ pub fn crc32(data: &[u8]) -> u32 {
 /// gzip magic bytes.
 const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 
-/// Compress `data` into a complete gzip member (header + deflate + CRC32
-/// + ISIZE). Fixed Huffman + LZ77.
+/// Compress `data` to gzip using Fixed Huffman + LZ77.
 pub fn gzip(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() / 2 + 64);
     out.extend_from_slice(&GZIP_MAGIC);
@@ -652,9 +631,7 @@ pub fn gzip(data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Decompress a complete gzip member. Only the first member is
-/// processed; trailing bytes are rejected (a gRPC message is one member).
-/// `max_out` caps the output size.
+/// Decompress a single gzip member up to `max_out` bytes, rejecting trailing data
 pub fn gunzip(data: &[u8], max_out: usize) -> Result<Vec<u8>> {
     if data.len() < 18 {
         return Err(Error::protocol("gzip: truncated header"));
@@ -667,8 +644,6 @@ pub fn gunzip(data: &[u8], max_out: usize) -> Result<Vec<u8>> {
     }
     let flg = data[3];
     let mut pos = 10usize;
-    // Skip optional fields (RFC 1952 §2.3.1) so real producers' members
-    // (FNAME/FCOMMENT/...) are accepted.
     if flg & 0x04 != 0 {
         // FEXTRA
         if pos + 2 > data.len() {
@@ -785,14 +760,11 @@ mod tests {
     #[test]
     fn gunzip_rejects_corruption() {
         let g = gzip(b"payload");
-        // Flip a byte in the middle of the deflate body.
         let mut bad = g.clone();
         let mid = bad.len() / 2;
         bad[mid] ^= 0xff;
         assert!(gunzip(&bad, 1 << 20).is_err());
-        // Truncated.
         assert!(gunzip(&g[..g.len() - 1], 1 << 20).is_err());
-        // Bad magic.
         assert!(gunzip(b"not-gzip-data-here", 1 << 20).is_err());
     }
 
@@ -809,20 +781,17 @@ mod tests {
         assert_eq!(length_code(258), Some((285, 0, 258)));
         assert_eq!(length_code(11), Some((265, 1, 11)));
         assert_eq!(distance_code(1), Some((0, 0, 1)));
-        // Code 29 spans 24577..=28672 (12 extra bits); larger distances
-        // and the table's gaps have no code.
+        // Code 29 covers 24577..=28672 (12 extra bits = 4096 bits); larger distances and gaps are uncoded
         assert_eq!(distance_code(28672), Some((29, 12, 24577)));
         assert_eq!(distance_code(24577), Some((29, 12, 24577)));
         assert_eq!(distance_code(16385), Some((28, 12, 16385)));
         assert_eq!(distance_code(32768), None);
-        assert_eq!(distance_code(5121), None); // gap
+        assert_eq!(distance_code(5121), None);
     }
 
     #[test]
     fn decompresses_stored_and_fixed_and_dynamic() {
-        // A hand-built stored block (BFINAL=1, BTYPE=00): "abc".
-        // 3 bits header = 1 (bfinal), 0,0 (stored). Pad to byte: 0b00000001.
-        // LEN=3, NLEN=0xFFFC, then "abc".
+        // Hand-built stored DEFLATE block ("abc"): Header 0x01 (BFINAL=1, BTYPE=00), LEN=3, NLEN=0xFFFC.
         let mut stored = vec![0x01, 0x03, 0x00, 0xfc, 0xff];
         stored.extend_from_slice(b"abc");
         assert_eq!(inflate(&stored, 1 << 10).unwrap(), b"abc");
@@ -872,7 +841,6 @@ mod tests {
         ];
         for (plain, deflate_hex, gzip_hex) in cases {
             let expected = plain.as_bytes();
-            // Raw DEFLATE from zlib (dynamic/stored blocks).
             let d = inflate(&hex(deflate_hex), 1 << 20).unwrap();
             assert_eq!(
                 &d,
@@ -880,7 +848,6 @@ mod tests {
                 "deflate vector mismatch for {:?}",
                 &plain[..plain.len().min(24)]
             );
-            // gzip container from zlib.
             let g = gunzip(&hex(gzip_hex), 1 << 20).unwrap();
             assert_eq!(
                 &g,

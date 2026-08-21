@@ -1,69 +1,50 @@
 # Benchmarks
 
-The repository ships two benchmark harnesses in the `benches/` sub-crate (`courierust_benchmark`):
+The `benches/` workspace provides three release-profile executables:
 
-- `throughput` — zero-dependency self-measurement: keep-alive round-trips, multi-core scaling, HTTP/2 multiplexing, RFC 9218 priority behavior.
-- `compare` — cross-library comparison against the mainstream stack (**hyper**, **reqwest**, **tiny_http**) with a process-wide counting allocator so allocation counts are comparable too.
+- `throughput`: Courierust HTTP/1.1 keep-alive, parallel HTTP/1.1, h2c multiplexing, and HTTPS plus HTTP/2.
+- `compare`: paired loopback comparisons with hyper and reqwest.
+- `interop`: protocol correctness checks against hyper, hyper-util, and reqwest. It is a validation suite, not a performance benchmark.
 
-## Run it
+Run the same suites used by GitHub Actions:
 
 ```bash
-cargo bench --manifest-path benches/Cargo.toml --bench throughput
-cargo bench --manifest-path benches/Cargo.toml --bench compare
+cargo bench --manifest-path benches/Cargo.toml --locked --bench throughput
+cargo bench --manifest-path benches/Cargo.toml --locked --bench compare
+cargo bench --manifest-path benches/Cargo.toml --locked --bench interop
 ```
 
-Builds use the `bench` profile (`lto = "thin"`, `codegen-units = 1`). The GitHub Actions `benchmark.yml` runs both on push to `main`, pull requests, and manual dispatch. It posts the full report to the run summary and uploads `Github_Action_Benchmark.md` (plus the raw logs) as the `Github_Action_Benchmark` artifact.
+The benchmark profile uses thin LTO and one code-generation unit. Each suite exits non-zero on a protocol or assertion failure. GitHub Actions captures a separate log for every suite, publishes a structured report to the run summary, and uploads the report and raw logs as an artifact.
 
-`Github_Action_Benchmark.md` in the repository is a locally generated example in the same format used by the workflow.
+## Throughput
 
-## Self-measurement (`throughput`)
+`throughput` measures complete request/response round trips on loopback. Every request verifies status and consumes the entire response body before it is counted. It covers empty, 1 KiB, and 64 KiB responses where applicable.
 
-```
-h1_sequential:            22882 req/s (total=0.874s, n=20000, workers=1)
-h1_concurrent:            71902 req/s (total=0.223s, n=16000, workers=8)
-h2_multiplex:             35892 req/s (total=0.178s, n=6400, workers=32)
-h2_priority_high_latency: 1.18 ms (high-urgency completion, workers=64)
-```
+| Case family | Transport | Workload |
+| --- | --- | --- |
+| `h1_sequential` | HTTP/1.1 | One keep-alive client connection |
+| `h1_parallel_w*` | HTTP/1.1 | Independent clients at 1, 4, and 8 workers |
+| `h2_multiplex_w*` | h2c prior knowledge | One pooled HTTP/2 connection at 1, 8, and 32 workers |
+| `https_h2_sequential` | TLS 1.3 plus HTTP/2 | Certificate verification, ALPN, and encrypted request/response path |
 
-| Case | Setup | What it tells you |
-|---|---|---|
-| `h1_sequential` | 20,000 GETs, one client, one keep-alive connection | raw round-trip latency of the HTTP/1.1 codec |
-| `h1_concurrent` | 8 threads × 2,000 GETs, one client per thread | multi-core scaling; per-worker pool shards avoid lock contention |
-| `h2_multiplex` | 32 threads × 200 GETs over the shared (≤4) h2 connections | HTTP/2 multiplexing throughput with interleaved streams |
-| `h2_priority_high_latency` | 64 low-urgency requests in flight, then one urgency-0 request | WUCS anti-starvation: how fast the high-urgency stream completes |
+Each result records RPS, response throughput, and P50/P75/P90/P95/P99 request latency. `BENCH_REQUESTS` and `BENCH_SERVER_THREADS` can override the default request count and server worker count.
 
-## Cross-library comparison (`compare`)
+## Cross-library comparison
 
-Sequential keep-alive round-trips on loopback, 2,000 requests per case, one client. The `raw_tcp_floor` row is a raw socket write+read with **no HTTP at all** — it is the platform's syscall floor and the ceiling any HTTP stack can reach on that machine. Sample run (Windows, 2026-08; the box was under load, so absolute numbers are depressed — the ratios are what matter):
+`compare` keeps the peer fixed while measuring one implementation at a time:
 
-```
-raw_tcp_floor:                                    ~12,000 req/s   (platform floor)
-h1 courierust client + courierust server:         9,190 req/s   47 allocs/req
-h1 courierust client + tiny_http server:          6,854 req/s   64 allocs/req
-h1 courierust client + hyper server:              8,952 req/s   32 allocs/req
-h1 reqwest client + courierust server:            3,953 req/s   73 allocs/req
-h1 reqwest client + tiny_http server:             4,488 req/s   88 allocs/req
-h2 courierust client (h2c):                       5,263 req/s   73 allocs/req
-h2 courierust client + hyper server (h2c):        3,747 req/s   59 allocs/req
-h2 reqwest client (h2c):                          2,886 req/s  100 allocs/req
-```
+- Client comparison: Courierust and reqwest clients use the same hyper server.
+- Server comparison: the same reqwest client is used against Courierust and hyper servers.
+- Protocols: HTTP/1.1 and h2c prior knowledge.
+- Payloads: 1 KiB and 64 KiB sequential responses, plus an 8-worker 1 KiB client-load case.
+- Each measurement consumes and validates the complete response body.
 
-Readings:
+Every configuration is repeated an even number of times. The execution order alternates on each round so neither side is always measured first. The emitted result combines all rounds and contains the actual repetition count. Set `BENCH_REPETITIONS`, `BENCH_REQUESTS`, `BENCH_PARALLEL_REQUESTS`, and `BENCH_COMPARE_WORKERS` to tune the load. Odd repetition settings are rounded up to the next even value to preserve balanced ordering.
 
-- **Courierust is at the syscall floor.** Its full h1 stack runs at ~76% of the raw TCP floor; the mainstream stack (reqwest + tiny_http) runs at ~37%. The gap between an HTTP stack and `raw_tcp_floor` is the headroom left in the wire codec — Courierust has very little left to give on this platform.
-- **Server-side**: Courierust, hyper, and tiny_http are all within ~35% of each other (all bounded by the floor); the differentiator is the client and the allocation count.
-- **Client-side**: Courierust's h1 client is ~2.3× faster than reqwest's against the same server; its h2 client is ~1.8× faster than reqwest's h2c client.
-- **Allocations**: 47 per request for the Courierust full stack vs 88 for reqwest + tiny_http. The `Scratch` (connection-scoped buffer recycling) and the reused h2 frame buffer are what keep this low.
+The `raw_tcp_floor` row is only a transport reference for a four-byte echo. It is not an HTTP comparison row and must not be used to claim a percentage of HTTP performance. The harness intentionally does not publish process-wide allocation counts because server threads, runtimes, logging, and the harness itself make that number non-attributable to one client or server implementation.
 
-## Reading the numbers
+## Reading Results
 
-- `h1_concurrent` should scale with core count; if it does not, the bottleneck is usually client/server locks, not the wire codec.
-- `h2_multiplex` below `h1_concurrent` on loopback is expected: framing overhead plus scheduler round-robining. The interesting property is that it stays high and does not collapse under load.
-- `h2_priority_high_latency` is the latency of one urgency-0 request launched *behind* a pile of low-urgency work. Sub-millisecond to low-millisecond is healthy; tens of milliseconds means the scheduler is starving the high-urgency bucket (RFC 9218 §10 violation).
+Results are emitted as `RESULT|...` records for machine parsing and include protocol, payload, workers, request count, RPS, response MB/s, percentile latency, and sample count. Compare only rows with the same protocol, payload, worker count, and layer. Loopback measurements are sensitive to runner CPU allocation, kernel scheduling, and background load; use them for controlled comparisons on the same runner, not as universal performance claims.
 
-## Notes
-
-- Loopback numbers depend on the runner's core count, OS, and clock — treat them as **relative** measurements.
-- The harness panics on any request error, so a red run means a real protocol bug, not a slow machine.
-- On Windows, benchmark output goes to stderr; `2>&1` captures it in CI.
-- The `compare` harness uses a process-wide counting allocator, so `allocs/req` counts everything the process allocates (harness included) — apples-to-apples across libraries.
+`interop` emits `INTEROP|...` records. A failure or timeout is a compatibility regression and fails CI regardless of performance numbers.

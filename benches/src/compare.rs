@@ -1,352 +1,463 @@
-//! Cross-library comparison benchmarks: Courierust vs the mainstream
-//! stack (reqwest + tiny_http), plus a raw-TCP syscall floor.
+//! Fair loopback comparison against hyper and reqwest.
 //!
-//! Run with `cargo bench --bench compare`. Everything is loopback.
-//!
-//! Each case reports `req/s` and, when the case uses the process-wide
-//! counting allocator, `allocs/req`. The allocator counts every
-//! allocation the whole process makes (including the benchmark harness
-//! itself), so numbers are comparable across libraries.
+//! Every row changes one side of the connection at a time. Client rows use
+//! the same hyper server; server rows use the same reqwest client. HTTP/1.1
+//! and h2c run independently, and response bodies are fully consumed before
+//! a request is counted as complete.
+
+mod metrics;
 
 use courierust::courierust_body::Body;
+use courierust::courierust_bytes::Bytes;
 use courierust::courierust_client::{Client, ClientConfig};
 use courierust::courierust_http::request::Request;
 use courierust::courierust_http::response::Response;
 use courierust::courierust_server::{Server, ServerConfig};
+use metrics::{run_concurrent, run_sequential, Timing, MAX_SAMPLES};
 use std::io::{Read, Write};
-use std::net::TcpListener;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::net::{SocketAddr, TcpListener, TcpStream};
 
-// ---------------------------------------------------------------------------
-// Counting global allocator
-// ---------------------------------------------------------------------------
+const ONE_KIB: Payload = Payload {
+    name: "1k",
+    bytes: 1024,
+};
+const SIXTY_FOUR_KIB: Payload = Payload {
+    name: "64k",
+    bytes: 64 * 1024,
+};
 
-use std::alloc::{GlobalAlloc, Layout, System};
+#[derive(Clone, Copy)]
+struct Payload {
+    name: &'static str,
+    bytes: usize,
+}
 
-static N_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+struct ResultMetadata {
+    case: &'static str,
+    layer: &'static str,
+    protocol: Protocol,
+    client: &'static str,
+    server: &'static str,
+    payload: Payload,
+    workers: usize,
+    repetitions: usize,
+}
 
-struct Counting;
+#[derive(Clone, Copy)]
+enum Protocol {
+    H1,
+    H2c,
+}
 
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        N_ALLOCS.fetch_add(1, Ordering::Relaxed);
-        System.alloc(l)
+impl Protocol {
+    fn name(self) -> &'static str {
+        match self {
+            Self::H1 => "h1",
+            Self::H2c => "h2c",
+        }
     }
-    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        System.dealloc(p, l)
-    }
-    unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-        N_ALLOCS.fetch_add(1, Ordering::Relaxed);
-        System.realloc(p, l, n)
-    }
-    unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-        N_ALLOCS.fetch_add(1, Ordering::Relaxed);
-        System.alloc_zeroed(l)
+
+    fn uses_http2(self) -> bool {
+        matches!(self, Self::H2c)
     }
 }
 
-#[global_allocator]
-static A: Counting = Counting;
-
-fn alloc_snapshot() -> usize {
-    N_ALLOCS.load(Ordering::Relaxed)
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+fn comparison_repetitions() -> usize {
+    let requested = env_usize("BENCH_REPETITIONS", 2);
+    if requested.is_multiple_of(2) {
+        requested
+    } else {
+        requested.checked_add(1).unwrap_or(requested - 1)
+    }
+}
 
-fn courierust_server() -> std::net::SocketAddr {
-    let server = Server::bind_with_config("127.0.0.1:0", ServerConfig::default()).unwrap();
-    let addr = server.local_addr().unwrap();
+fn response_bytes(payload: Payload) -> Bytes {
+    Bytes::from(vec![b'x'; payload.bytes])
+}
+
+fn courierust_server(protocol: Protocol, payload: Payload) -> SocketAddr {
+    let server = Server::bind_with_config(
+        "127.0.0.1:0",
+        ServerConfig {
+            http2: protocol.uses_http2(),
+            threads: 4,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let address = server.local_addr().unwrap();
+    let body = response_bytes(payload);
     let handle = server
-        .serve_background(|_req: Request<Body>| -> Response<Body> {
-            let mut resp = Response::with_status(200.into());
-            resp.body = Body::Bytes(courierust::courierust_bytes::Bytes::from_static(b"ok"));
-            resp
+        .serve_background(move |_request: Request<Body>| {
+            Response::<Body>::with_status(200.into()).with_body(Body::Bytes(body.clone()))
         })
         .unwrap();
     std::mem::forget(handle);
-    addr
+    address
 }
 
-fn tiny_http_server() -> std::net::SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
+fn hyper_server(protocol: Protocol, payload: Payload) -> SocketAddr {
+    use http_body_util::Full;
+    use hyper::body::{Bytes as HyperBytes, Incoming};
+    use hyper::service::service_fn;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder as AutoBuilder;
+    use std::convert::Infallible;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let body = HyperBytes::from(response_bytes(payload).to_vec());
+
     std::thread::spawn(move || {
-        let server = tiny_http::Server::from_listener(listener, None).unwrap();
-        for req in server.incoming_requests() {
-            let resp = tiny_http::Response::from_data("ok".as_bytes().to_vec());
-            let _ = req.respond(resp);
-        }
+        runtime.block_on(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = body.clone();
+                let service = service_fn(move |_request: hyper::Request<Incoming>| {
+                    let body = body.clone();
+                    async move {
+                        Ok::<_, Infallible>(hyper::Response::new(Full::new(body)))
+                    }
+                });
+                let builder = match protocol {
+                    Protocol::H1 => AutoBuilder::new(TokioExecutor::new()).http1_only(),
+                    Protocol::H2c => AutoBuilder::new(TokioExecutor::new()).http2_only(),
+                };
+                tokio::spawn(async move {
+                    let _ = builder.serve_connection(TokioIo::new(stream), service).await;
+                });
+            }
+        });
     });
-    addr
+    address
 }
 
-fn report(name: &str, n: usize, elapsed: std::time::Duration, before: usize, after: usize) {
-    let per_sec = n as f64 / elapsed.as_secs_f64();
-    let allocs = (after - before) as f64 / n as f64;
+fn assert_courierust_response(response: Response<Body>, expected_bytes: usize) {
+    assert_eq!(response.status.as_u16(), 200);
+    assert_eq!(response.body.collect().unwrap().len(), expected_bytes);
+}
+
+fn run_courierust_client(
+    protocol: Protocol,
+    address: SocketAddr,
+    payload: Payload,
+    requests: usize,
+    workers: usize,
+) -> Timing {
+    let client = Client::with_config(ClientConfig {
+        http2: protocol.uses_http2(),
+        max_connections_per_host: if protocol.uses_http2() { 1 } else { workers },
+        ..Default::default()
+    });
+    let url = format!("http://{address}/benchmark");
+    assert_courierust_response(client.get(&url).unwrap(), payload.bytes);
+
+    if workers == 1 {
+        run_sequential(requests, MAX_SAMPLES, || {
+            assert_courierust_response(client.get(&url).unwrap(), payload.bytes);
+        })
+    } else {
+        run_concurrent(requests, workers, MAX_SAMPLES, |_| {
+            let client = client.clone();
+            let url = url.clone();
+            Box::new(move || {
+                assert_courierust_response(client.get(&url).unwrap(), payload.bytes);
+            })
+        })
+    }
+}
+
+fn reqwest_client(protocol: Protocol, workers: usize) -> reqwest::blocking::Client {
+    let builder = reqwest::blocking::Client::builder().pool_max_idle_per_host(workers);
+    if protocol.uses_http2() {
+        builder.http2_prior_knowledge().build().unwrap()
+    } else {
+        builder.build().unwrap()
+    }
+}
+
+fn assert_reqwest_response(response: reqwest::blocking::Response, expected_bytes: usize) {
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(response.bytes().unwrap().len(), expected_bytes);
+}
+
+fn run_reqwest_client(
+    protocol: Protocol,
+    address: SocketAddr,
+    payload: Payload,
+    requests: usize,
+    workers: usize,
+) -> Timing {
+    let client = reqwest_client(protocol, workers);
+    let url = format!("http://{address}/benchmark");
+    assert_reqwest_response(client.get(&url).send().unwrap(), payload.bytes);
+
+    if workers == 1 {
+        run_sequential(requests, MAX_SAMPLES, || {
+            assert_reqwest_response(client.get(&url).send().unwrap(), payload.bytes);
+        })
+    } else {
+        run_concurrent(requests, workers, MAX_SAMPLES, |_| {
+            let client = client.clone();
+            let url = url.clone();
+            Box::new(move || {
+                assert_reqwest_response(client.get(&url).send().unwrap(), payload.bytes);
+            })
+        })
+    }
+}
+
+fn metric(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.2}"))
+        .unwrap_or_else(|| "na".to_owned())
+}
+
+fn print_result(metadata: ResultMetadata, mut timing: Timing) {
+    let ResultMetadata {
+        case,
+        layer,
+        protocol,
+        client,
+        server,
+        payload,
+        workers,
+        repetitions,
+    } = metadata;
+    timing.sort_samples();
     println!(
-        "{name}: {per_sec:.0} req/s ({:.3}s, n={n}) allocs/req={allocs:.1}",
-        elapsed.as_secs_f64()
+        "RESULT|suite=compare|case={case}|layer={layer}|protocol={}|client={client}|server={server}|payload={}|bytes={}|workers={workers}|repetitions={repetitions}|requests={}|elapsed_ms={:.3}|rps={:.1}|response_mbps={:.3}|p50_us={}|p75_us={}|p90_us={}|p95_us={}|p99_us={}|samples={}",
+        protocol.name(),
+        payload.name,
+        payload.bytes,
+        timing.requests,
+        timing.elapsed.as_secs_f64() * 1000.0,
+        timing.requests_per_second(),
+        timing.response_megabytes_per_second(payload.bytes),
+        metric(timing.percentile_us(0.50)),
+        metric(timing.percentile_us(0.75)),
+        metric(timing.percentile_us(0.90)),
+        metric(timing.percentile_us(0.95)),
+        metric(timing.percentile_us(0.99)),
+        timing.samples.len(),
     );
 }
 
-/// Run `n` sequential GETs with the given closure; returns elapsed and
-/// allocation delta.
-fn run(n: usize, mut f: impl FnMut()) -> (std::time::Duration, usize, usize) {
-    let before = alloc_snapshot();
-    let start = Instant::now();
-    for _ in 0..n {
-        f();
+fn merge_timing(total: &mut Option<Timing>, timing: Timing) {
+    if let Some(total) = total {
+        total.elapsed += timing.elapsed;
+        total.requests += timing.requests;
+        total.samples.extend(timing.samples);
+    } else {
+        *total = Some(timing);
     }
-    let elapsed = start.elapsed();
-    let after = alloc_snapshot();
-    (elapsed, before, after)
 }
 
-// ---------------------------------------------------------------------------
-// 1. Raw TCP floor
-// ---------------------------------------------------------------------------
+/// Execute both sides in alternating order. `repetitions` is always even,
+/// so each side runs first equally often and setup/cache effects do not
+/// consistently favor one implementation.
+fn measure_pair<First, Second>(repetitions: usize, first: First, second: Second) -> (Timing, Timing)
+where
+    First: Fn() -> Timing,
+    Second: Fn() -> Timing,
+{
+    let mut first_total = None;
+    let mut second_total = None;
 
-fn raw_tcp_floor(n: usize) {
+    for iteration in 0..repetitions {
+        if iteration % 2 == 0 {
+            merge_timing(&mut first_total, first());
+            merge_timing(&mut second_total, second());
+        } else {
+            merge_timing(&mut second_total, second());
+            merge_timing(&mut first_total, first());
+        }
+    }
+
+    (
+        first_total.expect("comparison repetitions must be positive"),
+        second_total.expect("comparison repetitions must be positive"),
+    )
+}
+
+fn raw_tcp_floor(requests: usize) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let handle = std::thread::spawn(move || {
-        let (mut s, _) = listener.accept().unwrap();
-        let mut buf = [0u8; 4096];
+    let address = listener.local_addr().unwrap();
+    let worker = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buffer = [0u8; 4096];
         loop {
-            match std::io::Read::read(&mut s, &mut buf) {
+            match stream.read(&mut buffer) {
                 Ok(0) | Err(_) => break,
-                Ok(k) => {
-                    if std::io::Write::write_all(&mut s, &buf[..k]).is_err() {
+                Ok(read) => {
+                    if stream.write_all(&buffer[..read]).is_err() {
                         break;
                     }
                 }
             }
         }
     });
-    let mut s = std::net::TcpStream::connect(addr).unwrap();
-    s.set_nodelay(true).unwrap();
-    // Warm up.
-    s.write_all(b"hi").unwrap();
-    let mut b = [0u8; 2];
-    let _ = s.read(&mut b);
-    let before = alloc_snapshot();
-    let start = Instant::now();
-    for _ in 0..n {
-        s.write_all(b"ping").unwrap();
-        let mut r = [0u8; 4];
-        let _ = s.read(&mut r);
-    }
-    let elapsed = start.elapsed();
-    let after = alloc_snapshot();
-    report("raw_tcp_floor", n, elapsed, before, after);
-    drop(s);
-    let _ = handle.join();
+    let mut stream = TcpStream::connect(address).unwrap();
+    stream.set_nodelay(true).unwrap();
+    stream.write_all(b"warm").unwrap();
+    let mut warm = [0u8; 4];
+    stream.read_exact(&mut warm).unwrap();
+
+    let timing = run_sequential(requests, MAX_SAMPLES, || {
+        stream.write_all(b"ping").unwrap();
+        let mut response = [0u8; 4];
+        stream.read_exact(&mut response).unwrap();
+        assert_eq!(&response, b"ping");
+    });
+    print_result(
+        ResultMetadata {
+            case: "raw_tcp_floor",
+            layer: "transport",
+            protocol: Protocol::H1,
+            client: "std_tcp",
+            server: "std_tcp",
+            payload: Payload {
+                name: "4b",
+                bytes: 4,
+            },
+            workers: 1,
+            repetitions: 1,
+        },
+        timing,
+    );
+    drop(stream);
+    worker.join().unwrap();
 }
 
-// ---------------------------------------------------------------------------
-// 2. HTTP/1.1 comparisons
-// ---------------------------------------------------------------------------
+fn compare_clients(
+    protocol: Protocol,
+    address: SocketAddr,
+    payload: Payload,
+    requests: usize,
+    workers: usize,
+    repetitions: usize,
+) {
+    let (courierust_timing, reqwest_timing) = measure_pair(
+        repetitions,
+        || run_courierust_client(protocol, address, payload, requests, workers),
+        || run_reqwest_client(protocol, address, payload, requests, workers),
+    );
+    print_result(
+        ResultMetadata {
+            case: "courierust_client_to_hyper",
+            layer: "client",
+            protocol,
+            client: "courierust",
+            server: "hyper",
+            payload,
+            workers,
+            repetitions,
+        },
+        courierust_timing,
+    );
 
-const N: usize = 2_000;
-
-fn courierust_full_stack() {
-    let addr = courierust_server();
-    let client = Client::new();
-    let url = format!("http://{addr}/bench");
-    let _ = client.get(&url).unwrap(); // warm up keep-alive
-    let (el, b, a) = run(N, || {
-        let r = client.get(&url).unwrap();
-        debug_assert_eq!(r.status.as_u16(), 200);
-    });
-    report("h1 courierust client + courierust server", N, el, b, a);
+    print_result(
+        ResultMetadata {
+            case: "reqwest_client_to_hyper",
+            layer: "client",
+            protocol,
+            client: "reqwest",
+            server: "hyper",
+            payload,
+            workers,
+            repetitions,
+        },
+        reqwest_timing,
+    );
 }
 
-fn courierust_client_vs_tinyhttp() {
-    let addr = tiny_http_server();
-    let client = Client::new();
-    let url = format!("http://{addr}/bench");
-    let _ = client.get(&url).unwrap(); // warm up
-    let (el, b, a) = run(N, || {
-        let r = client.get(&url).unwrap();
-        debug_assert_eq!(r.status.as_u16(), 200);
-    });
-    report("h1 courierust client + tiny_http server", N, el, b, a);
-}
+fn compare_servers(
+    protocol: Protocol,
+    courierust: SocketAddr,
+    hyper: SocketAddr,
+    payload: Payload,
+    requests: usize,
+    repetitions: usize,
+) {
+    let (courierust_timing, hyper_timing) = measure_pair(
+        repetitions,
+        || run_reqwest_client(protocol, courierust, payload, requests, 1),
+        || run_reqwest_client(protocol, hyper, payload, requests, 1),
+    );
+    print_result(
+        ResultMetadata {
+            case: "reqwest_client_to_courierust",
+            layer: "server",
+            protocol,
+            client: "reqwest",
+            server: "courierust",
+            payload,
+            workers: 1,
+            repetitions,
+        },
+        courierust_timing,
+    );
 
-fn reqwest_vs_courierust_server() {
-    let addr = courierust_server();
-    let client = reqwest::blocking::Client::new();
-    let url = format!("http://{addr}/bench");
-    let _ = client.get(&url).send().unwrap(); // warm up
-    let (el, b, a) = run(N, || {
-        let r = client.get(&url).send().unwrap();
-        debug_assert_eq!(r.status().as_u16(), 200);
-    });
-    report("h1 reqwest client + courierust server", N, el, b, a);
-}
-
-fn reqwest_full_stack() {
-    let addr = tiny_http_server();
-    let client = reqwest::blocking::Client::new();
-    let url = format!("http://{addr}/bench");
-    let _ = client.get(&url).send().unwrap(); // warm up
-    let (el, b, a) = run(N, || {
-        let r = client.get(&url).send().unwrap();
-        debug_assert_eq!(r.status().as_u16(), 200);
-    });
-    report("h1 reqwest client + tiny_http server", N, el, b, a);
-}
-
-// ---------------------------------------------------------------------------
-// 3. HTTP/2 comparison (h2c prior knowledge)
-// ---------------------------------------------------------------------------
-
-fn courierust_h2_client() {
-    let cfg = ServerConfig {
-        http2: true,
-        ..Default::default()
-    };
-    let server = Server::bind_with_config("127.0.0.1:0", cfg).unwrap();
-    let addr = server.local_addr().unwrap();
-    let handle = server
-        .serve_background(|_req: Request<Body>| -> Response<Body> {
-            let mut resp = Response::with_status(200.into());
-            resp.body = Body::Bytes(courierust::courierust_bytes::Bytes::from_static(b"ok"));
-            resp
-        })
-        .unwrap();
-    std::mem::forget(handle);
-
-    let ccfg = ClientConfig {
-        http2: true,
-        ..Default::default()
-    };
-    let client = Client::with_config(ccfg);
-    let url = format!("http://{addr}/bench");
-    let _ = client.get(&url).unwrap(); // warm up (opens the h2 connection)
-    let (el, b, a) = run(N, || {
-        let r = client.get(&url).unwrap();
-        debug_assert_eq!(r.status.as_u16(), 200);
-    });
-    report("h2 courierust client (h2c)", N, el, b, a);
-}
-
-fn reqwest_h2_client() {
-    let cfg = ServerConfig {
-        http2: true,
-        ..Default::default()
-    };
-    let server = Server::bind_with_config("127.0.0.1:0", cfg).unwrap();
-    let addr = server.local_addr().unwrap();
-    let handle = server
-        .serve_background(|_req: Request<Body>| -> Response<Body> {
-            let mut resp = Response::with_status(200.into());
-            resp.body = Body::Bytes(courierust::courierust_bytes::Bytes::from_static(b"ok"));
-            resp
-        })
-        .unwrap();
-    std::mem::forget(handle);
-
-    let client = reqwest::blocking::Client::builder()
-        .http2_prior_knowledge()
-        .build()
-        .unwrap();
-    let url = format!("http://{addr}/bench");
-    let _ = client.get(&url).send().unwrap(); // warm up
-    let (el, b, a) = run(N, || {
-        let r = client.get(&url).send().unwrap();
-        debug_assert_eq!(r.status().as_u16(), 200);
-    });
-    report("h2 reqwest client (h2c)", N, el, b, a);
-}
-
-// ---------------------------------------------------------------------------
-// 4. Hyper server comparison (the mainstream server)
-// ---------------------------------------------------------------------------
-
-fn hyper_server(http2: bool) -> std::net::SocketAddr {
-    use http_body_util::Full;
-    use hyper::body::{Bytes, Incoming};
-    use hyper::service::service_fn;
-    use hyper_util::rt::TokioExecutor;
-    use hyper_util::rt::TokioIo;
-    use hyper_util::server::conn::auto::Builder as AutoBuilder;
-    use std::convert::Infallible;
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
-        .unwrap();
-    let listener = rt
-        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    std::thread::spawn(move || {
-        rt.block_on(async move {
-            loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    break;
-                };
-                let io = TokioIo::new(stream);
-                let svc = service_fn(|_req: hyper::Request<Incoming>| async {
-                    Ok::<_, Infallible>(hyper::Response::new(Full::new(Bytes::from_static(b"ok"))))
-                });
-                let builder = if http2 {
-                    AutoBuilder::new(TokioExecutor::new()).http2_only()
-                } else {
-                    AutoBuilder::new(TokioExecutor::new()).http1_only()
-                };
-                tokio::spawn(async move {
-                    let _ = builder.serve_connection(io, svc).await;
-                });
-            }
-        });
-    });
-    addr
-}
-
-fn courierust_client_vs_hyper_h1() {
-    let addr = hyper_server(false);
-    let client = Client::new();
-    let url = format!("http://{addr}/bench");
-    let _ = client.get(&url).unwrap(); // warm up keep-alive
-    let (el, b, a) = run(N, || {
-        let r = client.get(&url).unwrap();
-        debug_assert_eq!(r.status.as_u16(), 200);
-    });
-    report("h1 courierust client + hyper server", N, el, b, a);
-}
-
-fn courierust_h2_client_vs_hyper_h2() {
-    let addr = hyper_server(true);
-    let ccfg = ClientConfig {
-        http2: true,
-        ..Default::default()
-    };
-    let client = Client::with_config(ccfg);
-    let url = format!("http://{addr}/bench");
-    let _ = client.get(&url).unwrap(); // warm up
-    let (el, b, a) = run(N, || {
-        let r = client.get(&url).unwrap();
-        debug_assert_eq!(r.status.as_u16(), 200);
-    });
-    report("h2 courierust client + hyper server (h2c)", N, el, b, a);
+    print_result(
+        ResultMetadata {
+            case: "reqwest_client_to_hyper",
+            layer: "server",
+            protocol,
+            client: "reqwest",
+            server: "hyper",
+            payload,
+            workers: 1,
+            repetitions,
+        },
+        hyper_timing,
+    );
 }
 
 fn main() {
-    println!("courierust vs mainstream (loopback, sequential keep-alive)");
-    raw_tcp_floor(20_000);
-    courierust_full_stack();
-    courierust_client_vs_tinyhttp();
-    courierust_client_vs_hyper_h1();
-    reqwest_vs_courierust_server();
-    reqwest_full_stack();
-    courierust_h2_client();
-    courierust_h2_client_vs_hyper_h2();
-    reqwest_h2_client();
+    let requests = env_usize("BENCH_REQUESTS", 2_000);
+    let parallel_requests = env_usize("BENCH_PARALLEL_REQUESTS", requests);
+    let parallel_workers = env_usize("BENCH_COMPARE_WORKERS", 8);
+    let repetitions = comparison_repetitions();
+    println!("courierust comparison suite (loopback, shared-peer matrix)");
+    println!(
+        "META|suite=compare|requests_per_repetition={requests}|parallel_requests_per_repetition={parallel_requests}|parallel_workers={parallel_workers}|repetitions={repetitions}|max_samples={MAX_SAMPLES}"
+    );
+
+    raw_tcp_floor(requests);
+    for protocol in [Protocol::H1, Protocol::H2c] {
+        for payload in [ONE_KIB, SIXTY_FOUR_KIB] {
+            let hyper = hyper_server(protocol, payload);
+            let courierust = courierust_server(protocol, payload);
+            compare_clients(protocol, hyper, payload, requests, 1, repetitions);
+            compare_servers(protocol, courierust, hyper, payload, requests, repetitions);
+            if payload.bytes == ONE_KIB.bytes {
+                compare_clients(
+                    protocol,
+                    hyper,
+                    payload,
+                    parallel_requests,
+                    parallel_workers,
+                    repetitions,
+                );
+            }
+        }
+    }
+    println!("total: complete");
 }

@@ -1008,6 +1008,7 @@ fn https_redirect_preserves_scheme() {
 
 /// Read one complete raw HTTP/1.1 response (head + Content-Length body)
 /// from a socket.
+#[cfg(windows)]
 fn read_raw_response(stream: &mut std::net::TcpStream) -> String {
     use std::io::Read;
     let mut buf = Vec::new();
@@ -1040,6 +1041,7 @@ fn read_raw_response(stream: &mut std::net::TcpStream) -> String {
     String::from_utf8_lossy(&buf[..he + cl]).to_string()
 }
 
+#[cfg(windows)]
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }

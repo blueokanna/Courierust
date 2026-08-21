@@ -193,8 +193,6 @@ fn courierust_client_h1_to_hyper_h1() {
     let body = resp.body.collect().unwrap();
     assert_eq!(&body[..], b"hello world", "POST body echo");
 
-    // Keep-alive reuse: several sequential requests over the same pooled
-    // connection must all succeed and map to the right path.
     for i in 0..25 {
         let url = format!("http://{addr}/keepalive-{i}");
         let resp = client
@@ -209,7 +207,6 @@ fn courierust_client_h1_to_hyper_h1() {
         );
     }
 
-    // 256 KiB POST: framing + chunked boundaries against a foreign peer.
     let big: Vec<u8> = (0..(256 * 1024)).map(|i| (i % 251) as u8).collect();
     let resp = client
         .post(&format!("http://{addr}/big"), big.clone())
@@ -242,9 +239,6 @@ fn courierust_client_h2c_to_hyper_h2() {
     let body = resp.body.collect().unwrap();
     assert_eq!(&body[..], b"payload", "h2 POST body echo");
 
-    // Multiplexing: 8 threads × 30 requests, each with a unique path.
-    // Response/request cross-wiring (the classic h2 bug) shows up as a
-    // path mismatch.
     let mut handles = Vec::new();
     for t in 0..8u32 {
         let client = client.clone();
@@ -306,9 +300,6 @@ fn hyper_client_h1_to_courierust_h1() {
         assert_eq!(&body[..], expect.as_bytes(), "hyper h1 path echo {i}");
     }
 
-    // POST echo. A separate client instance because the legacy hyper
-    // client is generic over the request body type, which is fixed at
-    // first use (`Empty` above, `Full` here).
     let body = HBytes::from_static(b"hello from hyper");
     let req = hyper::Request::builder()
         .method(hyper::Method::POST)
@@ -451,8 +442,6 @@ fn courierust_h2c_large_body_to_hyper_h2() {
 fn courierust_h1_slow_reader_to_hyper_h1() {
     let addr = hyper_server(false);
     let client = courierust_client(false);
-    // A moderately large response; read it in small chunks with pauses to
-    // exercise the client's read loop against a real server.
     let big: Vec<u8> = (0..(64 * 1024)).map(|i| (i % 239) as u8).collect();
     let resp = client
         .post(&format!("http://{addr}/slow"), big.clone())
@@ -500,6 +489,4 @@ fn main() {
     }
 }
 
-// Silence an unused-import warning when `Duration` is not referenced in
-// some builds; it documents the "slow" intent above.
 const _: Duration = Duration::from_secs(0);

@@ -1,11 +1,7 @@
 //! Shared benchmark timing and concurrency helpers.
 //!
-//! This module is compiled into every bench binary (`throughput`,
-//! `compare`, `concurrency`, `metrics`), and each binary only uses a
-//! subset of the helpers (e.g. `throughput` does not report per-request
-//! allocations). Items here are intentionally shared rather than dead.
-
-#![allow(dead_code)]
+//! It owns timing, sampling, and concurrent start coordination, while each
+//! suite owns its protocol setup.
 
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
@@ -17,7 +13,6 @@ pub struct Timing {
     pub elapsed: Duration,
     pub requests: usize,
     pub samples: Vec<Duration>,
-    pub allocations: usize,
 }
 
 impl Timing {
@@ -54,23 +49,13 @@ fn sample_plan(requests: usize, max_samples: usize) -> (usize, usize) {
 }
 
 /// Measure sequential work after all sample storage has been allocated.
-pub fn run_sequential<Work, Reset, Snapshot>(
-    requests: usize,
-    max_samples: usize,
-    mut work: Work,
-    reset_allocations: Reset,
-    snapshot_allocations: Snapshot,
-) -> Timing
+pub fn run_sequential<Work>(requests: usize, max_samples: usize, mut work: Work) -> Timing
 where
     Work: FnMut(),
-    Reset: Fn(),
-    Snapshot: Fn() -> usize,
 {
     let (sample_count, stride) = sample_plan(requests, max_samples);
     let mut samples = Vec::with_capacity(sample_count);
 
-    reset_allocations();
-    let allocations_before = snapshot_allocations();
     let started = Instant::now();
     for index in 0..requests {
         let request_started = (index % stride == 0).then(Instant::now);
@@ -80,29 +65,23 @@ where
         }
     }
     let elapsed = started.elapsed();
-    let allocations = snapshot_allocations().saturating_sub(allocations_before);
 
     Timing {
         elapsed,
         requests,
         samples,
-        allocations,
     }
 }
 
 /// Measure work distributed across independent worker closures.
-pub fn run_concurrent<MakeWorker, Reset, Snapshot>(
+pub fn run_concurrent<MakeWorker>(
     requests: usize,
     workers: usize,
     max_samples: usize,
     make_worker: MakeWorker,
-    reset_allocations: Reset,
-    snapshot_allocations: Snapshot,
 ) -> Timing
 where
     MakeWorker: Fn(usize) -> Box<dyn FnMut() + Send>,
-    Reset: Fn(),
-    Snapshot: Fn() -> usize,
 {
     assert!(
         requests > 0,
@@ -124,7 +103,9 @@ where
         for (index, (mut job, count)) in jobs.into_iter().zip(counts.iter().copied()).enumerate() {
             let ready = ready.clone();
             let start_line = start_line.clone();
-            let (sample_count, stride) = sample_plan(count, max_samples);
+            // Keep the global sampling bound independent of worker count.
+            let per_worker_max = max_samples.div_ceil(active_workers);
+            let (sample_count, stride) = sample_plan(count, per_worker_max);
             handles.push(scope.spawn(move || {
                 let mut samples = Vec::with_capacity(sample_count);
                 ready.wait();
@@ -147,8 +128,6 @@ where
             .sum();
         let mut samples = Vec::with_capacity(total_samples);
 
-        reset_allocations();
-        let allocations_before = snapshot_allocations();
         let started = Instant::now();
         start_line.wait();
         for handle in handles {
@@ -156,13 +135,11 @@ where
             samples.extend(worker_samples);
         }
         let elapsed = started.elapsed();
-        let allocations = snapshot_allocations().saturating_sub(allocations_before);
 
         Timing {
             elapsed,
             requests,
             samples,
-            allocations,
         }
     })
 }

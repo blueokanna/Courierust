@@ -32,10 +32,9 @@ pub struct ChromeH2Fingerprint {
     /// SETTINGS_MAX_HEADER_LIST_SIZE
     pub max_header_list_size: u32,
     /// The connection-level `WINDOW_UPDATE` increment sent right after
-    /// SETTINGS (65535 + 12517377 = 12 MiB total).
+    /// SETTINGS (65535 + 12517377 = 12 MiB total)
     pub connection_window_update: u32,
-    /// Whether regular headers are emitted lowercase-sorted after the
-    /// pseudo-headers (Chrome behavior).
+    /// Sort regular headers alphabetically after pseudo-headers (Chrome behavior)
     pub sort_headers: bool,
 }
 
@@ -85,8 +84,7 @@ impl ChromeH2Fingerprint {
         ]
     }
 
-    /// Apply the fingerprint onto local settings, preserving Chrome's
-    /// advertised values.
+    /// Apply fingerprint to local settings, keeping Chrome's values
     pub fn apply_to_settings(&self, s: &mut Settings) {
         s.header_table_size = self.header_table_size;
         s.enable_push = self.enable_push;
@@ -106,8 +104,7 @@ impl ChromeH2Fingerprint {
     }
 }
 
-/// Reorder a header block like Chrome: pseudo-headers first, then the
-/// regular headers sorted by (lowercased) name.
+/// /// Sort headers like Chrome: pseudo-headers first, regular headers
 pub fn order_headers_chrome(fields: &[HeaderField]) -> Vec<HeaderField> {
     let mut out = Vec::with_capacity(fields.len());
     let mut rest: Vec<&HeaderField> = Vec::new();

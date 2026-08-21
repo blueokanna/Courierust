@@ -32,7 +32,7 @@ concurrency:
 
 jobs:
   bench:
-    name: throughput + compare (release)
+    name: All benchmarks (release)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -44,23 +44,44 @@ jobs:
         id: benchmarks
         shell: bash
         run: |
-          set +e
-          set -o pipefail
+          suite_failed=0
 
-          cargo bench --manifest-path benches/Cargo.toml --locked --bench throughput 2>&1 | tee throughput.log
-          throughput_status=${PIPESTATUS[0]}
+          run_suite() {
+            local suite=$1
+            local log=$2
+            shift 2
 
-          cargo bench --manifest-path benches/Cargo.toml --locked --bench compare 2>&1 | tee compare.log
-          compare_status=${PIPESTATUS[0]}
+            local command_status
+            local log_status
 
-          cargo bench --manifest-path benches/Cargo.toml --locked --bench interop 2>&1 | tee interop.log
-          interop_status=${PIPESTATUS[0]}
+            if "$@" > "$log" 2>&1; then
+              command_status=0
+            else
+              command_status=$?
+            fi
 
-          printf 'throughput_exit=%s\n' "$throughput_status" >> "$GITHUB_OUTPUT"
-          printf 'compare_exit=%s\n' "$compare_status" >> "$GITHUB_OUTPUT"
-          printf 'interop_exit=%s\n' "$interop_status" >> "$GITHUB_OUTPUT"
+            if cat "$log"; then
+              log_status=0
+            else
+              log_status=$?
+            fi
+            printf '%s_exit=%s\n' "$suite" "$command_status" >> "$GITHUB_OUTPUT"
 
-          if [[ "$throughput_status" -ne 0 || "$compare_status" -ne 0 || "$interop_status" -ne 0 ]]; then
+            if [[ "$command_status" -ne 0 || "$log_status" -ne 0 ]]; then
+              printf '::error title=Benchmark %s failed::command exit=%s, log capture exit=%s; inspect %s\n' \
+                "$suite" "$command_status" "$log_status" "$log" >&2
+              suite_failed=1
+            fi
+          }
+
+          run_suite throughput throughput.log \
+            cargo bench --manifest-path benches/Cargo.toml --locked --bench throughput
+          run_suite compare compare.log \
+            cargo bench --manifest-path benches/Cargo.toml --locked --bench compare
+          run_suite interop interop.log \
+            cargo bench --manifest-path benches/Cargo.toml --locked --bench interop
+
+          if [[ "$suite_failed" -ne 0 ]]; then
             exit 1
           fi
 

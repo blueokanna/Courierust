@@ -102,8 +102,6 @@ fn main() {
         let server = Server::bind_with_config("127.0.0.1:0", server_cfg).unwrap();
         let addr = server.local_addr().unwrap();
         let _handle = server.serve_background(handler).unwrap();
-
-        // Warm the acceptor, then open the idle herd.
         let mut warm = TcpStream::connect(addr).unwrap();
         warm.write_all(b"GET /warm HTTP/1.1\r\nHost: x\r\n\r\n")
             .unwrap();
@@ -111,8 +109,6 @@ fn main() {
         drop(warm);
 
         let herd = open_idle_herd(addr, idle);
-
-        // Measure sequential fresh requests while the herd sits idle.
         let client = Client::with_config(ClientConfig {
             max_connections_per_host: 1,
             ..Default::default()
@@ -137,9 +133,6 @@ fn main() {
         drop(herd);
     }
 
-    // Idle-connection benchmark with a slow-sender herd (partial requests
-    // that stall): with the event loop these are parked, with the pool
-    // model they each hold a worker.
     let slow_idle = env_usize("COURIERUST_SLOW_CONNS", 16);
     let server_cfg = ServerConfig {
         http2: false,
@@ -154,7 +147,6 @@ fn main() {
     let mut slow: Vec<TcpStream> = Vec::new();
     for _ in 0..slow_idle {
         let mut s = TcpStream::connect(addr).unwrap();
-        // Send a partial request and stall.
         s.write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\n").unwrap();
         slow.push(s);
     }
