@@ -103,7 +103,7 @@ fn classify(buf: &[u8]) -> Class {
         return Class::Tls;
     }
     let n = buf.len().min(H2_PREFACE.len());
-    if &buf[..n] != &H2_PREFACE[..n] {
+    if buf[..n] != H2_PREFACE[..n] {
         return Class::H1;
     }
     if buf.len() < H2_PREFACE.len() {
@@ -738,7 +738,7 @@ fn event_loop(
     let mut pending: HashMap<usize, TcpStream> = HashMap::new();
     let mut activity: HashMap<usize, Instant> = HashMap::new();
 
-    let poll_timeout = (config.event_poll_timeout_ms.max(5)).min(1000) as i32;
+    let poll_timeout = config.event_poll_timeout_ms.clamp(5, 1000) as i32;
     let idle_timeout = config.idle_timeout;
 
     loop {
