@@ -41,13 +41,10 @@ impl H1Connection {
         cfg: &ClientConfig,
     ) -> Result<Self> {
         let stream = courierust_net::connect(&addr, cfg.connect_timeout)?;
-        courierust_net::configure(&stream, cfg.read_timeout)?;
         let conn = match tls {
             Some(c) => {
+                courierust_net::configure(&stream, cfg.handshake_timeout)?;
                 let conn = ConnStream::tls_client(stream, c, hostname)?;
-                // If the peer picked `h2` via ALPN, speaking HTTP/1.1 on
-                // this connection is a protocol mismatch; fail loudly
-                // instead of hanging on a stream the server will reject.
                 if let Some(alpn) = conn.alpn() {
                     if alpn.as_slice() == b"h2" {
                         return Err(Error::protocol(
@@ -57,8 +54,12 @@ impl H1Connection {
                 }
                 conn
             }
-            None => ConnStream::plain(stream),
+            None => {
+                courierust_net::configure(&stream, cfg.read_timeout)?;
+                ConnStream::plain(stream)
+            }
         };
+        let _ = conn.configure(cfg.read_timeout);
         let conn = Arc::new(conn);
         Ok(Self {
             reader: BufReader::new(conn.clone(), 16 * 1024),
@@ -112,7 +113,6 @@ impl H1Connection {
         cfg: &ClientConfig,
         host_header: &str,
     ) -> Result<Response<Body>> {
-        // Build the wire header set.
         let mut headers = HeaderMap::with_capacity(req.headers.len() + 4);
         for (n, v) in req.headers.iter() {
             if courierust_h1::is_hop_by_hop(n.as_str()) {
@@ -147,8 +147,6 @@ impl H1Connection {
             );
         }
 
-        // Serialize the head into the connection scratch, then write the
-        // whole request in one buffered pass.
         let head = self.scratch.body();
         courierust_h1::write_request_head(head, &req.method, &req.uri, Version::HTTP_11, &headers)?;
         self.writer.write_all(head)?;
@@ -162,12 +160,10 @@ impl H1Connection {
 
     fn read_response(&mut self, cfg: &ClientConfig) -> Result<Response<Body>> {
         let (reader, scratch) = (&mut self.reader, &mut self.scratch);
-        // Status line.
         let status_line = scratch.line();
         reader.read_until_into(b'\n', 16 * 1024, status_line)?;
         let (status, version) = courierust_h1::parse_status_line(status_line)?;
         self.version = version;
-        // 100-continue / informational responses: skip until a final one.
         let mut status = status;
         let mut headers = courierust_h1::read_headers_scratch(reader, scratch)?;
         while status.is_informational() {

@@ -13,7 +13,7 @@
 常见的 Rust HTTP 生态（hyper / h2 / h3 等）能力很强，但依赖树很深，且往往把 `no_std`、多核亲和、以及「客户端看起来像什么浏览器」这类问题留给使用者自己解决。这个仓库的目标是：
 
 - 协议层与平台完全解耦：核心代码不碰 `std`，`std` 只负责线程、TCP 和时钟；
-- 多核是真的多核（在模型范围内）：服务端连接通过工作窃取池调度；客户端连接池按 authority 共享，HTTP/2 请求按 reservation 选择负载最小的 driver，并由 `max_connections_per_host` 控制独立连接上限。**worker 占用按连接计**：一条 HTTP/2 连接上的任意多个流（慢流、SSE、gRPC 服务端流）只占同一个 worker，流之间互不阻塞。诚实的推论是：大量**连接**仍需足够 worker，纯明文 HTTP/1.1 才可用 Windows 事件驱动模式（见限制）。
+- 多核是真的多核（在模型范围内）：服务端连接通过工作窃取池调度；客户端连接池按 authority 共享，HTTP/2 请求按 reservation 选择负载最小的 driver，并由 `max_connections_per_host` 控制独立连接上限。**worker 占用按连接计**：一条 HTTP/2 连接上的任意多个流（慢流、SSE、gRPC 服务端流）只占同一个 worker，流之间互不阻塞。**事件驱动调度器（全平台默认）**把空闲/半截明文 HTTP 连接挂在就绪轮询器上，慢连接羊群不再耗尽 worker；`idle_timeout` 回收空转连接，`max_connections` 封顶驻留连接数。
 - 协议细节按 RFC 实现并对照公开测试向量验证过，不是「能跑就行」的玩具。
 
 ## 特性
@@ -216,7 +216,7 @@ courierust = { version = "0.1", default-features = false }
 
 - **没有 HTTP/3 / QUIC**。零外部依赖意味着没有可用的 QUIC 实现（QUIC 需要用户态 UDP 栈 + TLS 1.3——TLS 部分已有，传输层没有）。
 - **TLS 暂无 PSK / 0-RTT 恢复 / session ticket / key update，也无双向 mTLS**。每次都做完整 1-RTT 握手；对端发来的 NewSessionTicket 会被忽略；服务端不请求客户端证书。
-- **事件驱动服务器仅限 Windows 且只处理 HTTP/1.1**。Windows 上 `ServerConfig::event_driven`（默认开启）把空闲明文 HTTP 连接挂在轮询器上，少量 worker 即可服务大量 idle keep-alive / SSE / 长轮询连接；TLS 与 HTTP/2 连接仍走阻塞池模型。非 Windows 平台回退到每连接一任务的池模型。
+- **事件驱动服务器全平台默认开启，只处理 HTTP/1.1**。`ServerConfig::event_driven`（默认 `true`）把空闲明文 HTTP 连接挂在轮询器上（Winsock `select` / POSIX `poll`），少量 worker 即可服务大量 idle keep-alive / SSE / 长轮询连接；TLS 与 HTTP/2 连接仍走阻塞池模型（由 `handshake_timeout`、`h2_idle_timeout` 与 worker 数共同约束）。设为 `false` 恢复旧的每连接一池任务的模型（诊断/对比用）。
 - **请求体流式上传目前只在 HTTP/2 下可靠**（h2 天然分帧）。HTTP/1.1 的请求体要么一次性给全（`Body::Bytes`），要么你自己拼 chunked。
 - **gRPC 不含 protobuf、`.proto` 代码生成与 `grpc.reflection`**。消息编解码需要你实现 codec trait 或接你自己的 protobuf 生成代码；reflection 需要 protobuf 模式清单，属外部职责。
 - **长时间阻塞的同步 handler 会占住一个 worker**（事件驱动与否都一样）——任何同步服务器的通病；流式场景用 channel 响应体。worker 占用**按连接而非按流**：一条连接上的任意空闲流只占同一个 worker，慢流不阻塞同连接其他流——两者均有集成测试覆盖。
@@ -284,8 +284,8 @@ cargo fuzz run h2_frame --fuzz-dir fuzz -- -runs=10000
 
 ## 测试
 
-- 单元测试 115 个：覆盖 HPACK 全部 RFC 向量（C.2/C.3/C.4/C.6）、Huffman 编解码（含解码输出上限）、帧编解码、状态机、流控、WUCS 调度、JA3/JA4 公开记录比对、指纹解析、TLS 1.3 握手与 RFC 8448 密钥调度、X.25519/Ed25519/ECDSA/RSA 原语，以及 DEFLATE/gzip 编解码（往返、CRC-32 向量、损坏拒绝、输出上限、与 Python zlib 输出交叉验证）。
-- 集成测试 37 个：真实 TCP 环回上的 h1/h2/HTTPS 请求往返、keep-alive 复用、chunked、重定向、h2 并发多路复用、流式响应、大体积流控往返、gRPC unary/服务端流/客户端流/双向流与错误状态/trailers/deadline 执行、gzip 往返、`grpc.health.v1.Health` `Check` + `Watch`、RFC 7540 §3.2 `h2c` Upgrade、TLS 信任拒绝 + 畸形 TLS 输入存活、ALPN 一致强制，以及两个并发证明（慢流不阻塞同连接其他流；大量空闲流按连接而非按流占 worker）。
+- 单元测试 121 个：覆盖 HPACK 全部 RFC 向量（C.2/C.3/C.4/C.6）、Huffman 编解码（含解码输出上限）、帧编解码、状态机、流控、WUCS 调度、JA3/JA4 公开记录比对、指纹解析、TLS 1.3 握手与 RFC 8448 密钥调度、X.25519/Ed25519/ECDSA/RSA 原语、DEFLATE/gzip 编解码（往返、CRC-32 向量、损坏拒绝、输出上限、与 Python zlib 输出交叉验证），以及轮询器 self-pipe（唤醒描述符）语义。
+- 集成测试 45 个：真实 TCP 环回上的 h1/h2/HTTPS 请求往返、keep-alive 复用、chunked、重定向、h2 并发多路复用、流式响应、大体积流控往返、gRPC unary/服务端流/客户端流/双向流与错误状态/trailers/deadline 执行、gzip 往返、`grpc.health.v1.Health` `Check` + `Watch`、RFC 7540 §3.2 `h2c` Upgrade、TLS 信任拒绝 + 畸形 TLS 输入存活 + `verify:false` + 主机名不匹配拒绝 + ALPN 一致强制，以及并发证明（慢流不阻塞同连接其他流；大量空闲流按连接而非按流占 worker；空闲连接羊群不阻塞新请求；事件调度器回收 slow-loris 并执行 `max_connections`；服务端流式响应按短节奏冲刷；单条 h2 连接并发突发不饥饿）。
 - 加固测试 30 个：恶意帧输入（超长帧、畸形 SETTINGS/PING/WINDOW_UPDATE、流控窗口溢出、HPACK 头表与 Huffman 炸弹、截断/EOS Huffman、伪头顺序、`content-length` 不一致、非法 `transfer-encoding`/`connection` 系头、两端 `SETTINGS_MAX_CONCURRENT_STREAMS` 强制、`h2c` 存活检测：SETTINGS_TIMEOUT 与 keepalive 死对端检测）。
 
 ```bash

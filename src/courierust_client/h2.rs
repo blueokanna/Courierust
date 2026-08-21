@@ -180,6 +180,16 @@ fn start_inner(
     })
 }
 
+/// The driver's socket read timeout. It must be short enough that a
+/// command queued while the driver is blocked waiting for response data
+/// is served promptly: with a long timeout, requests arriving on a busy
+/// multiplexed connection wait out the whole read before the driver
+/// drains the command channel (a multi-hundred-millisecond P99 spike
+/// under concurrency). 5 ms bounds that stall to ~5 ms; responses are
+/// still read the instant their bytes arrive (socket readiness interrupts
+/// the read), so this does not add latency to the response path.
+const DRIVER_READ_TIMEOUT: Duration = Duration::from_millis(5);
+
 fn driver(
     stream: ConnStream,
     rx: Receiver<H2Cmd>,
@@ -188,7 +198,7 @@ fn driver(
     seed: Vec<u8>,
     upgrade_reply: Option<Sender<Result<H2Response>>>,
 ) {
-    let _ = stream.configure(Some(Duration::from_millis(250)));
+    let _ = stream.configure(Some(DRIVER_READ_TIMEOUT));
     let mut conn = if seed.is_empty() {
         Connection::new(&stream, &stream, h2_config(&cfg))
     } else {

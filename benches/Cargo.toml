@@ -52,6 +52,11 @@ name = "network"
 harness = false
 path = "src/network.rs"
 
+[[bench]]
+name = "tls_interop"
+harness = false
+path = "src/tls_interop.rs"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

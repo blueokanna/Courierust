@@ -1,0 +1,177 @@
+name: Cross-machine benchmark
+
+# Loopback-vs-real-network evidence for HTTP/1 and HTTP/2, run from
+# *separate physical machines*.
+#
+# A hosted runner produces the loopback baseline (server and client on
+# one host, 127.0.0.1). The cross-machine cases use two self-hosted
+# runners that must be on separate machines, registered with the labels
+# `courierust-server` and `courierust-client`:
+#
+#   - The `courierust-server` runner binds a plain h1 server on
+#     0.0.0.0:18080 and an h2 server on 0.0.0.0:18081, and keeps them up
+#     while the client benchmarks.
+#   - The `courierust-client` runner targets
+#     `http://<server_host>:18080` / `:18081`.
+#
+# Dispatch this workflow with the server runner's IP as the
+# `server_host` input (the two benchmark ports must be reachable from the
+# client machine). Comparing the `NETWORK|role=client|...` rows from the
+# loopback job and the cross-machine job isolates what is protocol-stack
+# cost (identical binaries, identical settings — only the network path
+# differs).
+
+on:
+  workflow_dispatch:
+    inputs:
+      server_host:
+        description: 'IP of the courierust-server self-hosted runner (benchmark ports 18080/18081 must be open to it)'
+        required: true
+      requests:
+        description: 'Requests per case'
+        required: false
+        default: '10000'
+      payload:
+        description: 'Response payload bytes'
+        required: false
+        default: '4096'
+  schedule:
+    - cron: '0 3 * * 1'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  loopback-baseline:
+    name: Loopback baseline (hosted)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: benches
+      - name: Build benches (release)
+        run: cargo bench --manifest-path benches/Cargo.toml --locked --no-run
+      - name: Server + client on one host (127.0.0.1)
+        shell: bash
+        env:
+          REQS: ${{ inputs.requests || '10000' }}
+          PAYLOAD: ${{ inputs.payload || '4096' }}
+        run: |
+          set -euo pipefail
+          DIR="$PWD/benches/target/release"
+          COURIERUST_NETWORK_ROLE=server COURIERUST_NETWORK_BIND=127.0.0.1:18090 \
+            COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" "$DIR/network" > loop_h1.log 2>&1 &
+          H1=$!
+          COURIERUST_NETWORK_ROLE=server COURIERUST_NETWORK_BIND=127.0.0.1:18091 \
+            COURIERUST_NETWORK_HTTP2=1 COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" "$DIR/network" > loop_h2.log 2>&1 &
+          H2=$!
+          sleep 1
+          echo "=== LOOPBACK h1 ==="
+          COURIERUST_NETWORK_URL=http://127.0.0.1:18090/ COURIERUST_NETWORK_PROTOCOL=h1 \
+            COURIERUST_NETWORK_WORKERS=8 COURIERUST_NETWORK_MAX_CONNECTIONS=8 \
+            COURIERUST_NETWORK_REQUESTS="$REQS" COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" \
+            "$DIR/network"
+          echo "=== LOOPBACK h2 ==="
+          COURIERUST_NETWORK_URL=http://127.0.0.1:18091/ COURIERUST_NETWORK_PROTOCOL=h2 \
+            COURIERUST_NETWORK_WORKERS=8 COURIERUST_NETWORK_MAX_CONNECTIONS=1 \
+            COURIERUST_NETWORK_REQUESTS="$REQS" COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" \
+            "$DIR/network"
+          kill "$H1" "$H2" 2>/dev/null || true
+          wait "$H1" 2>/dev/null || true
+          wait "$H2" 2>/dev/null || true
+
+  cross-server:
+    name: Cross-machine server (self-hosted)
+    runs-on: [self-hosted, courierust-server]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build benches (release)
+        run: cargo bench --manifest-path benches/Cargo.toml --locked --no-run
+      - name: Serve h1 + h2 on 0.0.0.0
+        shell: bash
+        env:
+          PAYLOAD: ${{ inputs.payload || '4096' }}
+        run: |
+          set -euo pipefail
+          DIR="$PWD/benches/target/release"
+          COURIERUST_NETWORK_ROLE=server COURIERUST_NETWORK_BIND=0.0.0.0:18080 \
+            COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" "$DIR/network" > cross_h1.log 2>&1 &
+          H1=$!
+          COURIERUST_NETWORK_ROLE=server COURIERUST_NETWORK_BIND=0.0.0.0:18081 \
+            COURIERUST_NETWORK_HTTP2=1 COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" "$DIR/network" > cross_h2.log 2>&1 &
+          H2=$!
+          echo "cross-machine servers listening on 18080 (h1) and 18081 (h2)"
+          # Keep serving while the client job benchmarks against us.
+          sleep 1200
+          kill "$H1" "$H2" 2>/dev/null || true
+          wait "$H1" 2>/dev/null || true
+          wait "$H2" 2>/dev/null || true
+          echo "cross-machine server finished"
+          cat cross_h1.log cross_h2.log
+
+  cross-client:
+    name: Cross-machine client (self-hosted)
+    runs-on: [self-hosted, courierust-client]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build benches (release)
+        run: cargo bench --manifest-path benches/Cargo.toml --locked --no-run
+      - name: Benchmark the remote server
+        shell: bash
+        env:
+          SERVER_HOST: ${{ inputs.server_host }}
+          REQS: ${{ inputs.requests || '10000' }}
+          PAYLOAD: ${{ inputs.payload || '4096' }}
+        run: |
+          set -euo pipefail
+          DIR="$PWD/benches/target/release"
+          HOST="${SERVER_HOST%%:*}"
+          # Wait for the remote servers to come up (the server job starts
+          # in parallel with this one).
+          for port in 18080 18081; do
+            ok=0
+            for _ in $(seq 1 300); do
+              if (exec 3<>"/dev/tcp/$HOST/$port") 2>/dev/null; then
+                exec 3>&- 3<&- 2>/dev/null || true
+                ok=1
+                break
+              fi
+              sleep 1
+            done
+            if [[ "$ok" -ne 1 ]]; then
+              echo "::error::remote server not reachable on $HOST:$port" >&2
+              exit 1
+            fi
+          done
+          echo "=== CROSS-MACHINE h1 (server_host=$HOST) ==="
+          COURIERUST_NETWORK_URL="http://$HOST:18080/" COURIERUST_NETWORK_PROTOCOL=h1 \
+            COURIERUST_NETWORK_WORKERS=8 COURIERUST_NETWORK_MAX_CONNECTIONS=8 \
+            COURIERUST_NETWORK_REQUESTS="$REQS" COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" \
+            "$DIR/network"
+          echo "=== CROSS-MACHINE h2 ==="
+          COURIERUST_NETWORK_URL="http://$HOST:18081/" COURIERUST_NETWORK_PROTOCOL=h2 \
+            COURIERUST_NETWORK_WORKERS=8 COURIERUST_NETWORK_MAX_CONNECTIONS=1 \
+            COURIERUST_NETWORK_REQUESTS="$REQS" COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" \
+            "$DIR/network"
+
+  publish-summary:
+    name: Publish cross-machine summary
+    needs: [loopback-baseline, cross-client]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Note
+        run: |
+          echo "The loopback and cross-machine NETWORK rows above are the
+          same-binary, same-settings comparison. Any rps/p99 gap between
+          them is the cost of the real network path, not the protocol
+          stack." >> "$GITHUB_STEP_SUMMARY"

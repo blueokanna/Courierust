@@ -7,9 +7,18 @@
 //!   zero-dependency way to wait on many sockets at once. `select` is
 //!   used instead of `WSAPoll` because `WSAPoll` rejects sockets with
 //!   `WSAEINVAL` in some environments; sockets are polled in batches of
-//!   `FD_SETSIZE` (64).
+//!   `FD_SETSIZE` (64). Only the *first* batch waits for the full
+//!   timeout; every later batch uses a zero timeout so a socket that is
+//!   ready in batch *k* is never delayed by the timeouts of batches
+//!   0..k-1 (which would multiply tail latency by the batch count).
 //! * **Unix** wraps the POSIX `poll()` call, which has no 64-socket batch
 //!   limit and does not mutate its timeout argument.
+//!
+//! Both backends accept an optional *wake* descriptor (a loopback socket
+//! pair used by the event loop as a self-pipe). The wake descriptor is
+//! watched for readability in **every** batch, so a worker or the accept
+//! thread can interrupt a blocking poll with a single byte — control
+//! messages no longer wait for the next poll tick.
 //!
 //! The server falls back to the per-connection blocking pool model only
 //! when `ServerConfig::event_driven` is explicitly disabled.
@@ -24,6 +33,10 @@ use std::net::TcpStream;
 pub(crate) type Fd = std::os::windows::io::RawSocket;
 #[cfg(not(windows))]
 pub(crate) type Fd = std::os::fd::RawFd;
+
+/// Reserved poller id for the wake (self-pipe) descriptor. The event
+/// loop never treats this id as a connection.
+pub(crate) const WAKE_ID: usize = 0;
 
 /// The raw descriptor of a socket, whatever the platform.
 pub(crate) fn fd_of(socket: &TcpStream) -> Fd {
@@ -174,38 +187,62 @@ impl Poller {
         }
     }
 
-    /// Wait up to `timeout_ms` for readiness. Returns the ids of ready
-    /// sockets (readable or writable per their registered direction, or
-    /// errored/closed).
-    pub(crate) fn wait(&mut self, timeout_ms: i32) -> std::io::Result<Vec<usize>> {
-        if self.fds.is_empty() {
+    /// Wait up to `timeout_ms` for readiness. `wake` is an optional
+    /// descriptor (the event loop's self-pipe) watched for readability in
+    /// every batch; when it fires, [`WAKE_ID`] is included in the result.
+    /// Returns the ids of ready sockets (readable or writable per their
+    /// registered direction, or errored/closed).
+    pub(crate) fn wait(
+        &mut self,
+        timeout_ms: i32,
+        wake: Option<Fd>,
+    ) -> std::io::Result<Vec<usize>> {
+        if self.fds.is_empty() && wake.is_none() {
             return Ok(Vec::new());
         }
         #[cfg(windows)]
         {
-            self.wait_select(timeout_ms)
+            self.wait_select(timeout_ms, wake)
         }
         #[cfg(not(windows))]
         {
-            self.wait_poll(timeout_ms)
+            self.wait_poll(timeout_ms, wake)
         }
     }
 
-    /// Winsock `select()` implementation, polling in `FD_SETSIZE`-sized batches
+    /// Winsock `select()` implementation, polling in `FD_SETSIZE`-sized
+    /// batches. Only the first batch waits for the full `timeout_ms`;
+    /// every later batch uses a zero timeout so a ready socket in a late
+    /// batch is reported promptly instead of being delayed by every
+    /// earlier batch's timeout. The wake descriptor (when given) is added
+    /// to every batch's read set, so a wakeup byte interrupts the very
+    /// first batch immediately.
     #[cfg(windows)]
-    fn wait_select(&self, timeout_ms: i32) -> std::io::Result<Vec<usize>> {
+    fn wait_select(&self, timeout_ms: i32, wake: Option<Fd>) -> std::io::Result<Vec<usize>> {
         use ws::*;
-        let tv = TimeVal {
+        let full_tv = TimeVal {
             tv_sec: timeout_ms / 1000,
             tv_usec: (timeout_ms % 1000) * 1000,
         };
+        let zero_tv = TimeVal {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
         let mut ready = Vec::new();
-        let mut batch = 0usize;
-        while batch < self.fds.len() {
-            let end = core::cmp::min(batch + FD_SETSIZE, self.fds.len());
+        // At least one batch always runs — when no connection fds are
+        // registered, a single batch holding just the wake descriptor is
+        // still polled, so the wake pipe alone can interrupt the wait.
+        let batches = self.fds.len().div_ceil(FD_SETSIZE).max(1);
+        for b in 0..batches {
+            let start = b * FD_SETSIZE;
+            let end = core::cmp::min(start + FD_SETSIZE, self.fds.len());
             let mut readset = FdSet::new();
             let mut writeset = FdSet::new();
-            for &(_, fd, ww) in &self.fds[batch..end] {
+            if let Some(w) = wake {
+                readset.insert(w);
+            }
+            let mut wake_ready = false;
+            for &(_, fd, ww) in &self.fds[start..end] {
                 if ww {
                     writeset.insert(fd);
                 } else {
@@ -213,34 +250,42 @@ impl Poller {
                 }
             }
 
-            let n = unsafe { select(0, &mut readset, &mut writeset, std::ptr::null_mut(), &tv) };
+            let tv = if b == 0 { &full_tv } else { &zero_tv };
+            let n = unsafe { select(0, &mut readset, &mut writeset, std::ptr::null_mut(), tv) };
             if n < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             if n > 0 {
                 for &fd in readset.ready() {
-                    if let Some((id, _, _)) = self.fds[batch..end].iter().find(|(_, f, _)| *f == fd)
+                    if Some(fd) == wake {
+                        wake_ready = true;
+                        continue;
+                    }
+                    if let Some((id, _, _)) = self.fds[start..end].iter().find(|(_, f, _)| *f == fd)
                     {
                         ready.push(*id);
                     }
                 }
                 for &fd in writeset.ready() {
-                    if let Some((id, _, _)) = self.fds[batch..end].iter().find(|(_, f, _)| *f == fd)
+                    if let Some((id, _, _)) = self.fds[start..end].iter().find(|(_, f, _)| *f == fd)
                     {
                         ready.push(*id);
                     }
                 }
             }
-            batch = end;
+            if wake_ready {
+                ready.push(WAKE_ID);
+            }
         }
         ready.sort_unstable();
         ready.dedup();
         Ok(ready)
     }
 
-    /// POSIX `poll()` implementation (single call; no batch limit).
+    /// POSIX `poll()` implementation (single call; no batch limit). The
+    /// wake descriptor (when given) is appended to the poll set.
     #[cfg(not(windows))]
-    fn wait_poll(&self, timeout_ms: i32) -> std::io::Result<Vec<usize>> {
+    fn wait_poll(&self, timeout_ms: i32, wake: Option<Fd>) -> std::io::Result<Vec<usize>> {
         use posix::*;
         let mut pfds: Vec<PollFd> = self
             .fds
@@ -251,6 +296,17 @@ impl Poller {
                 revents: 0,
             })
             .collect();
+        let wake_idx = match wake {
+            Some(w) => {
+                pfds.push(PollFd {
+                    fd: w,
+                    events: POLLIN,
+                    revents: 0,
+                });
+                Some(pfds.len() - 1)
+            }
+            None => None,
+        };
         let n = unsafe { poll(pfds.as_mut_ptr(), pfds.len() as NfdsT, timeout_ms) };
         if n < 0 {
             return Err(std::io::Error::last_os_error());
@@ -260,6 +316,12 @@ impl Poller {
         }
         let mut ready = Vec::new();
         for (idx, pfd) in pfds.iter().enumerate() {
+            if Some(idx) == wake_idx {
+                if pfd.revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL) != 0 {
+                    ready.push(WAKE_ID);
+                }
+                continue;
+            }
             let (_, _, ww) = self.fds[idx];
             let expected = if ww { POLLOUT } else { POLLIN };
             if pfd.revents & (expected | POLLERR | POLLHUP | POLLNVAL) != 0 {
@@ -289,11 +351,11 @@ mod tests {
         let fd = fd_of(&server);
         p.register(7, fd, false);
 
-        let ready = p.wait(50).unwrap();
+        let ready = p.wait(50, None).unwrap();
         assert!(ready.is_empty(), "unexpected ready: {ready:?}");
 
         client.write_all(b"hi").unwrap();
-        let ready = p.wait(2000).unwrap();
+        let ready = p.wait(2000, None).unwrap();
         assert_eq!(ready, vec![7]);
 
         let mut b = [0u8; 8];
@@ -316,7 +378,57 @@ mod tests {
         assert!(p.is_empty());
 
         client.write_all(b"hi").unwrap();
-        let ready = p.wait(100).unwrap();
+        let ready = p.wait(100, None).unwrap();
         assert!(ready.is_empty(), "unregistered socket reported: {ready:?}");
+    }
+
+    #[test]
+    fn wake_descriptor_interrupts_wait() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer = TcpStream::connect(addr).unwrap();
+        let (wake_reader, _) = listener.accept().unwrap();
+        wake_reader.set_nonblocking(true).unwrap();
+        writer.set_nonblocking(true).unwrap();
+
+        // A poll with a 10 s timeout must return as soon as a byte is
+        // written to the wake pair — this is the self-pipe the event loop
+        // relies on for sub-millisecond control-message wakeups.
+        let mut p = Poller::new();
+        let wfd = fd_of(&wake_reader);
+        let mut w: &TcpStream = &writer;
+        std::io::Write::write_all(&mut w, b"\x01").unwrap();
+        let started = std::time::Instant::now();
+        let ready = p.wait(10_000, Some(wfd)).unwrap();
+        assert_eq!(ready, vec![WAKE_ID]);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "wake did not interrupt the poll"
+        );
+    }
+
+    #[test]
+    fn wake_fires_alongside_connection_ready() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        // Wake pair.
+        let wl = TcpListener::bind("127.0.0.1:0").unwrap();
+        let wa = wl.local_addr().unwrap();
+        let mut writer = TcpStream::connect(wa).unwrap();
+        let (wake_reader, _) = wl.accept().unwrap();
+        wake_reader.set_nonblocking(true).unwrap();
+        writer.set_nonblocking(true).unwrap();
+
+        let mut p = Poller::new();
+        p.register(7, fd_of(&server), false);
+        std::io::Write::write_all(&mut writer, b"\x01").unwrap();
+        client.write_all(b"hi").unwrap();
+
+        let ready = p.wait(2000, Some(fd_of(&wake_reader))).unwrap();
+        assert!(ready.contains(&7), "connection not reported: {ready:?}");
+        assert!(ready.contains(&WAKE_ID), "wake not reported: {ready:?}");
     }
 }

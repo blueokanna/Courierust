@@ -286,7 +286,6 @@ struct ServerHelloInfo {
 
 fn parse_server_hello(body: &[u8]) -> TlsResult<ServerHelloInfo> {
     let mut c = Cur::new(body);
-    // legacy_version
     let legacy = c.u16().ok_or_else(|| TlsError::Protocol("bad SH".into()))?;
     if legacy != 0x0303 {
         return Err(TlsError::Protocol("bad SH legacy version".into()));
@@ -296,18 +295,15 @@ fn parse_server_hello(body: &[u8]) -> TlsResult<ServerHelloInfo> {
         c.take(32)
             .ok_or_else(|| TlsError::Protocol("bad SH".into()))?,
     );
-    // legacy_session_id (echoed)
     let sid_len = c.u8().ok_or_else(|| TlsError::Protocol("bad SH".into()))? as usize;
     if sid_len > 32 {
         return Err(TlsError::Protocol("bad SH session id".into()));
     }
     c.take(sid_len)
         .ok_or_else(|| TlsError::Protocol("bad SH".into()))?;
-    // cipher suite
     let suite_wire = c.u16().ok_or_else(|| TlsError::Protocol("bad SH".into()))?;
     let suite = CipherSuite::from_wire(suite_wire)
         .ok_or_else(|| TlsError::Protocol("unsupported suite".into()))?;
-    // compression
     let comp = c.u8().ok_or_else(|| TlsError::Protocol("bad SH".into()))?;
     if comp != 0 {
         return Err(TlsError::Protocol("bad SH compression".into()));
@@ -421,7 +417,6 @@ fn parse_certificate_list(body: &[u8]) -> TlsResult<Vec<Vec<u8>>> {
             .take(cert_len)
             .ok_or_else(|| TlsError::Protocol("bad cert".into()))?;
         out.push(cert.to_vec());
-        // Skip entry extensions.
         let ext_len = lc
             .u16()
             .ok_or_else(|| TlsError::Protocol("bad cert".into()))? as usize;
@@ -488,7 +483,6 @@ pub(crate) fn verify_cert_verify(
         d.finalize()
     };
 
-    // Determine the key type from the SPKI algorithm OID.
     if spki.oid == OID_RSA_ENCRYPTION {
         let (n, e) = parse_rsa_public_key(&spki.key)
             .ok_or_else(|| TlsError::Certificate("bad RSA SPKI".into()))?;
@@ -522,7 +516,6 @@ pub(crate) fn verify_cert_verify(
             ))
         }
     } else if spki.oid == OID_EC_PUBLIC_KEY {
-        // P-256 uncompressed point: 0x04 || X(32) || Y(32)
         if cv.scheme != 0x0403 || spki.key.len() != 65 || spki.key[0] != 0x04 {
             return Err(TlsError::Certificate("unsupported EC signature".into()));
         }
@@ -550,7 +543,6 @@ pub(crate) fn verify_cert_verify(
             return Err(TlsError::Certificate("bad Ed25519 signature length".into()));
         }
         sig.copy_from_slice(&cv.signature);
-        // Ed25519 signs the raw message (already includes the context prefix).
         if ed25519::verify(&pk, &msg, &sig) {
             Ok(())
         } else {
@@ -586,6 +578,7 @@ pub(crate) fn finished_verify_data(
 pub(crate) struct ClientHandshake {
     pub(crate) alpn: Vec<Vec<u8>>,
     pub(crate) server_name: Option<String>,
+    pub(crate) verify: bool,
 }
 
 impl ClientHandshake {
@@ -668,8 +661,6 @@ impl ClientHandshake {
         let peer_cert_der = peer_chain[0].clone();
         let cv = cv.ok_or_else(|| TlsError::Protocol("missing CertificateVerify".into()))?;
 
-        // Add EE + Certificate to the transcript, then verify CV over the
-        // transcript hash up to (but excluding) the CV.
         for (t, body) in &messages {
             if *t == HS_ENCRYPTED_EXTENSIONS || *t == HS_CERTIFICATE {
                 transcript.update(&encode_hs(*t, body));
@@ -677,20 +668,21 @@ impl ClientHandshake {
         }
         let cv_hash = transcript.current_hash();
 
-        // Validate the certificate chain and hostname.
         let leaf = super::x509::parse_certificate(&peer_cert_der)?;
         let spki = leaf.spki.clone();
-        let name = self.server_name.as_deref().unwrap_or("");
-        if !super::x509::hostname_matches(name, &leaf.dns_names, &leaf.ip_names) {
-            return Err(TlsError::Certificate("hostname mismatch".into()));
-        }
-        super::x509::validate_chain(roots, &peer_chain, now)?;
-        // RFC 5280 §4.2.1.12: a leaf with an EKU extension must permit TLS
-        // server authentication.
-        if !super::x509::has_server_auth_eku(&leaf) {
-            return Err(TlsError::Certificate(
-                "leaf certificate lacks TLS serverAuth EKU".into(),
-            ));
+        if self.verify {
+            let name = self.server_name.as_deref().unwrap_or("");
+            if !super::x509::hostname_matches(name, &leaf.dns_names, &leaf.ip_names) {
+                return Err(TlsError::Certificate("hostname mismatch".into()));
+            }
+            super::x509::validate_chain(roots, &peer_chain, now)?;
+            // RFC 5280 §4.2.1.12: a leaf with an EKU extension must
+            // permit TLS server authentication.
+            if !super::x509::has_server_auth_eku(&leaf) {
+                return Err(TlsError::Certificate(
+                    "leaf certificate lacks TLS serverAuth EKU".into(),
+                ));
+            }
         }
 
         // Verify the CertificateVerify signature.

@@ -13,7 +13,7 @@ None of this wraps an existing library. Frame codecs, HPACK header compression, 
 The mainstream Rust HTTP ecosystem (hyper / h2 / h3 and friends) is excellent, but the dependency trees run deep, and things like `no_std` support, core affinity, and "what does this client look like to a server" are left as your problem. This crate is built around three constraints:
 
 - **The protocol layer never touches `std`.** `std` only provides threads, TCP, and clocks.
-- **Multi-core is explicit — within the model.** Server connections are dispatched through a work-stealing pool. Client pools are shared by authority, and HTTP/2 requests are multiplexed by a dedicated driver per connection; set `max_connections_per_host` when independent connections are needed for load distribution. Worker occupancy is **per connection**: a single HTTP/2 connection with many streams (or a slow stream, or SSE) holds exactly one server worker, so a connection's streams never multiply worker usage and never block each other. The honest corollary is that a herd of *connections* needs either many workers or the Windows event-driven mode for plain HTTP/1.1 (see Limitations).
+- **Multi-core is explicit — within the model.** Server connections are dispatched through a work-stealing pool, and an **event-driven scheduler** (default on every platform) parks idle/partial plain-HTTP connections on a readiness poller so a herd of keep-alive / SSE / slow-loris connections cannot consume workers. Client pools are shared by authority, and HTTP/2 requests are multiplexed by a dedicated driver per connection; set `max_connections_per_host` when independent connections are needed for load distribution. Worker occupancy is **per connection**: a single HTTP/2 connection with many streams (or a slow stream, or SSE) holds exactly one server worker, so a connection's streams never multiply worker usage and never block each other.
 - **The wire details are implemented against the RFCs and verified against published test vectors**, not "good enough to pass a smoke test."
 
 ## Features
@@ -43,7 +43,7 @@ The mainstream Rust HTTP ecosystem (hyper / h2 / h3 and friends) is excellent, b
   - HTTP/1.1 keep-alive connection pool grouped by authority with bounded reuse;
   - HTTP/2 connections multiplex streams through dedicated drivers and can be capped per authority;
   - Redirect following (301/302/303 → GET), timeouts, `User-Agent`, etc.
-- **Server** (`courierust_server`): each accepted connection becomes a pool job, so connection handling scales across cores.
+- **Server** (`courierust_server`): by default an **event-driven scheduler** accepts, classifies (TLS / h2 / h1 from the first bytes), and parks idle plain-HTTP connections on a readiness poller (Winsock `select` / POSIX `poll`), handing ready ones to event workers in batches. TLS and HTTP/2 connections run on the blocking work-stealing pool. Setting `event_driven: false` restores the legacy one-pool-job-per-connection model for comparison.
 - **gRPC** (`courierust_grpc`): HTTP/2 + length-prefixed message framing + `grpc-status` / `grpc-message` handling, with unary, server-streaming, client-streaming and bidi calls on both sides. `gzip` message compression is implemented from scratch (RFC 1951/1952: full DEFLATE decompression for any producer, fixed-Huffman LZ77 compression) and negotiated per gRPC A6. Deadlines (`grpc-timeout`) are enforced server-side, metadata and interceptors are supported, `dns:///` targets round-robin, and the `grpc.health.v1.Health` service provides `Check` and `Watch`. Protobuf is deliberately left to you — implement `EncodeMessage` / `DecodeMessage` for your types, or use the raw-bytes API.
 - **Streaming bodies** (`courierust_body`): channel-backed `Body::Channel` lets handlers push response chunks from another thread.
 
@@ -68,6 +68,22 @@ The naive implementation replies with a `WINDOW_UPDATE` per frame, and control-f
 ### Connection ownership and scheduling
 
 Each client connection owns its codec buffers and, for HTTP/2, one driver thread that serializes wire access while multiplexing streams. Pool bookkeeping is bounded by authority and `max_connections_per_host`; it is not a promise that one HTTP/2 connection scales linearly with caller threads. Use the concurrency benchmark and the full latency tail before choosing a connection count for a deployment.
+
+### The event scheduler is a self-pipe, not a sleep-and-scan loop
+
+The default server path is an accept thread + an event-loop thread + a set of event workers. The part that is easy to get wrong: the event loop blocks in `select`/`poll`, but *control messages* (new connection, re-register a connection a worker just served) travel on an mpsc channel — if the loop only notices them on the next poll tick, every keep-alive round trip pays a full poll timeout (that was the original ~5 ms P99 spike). The fix is a **self-pipe**: a loopback socket pair whose read end is registered in the poller, so the accept thread and any worker can interrupt a blocking poll with one byte the instant a message is queued. Socket readiness (a client sending data) already wakes the poll immediately; with the self-pipe, *message* wakeups are immediate too, and the poll timeout only bounds the wait when nothing at all is happening — it is not in the request-latency path. Ready connections are dispatched to workers in **batches** (one channel message per 16 ids), and on Windows the `select` batching gives every batch after the first a zero timeout so a ready socket in batch *k* is never delayed by the timeouts of batches 0..k-1.
+
+Slow-loris and idle-herd protection is enforced before workers are ever involved: an incomplete request parks on the poller (zero workers), connections idle for `idle_timeout` are reaped, and `max_connections` caps the parked population outright.
+
+## Security hardening
+
+This crate treats parsers as attack surface. Beyond the usual limits (header/line/body caps everywhere), the notable defenses:
+
+- **Request smuggling (CWE-444).** Duplicate `Content-Length` with differing values is rejected; `Transfer-Encoding` is parsed as a codeword list where `chunked` must be the final, single occurrence (`Transfer-Encoding: notchunked`, `chunked, gzip` and empty codewords are all rejected); a request line must be exactly three tokens. Critically, the **blocking and the event-driven incremental parsers share the same chunk-size parser and framing rules** — two code paths that disagree on a request's meaning are exactly how smuggling happens behind a proxy, so there is exactly one authority.
+- **TLS record layer.** Ciphertext length bounds, padding validation, inner content-type checks, and per-direction sequence numbers (tampered records fail `bad_record_mac`). The decrypted handshake buffer is capped at the protocol's 16 MiB maximum so a peer streaming endless handshake records cannot grow memory without bound. Handshakes run under a dedicated `handshake_timeout` (10 s default) on both client and server, so a peer that connects and stalls mid-handshake releases its worker/caller instead of holding it for the full read timeout.
+- **TLS trust.** Chain validation (validity, name chaining, signatures, CA/key-usage, trust anchor), RFC 6125 hostname matching including IP SANs and single-wildcard, and EKU enforcement (a leaf with an EKU extension must permit `serverAuth`). `verify: false` exists for testing and truly-unanchored peers and still verifies `CertificateVerify` + `Finished` — the handshake stays cryptographically sound.
+- **HTTP/2.** HPACK bombs (integer overflow, header-list cap, dynamic-table size, Huffman EOS/padding) are rejected; flow-control windows are checked per frame at stream and connection level (overflow is `FLOW_CONTROL_ERROR`); DATA on bodyless messages, `content-length` mismatches at stream end, and RST on idle streams are all stream/connection errors; `SETTINGS_TIMEOUT` and keepalive dead-peer detection close silent peers.
+- **Redirects never forward `Authorization` / `Cookie` across origins** (RFC 9110 §15.4).
 
 ## Quick start
 
@@ -219,10 +235,10 @@ Things this crate deliberately does *not* do, so you know before you commit:
 
 - **No HTTP/3 / QUIC.** No external deps means no usable QUIC implementation (and QUIC needs a userspace UDP stack plus TLS 1.3; the TLS half exists, the transport does not).
 - **TLS: no PSK / 0-RTT resumption / session tickets / key update yet, and no mutual TLS.** A full 1-RTT handshake happens every time; NewSessionTicket from a peer is ignored; the server does not request client certificates.
-- **Event-driven server is Windows-only and HTTP/1.1-only.** On Windows, `ServerConfig::event_driven` (default on) parks idle plain-HTTP connections on a poller so a small worker pool serves many idle keep-alive / SSE / long-poll connections; TLS and HTTP/2 connections still use the blocking pool model. On non-Windows platforms the per-connection pool model is used.
+- **Event-driven server is default on every platform and HTTP/1.1-only.** `ServerConfig::event_driven` (default `true`) parks idle plain-HTTP connections on a readiness poller so a small worker pool serves many idle keep-alive / SSE / long-poll connections; TLS and HTTP/2 connections still use the blocking pool model (bounded by `handshake_timeout`, `h2_idle_timeout`, and worker count). Setting it to `false` restores the legacy one-pool-job-per-connection model for comparison and debugging.
 - **Streaming request bodies are only reliable over HTTP/2** (h2 frames naturally). Over HTTP/1.1, either send the whole body at once (`Body::Bytes`) or build chunked framing yourself.
 - **gRPC does not include protobuf, `.proto` code generation, or `grpc.reflection`.** You implement the codec traits or wire in your own protobuf-generated code; reflection needs a protobuf schema inventory, which is external by design.
-- **A synchronous handler that blocks for a long time holds a worker** (event-driven or not) — exactly as with any synchronous server; use channel response bodies for streaming. Worker occupancy is **per-connection, not per-stream**: on one HTTP/2 connection, any number of idle streams (SSE / long-poll / gRPC server-streaming) occupy the same single worker, and a slow stream never blocks its connection's other streams — both are covered by integration tests. A large herd of *connections* still needs either many workers or the Windows event-driven mode for plain HTTP/1.1.
+- **A synchronous handler that blocks for a long time holds a worker** (event-driven or not) — exactly as with any synchronous server; use channel response bodies for streaming. Worker occupancy is **per-connection, not per-stream**: on one HTTP/2 connection, any number of idle streams (SSE / long-poll / gRPC server-streaming) occupy the same single worker, and a slow stream never blocks its connection's other streams — both are covered by integration tests. A large herd of *connections* is handled by the event scheduler (idle reaping + `max_connections`) rather than by adding workers.
 - **HTTPS is first-class**: the client and server ship a from-scratch TLS 1.3 implementation; `https://` needs a root store (supply your own — there is no bundled CA set). ALPN is enforced: a client configured for h2 speaking to a server that negotiates `http/1.1` (or vice versa) fails with a clear error instead of a silent protocol mismatch.
 - Redirects, keep-alive reuse, and friends prioritize correctness over aggressive tuning.
 
@@ -294,11 +310,28 @@ This runs in CI on every PR (`benchmark.yml`), so a real interop regression
 fails the pipeline. The mainstream crates are dev-only dependencies of the
 bench workspace; the `courierust` library itself stays zero-dependency.
 
+The self-interop suite only proves Courierust agrees with *itself* on TLS.
+To prove the TLS layer against an independent implementation, a separate
+workflow (`tls-interop.yml`, script `scripts/tls_interop.sh`) drives
+**OpenSSL `s_server`** (Courierust client → OpenSSL), **`curl` / `openssl
+s_client`** (independent stack → Courierust server, h1 + h2 ALPN) and
+**nginx with HTTP/2** (Courierust h2 client → nginx) against a throwaway
+CA-signed certificate.
+
+Loopback numbers can never tell you what the wire costs. A
+`cross-machine.yml` workflow runs the identical `network` bench binary on
+two **self-hosted runners on separate physical machines** (labels
+`courierust-server` / `courierust-client`) and compares the resulting
+`NETWORK|...` rows against a loopback baseline from the same binary — so
+the rps/p99 gap between the two runs is the network path, not the
+protocol stack.
+
 ## Tests
 
-- 115 unit tests: all HPACK RFC vectors (C.2/C.3/C.4/C.6), Huffman encode/decode (plus a decode output cap), frame codec, state machine, flow control, WUCS scheduling, JA3/JA4 comparison against published records, fingerprint parsing, TLS 1.3 handshake + RFC 8448 key schedule, X.25519/Ed25519/ECDSA/RSA primitives, and the DEFLATE/gzip codec (round-trips, CRC-32 vectors, corruption rejection, output-cap enforcement, and cross-checked against Python zlib output).
-- 37 integration tests: real loopback TCP round trips for h1/h2/HTTPS, keep-alive reuse, chunked, redirects, h2 concurrent multiplexing, streaming responses, large-body flow-control round trips, gRPC unary/server/client/bidi streaming + error status + trailers + deadline enforcement + gzip round-trip, `grpc.health.v1.Health` `Check` + `Watch`, RFC 7540 §3.2 `h2c` Upgrade, TLS trust rejection + malformed-TLS-input survival, ALPN agreement enforcement, and two concurrency proofs (a slow stream does not block its connection's other streams; many idle streams consume one worker, not one per stream).
+- 121 unit tests: all HPACK RFC vectors (C.2/C.3/C.4/C.6), Huffman encode/decode (plus a decode output cap), frame codec, state machine, flow control, WUCS scheduling, JA3/JA4 comparison against published records, fingerprint parsing, TLS 1.3 handshake + RFC 8448 key schedule, X.25519/Ed25519/ECDSA/RSA primitives, the DEFLATE/gzip codec (round-trips, CRC-32 vectors, corruption rejection, output-cap enforcement, and cross-checked against Python zlib output), and the poller's wake-descriptor (self-pipe) semantics.
+- 45 integration tests: real loopback TCP round trips for h1/h2/HTTPS, keep-alive reuse, chunked, redirects, h2 concurrent multiplexing, streaming responses, large-body flow-control round trips, gRPC unary/server/client/bidi streaming + error status + trailers + deadline enforcement + gzip round-trip, `grpc.health.v1.Health` `Check` + `Watch`, RFC 7540 §3.2 `h2c` Upgrade, TLS trust rejection + malformed-TLS-input survival + `verify:false` + hostname-mismatch rejection + ALPN agreement enforcement, and concurrency proofs: a slow stream does not block its connection's other streams; many idle streams consume one worker; an idle-connection herd does not block fresh requests; the event scheduler reaps slow-loris connections and enforces `max_connections`; server-streaming responses flush on a short cadence; and one h2 connection serves a concurrent burst without command starvation.
 - 30 hardening tests: hostile-frame inputs (oversized frames, malformed SETTINGS/PING/WINDOW_UPDATE, flow-control window overflow, HPACK header-list and Huffman bombs, truncated/EOS Huffman, pseudo-header ordering, `content-length` mismatches, forbidden `transfer-encoding`/`connection`-specific headers, `SETTINGS_MAX_CONCURRENT_STREAMS` enforcement on both ends, `h2c` liveness: SETTINGS_TIMEOUT and keepalive dead-peer detection).
+- 4 fuzz targets (`cargo-fuzz`): `h2_frame`, `hpack_block`, plus **`h1_request`** (the shared request/header/chunked path used by both server parsers) and **`h2_connection`** (the full h2 state machine driven by hostile frame streams in both roles). A nightly long-fuzz workflow runs each with a wall-clock budget; a PR-time smoke run covers the same targets in `benchmark.yml`.
 
 ```bash
 cargo test                 # everything

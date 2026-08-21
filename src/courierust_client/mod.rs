@@ -69,6 +69,12 @@ pub struct ClientConfig {
     pub connect_timeout: Option<Duration>,
     /// Read timeout.
     pub read_timeout: Option<Duration>,
+    /// TLS handshake timeout: a server that accepts and then stalls
+    /// mid-handshake releases the caller after this long instead of
+    /// holding it for the full `read_timeout`. Without this, the HTTP/2
+    /// TLS handshake had no timeout at all (a hostile server could block
+    /// the caller forever). `None` falls back to `read_timeout`.
+    pub handshake_timeout: Option<Duration>,
     /// Maximum redirects to follow.
     pub max_redirects: usize,
     /// Default `User-Agent`.
@@ -107,6 +113,7 @@ impl Default for ClientConfig {
             max_connections_per_host: 4,
             connect_timeout: Some(Duration::from_secs(10)),
             read_timeout: Some(Duration::from_secs(60)),
+            handshake_timeout: Some(Duration::from_secs(10)),
             max_redirects: 10,
             user_agent: Some(format!("courierust/{}", env!("CARGO_PKG_VERSION"))),
             max_header_list: 1 << 20,
@@ -631,6 +638,11 @@ impl Client {
         let stream = crate::courierust_net::connect(&addr, self.inner.config.connect_timeout)?;
         match tls {
             Some(c) => {
+                // Short timeout during the handshake so a stalled peer
+                // releases the caller (the driver applies its own short
+                // read timeout right after).
+                let _ =
+                    crate::courierust_net::configure(&stream, self.inner.config.handshake_timeout);
                 let conn = crate::courierust_net::ConnStream::tls_client(stream, c, hostname)?;
                 // The peer's ALPN choice must agree with speaking
                 // HTTP/2: a server that negotiated `http/1.1` cannot be

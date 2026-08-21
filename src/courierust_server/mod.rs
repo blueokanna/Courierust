@@ -58,10 +58,27 @@ pub struct ServerConfig {
     pub event_driven: bool,
     /// Number of event-worker threads (0 = auto).
     pub event_workers: usize,
-    /// How often the event loop re-polls for readiness (milliseconds).
-    /// Lower values cut first-byte latency at the cost of more wakeups;
-    /// 0 falls back to a 5 ms default.
+    /// Upper bound on how long the event loop parks inside a single poll
+    /// call (milliseconds). Socket readiness (a client sending a request)
+    /// and the self-pipe (a worker or the accept thread queuing a control
+    /// message) both interrupt the poll immediately, so this value only
+    /// bounds the wait when *nothing* is happening — it is not in the
+    /// request-latency path. Larger values cut idle wakeups; 0 falls back
+    /// to the 50 ms default.
     pub event_poll_timeout_ms: u64,
+    /// Maximum number of concurrently open HTTP/1.1 connections the
+    /// event-driven scheduler will keep (0 = unlimited). New connections
+    /// beyond this cap are closed immediately, bounding the file
+    /// descriptors and parked slots a herd of idle / slow-loris clients
+    /// can consume even before the idle timeout reaps them. This bounds
+    /// the event path; TLS and HTTP/2 connections are additionally
+    /// bounded by the worker pool and their idle timeouts.
+    pub max_connections: usize,
+    /// TLS handshake timeout: a client that connects and then stalls
+    /// mid-handshake releases its pool worker after this long (instead of
+    /// holding it for the full `read_timeout`). Plain connections are
+    /// unaffected. `None` falls back to `read_timeout`.
+    pub handshake_timeout: Option<Duration>,
     /// Close an HTTP/1.1 connection that has been parked (no bytes in
     /// either direction) for this long. Bounds the resources a herd of
     /// idle / slow-loris connections can consume. `None` disables it.
@@ -101,7 +118,9 @@ impl Default for ServerConfig {
             tls: None,
             event_driven: true,
             event_workers: 0,
-            event_poll_timeout_ms: 5,
+            event_poll_timeout_ms: 50,
+            max_connections: 0,
+            handshake_timeout: Some(Duration::from_secs(10)),
             idle_timeout: Some(Duration::from_secs(300)),
             h2_settings_timeout: Some(Duration::from_secs(10)),
             h2_ping_interval: Some(Duration::from_secs(30)),
@@ -237,7 +256,15 @@ pub(crate) fn serve_accepted(
     handler: &dyn Handler,
     config: &ServerConfig,
 ) -> crate::Result<()> {
-    crate::courierust_net::configure(&stream, config.read_timeout)?;
+    // A TLS handshake runs under `handshake_timeout` (short) so a
+    // client that connects and then stalls mid-handshake releases its
+    // pool worker instead of holding it for the full application read
+    // timeout. The application timeout is restored before serving.
+    if config.tls.is_some() {
+        crate::courierust_net::configure(&stream, config.handshake_timeout)?;
+    } else {
+        crate::courierust_net::configure(&stream, config.read_timeout)?;
+    }
     match &config.tls {
         Some(t) => {
             let acceptor =
@@ -255,11 +282,9 @@ pub(crate) fn serve_accepted(
                     e.to_string(),
                 )
             })?;
-            serve_connection(
-                crate::courierust_net::ConnStream::tls_server(tls, peer),
-                handler,
-                config,
-            )
+            let conn = crate::courierust_net::ConnStream::tls_server(tls, peer);
+            let _ = conn.configure(config.read_timeout);
+            serve_connection(conn, handler, config)
         }
         None => serve_connection(
             crate::courierust_net::ConnStream::plain(stream),

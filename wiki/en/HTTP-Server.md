@@ -1,6 +1,15 @@
 # HTTP Server
 
-The server accepts connections and submits each one as a job to a **work-stealing thread pool**, so connection handling scales across cores. A handler is just a function — no framework types to implement.
+By default the server runs an **event-driven scheduler**: an accept thread
+hands sockets to an event loop that parks idle/partial plain-HTTP
+connections on a readiness poller (Winsock `select` / POSIX `poll`), so a
+herd of keep-alive / SSE / slow-loris connections consumes **zero**
+workers. A ready connection is handed to one of a small set of event
+workers, which run an incremental request parser that resumes where it
+left off; a slow sender is parked again instead of holding a worker.
+TLS and HTTP/2 connections run on the **work-stealing thread pool**, so
+connection handling still scales across cores. A handler is just a
+function — no framework types to implement.
 
 ## The handler
 
@@ -110,5 +119,6 @@ Send an error mid-stream with `tx.fail(err)` — the connection resets that stre
 ## Notes
 
 - HTTP/1.1 responses without a body get an explicit `Content-Length: 0`; chunked encoding is emitted when the length is unknown.
-- `Server::serve` submits each accepted connection as one pool job. A slow request holds a worker until it finishes reading — fine for typical workloads; very long-lived connections may warrant splitting the event loop yourself.
+- The event scheduler is the default on every platform for plain HTTP/1.1: a partial request parks on the poller (zero workers), and connections idle for `ServerConfig::idle_timeout` are reaped. `max_connections` caps the parked population. TLS and HTTP/2 connections run on the blocking pool, bounded by `handshake_timeout` / `h2_idle_timeout`. Setting `event_driven: false` restores the legacy one-pool-job-per-connection model.
+- A *synchronous handler* that blocks holds its event worker for as long as it blocks — exactly like any synchronous server. Use a channel body (`Body::Channel`) for streaming so the worker returns promptly.
 - gRPC servers are a thin layer on this server — see [gRPC](gRPC).

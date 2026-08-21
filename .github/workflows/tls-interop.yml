@@ -1,0 +1,82 @@
+name: TLS interop (OpenSSL / nginx)
+
+# Validates the Courierust TLS layer against mainstream, independently
+# implemented TLS stacks — the counterweight to the self-interop suite:
+#
+#   A. Courierust client  ->  OpenSSL s_server (TLS 1.3, HTTP/1.1)
+#   B. Courierust server  <-  curl / OpenSSL s_client (h1, h2 ALPN)
+#   C. Courierust h2 client -> nginx (TLS + HTTP/2), when nginx exists
+#
+# The script (`scripts/tls_interop.sh`) generates a throwaway CA + leaf,
+# so no long-lived test servers or network are needed.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/tls-interop.yml'
+      - 'scripts/tls_interop.sh'
+      - 'benches/src/tls_interop.rs'
+      - 'benches/src/network.rs'
+      - 'src/courierust_tls/**'
+      - 'src/courierust_net/**'
+      - 'src/courierust_client/**'
+      - 'src/courierust_server/**'
+  pull_request:
+    paths:
+      - '.github/workflows/tls-interop.yml'
+      - 'scripts/tls_interop.sh'
+      - 'benches/src/tls_interop.rs'
+      - 'benches/src/network.rs'
+      - 'src/courierust_tls/**'
+      - 'src/courierust_net/**'
+      - 'src/courierust_client/**'
+      - 'src/courierust_server/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tls-interop:
+    name: Real TLS stack interop
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: benches
+      - name: Install nginx (for the HTTP/2 over TLS case)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nginx
+          nginx -v
+      - name: Build the interop binaries (release)
+        run: cargo bench --manifest-path benches/Cargo.toml --locked --bench tls_interop --bench network
+      - name: Run TLS interop (OpenSSL s_server, curl, s_client, nginx)
+        shell: bash
+        run: |
+          set -o pipefail
+          bash scripts/tls_interop.sh benches/target/release tls_interop.log
+        env:
+          OPENSSL: openssl
+          CURL: curl
+          NGINX: nginx
+      - name: Publish TLS interop evidence to the run summary
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f tls_interop.log ]]; then
+            cat tls_interop.log >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload TLS interop log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tls-interop-log
+          path: tls_interop.log
+          if-no-files-found: warn

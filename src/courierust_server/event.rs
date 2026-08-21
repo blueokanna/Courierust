@@ -15,11 +15,20 @@
 //!   threads. The event loop classifies each new connection (TLS / h2 /
 //!   h1) from its first bytes with a non-blocking peek, so even
 //!   classification never holds a worker.
+//! * A **self-pipe** (loopback socket pair) lets the accept thread and
+//!   the workers interrupt the event loop's blocking poll the instant a
+//!   control message is queued. Control messages therefore never wait
+//!   for a poll tick: a freshly re-registered keep-alive connection is
+//!   polled again immediately, which keeps per-request latency out of the
+//!   poll-timeout path.
 //! * When a connection becomes readable, the event loop hands it to one
-//!   of a small set of **event workers**. Each worker runs an
-//!   **incremental request parser** that resumes exactly where it left
-//!   off, so a slow sender (partial request) is parked again instead of
-//!   holding a worker.
+//!   of a small set of **event workers** in *batches* (a single channel
+//!   message carries up to [`DISPATCH_BATCH`] ready ids), so a burst of
+//!   ready connections does not serialize one channel send + recv per
+//!   connection.
+//! * Each worker runs an **incremental request parser** that resumes
+//!   exactly where it left off, so a slow sender (partial request) is
+//!   parked again instead of holding a worker.
 //! * After the response is written the connection returns to the poller
 //!   for the next request (keep-alive), again consuming no worker.
 //! * Connections that make no progress for [`ServerConfig::idle_timeout`]
@@ -39,9 +48,9 @@ use crate::courierust_http::header::{HeaderMap, HeaderName, HeaderValue};
 use crate::courierust_http::request::Request;
 use crate::courierust_http::response::Response;
 use crate::courierust_http::version::Version;
-use crate::courierust_net::poller::{fd_of, Fd, Poller};
+use crate::courierust_net::poller::{fd_of, Fd, Poller, WAKE_ID};
 use crate::courierust_server::{Handler, ServerConfig};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::TcpStream;
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
@@ -52,6 +61,11 @@ use std::time::{Duration, Instant};
 const MAX_LINE: usize = 64 * 1024;
 const MAX_HEADERS: usize = 1024;
 const MAX_HEADER_BLOCK: usize = 1024 * 1024;
+
+/// How many ready connection ids travel in one dispatch message to the
+/// event workers. Batching amortizes the shared channel + mutex so a
+/// burst of ready connections cannot serialize one send/recv per id.
+const DISPATCH_BATCH: usize = 16;
 
 /// Control messages sent to the event loop.
 enum EventMsg {
@@ -137,6 +151,9 @@ enum ChunkState {
 struct Chunked {
     state: ChunkState,
     remaining: usize,
+    /// Total trailer-section bytes (mirrors the blocking decoder's
+    /// `MAX_HEADER_BLOCK` cap so a slowloris trailer stream is bounded).
+    trailer_bytes: usize,
 }
 
 /// Incremental HTTP/1.1 request parser over a non-blocking socket.
@@ -282,10 +299,21 @@ impl IncrRequest {
                         let bl = courierust_h1::body_length(&self.headers, Some(&rl.method), None)?;
                         self.phase = match bl {
                             courierust_h1::BodyLen::None => Phase::Done,
-                            courierust_h1::BodyLen::Length(n) => Phase::BodyFixed { remaining: n },
+                            courierust_h1::BodyLen::Length(n) => {
+                                // Reject an over-limit Content-Length up
+                                // front, exactly like the blocking path —
+                                // otherwise a huge advertised length would
+                                // park this connection waiting for a body
+                                // that is never allowed to arrive.
+                                if n > self.body_limit {
+                                    return Err(Error::overflow("request body too large"));
+                                }
+                                Phase::BodyFixed { remaining: n }
+                            }
                             courierust_h1::BodyLen::Chunked => Phase::BodyChunked(Chunked {
                                 state: ChunkState::Size,
                                 remaining: 0,
+                                trailer_bytes: 0,
                             }),
                         };
                     } else {
@@ -330,6 +358,11 @@ impl IncrRequest {
     }
 
     /// One chunked-encoding parse step. Returns true on progress.
+    ///
+    /// The framing rules here must match the blocking decoder in
+    /// `courierust_h1` exactly (shared chunk-size parser, strict CRLF
+    /// terminators, bounded trailer section) so the event-driven and
+    /// blocking server paths can never disagree on a request's meaning.
     fn parse_chunked(&mut self, ch: &mut Chunked) -> Result<bool> {
         match ch.state {
             ChunkState::Size => match self.read_line(b'\n', 1024) {
@@ -338,8 +371,8 @@ impl IncrRequest {
                         return Err(Error::protocol("chunk size line too long"));
                     }
                     let line = core::mem::take(&mut self.line);
-                    let sz = parse_chunk_size(courierust_h1::trim_crlf(&line))
-                        .ok_or_else(|| Error::protocol("bad chunk size"))?;
+                    let sz = courierust_h1::parse_chunk_size(courierust_h1::trim_crlf(&line))
+                        .ok_or_else(|| Error::protocol("invalid chunk size"))?;
                     if sz == 0 {
                         ch.state = ChunkState::Trailers;
                     } else {
@@ -371,21 +404,16 @@ impl IncrRequest {
             ChunkState::Crlf => {
                 let avail = self.buf.len() - self.pos;
                 if avail >= 2 {
+                    // Strict CRLF (mirrors the blocking decoder). A bare
+                    // LF or any other terminator is rejected — the two
+                    // paths must agree on where a chunk ends.
                     if &self.buf[self.pos..self.pos + 2] == b"\r\n" {
                         self.pos += 2;
                         ch.state = ChunkState::Size;
                         Ok(true)
-                    } else if self.buf[self.pos] == b'\n' {
-                        self.pos += 1;
-                        ch.state = ChunkState::Size;
-                        Ok(true)
                     } else {
-                        Err(Error::protocol("bad chunk terminator"))
+                        Err(Error::protocol("chunk terminator missing"))
                     }
-                } else if avail == 1 && self.buf[self.pos] == b'\n' {
-                    self.pos += 1;
-                    ch.state = ChunkState::Size;
-                    Ok(true)
                 } else {
                     Ok(false)
                 }
@@ -394,6 +422,10 @@ impl IncrRequest {
                 Some(()) => {
                     if self.line.len() >= MAX_LINE {
                         return Err(Error::overflow("trailer line too long"));
+                    }
+                    ch.trailer_bytes += self.line.len();
+                    if ch.trailer_bytes > MAX_HEADER_BLOCK {
+                        return Err(Error::overflow("trailer section too large"));
                     }
                     let line = core::mem::take(&mut self.line);
                     if courierust_h1::trim_crlf(&line).is_empty() {
@@ -427,24 +459,6 @@ impl IncrRequest {
             },
         })
     }
-}
-
-/// Parse a chunk-size line (`1A ; optional-comment`).
-fn parse_chunk_size(line: &[u8]) -> Option<usize> {
-    let hex = line
-        .iter()
-        .take_while(|&&b| b != b';' && b != b' ')
-        .copied()
-        .collect::<Vec<u8>>();
-    if hex.is_empty() {
-        return None;
-    }
-    let mut n: usize = 0;
-    for &b in &hex {
-        let d = (b as char).to_digit(16)? as usize;
-        n = n.checked_mul(16)?.checked_add(d)?;
-    }
-    Some(n)
 }
 
 // ---------------------------------------------------------------------
@@ -628,10 +642,15 @@ pub(crate) fn serve_event(
     pool: Arc<crate::courierust_pool::ThreadPool>,
 ) -> std::io::Result<()> {
     let (msg_tx, msg_rx) = channel::<EventMsg>();
-    let (ready_tx, ready_rx): (Sender<usize>, Receiver<usize>) = channel();
+    let (ready_tx, ready_rx): (Sender<Vec<usize>>, Receiver<Vec<usize>>) = channel();
     let ready_rx = Arc::new(std::sync::Mutex::new(ready_rx));
     let registry: Arc<std::sync::Mutex<HashMap<usize, EventConn>>> =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
+    // Self-pipe: the accept thread and the workers write one byte here
+    // whenever they queue a control message, so the event loop's blocking
+    // poll returns immediately instead of waiting for the next poll tick.
+    let (wake_reader, wake_writer) = wakeup_pair()?;
+    let wake_writer = Arc::new(wake_writer);
 
     // Event loop thread (owns the poller + pending/activity state).
     let loop_handler = handler.clone();
@@ -648,6 +667,7 @@ pub(crate) fn serve_event(
                 loop_config,
                 loop_pool,
                 loop_registry,
+                wake_reader,
             );
         })?;
 
@@ -666,11 +686,19 @@ pub(crate) fn serve_event(
         let w_config = config.clone();
         let w_ready_rx = ready_rx.clone();
         let w_msg_tx = msg_tx.clone();
+        let w_wake = wake_writer.clone();
         worker_handles.push(
             thread::Builder::new()
                 .name("courierust-event-worker".into())
                 .spawn(move || {
-                    event_worker(w_ready_rx, w_registry, &*w_handler, &w_config, &w_msg_tx);
+                    event_worker(
+                        w_ready_rx,
+                        w_registry,
+                        &*w_handler,
+                        &w_config,
+                        &w_msg_tx,
+                        &w_wake,
+                    );
                 })?,
         );
     }
@@ -679,10 +707,11 @@ pub(crate) fn serve_event(
     // It never reads, peeks, sleeps or classifies, so a slow client can
     // never stall the accept path.
     let a_msg_tx = msg_tx.clone();
+    let a_wake = wake_writer.clone();
     let accept_thread = thread::Builder::new()
         .name("courierust-accept".into())
         .spawn(move || {
-            accept_loop(listener, a_msg_tx);
+            accept_loop(listener, a_msg_tx, &a_wake);
         })?;
 
     let _ = accept_thread.join();
@@ -693,6 +722,37 @@ pub(crate) fn serve_event(
     Ok(())
 }
 
+/// Create a loopback socket pair used as a self-pipe to wake the event
+/// loop out of a blocking poll. Pure std, cross-platform (Windows has no
+/// native `socketpair`; a loopback pair is the portable equivalent).
+fn wakeup_pair() -> std::io::Result<(TcpStream, TcpStream)> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let writer = TcpStream::connect(listener.local_addr()?)?;
+    let (reader, _) = listener.accept()?;
+    reader.set_nonblocking(true)?;
+    writer.set_nonblocking(true)?;
+    Ok((reader, writer))
+}
+
+/// Write one byte to the wake pipe (best-effort; a full or failed write
+/// only loses an optimization, never correctness).
+fn wake_nudge(w: &TcpStream) {
+    let mut s: &TcpStream = w;
+    let _ = std::io::Write::write(&mut s, &[1]);
+}
+
+/// Drain all pending wake bytes so the pipe cannot fire spuriously.
+fn drain_wake(r: &TcpStream) {
+    let mut buf = [0u8; 64];
+    loop {
+        let mut s: &TcpStream = r;
+        match std::io::Read::read(&mut s, &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+}
+
 /// Apply one control message to the poller / pending / activity state.
 /// Used by both the message-drain path and the block-on-channel path, so
 /// a message consumed from the channel is never dropped.
@@ -701,9 +761,19 @@ fn handle_msg(
     poller: &mut Poller,
     pending: &mut HashMap<usize, TcpStream>,
     activity: &mut HashMap<usize, Instant>,
+    max_connections: usize,
 ) {
     match msg {
         EventMsg::NewConn { id, stream } => {
+            // Connection cap: beyond it, the new socket is closed
+            // immediately (its fd is never registered, so the idle
+            // timeout does not even have to reap it). The accept thread
+            // has already accepted, so this is an accept-then-close —
+            // the standard way to bound resources at the accept queue.
+            if max_connections > 0 && activity.len() >= max_connections {
+                drop(stream);
+                return;
+            }
             // The accept thread hands us a blocking socket; the event
             // loop requires non-blocking mode.
             if stream.set_nonblocking(true).is_err() {
@@ -728,17 +798,19 @@ fn handle_msg(
 /// dispatches ready HTTP/1.1 connections to workers.
 fn event_loop(
     msg_rx: Receiver<EventMsg>,
-    ready_tx: Sender<usize>,
+    ready_tx: Sender<Vec<usize>>,
     handler: Arc<dyn Handler>,
     config: ServerConfig,
     pool: Arc<crate::courierust_pool::ThreadPool>,
     registry: Arc<std::sync::Mutex<HashMap<usize, EventConn>>>,
+    wake_reader: TcpStream,
 ) {
     let mut poller = Poller::new();
     let mut pending: HashMap<usize, TcpStream> = HashMap::new();
     let mut activity: HashMap<usize, Instant> = HashMap::new();
 
-    let poll_timeout = config.event_poll_timeout_ms.clamp(5, 1000) as i32;
+    let wake_fd = fd_of(&wake_reader);
+    let poll_timeout = config.event_poll_timeout_ms.clamp(1, 1000) as i32;
     let idle_timeout = config.idle_timeout;
 
     loop {
@@ -746,7 +818,13 @@ fn event_loop(
         //    closures).
         loop {
             match msg_rx.try_recv() {
-                Ok(msg) => handle_msg(msg, &mut poller, &mut pending, &mut activity),
+                Ok(msg) => handle_msg(
+                    msg,
+                    &mut poller,
+                    &mut pending,
+                    &mut activity,
+                    config.max_connections,
+                ),
                 Err(TryRecvError::Disconnected) => return,
                 Err(TryRecvError::Empty) => break,
             }
@@ -759,12 +837,24 @@ fn event_loop(
         //    channel and would otherwise be lost.
         if poller.is_empty() {
             match msg_rx.recv() {
-                Ok(msg) => handle_msg(msg, &mut poller, &mut pending, &mut activity),
+                Ok(msg) => handle_msg(
+                    msg,
+                    &mut poller,
+                    &mut pending,
+                    &mut activity,
+                    config.max_connections,
+                ),
                 Err(_) => return,
             }
             continue;
         }
 
+        // 3. Poll. `wait` also watches the self-pipe, so a queued control
+        //    message interrupts the timeout immediately; socket
+        //    readiness (a client sending data) interrupts it the moment
+        //    it happens. The timeout therefore only bounds the wait when
+        //    nothing at all is happening — it never sits in the request
+        //    latency path.
         let wait_ms = match idle_timeout {
             Some(t) => {
                 let now = Instant::now();
@@ -780,12 +870,38 @@ fn event_loop(
             }
             None => poll_timeout,
         };
-        let ready = match poller.wait(wait_ms) {
+        let ready = match poller.wait(wait_ms, Some(wake_fd)) {
             Ok(r) => r,
             Err(_) => continue,
         };
 
+        // 4. A wake byte means a control message is queued. Drain the
+        //    pipe (so it cannot fire spuriously) and the channel (so the
+        //    message is applied before the next poll).
+        if ready.contains(&WAKE_ID) {
+            drain_wake(&wake_reader);
+            loop {
+                match msg_rx.try_recv() {
+                    Ok(msg) => handle_msg(
+                        msg,
+                        &mut poller,
+                        &mut pending,
+                        &mut activity,
+                        config.max_connections,
+                    ),
+                    Err(TryRecvError::Disconnected) => return,
+                    Err(TryRecvError::Empty) => break,
+                }
+            }
+        }
+
+        // 5. Classify and dispatch the ready connections. Ready ids are
+        //    collected and sent to the workers in batches.
+        let mut to_dispatch: Vec<usize> = Vec::new();
         for id in ready {
+            if id == WAKE_ID {
+                continue;
+            }
             poller.unregister(id);
             activity.insert(id, Instant::now());
             if let Some(stream) = pending.remove(&id) {
@@ -837,7 +953,7 @@ fn event_loop(
                     Class::H1 => {
                         let conn = EventConn::new(stream, config.max_body);
                         registry.lock().unwrap().insert(id, conn);
-                        let _ = ready_tx.send(id);
+                        to_dispatch.push(id);
                     }
                     Class::NeedMore => {
                         let fd = fd_of(&stream);
@@ -851,18 +967,27 @@ fn event_loop(
             } else {
                 // An HTTP/1.1 connection (or a stale id — the worker
                 // drops it defensively).
-                let _ = ready_tx.send(id);
+                to_dispatch.push(id);
+            }
+        }
+        if !to_dispatch.is_empty() {
+            for chunk in to_dispatch.chunks(DISPATCH_BATCH) {
+                let _ = ready_tx.send(chunk.to_vec());
             }
         }
 
+        // 6. Reap connections that have made no progress for the idle
+        //    timeout (slow-loris / idle keep-alive bound). The registry
+        //    is locked once per scan, not once per candidate.
         if let Some(t) = idle_timeout {
             let now = Instant::now();
             let mut expired = Vec::new();
+            let registered: HashSet<usize> = registry.lock().unwrap().keys().copied().collect();
             for (&id, &at) in &activity {
                 if now.duration_since(at) < t {
                     continue;
                 }
-                if pending.contains_key(&id) || registry.lock().unwrap().contains_key(&id) {
+                if pending.contains_key(&id) || registered.contains(&id) {
                     expired.push(id);
                 }
             }
@@ -876,38 +1001,47 @@ fn event_loop(
     }
 }
 
-/// One event worker: processes ready connections and re-registers them.
+/// One event worker: processes a *batch* of ready connections and
+/// re-registers the survivors. Each processed connection is followed by a
+/// wake byte, so the event loop re-registers it without waiting for a
+/// poll tick.
 fn event_worker(
-    ready_rx: Arc<std::sync::Mutex<Receiver<usize>>>,
+    ready_rx: Arc<std::sync::Mutex<Receiver<Vec<usize>>>>,
     registry: Arc<std::sync::Mutex<HashMap<usize, EventConn>>>,
     handler: &dyn Handler,
     config: &ServerConfig,
     msg_tx: &Sender<EventMsg>,
+    wake_writer: &Arc<TcpStream>,
 ) {
     loop {
-        let id = match ready_rx.lock().unwrap().recv() {
-            Ok(id) => id,
+        let ids = match ready_rx.lock().unwrap().recv() {
+            Ok(ids) => ids,
             Err(_) => return,
         };
-        let mut conn = match registry.lock().unwrap().remove(&id) {
-            Some(c) => c,
-            None => continue,
-        };
-        let step =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| conn.step(handler, config)));
-        let outcome = match step {
-            Ok(Ok(o)) => o,
-            _ => StepOutcome::Close,
-        };
-        match outcome {
-            StepOutcome::Idle | StepOutcome::NeedWrite => {
-                let fd = fd_of(&conn.socket);
-                let want_write = matches!(outcome, StepOutcome::NeedWrite);
-                registry.lock().unwrap().insert(id, conn);
-                let _ = msg_tx.send(EventMsg::Register { id, fd, want_write });
-            }
-            StepOutcome::Close => {
-                let _ = msg_tx.send(EventMsg::Closed { id });
+        for id in ids {
+            let mut conn = match registry.lock().unwrap().remove(&id) {
+                Some(c) => c,
+                None => continue,
+            };
+            let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                conn.step(handler, config)
+            }));
+            let outcome = match step {
+                Ok(Ok(o)) => o,
+                _ => StepOutcome::Close,
+            };
+            match outcome {
+                StepOutcome::Idle | StepOutcome::NeedWrite => {
+                    let fd = fd_of(&conn.socket);
+                    let want_write = matches!(outcome, StepOutcome::NeedWrite);
+                    registry.lock().unwrap().insert(id, conn);
+                    let _ = msg_tx.send(EventMsg::Register { id, fd, want_write });
+                    wake_nudge(wake_writer);
+                }
+                StepOutcome::Close => {
+                    let _ = msg_tx.send(EventMsg::Closed { id });
+                    wake_nudge(wake_writer);
+                }
             }
         }
     }
@@ -916,13 +1050,19 @@ fn event_worker(
 /// Accept loop: accept sockets and hand them to the event loop in
 /// non-blocking mode. It never reads, peeks, sleeps or classifies, so a
 /// slow client can never stall the accept path (which would starve every
-/// later connection to this listener).
-fn accept_loop(listener: std::net::TcpListener, msg_tx: Sender<EventMsg>) {
+/// later connection to this listener). Each accept is followed by a wake
+/// byte so the event loop registers the new socket immediately.
+fn accept_loop(
+    listener: std::net::TcpListener,
+    msg_tx: Sender<EventMsg>,
+    wake_writer: &Arc<TcpStream>,
+) {
     let mut next_id = 1usize;
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let id = next_id;
         next_id += 1;
         let _ = msg_tx.send(EventMsg::NewConn { id, stream });
+        wake_nudge(wake_writer);
     }
 }

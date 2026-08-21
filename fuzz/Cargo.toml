@@ -8,7 +8,10 @@ edition = "2021"
 cargo-fuzz = true
 
 [dependencies]
-courierust = { path = "..", default-features = false }
+# The HTTP/1 parser and the h2 connection layer need the std transport
+# adapters (SliceReader/VecWriter and error formatting), so the fuzz
+# harness builds with `std` even though the protocol core is no_std.
+courierust = { path = "..", features = ["std"] }
 libfuzzer-sys = "0.4"
 
 [[bin]]
@@ -21,6 +24,20 @@ bench = false
 [[bin]]
 name = "hpack_block"
 path = "fuzz_targets/hpack_block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h1_request"
+path = "fuzz_targets/h1_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h2_connection"
+path = "fuzz_targets/h2_connection.rs"
 test = false
 doc = false
 bench = false

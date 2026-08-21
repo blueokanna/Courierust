@@ -10,7 +10,9 @@ use courierust::courierust_grpc::GrpcClient;
 use courierust::courierust_http::method::Method;
 use courierust::courierust_http::request::Request;
 use courierust::courierust_server::{Server, ServerConfig, TlsSettings as ServerTls};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Spin up an HTTP server on an ephemeral port and return its base URL.
 fn spawn_server(
@@ -91,7 +93,6 @@ fn echo_handler(
 fn h1_get_and_post_roundtrip() {
     let base = spawn_server(ServerConfig::default(), echo_handler);
     let client = Client::new();
-    // GET
     let resp = client.get(&format!("{base}/hello")).unwrap();
     assert_eq!(resp.status.as_u16(), 200);
     assert_eq!(
@@ -99,7 +100,6 @@ fn h1_get_and_post_roundtrip() {
         "GET"
     );
     assert!(resp.body.is_empty());
-    // POST with a body
     let resp = client
         .post(&format!("{base}/echo"), "hello world".to_string())
         .unwrap();
@@ -111,7 +111,6 @@ fn h1_get_and_post_roundtrip() {
         resp.body.collect().unwrap().to_str().unwrap(),
         "hello world"
     );
-    // POST via a Request
     let mut req = Request::new(Method::POST, "/path?q=1");
     req.body = Body::Bytes(Bytes::from_static(b"payload"));
     let resp = client.execute(&format!("{base}/path?q=1"), req).unwrap();
@@ -129,8 +128,6 @@ fn h2_get_and_post_roundtrip() {
 
     let client_cfg = ClientConfig {
         http2: true,
-        // The suite runs many servers in parallel; under load a server
-        // can be starved past the 10 s default SETTINGS_TIMEOUT.
         h2_settings_timeout: Some(std::time::Duration::from_secs(60)),
         h2_ping_interval: None,
         h2_ping_timeout: None,
@@ -180,10 +177,6 @@ fn h2_large_body_flow_control_roundtrip() {
         ..Default::default()
     };
     let client = Client::with_config(client_cfg);
-
-    // 2 MiB, deliberately above both the 64 KiB connection window and the
-    // 256 KiB initial stream window, so both directions must replenish
-    // flow-control credit mid-transfer.
     let big: Vec<u8> = (0..(2 * 1024 * 1024)).map(|i| (i % 251) as u8).collect();
     let mut req = Request::new(Method::POST, "/h2-big");
     req.body = Body::Bytes(Bytes::from(big.clone()));
@@ -201,15 +194,12 @@ fn h2_concurrent_streams_multiplex() {
         ..Default::default()
     };
     let base = spawn_server(server_cfg, |req| {
-        // Echo with a small delay to interleave streams.
         std::thread::sleep(std::time::Duration::from_millis(10));
         echo_handler(req)
     });
 
     let client_cfg = ClientConfig {
         http2: true,
-        // This test verifies multiplexing on one driver. Multiple client
-        // connections would occupy the server's single connection worker.
         max_connections_per_host: 1,
         h2_settings_timeout: Some(std::time::Duration::from_secs(60)),
         h2_ping_interval: None,
@@ -218,8 +208,6 @@ fn h2_concurrent_streams_multiplex() {
         ..Default::default()
     };
     let client = Client::with_config(client_cfg);
-
-    // Fire several concurrent requests; they share one h2 connection.
     let mut handles = Vec::new();
     for i in 0..16 {
         let client = client.clone();
@@ -235,6 +223,97 @@ fn h2_concurrent_streams_multiplex() {
     }
 }
 
+#[test]
+fn h2_one_connection_concurrent_burst_completes() {
+    let server_cfg = ServerConfig {
+        http2: true,
+        threads: 2,
+        ..Default::default()
+    };
+    let base = spawn_server(server_cfg, |_req| {
+        courierust::courierust_http::response::Response::<Body>::with_status(200.into())
+            .with_body(Body::Bytes(Bytes::from_static(b"ok")))
+    });
+    let client = Client::with_config(ClientConfig {
+        http2: true,
+        max_connections_per_host: 1,
+        h2_settings_timeout: Some(std::time::Duration::from_secs(60)),
+        h2_ping_interval: None,
+        h2_ping_timeout: None,
+        h2_idle_timeout: None,
+        ..Default::default()
+    });
+    let t0 = std::time::Instant::now();
+    let n = 64;
+    let handles: Vec<_> = (0..n)
+        .map(|_| {
+            let client = client.clone();
+            let url = format!("{base}/burst");
+            std::thread::spawn(move || {
+                let resp = client.get(&url).unwrap();
+                assert_eq!(resp.status.as_u16(), 200);
+                assert_eq!(resp.body.collect().unwrap().as_slice(), b"ok");
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(15),
+        "concurrent h2 burst stalled: {:?}",
+        t0.elapsed()
+    );
+}
+
+#[test]
+fn h2_server_streaming_flush_cadence() {
+    let server_cfg = ServerConfig {
+        http2: true,
+        threads: 1,
+        h2_settings_timeout: Some(std::time::Duration::from_secs(60)),
+        h2_ping_interval: None,
+        h2_ping_timeout: None,
+        h2_idle_timeout: None,
+        ..Default::default()
+    };
+    let base = spawn_server(server_cfg, |_req| {
+        let (tx, body) = courierust::courierust_body::channel();
+        std::thread::spawn(move || {
+            for i in 0..8 {
+                tx.send(Bytes::from(format!("chunk-{i}\n"))).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        });
+        let mut resp =
+            courierust::courierust_http::response::Response::<Body>::with_status(200.into());
+        resp.body = body;
+        resp
+    });
+    let client = Client::with_config(ClientConfig {
+        http2: true,
+        max_connections_per_host: 1,
+        h2_settings_timeout: Some(std::time::Duration::from_secs(60)),
+        h2_ping_interval: None,
+        h2_ping_timeout: None,
+        h2_idle_timeout: None,
+        ..Default::default()
+    });
+    let t0 = std::time::Instant::now();
+    let resp = client.get(&format!("{base}/stream")).unwrap();
+    let body = resp.body.collect().unwrap().to_str().unwrap().to_string();
+    assert!(
+        body.contains("chunk-0") && body.contains("chunk-7"),
+        "got {body}"
+    );
+    assert!(
+        t0.elapsed() < std::time::Duration::from_millis(1500),
+        "server-streaming flush stalled per chunk: {:?}",
+        t0.elapsed()
+    );
+}
+
 // ---------------------------------------------------------------------
 // Concurrency model proofs (worker occupancy is per-connection, not
 // per-stream; a slow stream does not block its connection's other
@@ -248,9 +327,6 @@ fn spawn_hold_server(threads: usize) -> String {
     let server_cfg = ServerConfig {
         http2: true,
         threads,
-        // The suite runs many servers in parallel; a tight
-        // SETTINGS_TIMEOUT on the server would kill a connection whose
-        // client driver is momentarily starved under load.
         h2_settings_timeout: Some(std::time::Duration::from_secs(60)),
         h2_ping_interval: None,
         h2_ping_timeout: None,
@@ -260,9 +336,6 @@ fn spawn_hold_server(threads: usize) -> String {
     spawn_server(server_cfg, |req| {
         if req.uri.as_str() == "/hold" {
             let (tx, body) = courierust::courierust_body::channel();
-            // Hold the stream open without sending the body end. The
-            // sender is dropped when this thread ends, which closes the
-            // channel and ends the stream — so keep it alive for a while.
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_secs(30));
                 let _ = tx.send(Bytes::from_static(b"done"));
@@ -286,16 +359,11 @@ fn h2_slow_stream_does_not_block_other_streams_same_connection() {
     use std::time::{Duration, Instant};
 
     let base = spawn_hold_server(2);
-    // One connection carries everything: multiplexing is what makes a
-    // slow stream harmless to its peers.
     let client = Client::with_config(ClientConfig {
         http2: true,
         max_connections_per_host: 1,
         connect_timeout: Some(Duration::from_secs(5)),
         read_timeout: Some(Duration::from_secs(30)),
-        // The suite runs many servers in parallel; a tight
-        // SETTINGS_TIMEOUT would spuriously kill the connection under
-        // load before the slow stream is exercised.
         h2_settings_timeout: Some(Duration::from_secs(60)),
         h2_ping_interval: None,
         h2_ping_timeout: None,
@@ -303,25 +371,17 @@ fn h2_slow_stream_does_not_block_other_streams_same_connection() {
         ..Default::default()
     });
 
-    // Open a `/hold` stream and confirm its response head arrived (the
-    // stream is now open and idle — the server keeps it that way).
     let head_received = Arc::new(AtomicBool::new(false));
     let head_received2 = head_received.clone();
     let slow_client = client.clone();
     let slow_base = base.clone();
     let _slow = std::thread::spawn(move || {
-        // Under a heavily loaded parallel suite a fresh connection can
-        // transiently fail; the property under test is that the slow
-        // stream does not block its peers, so retry the setup a few
-        // times before giving up.
         let mut last_err = None;
         for _ in 0..4 {
             match slow_client.get(&format!("{slow_base}/hold")) {
                 Ok(resp) => {
                     assert_eq!(resp.status.as_u16(), 200);
                     head_received2.store(true, Ordering::SeqCst);
-                    // Keep the response alive (stream stays open); never
-                    // read the body.
                     std::thread::sleep(Duration::from_secs(8));
                     drop(resp);
                     return;
@@ -344,8 +404,6 @@ fn h2_slow_stream_does_not_block_other_streams_same_connection() {
         "the slow stream's response head never arrived"
     );
 
-    // Fast requests on the SAME connection must complete promptly while
-    // the slow stream is open and idle.
     for i in 0..5 {
         let t = Instant::now();
         let resp = client.get(&format!("{base}/fast/{i}")).unwrap();
@@ -361,25 +419,13 @@ fn h2_slow_stream_does_not_block_other_streams_same_connection() {
 
 #[test]
 fn h2_many_idle_streams_consume_one_worker_not_one_per_stream() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{Duration, Instant};
-
-    // Two workers total. The hold connection occupies exactly one of
-    // them (the other serves new connections) — if worker occupancy
-    // scaled with open streams, ten idle streams would exhaust the pool
-    // and a fresh connection could never be served.
     let base = spawn_hold_server(2);
-
-    // Connection A: one client opens ten idle `/hold` streams.
     let opened = Arc::new(AtomicUsize::new(0));
     let client_a = Client::with_config(ClientConfig {
         http2: true,
         max_connections_per_host: 1,
         connect_timeout: Some(Duration::from_secs(5)),
         read_timeout: Some(Duration::from_secs(30)),
-        // The suite runs many servers in parallel; a tight
-        // SETTINGS_TIMEOUT would spuriously kill the connection under
-        // load before the assertion runs.
         h2_settings_timeout: Some(Duration::from_secs(60)),
         h2_ping_interval: None,
         h2_ping_timeout: None,
@@ -395,20 +441,15 @@ fn h2_many_idle_streams_consume_one_worker_not_one_per_stream() {
             let resp = c.get(&format!("{b}/hold")).unwrap();
             assert_eq!(resp.status.as_u16(), 200);
             opened.fetch_add(1, Ordering::SeqCst);
-            // Keep the response alive (stream stays open); never read
-            // the body.
             std::thread::sleep(Duration::from_secs(8));
             drop(resp);
         }));
     }
 
-    // Wait until all ten idle streams are open.
     let t0 = Instant::now();
     while opened.load(Ordering::SeqCst) < 10 && t0.elapsed() < Duration::from_secs(30) {
         std::thread::sleep(Duration::from_millis(10));
     }
-    // Surface any per-stream failures (threads that panicked) so a load
-    // regression is visible rather than swallowed.
     for h in handles {
         let _ = h.join();
     }
@@ -418,13 +459,6 @@ fn h2_many_idle_streams_consume_one_worker_not_one_per_stream() {
         "not all idle streams opened"
     );
 
-    // Connection B: a completely separate client must still be served
-    // promptly (the pool is not exhausted by idle streams). A fresh
-    // connection can transiently fail under a heavily loaded parallel
-    // suite (a worker starved past the connection timeout); the property
-    // is that idle streams do not consume workers, so a genuine
-    // per-stream exhaustion would fail every attempt while a transient
-    // load spike succeeds on retry.
     let mut served = false;
     let mut last_err = None;
     for _ in 0..6 {
@@ -532,7 +566,6 @@ fn grpc_unary_roundtrip() {
         .unwrap();
     assert_eq!(resp.to_str().unwrap(), "echo:ping");
 
-    // Typed (string codec) call.
     let s = client
         .call_unary::<String, String>("/echo.Echo/Say", &"typed".to_string())
         .unwrap();
@@ -559,8 +592,6 @@ fn grpc_error_status() {
 
 #[test]
 fn grpc_success_status_delivered_in_trailers() {
-    // A successful call must carry grpc-status in the trailing header
-    // block (the gRPC wire contract), not the initial metadata.
     let service = |_method: &str, req: Bytes| -> courierust::Result<Bytes> {
         Ok(Bytes::from(format!("echo:{}", req.to_str().unwrap())))
     };
@@ -576,7 +607,6 @@ fn grpc_success_status_delivered_in_trailers() {
         .unwrap();
     let msg = stream.next_message().unwrap().unwrap();
     assert_eq!(msg.to_str().unwrap(), "echo:x");
-    // Drain the body; the stream ends with trailers carrying grpc-status.
     assert!(stream.next_message().unwrap().is_none());
     let tr = stream.trailers().expect("trailers must be present");
     assert_eq!(tr.get("grpc-status").unwrap().to_str().unwrap(), "0");
@@ -588,14 +618,11 @@ fn grpc_success_status_delivered_in_trailers() {
 
 #[test]
 fn grpc_server_enforces_deadline() {
-    // A handler that overruns the client's grpc-timeout must produce
-    // DEADLINE_EXCEEDED, not a late OK.
     let service = |_method: &str, _req: Bytes| -> courierust::Result<Bytes> {
         std::thread::sleep(std::time::Duration::from_millis(400));
         Ok(Bytes::from_static(b"too-late"))
     };
     let addr = bind_grpc_unary(service);
-
     let client = courierust::courierust_grpc::GrpcClient::with_config(
         courierust::courierust_grpc::GrpcClientConfig {
             base: format!("http://{addr}"),
@@ -740,7 +767,6 @@ fn redirect_strips_credentials_cross_origin() {
 
     let got_auth = Arc::new(Mutex::new(false));
     let got_auth_b = got_auth.clone();
-
     let base_b = Arc::new(spawn_server(ServerConfig::default(), move |req| {
         let has = req.headers.contains_key("authorization");
         *got_auth_b.lock().unwrap() = has;
@@ -835,8 +861,6 @@ fn https_client_config(http2: bool) -> ClientConfig {
 fn https_h1_get_and_post_roundtrip() {
     let base = spawn_tls_server(https_server_config(false), echo_handler);
     let client = Client::with_config(https_client_config(false));
-
-    // GET over TLS.
     let resp = client.get(&format!("{base}/secure-hello")).unwrap();
     assert_eq!(resp.status.as_u16(), 200);
     assert_eq!(
@@ -844,7 +868,6 @@ fn https_h1_get_and_post_roundtrip() {
         "GET"
     );
 
-    // POST over TLS.
     let mut req = Request::new(Method::POST, "/secure-echo");
     req.body = Body::Bytes(Bytes::from_static(b"over-tls"));
     let resp = client.execute(&format!("{base}/secure-echo"), req).unwrap();
@@ -875,8 +898,6 @@ fn https_h2_get_and_post_roundtrip() {
 #[test]
 fn https_rejects_untrusted_server() {
     let base = spawn_tls_server(https_server_config(false), echo_handler);
-
-    // No roots configured -> https must be refused (certificate error).
     let client = Client::new(); // tls = None
     let err = client.get(&format!("{base}/nope")).unwrap_err();
     assert!(
@@ -925,9 +946,6 @@ fn https_server_survives_malformed_tls_input() {
 
     let base = spawn_tls_server(https_server_config(true), echo_handler);
     let addr = base.trim_start_matches("https://").to_string();
-
-    // A batch of malformed "TLS" clients: truncated records, wrong
-    // content types, and garbage bytes that never form a ClientHello.
     let junk: [&[u8]; 3] = [
         &[0x16, 0x03, 0x01, 0x00, 0x02, 0xff, 0xff], // truncated handshake
         &[0x15, 0x03, 0x03, 0x00, 0x01, 0x00],       // alert as first record
@@ -944,7 +962,6 @@ fn https_server_survives_malformed_tls_input() {
     // Give the server a moment to process (and fail) the garbage.
     std::thread::sleep(std::time::Duration::from_millis(50));
 
-    // A valid HTTPS client must still be served.
     let client = Client::with_config(https_client_config(true));
     let resp = client.get(&format!("{base}/after-garbage")).unwrap();
     assert_eq!(resp.status.as_u16(), 200);
@@ -955,11 +972,7 @@ fn https_server_survives_malformed_tls_input() {
 /// silent protocol mismatch.
 #[test]
 fn https_client_enforces_alpn_agreement() {
-    // h2-only server (alpn = [h2]).
     let base = spawn_tls_server(https_server_config(true), echo_handler);
-    // Client configured for HTTP/1.1 (http2: false) but whose ALPN list
-    // overlaps the server (h2), so TLS negotiates h2 — the h1 codec must
-    // refuse to run on it.
     let client = Client::with_config(ClientConfig {
         http2: false,
         tls: Some(ClientTls {
@@ -975,6 +988,72 @@ fn https_client_enforces_alpn_agreement() {
     assert!(
         msg.contains("negotiated") && msg.contains("h2"),
         "expected an ALPN agreement error, got {err:?}"
+    );
+}
+
+/// `TlsSettings::verify = false` must skip certificate/hostname
+/// validation: a client with an *empty* root store still completes the
+/// handshake against the self-signed test server. The CertificateVerify
+/// signature is still always checked, so the handshake is
+/// cryptographically sound — it is simply not anchored to a trust root.
+#[test]
+fn https_verify_disabled_accepts_self_signed() {
+    let base = spawn_tls_server(https_server_config(false), echo_handler);
+    let client = Client::with_config(ClientConfig {
+        http2: false,
+        tls: Some(ClientTls {
+            roots: courierust::courierust_tls::RootStore::new(), // no trust anchor
+            verify: false,
+            alpn: vec![b"http/1.1".to_vec()],
+            now: common::NOW,
+        }),
+        ..Default::default()
+    });
+    let resp = client.get(&format!("{base}/unverified")).unwrap();
+    assert_eq!(resp.status.as_u16(), 200);
+    assert_eq!(
+        resp.headers.get("x-method").unwrap().to_str().unwrap(),
+        "GET"
+    );
+}
+
+/// With verification enabled, a server whose certificate does not cover
+/// the requested hostname must be rejected (RFC 6125). The test
+/// certificate only covers `DNS:localhost` and `IP:127.0.0.1`.
+#[test]
+fn tls_hostname_mismatch_rejected() {
+    let base = spawn_tls_server(https_server_config(false), echo_handler);
+    let addr = base.trim_start_matches("https://").to_string();
+    let connector =
+        courierust::courierust_tls::TlsConnector::new(courierust::courierust_tls::ClientConfig {
+            roots: common::root_store(),
+            verify: true,
+            alpn: vec![b"http/1.1".to_vec()],
+            now: common::NOW,
+        });
+    // Control: the covered hostname validates. The socket is scoped so it
+    // is dropped right after the handshake — the server's pool worker
+    // (threads: 1) must not stay parked on this connection.
+    {
+        let s = std::net::TcpStream::connect(&addr).unwrap();
+        s.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        connector
+            .connect("localhost", &s, &s)
+            .expect("covered hostname must validate");
+    } // s dropped: FIN reaches the server, releasing its worker
+
+    let s = std::net::TcpStream::connect(&addr).unwrap();
+    s.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    let err = match connector.connect("not-localhost.invalid", &s, &s) {
+        Ok(_) => panic!("uncovered hostname unexpectedly validated"),
+        Err(e) => e,
+    };
+    let msg = err.to_string().to_ascii_lowercase();
+    assert!(
+        msg.contains("hostname") || msg.contains("certificate"),
+        "expected a hostname/certificate rejection, got {err:?}"
     );
 }
 
@@ -1091,15 +1170,12 @@ fn event_many_idle_connections_do_not_block_workers() {
     let t0 = std::time::Instant::now();
     let resp = client.get(&format!("{base}/fresh")).unwrap();
     assert_eq!(resp.status.as_u16(), 200);
-    // Generous sanity bound (not a latency benchmark): under a full
-    // parallel suite the accept/event threads can be starved for seconds.
     assert!(
         t0.elapsed() < std::time::Duration::from_secs(10),
         "fresh request blocked behind idle connections: {:?}",
         t0.elapsed()
     );
 
-    // The idle connections are still usable (kept alive).
     for s in idle.iter_mut() {
         s.write_all(b"GET /again HTTP/1.1\r\nHost: x\r\n\r\n")
             .unwrap();
@@ -1108,10 +1184,191 @@ fn event_many_idle_connections_do_not_block_workers() {
     }
 }
 
+/// The default server configuration must use the event-driven scheduler
+/// (the one that parks idle connections) on every platform, with the
+/// slow-loris idle bound and the low-idle-wakeup poll timeout — the
+/// properties the user-visible scheduler switch is supposed to guarantee.
+#[test]
+fn server_defaults_to_event_driven_scheduler() {
+    let d = ServerConfig::default();
+    assert!(d.event_driven, "event_driven must default to true");
+    assert_eq!(d.event_poll_timeout_ms, 50);
+    assert_eq!(d.idle_timeout, Some(std::time::Duration::from_secs(300)));
+    assert_eq!(d.h2_idle_timeout, Some(std::time::Duration::from_secs(300)));
+}
+
+/// Sequential keep-alive requests over one event-driven connection must
+/// be served without a multi-poll stall: the self-pipe wakes the event
+/// loop the moment a worker re-registers the connection, and socket
+/// readiness wakes it the moment the client sends data. 200 round trips
+/// must complete promptly from a tiny worker pool.
+#[test]
+fn event_keepalive_sequential_requests_do_not_stall() {
+    use std::io::Write;
+    use std::net::TcpStream;
+
+    let server_cfg = ServerConfig {
+        http2: false,
+        event_driven: true,
+        event_workers: 1,
+        threads: 1,
+        ..Default::default()
+    };
+    let base = spawn_server(server_cfg, |_req| {
+        let mut resp =
+            courierust::courierust_http::response::Response::<Body>::with_status(200.into());
+        resp.headers.insert(
+            courierust::courierust_http::header::HeaderName::from_lowercase("content-length"),
+            courierust::courierust_http::header::HeaderValue::from_static("2"),
+        );
+        resp.body = Body::Bytes(Bytes::from_static(b"ok"));
+        resp
+    });
+    let addr = base.trim_start_matches("http://").to_string();
+    let mut s = TcpStream::connect(&addr).unwrap();
+    let t0 = std::time::Instant::now();
+    for _ in 0..200 {
+        s.write_all(b"GET /k HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let resp = read_raw_response(&mut s);
+        assert!(resp.starts_with("HTTP/1.1 200"), "got {resp}");
+    }
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(10),
+        "sequential keep-alive stalled: {:?}",
+        t0.elapsed()
+    );
+}
+
+/// An HTTP/1.1 connection that sends a partial request and then stalls
+/// (slow-loris) must be closed by the idle timeout, releasing its fd and
+/// its parked slot even though it never completes a request.
+#[test]
+fn event_idle_timeout_reaps_slowloris() {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let server_cfg = ServerConfig {
+        http2: false,
+        event_driven: true,
+        event_workers: 1,
+        threads: 1,
+        idle_timeout: Some(std::time::Duration::from_millis(300)),
+        event_poll_timeout_ms: 10,
+        ..Default::default()
+    };
+    let base = spawn_server(server_cfg, |_req| {
+        let mut resp =
+            courierust::courierust_http::response::Response::<Body>::with_status(200.into());
+        resp.headers.insert(
+            courierust::courierust_http::header::HeaderName::from_lowercase("content-length"),
+            courierust::courierust_http::header::HeaderValue::from_static("2"),
+        );
+        resp.body = Body::Bytes(Bytes::from_static(b"ok"));
+        resp
+    });
+    let addr = base.trim_start_matches("http://").to_string();
+
+    let mut s = TcpStream::connect(&addr).unwrap();
+    s.write_all(b"GET /loris HTTP/1.1\r\nHost: x\r\n").unwrap();
+    let t0 = std::time::Instant::now();
+    let mut buf = [0u8; 16];
+    let mut closed = false;
+    while t0.elapsed() < std::time::Duration::from_secs(5) {
+        match s.read(&mut buf) {
+            Ok(0) => {
+                closed = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                closed = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        closed,
+        "slow-loris connection was not reaped by the idle timeout"
+    );
+}
+
+/// The connection cap bounds the event path: connections beyond
+/// `max_connections` are closed immediately (a herd cannot grow without
+/// bound), and once the admitted connections go away the server keeps
+/// serving fresh requests (the cap never wedges the loop).
+#[test]
+fn event_connection_cap_limits_herd() {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let server_cfg = ServerConfig {
+        http2: false,
+        event_driven: true,
+        event_workers: 1,
+        threads: 1,
+        max_connections: 4,
+        idle_timeout: Some(std::time::Duration::from_secs(300)), // long: cap, not reap, closes the excess
+        ..Default::default()
+    };
+    let base = spawn_server(server_cfg, |_req| {
+        let mut resp =
+            courierust::courierust_http::response::Response::<Body>::with_status(200.into());
+        resp.headers.insert(
+            courierust::courierust_http::header::HeaderName::from_lowercase("content-length"),
+            courierust::courierust_http::header::HeaderValue::from_static("2"),
+        );
+        resp.body = Body::Bytes(Bytes::from_static(b"ok"));
+        resp
+    });
+    let addr = base.trim_start_matches("http://").to_string();
+
+    // Open 8 connections that never complete a request (parked). The
+    // first `max_connections` are admitted; the rest are closed by the
+    // cap.
+    let mut herd = Vec::new();
+    for _ in 0..8 {
+        let mut s = TcpStream::connect(&addr).unwrap();
+        s.set_read_timeout(Some(std::time::Duration::from_millis(400)))
+            .unwrap();
+        s.write_all(b"GET /partial HTTP/1.1\r\nHost: x\r\n")
+            .unwrap();
+        herd.push(s);
+    }
+
+    // Wait for the event loop to apply the cap, then count how many of
+    // the herd were closed by it. The admitted (parked) connections stay
+    // open, so exactly the excess should read EOF/error.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let mut closed = 0usize;
+    let mut open = 0usize;
+    let mut buf = [0u8; 16];
+    for s in herd.iter_mut() {
+        match s.read(&mut buf) {
+            Ok(0) => closed += 1,
+            Ok(_) => open += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => open += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => open += 1,
+            Err(_) => closed += 1,
+        }
+    }
+    assert!(
+        closed >= 4,
+        "connection cap did not close the excess (closed {closed}, open {open})"
+    );
+
+    // Close the admitted herd, then a fresh request must be served — the
+    // cap only rejects while it is full.
+    drop(herd);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let client = Client::new();
+    let resp = client.get(&format!("{base}/fresh")).unwrap();
+    assert_eq!(resp.status.as_u16(), 200);
+}
+
 /// A slow sender that stalls mid-request must be parked (not hold a
 /// worker) and resume when the rest arrives (incremental parsing).
 #[test]
-#[cfg(windows)]
 fn event_slow_sender_resumes_partial_request() {
     use std::io::Write;
     use std::net::TcpStream;
@@ -1143,9 +1400,7 @@ fn event_slow_sender_resumes_partial_request() {
     s.write_all(b"\r\n").unwrap(); // complete the headers
     let resp = read_raw_response(&mut s);
     assert!(resp.starts_with("HTTP/1.1 200"), "got {resp}");
-    // The stalled request must resume. The bound is a generous sanity
-    // check (not a latency benchmark): under a full parallel test suite
-    // the event-loop thread can occasionally be starved for seconds.
+
     assert!(t0.elapsed() < Duration::from_secs(10));
 
     let client = Client::new();
@@ -1155,7 +1410,6 @@ fn event_slow_sender_resumes_partial_request() {
 
 /// Pipelined requests on one connection are served in order.
 #[test]
-#[cfg(windows)]
 fn event_pipelining() {
     use std::io::Write;
     use std::net::TcpStream;
@@ -1193,7 +1447,6 @@ fn event_pipelining() {
 /// SSE-style streaming over the event loop: a channel body streamed as
 /// chunked reaches the client across multiple events.
 #[test]
-#[cfg(windows)]
 fn event_sse_streaming() {
     let server_cfg = ServerConfig {
         http2: false,

@@ -29,7 +29,7 @@ pub struct RequestLine {
     pub version: Version,
 }
 
-/// Parse a request line (`METHOD SP target SP HTTP/x.y`).
+/// Strict RFC 9112 §3 request parser preventing smuggling across all paths
 pub fn parse_request_line(line: &[u8]) -> Result<RequestLine> {
     let line = trim_crlf(line);
     let mut parts = line.split(|&b| b == b' ');
@@ -43,10 +43,14 @@ pub fn parse_request_line(line: &[u8]) -> Result<RequestLine> {
         .filter(|t| !t.is_empty())
         .ok_or_else(|| Error::protocol("missing request target"))
         .and_then(PathAndQuery::from_bytes)?;
-    let version = match parts.next() {
-        Some(v) => parse_version(v)?,
-        None => Version::HTTP_10,
-    };
+    let version = parts
+        .next()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| Error::protocol("missing HTTP version"))
+        .and_then(parse_version)?;
+    if parts.next().is_some() {
+        return Err(Error::protocol("malformed request line"));
+    }
     Ok(RequestLine {
         method,
         target,
@@ -152,7 +156,6 @@ pub(crate) fn split_header(line: &[u8]) -> Result<(HeaderName, HeaderValue)> {
         .position(|&b| b == b':')
         .ok_or_else(|| Error::protocol("header line missing colon"))?;
     let name = HeaderName::from_bytes(&line[..colon])?;
-    // OWS trimming around the value.
     let mut start = colon + 1;
     let mut end = line.len();
     while start < end && (line[start] == b' ' || line[start] == b'\t') {
@@ -191,19 +194,39 @@ pub fn body_length(
     method: Option<&Method>,
     status: Option<StatusCode>,
 ) -> Result<BodyLen> {
-    let te = headers
-        .get("transfer-encoding")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if !te.is_empty() {
-        if te.to_ascii_lowercase().ends_with("chunked") {
-            return Ok(BodyLen::Chunked);
+    let mut te_count = 0usize;
+    let mut chunked_pos: Option<usize> = None;
+    let mut any_te = false;
+    for v in headers.get_all("transfer-encoding") {
+        any_te = true;
+        let s = v
+            .to_str()
+            .map_err(|_| Error::protocol("invalid transfer-encoding"))?;
+        for tok in s.split(',') {
+            let tok = tok.trim();
+            if tok.is_empty() {
+                return Err(Error::protocol("invalid transfer-encoding"));
+            }
+            if tok.eq_ignore_ascii_case("chunked") {
+                if chunked_pos.is_some() {
+                    return Err(Error::protocol("chunked repeated in transfer-encoding"));
+                }
+                chunked_pos = Some(te_count);
+            }
+            te_count += 1;
         }
-        return Err(Error::protocol("unsupported transfer-encoding"));
     }
-    // Multiple Content-Length fields are only legal if their values agree;
-    // a disagreement is a request-smuggling vector (RFC 9112 §6.3, CWE-444)
-    // and must be rejected outright. `get_all` preserves duplicates.
+    if any_te {
+        match chunked_pos {
+            Some(i) if i == te_count - 1 => return Ok(BodyLen::Chunked),
+            Some(_) => {
+                return Err(Error::protocol(
+                    "chunked must be the final transfer-encoding",
+                ))
+            }
+            None => return Err(Error::protocol("unsupported transfer-encoding")),
+        }
+    }
     let cls: Vec<&HeaderValue> = headers.get_all("content-length").collect();
     if !cls.is_empty() {
         let parse_len = |v: &HeaderValue| -> Option<usize> {
@@ -218,8 +241,6 @@ pub fn body_length(
         }
         return Ok(BodyLen::Length(first));
     }
-    // No framing: only requests with a body / responses with one carry
-    // one. HEAD, 1xx, 204, 304 never have a body.
     if let Some(m) = method {
         if *m == Method::HEAD {
             return Ok(BodyLen::None);
@@ -232,8 +253,6 @@ pub fn body_length(
             return Ok(BodyLen::None);
         }
     }
-    // Responses without framing are body-less (keep-alive requires
-    // framing; close-delimited bodies are handled by the caller).
     Ok(BodyLen::None)
 }
 
@@ -311,29 +330,25 @@ pub fn read_body_chunked_scratch<R: Read>(
 /// Decode a chunked body into `out`. Chunk sizes are validated against
 /// `max` with saturating arithmetic so a hostile size line can never
 /// overflow past the limit (remote DoS guard).
+///
+/// This is the single authority for chunked decoding on the blocking
+/// path. The event-driven incremental parser (`courierust_server::event`)
+/// shares [`parse_chunk_size`] and the same framing rules so the two
+/// paths can never disagree on what a request means (a disagreement is a
+/// request-smuggling vector when either side sits behind a proxy).
 fn read_body_chunked_into<R: Read>(
     reader: &mut BufReader<R>,
     max: usize,
     out: &mut Vec<u8>,
 ) -> Result<()> {
     let mut line = Vec::new();
+    let mut trailer_total = 0usize;
     loop {
         line.clear();
         reader.read_until_into(b'\n', MAX_LINE, &mut line)?;
-        let size_str = trim_crlf(&line);
-        let size_str = match size_str.iter().position(|&b| b == b';') {
-            Some(i) => &size_str[..i], // strip chunk extensions
-            None => size_str,
-        };
-        let size_str =
-            std::str::from_utf8(size_str).map_err(|_| Error::protocol("chunk size not ASCII"))?;
-        let size = usize::from_str_radix(size_str.trim(), 16)
-            .map_err(|_| Error::protocol("invalid chunk size"))?;
+        let size = parse_chunk_size(trim_crlf(&line))
+            .ok_or_else(|| Error::protocol("invalid chunk size"))?;
         if size == 0 {
-            // Trailer section until blank line. Cap it so an endless
-            // stream of trailer lines cannot pin this connection (a
-            // slowloris-style resource drain).
-            let mut trailer_total = 0usize;
             loop {
                 line.clear();
                 reader.read_until_into(b'\n', MAX_LINE, &mut line)?;
@@ -347,13 +362,10 @@ fn read_body_chunked_into<R: Read>(
             }
             break;
         }
-        // Saturating subtraction: a huge advertised size can never wrap
-        // `out.len() + size` past `max`.
         if size > max.saturating_sub(out.len()) {
             return Err(Error::overflow("body exceeds limit"));
         }
         read_into(reader, out, out.len() + size)?;
-        // CRLF after chunk data.
         let mut crlf = [0u8; 2];
         reader.read_exact_into(&mut crlf)?;
         if crlf != *b"\r\n" {
@@ -361,6 +373,28 @@ fn read_body_chunked_into<R: Read>(
         }
     }
     Ok(())
+}
+
+/// Parse a chunk-size line: `1A`, `1A;ext`, `1A ;ext`, or any amount of
+/// surrounding whitespace. The size itself must be pure hexadecimal —
+/// anything else (trailing garbage after the digits, a second hex token)
+/// is rejected. Chunk extensions after `;` are ignored. Returns `None`
+/// on malformed or overflowing input.
+///
+/// Shared by the blocking server/client decoder and the event-driven
+/// incremental parser so both paths accept and reject exactly the same
+/// byte sequences.
+pub(crate) fn parse_chunk_size(line: &[u8]) -> Option<usize> {
+    let before_ext = match line.iter().position(|&b| b == b';') {
+        Some(i) => &line[..i],
+        None => line,
+    };
+    let s = core::str::from_utf8(before_ext).ok()?;
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    usize::from_str_radix(s, 16).ok()
 }
 
 /// Serialize a request head into `out`.
@@ -490,27 +524,28 @@ fn put_hex_usize(out: &mut Vec<u8>, mut v: usize) {
     out.extend_from_slice(&buf[i..]);
 }
 
+/// Whether a `Connection` header value contains the exact comma-separated
+/// token `tok` (RFC 9110 §7.6.1). Substring matching here is a bug:
+/// `Connection: keep-aliveX` is not a keep-alive request, and
+/// `Connection: closex` is not a close request.
+fn connection_has_token(value: &str, tok: &str) -> bool {
+    value.split(',').any(|t| t.trim().eq_ignore_ascii_case(tok))
+}
+
 /// Whether a response indicates connection close.
 pub fn wants_close(headers: &HeaderMap) -> bool {
     headers
         .get("connection")
-        .map(|v| {
-            v.to_str()
-                .unwrap_or("")
-                .to_ascii_lowercase()
-                .contains("close")
-        })
+        .and_then(|v| v.to_str().ok())
+        .map(|v| connection_has_token(v, "close"))
         .unwrap_or(false)
 }
 
 /// Whether the request asked for keep-alive.
 pub fn keep_alive_requested(version: Version, headers: &HeaderMap) -> bool {
-    match headers
-        .get("connection")
-        .map(|v| v.to_str().unwrap_or("").to_ascii_lowercase())
-    {
-        Some(c) if c.contains("close") => false,
-        Some(c) if c.contains("keep-alive") => true,
+    match headers.get("connection").and_then(|v| v.to_str().ok()) {
+        Some(c) if connection_has_token(c, "close") => false,
+        Some(c) if connection_has_token(c, "keep-alive") => true,
         _ => version == Version::HTTP_11,
     }
 }
@@ -624,5 +659,90 @@ mod tests {
         assert_eq!(IToA::new(0).as_slice(), b"0");
         assert_eq!(IToA::new(200).as_slice(), b"200");
         assert_eq!(IToA::new(65535).as_slice(), b"65535");
+    }
+
+    /// Request-smuggling guard: `Transfer-Encoding: notchunked` is not
+    /// chunked — the codeword must be exactly `chunked` (a substring
+    /// `ends_with` check would wrongly accept it).
+    #[test]
+    fn transfer_encoding_notchunked_rejected() {
+        let h = headers(&[("transfer-encoding", "notchunked")]);
+        assert!(body_length(&h, Some(&Method::POST), None).is_err());
+    }
+
+    /// `chunked` must be the final codeword; a non-final chunked is a
+    /// smuggling vector.
+    #[test]
+    fn transfer_encoding_chunked_not_final_rejected() {
+        let h = headers(&[("transfer-encoding", "chunked, gzip")]);
+        assert!(body_length(&h, Some(&Method::POST), None).is_err());
+    }
+
+    /// Repeated `chunked` codewords are rejected.
+    #[test]
+    fn transfer_encoding_repeated_chunked_rejected() {
+        let h = headers(&[("transfer-encoding", "chunked, chunked")]);
+        assert!(body_length(&h, Some(&Method::POST), None).is_err());
+    }
+
+    /// Multiple TE fields are combined as one codeword list.
+    #[test]
+    fn transfer_encoding_split_across_fields_accepted() {
+        let h = headers(&[
+            ("transfer-encoding", "gzip"),
+            ("transfer-encoding", "chunked"),
+        ]);
+        assert_eq!(
+            body_length(&h, Some(&Method::POST), None).unwrap(),
+            BodyLen::Chunked
+        );
+    }
+
+    /// A request line must have exactly three tokens (RFC 9112 §3);
+    /// trailing junk must not be silently ignored.
+    #[test]
+    fn request_line_extra_tokens_rejected() {
+        assert!(parse_request_line(b"GET / HTTP/1.1 garbage\r\n").is_err());
+        assert!(parse_request_line(b"GET / HTTP/1.1 extra more\r\n").is_err());
+        assert!(parse_request_line(b"GET /\r\n").is_err()); // missing version
+    }
+
+    #[test]
+    fn request_line_normal_accepted() {
+        assert!(parse_request_line(b"GET /a?b HTTP/1.1\r\n").is_ok());
+    }
+
+    /// Chunk-size parsing is shared by the blocking and event-driven
+    /// parsers; whitespace and extensions around the size are tolerated,
+    /// trailing garbage is not.
+    #[test]
+    fn chunk_size_whitespace_and_garbage() {
+        assert_eq!(parse_chunk_size(b"1A\r\n"), Some(0x1a));
+        assert_eq!(parse_chunk_size(b"1A ;ext\r\n"), Some(0x1a));
+        assert_eq!(parse_chunk_size(b"1A\t;ext\r\n"), Some(0x1a));
+        assert_eq!(parse_chunk_size(b" 1A \r\n"), Some(0x1a));
+        assert_eq!(parse_chunk_size(b"1A zzz\r\n"), None); // garbage after size
+        assert_eq!(parse_chunk_size(b"\r\n"), None); // empty
+        assert_eq!(
+            parse_chunk_size(b"ffffffffffffffffffff\r\n"),
+            None // overflows usize
+        );
+    }
+
+    /// `Connection` is a comma-separated token list; substring matching
+    /// must not treat `closex`/`keep-aliveX` as the real tokens.
+    #[test]
+    fn connection_token_boundary() {
+        let close = headers(&[("connection", "closex")]);
+        assert!(!wants_close(&close), "closex must not count as close");
+        let mixed = headers(&[("connection", "keep-alive, close")]);
+        assert!(wants_close(&mixed), "exact close token must count");
+        let ka = headers(&[("connection", "keep-aliveX")]);
+        assert!(
+            !keep_alive_requested(Version::HTTP_10, &ka),
+            "keep-aliveX must not count as keep-alive for HTTP/1.0"
+        );
+        let ok = headers(&[("connection", "keep-alive")]);
+        assert!(keep_alive_requested(Version::HTTP_10, &ok));
     }
 }

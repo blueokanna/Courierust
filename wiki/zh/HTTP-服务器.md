@@ -1,6 +1,6 @@
 # HTTP 服务器
 
-服务器把每个 accept 到的连接作为任务投递到**工作窃取线程池**，连接处理跨核并行。handler 就是一个普通函数，不需要实现任何框架类型。
+默认采用**事件驱动调度器**：accept 线程把 socket 交给事件循环，事件循环用就绪轮询器（Winsock `select` / POSIX `poll`）挂起空闲/半截的明文 HTTP 连接——大量 keep-alive / SSE / slow-loris 连接**零 worker 占用**。就绪连接交给少量事件 worker，由**增量式请求解析器**从断点继续解析；慢发送方重新挂回轮询器，不占 worker。TLS 与 HTTP/2 连接走**工作窃取线程池**，连接处理跨核并行。handler 就是一个普通函数，不需要实现任何框架类型。
 
 ## handler
 
@@ -109,5 +109,6 @@ let handler = |_req: Request<Body>| -> Response<Body> {
 ## 注意
 
 - 无响应体的 HTTP/1.1 响应会显式补 `Content-Length: 0`；长度未知时发 chunked。
-- `Server::serve` 把每个连接作为一个池任务。慢请求会占住一个 worker 直到读完——对多数场景够用；超长连接可能需要你自己拆事件循环。
+- 明文 HTTP/1.1 全平台默认走事件调度器：半截请求挂在轮询器上（零 worker），超过 `ServerConfig::idle_timeout` 的空转连接被回收，`max_connections` 封顶驻留连接数。TLS 与 HTTP/2 连接走阻塞池，由 `handshake_timeout` / `h2_idle_timeout` 约束。设 `event_driven: false` 恢复旧的每连接一池任务模型。
+- **同步 handler** 阻塞多久就占住事件 worker 多久——与任何同步服务器一致。流式场景用 channel body（`Body::Channel`），worker 可及时归还。
 - gRPC 服务器就是这层之上的薄封装，见 [gRPC 使用指南](gRPC-使用指南)。

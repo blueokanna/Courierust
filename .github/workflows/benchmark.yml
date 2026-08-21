@@ -109,9 +109,14 @@ jobs:
           : > fuzz.log
           rustup toolchain install nightly --profile minimal
           cargo +nightly install cargo-fuzz --locked
-          for target in h2_frame hpack_block; do
+          # h2_frame / hpack_block: legacy targets. h1_request: the
+          # shared HTTP/1 request path (request line, headers, chunked
+          # framing) that both the blocking and event-driven parsers use.
+          # h2_connection: the full h2 state machine driven by hostile
+          # frame streams (client and server roles).
+          for target in h2_frame hpack_block h1_request h2_connection; do
             started=$(date +%s)
-            cargo +nightly fuzz run --fuzz-dir fuzz "$target" -- -runs=10000 -max_len=16384 >> fuzz.log 2>&1
+            cargo +nightly fuzz run --fuzz-dir fuzz "$target" -- -runs=20000 -max_len=16384 >> fuzz.log 2>&1
             command_status=$?
             duration=$(( $(date +%s) - started ))
             if [[ "$command_status" -eq 0 ]]; then
@@ -120,7 +125,7 @@ jobs:
               status=failed
               fuzz_failed=1
             fi
-            printf 'FUZZ|target=%s|status=%s|runs=10000|duration_s=%s|corpus=fuzz/corpus/%s|reason=command_exit_%s\n' \
+            printf 'FUZZ|target=%s|status=%s|runs=20000|duration_s=%s|corpus=fuzz/corpus/%s|reason=command_exit_%s\n' \
               "$target" "$status" "$duration" "$target" "$command_status" >> fuzz.log
           done
           cat fuzz.log

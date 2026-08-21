@@ -39,13 +39,13 @@ fn read_preface(stream: &ConnStream) -> Result<()> {
 }
 
 /// A short read timeout lets the serve loop wake to flush deferred
-/// (channel) response bodies even while the peer is silent; without it a
-/// blocked read and a pending stream body deadlock until the long
-/// timeout. 250 ms is long enough that a legitimate read (including a
-/// multi-record TLS read) is never spuriously interrupted under load.
+/// (channel) response bodies even while the peer is silent
 fn configure_read_timeout(stream: &ConnStream) {
     let _ = stream.configure(Some(std::time::Duration::from_millis(250)));
 }
+
+const STREAMING_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5);
+const QUIET_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Serve HTTP/2 requests on `stream` (client preface already verified via
 /// peek or ALPN; consumed here).
@@ -59,14 +59,17 @@ pub(crate) fn serve(
     let mut conn = Connection::new(stream, stream, server_config(config));
     let mut req_bodies: HashMap<u32, RequestBuilder> = HashMap::new();
     let mut deferred: HashMap<u32, Deferred> = HashMap::new();
-    serve_loop(&mut conn, handler, config, &mut req_bodies, &mut deferred)
+    serve_loop(
+        &mut conn,
+        stream,
+        handler,
+        config,
+        &mut req_bodies,
+        &mut deferred,
+    )
 }
 
-/// Serve the HTTP/2 side of an RFC 7540 §3.2 `h2c` Upgrade. The client's
-/// preface arrives only after the `101` response; the upgraded HTTP/1.1
-/// request occupies stream 1 (half-closed remote) and `resp` — the
-/// handler's response to that request — is sent on stream 1 before the
-/// regular loop takes over.
+/// Serve the HTTP/2 side of an RFC 7540 §3.2 `h2c` Upgrade.
 pub(crate) fn serve_upgraded(
     stream: &ConnStream,
     handler: &dyn Handler,
@@ -80,13 +83,20 @@ pub(crate) fn serve_upgraded(
     let mut req_bodies: HashMap<u32, RequestBuilder> = HashMap::new();
     let mut deferred: HashMap<u32, Deferred> = HashMap::new();
     send_response(&mut conn, 1, resp, &mut deferred)?;
-    serve_loop(&mut conn, handler, config, &mut req_bodies, &mut deferred)
+    serve_loop(
+        &mut conn,
+        stream,
+        handler,
+        config,
+        &mut req_bodies,
+        &mut deferred,
+    )
 }
 
-/// The shared h2 event loop: poll, dispatch events, flush deferred
-/// channel bodies, and apply connection liveness policies.
+/// The shared h2 event loop
 fn serve_loop(
     conn: &mut Connection<&ConnStream, &ConnStream>,
+    stream: &ConnStream,
     handler: &dyn Handler,
     config: &ServerConfig,
     req_bodies: &mut HashMap<u32, RequestBuilder>,
@@ -97,9 +107,19 @@ fn serve_loop(
     let started = std::time::Instant::now();
     let mut last_rx = started;
     let mut last_ping: Option<std::time::Instant> = None;
+    let mut streaming = false;
 
     loop {
-        if !deferred.is_empty() {
+        let want_streaming = !deferred.is_empty();
+        if want_streaming != streaming {
+            let _ = stream.configure(Some(if want_streaming {
+                STREAMING_READ_TIMEOUT
+            } else {
+                QUIET_READ_TIMEOUT
+            }));
+            streaming = want_streaming;
+        }
+        if want_streaming {
             let _ = conn.flush();
             flush_deferred(conn, deferred)?;
         }

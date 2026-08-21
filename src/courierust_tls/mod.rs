@@ -42,6 +42,14 @@ pub const TLS_VERSION_1_3: u16 = 0x0304;
 /// TLS version identifier for TLS 1.2 (legacy_record_version / fallback).
 pub const TLS_VERSION_1_2: u16 = 0x0303;
 
+/// Upper bound on the accumulated decrypted handshake bytes. The
+/// protocol's handshake length field is 24 bits (max ~16 MiB), so a
+/// peer that keeps streaming handshake records without ever completing a
+/// message is hostile — without this cap the receive buffer would grow
+/// without bound (memory-exhaustion DoS on both the client and the
+/// server).
+const MAX_HANDSHAKE_BUFFER: usize = 16 * 1024 * 1024;
+
 /// A parsed `ClientHello` summary (used by server-side ALPN/SNI and by
 /// the fingerprint layer).
 #[derive(Debug, Clone, Default)]
@@ -214,8 +222,6 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsIo<R, W> 
         self.writer.flush().map_err(TlsError::from)
     }
 
-    /// Read records until at least one full handshake message is
-    /// buffered; returns the accumulated decrypted handshake bytes.
     pub(crate) fn read_encrypted_handshake(
         &mut self,
         suite: key_schedule::CipherSuite,
@@ -235,10 +241,13 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsIo<R, W> 
             let seq = self.read_seq.next()?;
             let (ct, payload) = open_record(suite, keys, seq, &header, &encrypted)?;
             if ct == CONTENT_HANDSHAKE {
+                if plain.len() > MAX_HANDSHAKE_BUFFER - payload.len() {
+                    return Err(TlsError::Protocol(
+                        "handshake message exceeds the 16 MiB protocol maximum".into(),
+                    ));
+                }
                 plain.extend_from_slice(&payload);
-                // Stop when we have a complete handshake message.
-                if let Some(m) = handshake::peek_complete_hs(&plain) {
-                    let _ = m;
+                if handshake::peek_complete_hs(&plain).is_some() {
                     return Ok(plain);
                 }
             }
@@ -286,9 +295,6 @@ pub struct TlsStream<R, W> {
     server_name: Option<String>,
     peer_certificate: Option<Vec<u8>>,
     closed: bool,
-    /// Bytes of the current decrypted record not yet consumed by the
-    /// caller (a TLS record can be up to 16 KiB, larger than any single
-    /// `read` buffer).
     pending: Vec<u8>,
     /// Resumable inbound record read (see [`RecState`]).
     rec: RecState,
@@ -348,12 +354,8 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
             return Ok(Vec::new());
         }
         loop {
-            // Phase 1: a complete 5-byte record header.
             let payload_len = match &self.rec {
-                RecState::Payload { payload, .. } => {
-                    // Header already complete from a previous call.
-                    payload.len()
-                }
+                RecState::Payload { payload, .. } => payload.len(),
                 _ => match self.read_record_header()? {
                     Some((_, len)) => len,
                     None => return Ok(Vec::new()), // clean EOF
@@ -362,16 +364,12 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
             if payload_len > record::MAX_RECORD_PAYLOAD + 16 {
                 return Err(TlsError::Protocol("record too large".into()));
             }
-            // Phase 2: the (encrypted) payload.
             let (header, encrypted) = self.read_record_payload()?;
-            // Phase 3: decrypt and dispatch.
             let seq = self.io.read_seq.next()?;
             let (ct, payload) = open_record(self.suite, &self.read_keys, seq, &header, &encrypted)?;
             match ct {
                 record::CONTENT_APPLICATION_DATA => return Ok(payload),
                 record::CONTENT_ALERT => {
-                    // close_notify (0) is a clean shutdown; anything
-                    // else is a protocol error.
                     if payload.first() == Some(&1) && payload.get(1) == Some(&0) {
                         self.closed = true;
                         return Ok(Vec::new());
@@ -382,8 +380,6 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
                     });
                 }
                 record::CONTENT_HANDSHAKE => {
-                    // KeyUpdate / NewSessionTicket — parse and ignore
-                    // NewSessionTicket; reject anything else.
                     if let Some(m) = handshake::peek_complete_hs(&payload) {
                         if m.msg_type != handshake::HS_NEW_SESSION_TICKET {
                             return Err(TlsError::Protocol(
@@ -466,7 +462,6 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
             }
             match self.io.reader.fill_buf() {
                 Ok([]) => {
-                    // Peer closed mid-record: truncated record.
                     self.closed = true;
                     return Err(TlsError::UnexpectedEof);
                 }
@@ -516,16 +511,9 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> crate::couri
     for TlsStream<R, W>
 {
     fn read(&mut self, buf: &mut [u8]) -> crate::courierust_error::Result<usize> {
-        // Serve buffered excess from the previous record first; a TLS
-        // record (up to 16 KiB) can be much larger than the caller's
-        // buffer, so never discard the remainder.
         if self.pending.is_empty() {
             self.pending = match self.read_record() {
                 Ok(p) => p,
-                // A transport read timeout is a transient "no data yet"
-                // (the h2 driver polls with a short socket timeout); the
-                // partial record state is preserved and the read resumes
-                // on the next call. Only non-timeout failures are fatal.
                 Err(TlsError::Timeout) => {
                     return Err(crate::courierust_error::Error::new(
                         crate::courierust_error::ErrorKind::Timeout,
@@ -622,9 +610,9 @@ impl TlsConnector {
         let hs = handshake::ClientHandshake {
             alpn: self.config.alpn.clone(),
             server_name: Some(hostname.to_string()),
+            verify: self.config.verify,
         };
         let result = hs.run(&mut io, &self.config.roots, self.config.now)?;
-        // Reset sequence numbers for application data.
         io.reset_sequences();
         Ok(TlsStream {
             io,

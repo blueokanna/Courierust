@@ -1,0 +1,63 @@
+name: Fuzz (long-running)
+
+# Deep fuzz runs: instead of a fixed run count, each target gets a time
+# budget of wall-clock fuzzing so the h1 parser, the h2 state machine and
+# the HPACK/Huffman codecs are explored far beyond what a PR-time smoke
+# run covers. Failures abort the job (a crash anywhere is a release
+# blocker). Runs on demand and nightly.
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes_per_target:
+        description: 'Wall-clock minutes per fuzz target'
+        required: false
+        default: '10'
+  schedule:
+    - cron: '0 4 * * *'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: Long fuzz (${{ inputs.minutes_per_target || 10 }}m/target)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly + cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo +nightly install cargo-fuzz --locked
+      - name: Fuzz all targets with a time budget
+        shell: bash
+        env:
+          MINUTES: ${{ inputs.minutes_per_target || '10' }}
+        run: |
+          set -euo pipefail
+          for target in h2_frame hpack_block h1_request h2_connection; do
+            echo "=== fuzzing $target for ${MINUTES} minutes ==="
+            # `-max_total_time` is the libFuzzer time budget; the run
+            # aborts non-zero on any crash/leak/hang in the target.
+            cargo +nightly fuzz run --fuzz-dir fuzz "$target" -- \
+              -max_total_time="$((MINUTES * 60))" -max_len=16384 \
+              -timeout=10 -rss_limit_mb=2048
+            echo "FUZZ|target=$target|status=ok|budget_min=${MINUTES}" | tee -a fuzz.log
+          done
+          # Fresh inputs discovered during the runs are committed back to
+          # the corpus only when the whole job passes (corpus growth is
+          # the point of long fuzzing).
+          git status --short fuzz/corpus || true
+      - name: Upload fuzz logs + corpus diff
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-long
+          path: |
+            fuzz.log
+            fuzz/corpus/**/*.bin
+          if-no-files-found: warn
