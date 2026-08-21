@@ -71,7 +71,9 @@ impl BigInt {
 
     /// From little-endian u64 limbs (the internal representation).
     pub(crate) fn from_le_limbs(limbs: &[u64]) -> Self {
-        let mut out = Self { limbs: limbs.to_vec() };
+        let mut out = Self {
+            limbs: limbs.to_vec(),
+        };
         out.trim();
         out
     }
@@ -254,23 +256,23 @@ impl BigInt {
         // whether the subtraction underflowed). If it underflowed the
         // value was already < m and we add m back.
         let mut borrow = 0u64;
-        for i in 0..r_limbs.len() {
-            let a = r_limbs[i];
+        for (i, limb) in r_limbs.iter_mut().enumerate() {
+            let a = *limb;
             let b = if i < k { m.limbs[i] } else { 0 };
             let (s1, b1) = a.overflowing_sub(b);
             let (s2, b2) = s1.overflowing_sub(borrow);
-            r_limbs[i] = s2;
-            borrow = (b1 as u64) + (b2 as u64);
+            *limb = s2;
+            borrow = b1 as u64 + b2 as u64;
         }
         if borrow != 0 {
             let mut carry = 0u64;
-            for i in 0..r_limbs.len() {
-                let a = r_limbs[i];
+            for (i, limb) in r_limbs.iter_mut().enumerate() {
+                let a = *limb;
                 let b = if i < k { m.limbs[i] } else { 0 };
                 let (s1, c1) = a.overflowing_add(b);
                 let (s2, c2) = s1.overflowing_add(carry);
-                r_limbs[i] = s2;
-                carry = (c1 as u64) + (c2 as u64);
+                *limb = s2;
+                carry = c1 as u64 + c2 as u64;
             }
         }
         let mut r = Self {
@@ -603,10 +605,10 @@ pub fn verify_rsa_pkcs1v15(key: &RsaPublicKey, sha384: bool, digest: &[u8], sig:
 /// Verify an RSA-PSS signature with SHA-256 or SHA-384.
 pub fn verify_rsa_pss(key: &RsaPublicKey, sha384: bool, digest: &[u8], sig: &[u8]) -> bool {
     if sha384 {
-        let mut h: BoxDigest = Box::new(Sha384::new());
+        let mut h: BoxDigest = Box::<Sha384>::default();
         key.verify_pss(h.as_mut(), digest, 48, sig)
     } else {
-        let mut h: BoxDigest = Box::new(Sha256::new());
+        let mut h: BoxDigest = Box::<Sha256>::default();
         key.verify_pss(h.as_mut(), digest, 32, sig)
     }
 }
@@ -743,8 +745,10 @@ mod tests {
         let reduced = t.rem(&n);
         assert_eq!(lhs, reduced);
         // Also check the even-modulus fallback path against a reference.
-        let n_even = BigInt::from_be_bytes(&[0x00, 0xa5, 0x23, 0x9b, 0x8f, 0x1c, 0x0d, 0x21, 0x77,
-            0x54, 0x09, 0xcc, 0x62, 0x01, 0x9e, 0x99, 0x1c]);
+        let n_even = BigInt::from_be_bytes(&[
+            0x00, 0xa5, 0x23, 0x9b, 0x8f, 0x1c, 0x0d, 0x21, 0x77, 0x54, 0x09, 0xcc, 0x62, 0x01,
+            0x9e, 0x99, 0x1c,
+        ]);
         let v = BigInt::from_be_bytes(&[0x01, 0x02, 0x03]);
         let r_even = v.mod_pow(&e, &n_even);
         // Reference: computed with Python pow(v, e, n_even) == 0x2da03a573b5158eff3a802d1b74c8a7b

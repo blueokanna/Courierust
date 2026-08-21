@@ -130,7 +130,7 @@ pub struct Identity {
 // ---------------------------------------------------------------------
 
 use crate::io::{BufReader, BufWriter};
-use record::{Sequence, seal_record, open_record, CONTENT_HANDSHAKE, MAX_RECORD_PAYLOAD};
+use record::{open_record, seal_record, Sequence, CONTENT_HANDSHAKE, MAX_RECORD_PAYLOAD};
 
 /// Buffered record-level I/O over a transport. Sequence numbers are
 /// tracked per direction and reset when the traffic keys change.
@@ -366,8 +366,7 @@ impl<R: crate::io::Read, W: crate::io::Write> TlsStream<R, W> {
             let (header, encrypted) = self.read_record_payload()?;
             // Phase 3: decrypt and dispatch.
             let seq = self.io.read_seq.next()?;
-            let (ct, payload) =
-                open_record(self.suite, &self.read_keys, seq, &header, &encrypted)?;
+            let (ct, payload) = open_record(self.suite, &self.read_keys, seq, &header, &encrypted)?;
             match ct {
                 record::CONTENT_APPLICATION_DATA => return Ok(payload),
                 record::CONTENT_ALERT => {
@@ -421,7 +420,7 @@ impl<R: crate::io::Read, W: crate::io::Write> TlsStream<R, W> {
                 return Ok(Some((hdr, payload_len)));
             }
             match self.io.reader.fill_buf() {
-                Ok(b) if b.is_empty() => {
+                Ok([]) => {
                     self.closed = true;
                     return Ok(None);
                 }
@@ -458,11 +457,7 @@ impl<R: crate::io::Read, W: crate::io::Write> TlsStream<R, W> {
                     payload,
                     filled,
                 } => (header, payload, filled),
-                _ => {
-                    return Err(TlsError::Internal(
-                        "payload read without header".into(),
-                    ))
-                }
+                _ => return Err(TlsError::Internal("payload read without header".into())),
             };
         let total = payload.len();
         loop {
@@ -470,7 +465,7 @@ impl<R: crate::io::Read, W: crate::io::Write> TlsStream<R, W> {
                 return Ok((header, payload));
             }
             match self.io.reader.fill_buf() {
-                Ok(b) if b.is_empty() => {
+                Ok([]) => {
                     // Peer closed mid-record: truncated record.
                     self.closed = true;
                     return Err(TlsError::UnexpectedEof);
@@ -530,9 +525,7 @@ impl<R: crate::io::Read, W: crate::io::Write> crate::io::Read for TlsStream<R, W
                 // partial record state is preserved and the read resumes
                 // on the next call. Only non-timeout failures are fatal.
                 Err(TlsError::Timeout) => {
-                    return Err(crate::error::Error::new(
-                        crate::error::ErrorKind::Timeout,
-                    ))
+                    return Err(crate::error::Error::new(crate::error::ErrorKind::Timeout))
                 }
                 Err(e) => {
                     return Err(crate::error::Error::with_message(
@@ -621,11 +614,7 @@ impl TlsConnector {
             alpn: self.config.alpn.clone(),
             server_name: Some(hostname.to_string()),
         };
-        let result = hs.run(
-            &mut io,
-            &self.config.roots,
-            self.config.now,
-        )?;
+        let result = hs.run(&mut io, &self.config.roots, self.config.now)?;
         // Reset sequence numbers for application data.
         io.reset_sequences();
         Ok(TlsStream {
@@ -701,7 +690,10 @@ impl TlsAcceptor {
 
 /// Sign the CertificateVerify message with the server identity. Returns
 /// the (signature scheme, signature) pair.
-pub(crate) fn server_sign(identity: &Identity, message: &[u8]) -> TlsResult<Option<(u16, Vec<u8>)>> {
+pub(crate) fn server_sign(
+    identity: &Identity,
+    message: &[u8],
+) -> TlsResult<Option<(u16, Vec<u8>)>> {
     sign::sign_server_cert_verify(identity, message)
 }
 
@@ -809,4 +801,3 @@ mod tests {
         let _ = server.join();
     }
 }
-

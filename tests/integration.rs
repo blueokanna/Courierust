@@ -42,9 +42,7 @@ fn grpc_test_http_cfg() -> ServerConfig {
 }
 
 /// Bind and serve a streaming gRPC service in the background.
-fn bind_grpc_streaming(
-    service: impl courierust::grpc::StreamingService,
-) -> std::net::SocketAddr {
+fn bind_grpc_streaming(service: impl courierust::grpc::StreamingService) -> std::net::SocketAddr {
     let srv = courierust::grpc::GrpcServer::bind_streaming_with_config(
         "127.0.0.1:0",
         service,
@@ -145,6 +143,47 @@ fn h2_get_and_post_roundtrip() {
     req.body = Body::Bytes(Bytes::from_static(b"via-h2"));
     let resp = client.execute(&format!("{base}/h2echo"), req).unwrap();
     assert_eq!(resp.body.collect().unwrap().to_str().unwrap(), "via-h2");
+}
+
+/// Flow-control regression: a large request body and a large response
+/// body on a fresh h2 connection must both round-trip intact.
+///
+/// * The request direction needs the connection-level WINDOW_UPDATE to
+///   re-schedule a stream whose END_STREAM chunk is still buffered
+///   (previously the stream was excluded because `send_done` was set as
+///   soon as the body was queued).
+/// * The response direction needs batched stream-level WINDOW_UPDATEs as
+///   data is consumed (previously the batch accumulator cancelled itself,
+///   so responses larger than the initial stream window stalled).
+#[test]
+fn h2_large_body_flow_control_roundtrip() {
+    let server_cfg = ServerConfig {
+        http2: true,
+        threads: 1,
+        ..Default::default()
+    };
+    let base = spawn_server(server_cfg, echo_handler);
+
+    let client_cfg = ClientConfig {
+        http2: true,
+        h2_settings_timeout: Some(std::time::Duration::from_secs(60)),
+        h2_ping_interval: None,
+        h2_ping_timeout: None,
+        h2_idle_timeout: None,
+        ..Default::default()
+    };
+    let client = Client::with_config(client_cfg);
+
+    // 2 MiB, deliberately above both the 64 KiB connection window and the
+    // 256 KiB initial stream window, so both directions must replenish
+    // flow-control credit mid-transfer.
+    let big: Vec<u8> = (0..(2 * 1024 * 1024)).map(|i| (i % 251) as u8).collect();
+    let mut req = Request::new(Method::POST, "/h2-big");
+    req.body = Body::Bytes(Bytes::from(big.clone()));
+    let resp = client.execute(&format!("{base}/h2-big"), req).unwrap();
+    assert_eq!(resp.status.as_u16(), 200);
+    let body = resp.body.collect().unwrap();
+    assert_eq!(body.as_ref(), big.as_slice(), "2 MiB body must round-trip");
 }
 
 #[test]
@@ -540,20 +579,18 @@ fn grpc_server_enforces_deadline() {
     };
     let addr = bind_grpc_unary(service);
 
-    let client = courierust::grpc::GrpcClient::with_config(
-        courierust::grpc::GrpcClientConfig {
-            base: format!("http://{addr}"),
-            max_message_size: courierust::grpc::DEFAULT_MAX_MESSAGE_SIZE,
-            interceptor: None,
-            timeout: Some(std::time::Duration::from_millis(50)),
-            compress: false,
-            http_client: Client::with_config(ClientConfig {
-                http2: true,
-                user_agent: None,
-                ..Default::default()
-            }),
-        },
-    )
+    let client = courierust::grpc::GrpcClient::with_config(courierust::grpc::GrpcClientConfig {
+        base: format!("http://{addr}"),
+        max_message_size: courierust::grpc::DEFAULT_MAX_MESSAGE_SIZE,
+        interceptor: None,
+        timeout: Some(std::time::Duration::from_millis(50)),
+        compress: false,
+        http_client: Client::with_config(ClientConfig {
+            http2: true,
+            user_agent: None,
+            ..Default::default()
+        }),
+    })
     .unwrap();
     let err = client
         .call("/echo.Echo/Say", Bytes::from_static(b"x"))
@@ -1165,7 +1202,10 @@ fn grpc_echo_stream_server() -> std::net::SocketAddr {
         match method {
             "/echo.Echo/Say" => {
                 let first = reqs.next().transpose()?.unwrap_or_default();
-                tx.send(Bytes::from(format!("echo:{}", first.to_str().unwrap_or(""))))?;
+                tx.send(Bytes::from(format!(
+                    "echo:{}",
+                    first.to_str().unwrap_or("")
+                )))?;
                 Ok(())
             }
             "/echo.Echo/ServerStream" => {
@@ -1375,13 +1415,13 @@ fn grpc_health_check() {
     assert_eq!(resp[1], health::serving_status::SERVING as u8);
 
     // Known service -> SERVING.
-    let req = vec![0x0A, 5]; // field 1, len 5
+    let req = [0x0A, 5]; // field 1, len 5
     let req = Bytes::from([&req[..], b"svc.A"].concat());
     let resp = client.call(health::CHECK_METHOD, req).unwrap();
     assert_eq!(resp[1], health::serving_status::SERVING as u8);
 
     // Unknown service -> SERVICE_UNKNOWN.
-    let req = vec![0x0A, 1];
+    let req = [0x0A, 1];
     let req = Bytes::from([&req[..], b"x"].concat());
     let resp = client.call(health::CHECK_METHOD, req).unwrap();
     assert_eq!(resp[1], health::serving_status::SERVICE_UNKNOWN as u8);
@@ -1417,11 +1457,9 @@ fn grpc_health_watch() {
 
     // A service appearing after the watch started is also pushed.
     service.update_service("svc.Late", health::serving_status::SERVING);
-    let req = vec![0x0A, 8]; // field 1, len 8
+    let req = [0x0A, 8]; // field 1, len 8
     let req = Bytes::from([&req[..], b"svc.Late"].concat());
-    let mut stream2 = client
-        .call_stream(health::WATCH_METHOD, req)
-        .unwrap();
+    let mut stream2 = client.call_stream(health::WATCH_METHOD, req).unwrap();
     let late = stream2
         .next_message()
         .unwrap()

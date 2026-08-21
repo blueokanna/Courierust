@@ -40,7 +40,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: benches
-      - name: Run benchmarks
+      - name: Run benchmarks + interop validation
         id: benchmarks
         shell: bash
         run: |
@@ -53,10 +53,14 @@ jobs:
           cargo bench --manifest-path benches/Cargo.toml --locked --bench compare 2>&1 | tee compare.log
           compare_status=${PIPESTATUS[0]}
 
+          cargo bench --manifest-path benches/Cargo.toml --locked --bench interop 2>&1 | tee interop.log
+          interop_status=${PIPESTATUS[0]}
+
           printf 'throughput_exit=%s\n' "$throughput_status" >> "$GITHUB_OUTPUT"
           printf 'compare_exit=%s\n' "$compare_status" >> "$GITHUB_OUTPUT"
+          printf 'interop_exit=%s\n' "$interop_status" >> "$GITHUB_OUTPUT"
 
-          if [[ "$throughput_status" -ne 0 || "$compare_status" -ne 0 ]]; then
+          if [[ "$throughput_status" -ne 0 || "$compare_status" -ne 0 || "$interop_status" -ne 0 ]]; then
             exit 1
           fi
 
@@ -65,10 +69,12 @@ jobs:
         env:
           BENCHMARK_THROUGHPUT_EXIT: ${{ steps.benchmarks.outputs.throughput_exit }}
           BENCHMARK_COMPARE_EXIT: ${{ steps.benchmarks.outputs.compare_exit }}
+          BENCHMARK_INTEROP_EXIT: ${{ steps.benchmarks.outputs.interop_exit }}
         run: |
           bash scripts/generate_benchmark_report.sh \
             throughput.log \
             compare.log \
+            interop.log \
             Github_Action_Benchmark.md
 
       - name: Publish benchmark report to the run summary
@@ -88,4 +94,5 @@ jobs:
             Github_Action_Benchmark.md
             throughput.log
             compare.log
+            interop.log
           if-no-files-found: error

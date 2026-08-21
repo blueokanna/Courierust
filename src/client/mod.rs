@@ -279,6 +279,19 @@ impl Client {
         req: Request<Body>,
         priority: Priority,
     ) -> Result<Response<Body>> {
+        // The URL supplies scheme/host/port; the request path is used
+        // as-is when the caller set one (gRPC method paths, redirects,
+        // explicit `execute` calls). The convenience methods `get`/`post`
+        // construct requests with the default target `/`, so when the
+        // path is still the default we take it from the URL — otherwise
+        // `client.get("http://host/api/v1")` would silently request `/`.
+        let req = if req.uri.as_str() == "/" && url.path_and_query.as_str() != "/" {
+            let mut req = req;
+            req.uri = url.path_and_query.clone();
+            req
+        } else {
+            req
+        };
         let tls = self.tls_for_scheme(&url.scheme)?;
         self.inner.seq.fetch_add(1, Ordering::Relaxed);
         let addr = resolve_addr(&url.host, url.port)?;
@@ -453,8 +466,9 @@ impl Client {
                         list.push(conn);
                     }
                 }
-                let raw =
-                    rx.recv().map_err(|_| Error::canceled("h2 driver closed the channel"))??;
+                let raw = rx
+                    .recv()
+                    .map_err(|_| Error::canceled("h2 driver closed the channel"))??;
                 Ok(Response {
                     status: raw.head.status,
                     version: raw.head.version,
@@ -482,6 +496,11 @@ impl Client {
 
     /// Send a driver command, retrying once on a fresh connection if the
     /// driver is gone, then wait for the reply.
+    //
+    // The `authority`/`addr`/`tls`/`hostname` bundle is deliberately kept
+    // flat here (and in `get_h2_conn`/`open_h2_conn`) so the retry path
+    // can re-open a fresh connection with exactly the same parameters.
+    #[allow(clippy::too_many_arguments)]
     fn send_h2_cmd(
         &self,
         conn: H2Conn,

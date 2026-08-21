@@ -70,7 +70,7 @@ fn cipher_block(aes: &Aes, v: u128) -> u128 {
 
 /// GCM seal. `key` is 16 or 32 bytes; `iv` is 12 bytes.
 pub fn seal(key: &[u8], iv: &[u8; 12], aad: &[u8], plaintext: &[u8]) -> Option<Vec<u8>> {
-    let aes = Aes::new(key).ok()?;
+    let aes = Aes::new(key)?;
     let h = cipher_block(&aes, 0);
     // J0 = IV || 0^31 || 1
     let mut j0_bytes = [0u8; 16];
@@ -107,7 +107,7 @@ pub fn open(key: &[u8], iv: &[u8; 12], aad: &[u8], sealed: &[u8]) -> Option<Vec<
         return None;
     }
     let (ct, tag) = sealed.split_at(sealed.len() - TAG_LEN);
-    let aes = Aes::new(key).ok()?;
+    let aes = Aes::new(key)?;
     let h = cipher_block(&aes, 0);
     let mut j0_bytes = [0u8; 16];
     j0_bytes[..12].copy_from_slice(iv);

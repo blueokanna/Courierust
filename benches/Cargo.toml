@@ -45,6 +45,11 @@ name = "concurrency"
 harness = false
 path = "src/concurrency.rs"
 
+[[bench]]
+name = "interop"
+harness = false
+path = "src/interop.rs"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

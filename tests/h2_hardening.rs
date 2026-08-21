@@ -96,10 +96,8 @@ impl RawH2Peer {
         let flags = hdr[4];
         let sid = u32::from_be_bytes([hdr[5] & 0x7f, hdr[6], hdr[7], hdr[8]]);
         let mut payload = vec![0u8; len];
-        if len > 0 {
-            if self.stream.read_exact(&mut payload).is_err() {
-                return None;
-            }
+        if len > 0 && self.stream.read_exact(&mut payload).is_err() {
+            return None;
         }
         Some((kind, flags, sid, payload))
     }
@@ -111,7 +109,7 @@ impl RawH2Peer {
         if self.stream.read_exact(&mut p).is_err() {
             return false;
         }
-        &p == PREFACE
+        p == PREFACE
     }
 
     /// Drain frames until a GOAWAY is observed (or the peer closes);
@@ -336,8 +334,8 @@ fn h2_client_rejects_pseudo_after_regular_response() {
         assert!(peer.read_preface());
         let _ = peer.read_frame(); // client SETTINGS
         peer.send_frame(0x4, 0, 0, &[]); // our (empty) SETTINGS
-        // Read the client's request HEADERS on stream 1, then respond
-        // with a malformed block (regular field before :status).
+                                         // Read the client's request HEADERS on stream 1, then respond
+                                         // with a malformed block (regular field before :status).
         loop {
             match peer.read_frame() {
                 Some((0x1, _, 1, _)) => break,
@@ -530,13 +528,14 @@ fn h2_client_keepalive_detects_dead_peer() {
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
         if let Ok((sock, _)) = listener.accept() {
-            sock.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+            sock.set_read_timeout(Some(Duration::from_millis(300)))
+                .unwrap();
             let mut peer = RawH2Peer { stream: sock };
             assert!(peer.read_preface());
             let _ = peer.read_frame(); // client SETTINGS (after preface)
             peer.send_frame(0x4, 0, 0, &[]); // our SETTINGS (client ACKs it)
-            // Stay open but never answer PINGs, so the client's keepalive
-            // timeout (not an EOF) must be what fails the request.
+                                             // Stay open but never answer PINGs, so the client's keepalive
+                                             // timeout (not an EOF) must be what fails the request.
             let mut buf = [0u8; 4096];
             let deadline = std::time::Instant::now() + Duration::from_secs(3);
             while std::time::Instant::now() < deadline {
@@ -806,8 +805,32 @@ fn h2_rejects_window_update_overflow() {
 #[test]
 fn h2_rejects_data_exceeding_flow_window() {
     // Sending DATA beyond the advertised flow-control window is a
-    // FLOW_CONTROL_ERROR (RFC 9113 §6.9).
-    let addr = spawn_h2_server(1 << 20);
+    // FLOW_CONTROL_ERROR (RFC 9113 §6.9). The server must not auto-release
+    // receive credit here, otherwise the 5 × 16 KiB would legitimately be
+    // granted and no violation would occur.
+    let server = Server::bind_with_config(
+        "127.0.0.1:0",
+        ServerConfig {
+            http2: true,
+            event_driven: false,
+            threads: 1,
+            max_header_list: 1 << 20,
+            auto_release_credit: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let addr = server.local_addr().unwrap();
+    let handle = server
+        .serve_background(|req: courierust::http::request::Request<Body>| {
+            let mut resp = courierust::http::response::Response::<Body>::with_status(200.into());
+            let body = req.body.collect().unwrap();
+            resp.body = Body::Bytes(body);
+            resp
+        })
+        .unwrap();
+    std::mem::forget(handle);
+
     let mut peer = RawH2Peer::connect(addr).unwrap();
     peer.send_preface_and_settings();
     peer.send_frame(0x1, 0x4, 1, &get_block()); // open stream 1
@@ -957,7 +980,7 @@ fn h2_client_rejects_content_length_mismatch_response() {
         assert!(peer.read_preface());
         let _ = peer.read_frame(); // client SETTINGS
         peer.send_frame(0x4, 0, 0, &[]); // our SETTINGS
-        // Wait for the request.
+                                         // Wait for the request.
         loop {
             match peer.read_frame() {
                 Some((0x1, _, 1, _)) => break,
@@ -967,14 +990,11 @@ fn h2_client_rejects_content_length_mismatch_response() {
             }
         }
         // Response: content-length 100, body "hi" (2 bytes) + END_STREAM.
-        let block = hpack(&[
-            hdr(":status", "200"),
-            hdr("content-length", "100"),
-        ]);
+        let block = hpack(&[hdr(":status", "200"), hdr("content-length", "100")]);
         peer.send_frame(0x1, 0x4, 1, &block); // HEADERS, no END_STREAM
         peer.send_frame(0x0, 0x1, 1, b"hi"); // DATA + END_STREAM
-        // Keep reading so the connection stays open long enough for the
-        // client to observe the mismatch.
+                                             // Keep reading so the connection stays open long enough for the
+                                             // client to observe the mismatch.
         for _ in 0..200 {
             if peer.read_frame().is_none() {
                 break;
@@ -997,14 +1017,12 @@ fn h2_client_rejects_content_length_mismatch_response() {
     // The mismatch is detected when the body ends, so it surfaces as a
     // body-read error even though the response head was already
     // delivered.
-    match result {
-        Ok(resp) => {
-            let body_result = resp.body.collect();
-            assert!(
-                body_result.is_err(),
-                "client must reject a response whose content-length does not match the body"
-            );
-        }
-        Err(_) => {} // surfaced at the head is also acceptable
+    if let Ok(resp) = result {
+        let body_result = resp.body.collect();
+        assert!(
+            body_result.is_err(),
+            "client must reject a response whose content-length does not match the body"
+        );
     }
+    // An `Err` surfaced at the head is also acceptable.
 }

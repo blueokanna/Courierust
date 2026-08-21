@@ -24,7 +24,8 @@ mod os {
     /// Fill `buf` from the Windows cryptographic RNG.
     pub fn fill(buf: &mut [u8]) -> bool {
         for chunk in buf.chunks_mut(u32::MAX as usize) {
-            let ok = unsafe { SystemFunction036(chunk.as_mut_ptr() as *mut c_void, chunk.len() as u32) };
+            let ok =
+                unsafe { SystemFunction036(chunk.as_mut_ptr() as *mut c_void, chunk.len() as u32) };
             if ok == 0 {
                 return false;
             }
@@ -150,7 +151,8 @@ impl ChaChaRng {
                 self.reseed();
             }
             let blocks_needed = (out.len() - offset).div_ceil(64) as u64;
-            let blocks_this_round = core::cmp::min(blocks_needed, RESEED_BLOCKS - self.since_reseed);
+            let blocks_this_round =
+                core::cmp::min(blocks_needed, RESEED_BLOCKS - self.since_reseed);
             let bytes_this_round = (blocks_this_round as usize) * 64;
             let end = core::cmp::min(offset + bytes_this_round, out.len());
             self.fill_blocks_raw(&mut out[offset..end], self.counter);

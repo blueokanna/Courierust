@@ -7,7 +7,7 @@
 
 use super::crypto::hash::{Digest, Sha256};
 use super::crypto::{ecdsa, ed25519, rsa};
-use super::x509::der::{read_element, expect_sequence};
+use super::x509::der::{expect_sequence, read_element};
 use super::{Identity, TlsError, TlsResult};
 use alloc::vec::Vec;
 
@@ -33,19 +33,16 @@ pub(crate) fn sign_server_cert_verify(
     identity: &Identity,
     message: &[u8],
 ) -> TlsResult<Option<(u16, Vec<u8>)>> {
-    let key = match parse_private_key(&identity.private_key) {
-        Ok(k) => k,
-        Err(e) => return Err(e),
-    };
+    let key = parse_private_key(&identity.private_key)?;
     match key {
         ParsedKey::Rsa { n, d } => {
             // Prefer RSA-PSS (rsa_pss_rsae_sha256) as required for
             // modern interop; fall back to PKCS#1 v1.5 if PSS fails.
-            let mut h: super::crypto::hash::BoxDigest = Box::new(Sha256::new());
+            let mut h: super::crypto::hash::BoxDigest = Box::<Sha256>::default();
             if let Some(sig) = rsa::sign_pss(h.as_mut(), &n, &d, message, 32) {
                 return Ok(Some((0x0804, sig)));
             }
-            let mut h: super::crypto::hash::BoxDigest = Box::new(Sha256::new());
+            let mut h: super::crypto::hash::BoxDigest = Box::<Sha256>::default();
             let digest = {
                 h.update(message);
                 h.finalize()
@@ -116,7 +113,9 @@ fn parse_private_key(der: &[u8]) -> TlsResult<ParsedKey> {
     if let Some(k) = parse_pkcs1_rsa(der) {
         return Ok(k);
     }
-    Err(TlsError::Certificate("unsupported private key format".into()))
+    Err(TlsError::Certificate(
+        "unsupported private key format".into(),
+    ))
 }
 
 /// Parse a PKCS#8 PrivateKeyInfo.
@@ -221,7 +220,10 @@ fn parse_pkcs1_rsa(der: &[u8]) -> Option<ParsedKey> {
     // Strip sign padding from INTEGERs.
     let nv = strip_int(n.content);
     let dv = strip_int(d.content);
-    Some(ParsedKey::Rsa { n: nv.to_vec(), d: dv.to_vec() })
+    Some(ParsedKey::Rsa {
+        n: nv.to_vec(),
+        d: dv.to_vec(),
+    })
 }
 
 /// Remove a leading 0x00 sign byte from a positive INTEGER.
@@ -252,9 +254,10 @@ mod tests {
     /// RFC 8032 §7.1 test vector 1: seed + public key.
     #[test]
     fn ed25519_sign_verify_roundtrip() {
-        let seed: [u8; 32] = hex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
-            .try_into()
-            .unwrap();
+        let seed: [u8; 32] =
+            hex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+                .try_into()
+                .unwrap();
         let msg = b"";
         let sig = ed25519::sign(&seed, msg);
         // RFC 8032 expects this exact signature.
@@ -277,9 +280,10 @@ mod tests {
         let d: [u8; 32] = hex("C9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721")
             .try_into()
             .unwrap();
-        let digest: [u8; 32] = hex("af2bdbe1aa9b6ec1e2ade1d694f41fc71a831d0268e9891562113d8a62add1bf")
-            .try_into()
-            .unwrap();
+        let digest: [u8; 32] =
+            hex("af2bdbe1aa9b6ec1e2ade1d694f41fc71a831d0268e9891562113d8a62add1bf")
+                .try_into()
+                .unwrap();
         let (r, s) = ecdsa::sign(&d, &digest).expect("sign");
         let qx: [u8; 32] = hex("60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6")
             .try_into()
@@ -289,11 +293,15 @@ mod tests {
             .unwrap();
         // Encode as DER ECDSA-Sig-Value and verify.
         let der = encode_ecdsa_sig(&r, &s);
-        assert!(super::super::crypto::ecdsa::verify_der(&qx, &qy, &digest, &der));
+        assert!(super::super::crypto::ecdsa::verify_der(
+            &qx, &qy, &digest, &der
+        ));
         // Tamper with the digest → must fail.
         let mut bad = digest;
         bad[0] ^= 1;
-        assert!(!super::super::crypto::ecdsa::verify_der(&qx, &qy, &bad, &der));
+        assert!(!super::super::crypto::ecdsa::verify_der(
+            &qx, &qy, &bad, &der
+        ));
     }
 
     /// RSA PKCS#1 v1.5 and PSS sign → verify round-trip with a real

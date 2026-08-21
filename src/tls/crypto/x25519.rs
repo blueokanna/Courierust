@@ -145,7 +145,8 @@ pub fn fe_sq_times(a: Fe, n: u32) -> Fe {
         let d4 = d419 * 2;
 
         let t0 = r0 as u128 * r0 as u128 + d4 as u128 * r1 as u128 + d2 as u128 * r3 as u128;
-        let mut t1 = d0 as u128 * r1 as u128 + d4 as u128 * r2 as u128 + (r3 as u128) * (r3 as u128 * 19);
+        let mut t1 =
+            d0 as u128 * r1 as u128 + d4 as u128 * r2 as u128 + (r3 as u128) * (r3 as u128 * 19);
         let mut t2 = d0 as u128 * r2 as u128 + r1 as u128 * r1 as u128 + d4 as u128 * r3 as u128;
         let mut t3 = d0 as u128 * r3 as u128 + d1 as u128 * r2 as u128 + r4 as u128 * d419 as u128;
         let mut t4 = d0 as u128 * r4 as u128 + d1 as u128 * r3 as u128 + r2 as u128 * r2 as u128;
@@ -167,7 +168,7 @@ pub fn fe_sq_times(a: Fe, n: u32) -> Fe {
         c = t4 >> 51;
         let folded = r0 as u128 + c * 19;
         r0 = (folded as u64) & MASK51;
-        r1 = r1 + (folded >> 51) as u64;
+        r1 += (folded >> 51) as u64;
     }
     [r0, r1, r2, r3, r4]
 }
@@ -380,10 +381,13 @@ pub fn x25519(scalar: &[u8; 32], u: &[u8; 32]) -> [u8; 32] {
 pub fn keypair(rng: &mut impl FnMut(&mut [u8])) -> ([u8; 32], [u8; 32]) {
     let mut secret = [0u8; 32];
     rng(&mut secret);
-    let public = x25519(&secret, &[
-        9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0,
-    ]);
+    let public = x25519(
+        &secret,
+        &[
+            9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0,
+        ],
+    );
     (secret, public)
 }
 
@@ -400,9 +404,11 @@ mod tests {
 
     #[test]
     fn x25519_rfc7748_vector_1() {
-        let scalar = hex_to_bytes("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4");
+        let scalar =
+            hex_to_bytes("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4");
         let u = hex_to_bytes("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c");
-        let expected = hex_to_bytes("c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552");
+        let expected =
+            hex_to_bytes("c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552");
         let mut s = [0u8; 32];
         let mut uu = [0u8; 32];
         s.copy_from_slice(&scalar);
@@ -412,9 +418,11 @@ mod tests {
 
     #[test]
     fn x25519_rfc7748_vector_2() {
-        let scalar = hex_to_bytes("4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d");
+        let scalar =
+            hex_to_bytes("4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d");
         let u = hex_to_bytes("e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493");
-        let expected = hex_to_bytes("95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957");
+        let expected =
+            hex_to_bytes("95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957");
         let mut s = [0u8; 32];
         let mut uu = [0u8; 32];
         s.copy_from_slice(&scalar);
@@ -429,7 +437,8 @@ mod tests {
         let mut s = [0u8; 32];
         s.copy_from_slice(&k);
         let out = x25519(&s, &s);
-        let expected_1 = hex_to_bytes("422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079");
+        let expected_1 =
+            hex_to_bytes("422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079");
         assert_eq!(&out[..], &expected_1[..]);
     }
 
@@ -452,8 +461,14 @@ mod tests {
 
     #[test]
     fn fe_arithmetic_basic() {
-        let a = fe_frombytes(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]);
-        let b = fe_frombytes(&[32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]);
+        let a = fe_frombytes(&[
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25, 26, 27, 28, 29, 30, 31, 32,
+        ]);
+        let b = fe_frombytes(&[
+            32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11,
+            10, 9, 8, 7, 6, 5, 4, 3, 2, 1,
+        ]);
         // (a + b) - b == a
         let sum = fe_add(a, b);
         let back = fe_sub(sum, b);

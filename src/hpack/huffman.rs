@@ -376,9 +376,7 @@ mod tests {
         assert!(out.len() <= 4, "output must not grow past the cap");
         // A generous cap succeeds.
         let mut out2 = Vec::new();
-        HuffmanDecoder::new()
-            .decode(&enc, &mut out2, 1024)
-            .unwrap();
+        HuffmanDecoder::new().decode(&enc, &mut out2, 1024).unwrap();
         assert_eq!(out2, b"www.example.com");
     }
 

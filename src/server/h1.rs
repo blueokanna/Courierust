@@ -13,7 +13,11 @@ use crate::server::{Handler, ServerConfig};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 
 /// Serve HTTP/1.1 requests on `stream` until the connection closes.
-pub(crate) fn serve(stream: &ConnStream, handler: &dyn Handler, config: &ServerConfig) -> Result<()> {
+pub(crate) fn serve(
+    stream: &ConnStream,
+    handler: &dyn Handler,
+    config: &ServerConfig,
+) -> Result<()> {
     let mut reader = BufReader::new(stream, 16 * 1024);
     let mut writer = BufWriter::new(stream, 16 * 1024);
     let mut scratch = Scratch::new();
@@ -60,7 +64,8 @@ pub(crate) fn serve(stream: &ConnStream, handler: &dyn Handler, config: &ServerC
         // stream 1. An h1-only server ignores the Upgrade and answers
         // normally.
         if upgrade && config.http2 {
-            let out = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n";
+            let out =
+                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n";
             writer.write_all(out)?;
             writer.flush()?;
             drop(writer);

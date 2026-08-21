@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 3 ]]; then
-    printf 'usage: %s THROUGHPUT_LOG COMPARE_LOG OUTPUT\n' "$0" >&2
+if [[ $# -ne 4 ]]; then
+    printf 'usage: %s THROUGHPUT_LOG COMPARE_LOG INTEROP_LOG OUTPUT\n' "$0" >&2
     exit 2
 fi
 
 throughput_log=$1
 compare_log=$2
-output=$3
+interop_log=$3
+output=$4
 
 extract_lines() {
     local pattern=$1
@@ -94,9 +95,11 @@ ref=${GITHUB_REF_NAME:-local}
 runner=${RUNNER_OS:-$(uname -s)}
 throughput_status=${BENCHMARK_THROUGHPUT_EXIT:-not-recorded}
 compare_status=${BENCHMARK_COMPARE_EXIT:-not-recorded}
+interop_status=${BENCHMARK_INTEROP_EXIT:-not-recorded}
 
 throughput_results=$(extract_lines '^RESULT\|suite=throughput' "$throughput_log")
 compare_results=$(extract_lines '^(raw_tcp_floor|h1 |h2 )[^:]*:' "$compare_log")
+interop_results=$(extract_lines '^INTEROP\|' "$interop_log")
 
 {
     printf '# GitHub Action Benchmark\n\n'
@@ -108,6 +111,7 @@ compare_results=$(extract_lines '^(raw_tcp_floor|h1 |h2 )[^:]*:' "$compare_log")
     printf -- '- Runner: `%s`\n' "$runner"
     printf -- '- Throughput exit code: `%s`\n' "$throughput_status"
     printf -- '- Comparison exit code: `%s`\n' "$compare_status"
+    printf -- '- Interop exit code: `%s`\n' "$interop_status"
     if [[ -n "${GITHUB_SERVER_URL:-}" && -n "${GITHUB_REPOSITORY:-}" && -n "${GITHUB_RUN_ID:-}" ]]; then
         printf -- '- Workflow run: [%s](%s/%s/actions/runs/%s)\n' "$run_id" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
     else
@@ -124,6 +128,12 @@ compare_results=$(extract_lines '^(raw_tcp_floor|h1 |h2 )[^:]*:' "$compare_log")
     write_table "$compare_results"
     printf '\n'
 
+    printf '%s\n\n' '## Interop validation (hyper / reqwest)'
+    printf '| Case | Result |\n'
+    printf '| --- | --- |\n'
+    write_table "$interop_results"
+    printf '\n'
+
     printf '%s\n\n' '## Captured Benchmark Output'
     printf '%s\n\n' '### Throughput'
     printf '%s\n' '```text'
@@ -132,6 +142,10 @@ compare_results=$(extract_lines '^(raw_tcp_floor|h1 |h2 )[^:]*:' "$compare_log")
     printf '%s\n\n' '### Cross-library comparison'
     printf '%s\n' '```text'
     write_raw_block "$compare_log" '^(courierust vs mainstream|raw_tcp_floor|h1 |h2 )'
+    printf '%s\n' '```'
+    printf '%s\n\n' '### Interop validation'
+    printf '%s\n' '```text'
+    write_raw_block "$interop_log" '^(courierust vs mainstream|INTEROP)'
     printf '%s\n' '```'
 } > "$output"
 

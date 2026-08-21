@@ -14,25 +14,69 @@ use crate::error::{Error, Result};
 
 /// RFC 1951 length code table for codes 257..=285: (base, extra bits).
 const LENGTH_BASE: [(u16, u8); 29] = [
-    (3, 0), (4, 0), (5, 0), (6, 0), (7, 0), (8, 0), (9, 0), (10, 0), // 257-264
-    (11, 1), (13, 1), (15, 1), (17, 1), // 265-268
-    (19, 2), (23, 2), (27, 2), (31, 2), // 269-272
-    (35, 3), (43, 3), (51, 3), (59, 3), // 273-276
-    (67, 4), (83, 4), (99, 4), (115, 4), // 277-280
-    (131, 5), (163, 5), (195, 5), (227, 5), // 281-284
+    (3, 0),
+    (4, 0),
+    (5, 0),
+    (6, 0),
+    (7, 0),
+    (8, 0),
+    (9, 0),
+    (10, 0), // 257-264
+    (11, 1),
+    (13, 1),
+    (15, 1),
+    (17, 1), // 265-268
+    (19, 2),
+    (23, 2),
+    (27, 2),
+    (31, 2), // 269-272
+    (35, 3),
+    (43, 3),
+    (51, 3),
+    (59, 3), // 273-276
+    (67, 4),
+    (83, 4),
+    (99, 4),
+    (115, 4), // 277-280
+    (131, 5),
+    (163, 5),
+    (195, 5),
+    (227, 5), // 281-284
     (258, 0), // 285
 ];
 
 /// RFC 1951 distance code table for codes 0..=29: (base, extra bits).
 const DIST_BASE: [(u16, u8); 30] = [
-    (1, 0), (2, 0), (3, 0), (4, 0), // 0-3
-    (5, 1), (7, 1), (9, 2), (13, 2), // 4-7
-    (17, 3), (25, 3), (33, 4), (49, 4), // 8-11
-    (65, 5), (97, 5), (129, 6), (193, 6), // 12-15
-    (257, 7), (385, 7), (513, 8), (769, 8), // 16-19
-    (1025, 9), (1537, 9), (2049, 9), (3073, 9), // 20-23
-    (4097, 10), (6145, 10), (8193, 11), (12289, 11), // 24-27
-    (16385, 12), (24577, 12), // 28-29
+    (1, 0),
+    (2, 0),
+    (3, 0),
+    (4, 0), // 0-3
+    (5, 1),
+    (7, 1),
+    (9, 2),
+    (13, 2), // 4-7
+    (17, 3),
+    (25, 3),
+    (33, 4),
+    (49, 4), // 8-11
+    (65, 5),
+    (97, 5),
+    (129, 6),
+    (193, 6), // 12-15
+    (257, 7),
+    (385, 7),
+    (513, 8),
+    (769, 8), // 16-19
+    (1025, 9),
+    (1537, 9),
+    (2049, 9),
+    (3073, 9), // 20-23
+    (4097, 10),
+    (6145, 10),
+    (8193, 11),
+    (12289, 11), // 24-27
+    (16385, 12),
+    (24577, 12), // 28-29
 ];
 
 /// Look up the length code for a literal length in `3..=258`.
@@ -75,7 +119,11 @@ struct BitReader<'a> {
 
 impl<'a> BitReader<'a> {
     fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0, bit: 0 }
+        Self {
+            data,
+            pos: 0,
+            bit: 0,
+        }
     }
 
     fn read_bit(&mut self) -> Result<u32> {
@@ -127,7 +175,11 @@ struct BitWriter {
 
 impl BitWriter {
     fn new() -> Self {
-        Self { out: Vec::new(), acc: 0, nbits: 0 }
+        Self {
+            out: Vec::new(),
+            acc: 0,
+            nbits: 0,
+        }
     }
 
     /// Write `n` bits (the low `n` bits of `value`), LSB-first. This is
@@ -278,17 +330,17 @@ pub fn inflate(data: &[u8], max_out: usize) -> Result<Vec<u8>> {
             0 => inflate_stored(&mut br, &mut out, max_out)?,
             1 => {
                 let mut litlen = [0u8; 288];
-                for i in 0..144 {
-                    litlen[i] = 8;
+                for item in litlen.iter_mut().take(144) {
+                    *item = 8;
                 }
-                for i in 144..256 {
-                    litlen[i] = 9;
+                for item in litlen.iter_mut().take(256).skip(144) {
+                    *item = 9;
                 }
-                for i in 256..280 {
-                    litlen[i] = 7;
+                for item in litlen.iter_mut().take(280).skip(256) {
+                    *item = 7;
                 }
-                for i in 280..288 {
-                    litlen[i] = 8;
+                for item in litlen.iter_mut().skip(280) {
+                    *item = 8;
                 }
                 let dist = [5u8; 30];
                 inflate_block(&mut br, &litlen, &dist, &mut out, max_out)?;
@@ -310,7 +362,7 @@ fn inflate_stored(br: &mut BitReader, out: &mut Vec<u8>, max_out: usize) -> Resu
     if (len ^ 0xffff) != nlen {
         return Err(Error::protocol("deflate: stored block length mismatch"));
     }
-    if out.len().checked_add(len).map_or(true, |t| t > max_out) {
+    if out.len().checked_add(len).is_none_or(|t| t > max_out) {
         return Err(Error::overflow("deflate: output exceeds limit"));
     }
     if br.pos + len > br.data.len() {
@@ -364,18 +416,14 @@ fn inflate_dynamic(br: &mut BitReader, out: &mut Vec<u8>, max_out: usize) -> Res
                 if lens.len() + rep > total {
                     return Err(Error::protocol("deflate: code-length repeat overflow"));
                 }
-                for _ in 0..rep {
-                    lens.push(0);
-                }
+                lens.extend(core::iter::repeat_n(0, rep));
             }
             18 => {
                 let rep = 11 + br.read_bits(7)? as usize;
                 if lens.len() + rep > total {
                     return Err(Error::protocol("deflate: code-length repeat overflow"));
                 }
-                for _ in 0..rep {
-                    lens.push(0);
-                }
+                lens.extend(core::iter::repeat_n(0, rep));
             }
             _ => return Err(Error::protocol("deflate: invalid code-length symbol")),
         }
@@ -427,7 +475,7 @@ fn inflate_block(
             if distance == 0 || distance > out.len() {
                 return Err(Error::protocol("deflate: invalid back-reference distance"));
             }
-            if out.len().checked_add(len).map_or(true, |t| t > max_out) {
+            if out.len().checked_add(len).is_none_or(|t| t > max_out) {
                 return Err(Error::overflow("deflate: output exceeds limit"));
             }
             let start = out.len() - distance;
@@ -695,12 +743,19 @@ mod tests {
             b"a",
             b"hello world",
             b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            b"The quick brown fox jumps over the lazy dog. ".repeat(4).as_slice(),
+            b"The quick brown fox jumps over the lazy dog. "
+                .repeat(4)
+                .as_slice(),
             &(0u8..=255).collect::<Vec<u8>>()[..],
         ] {
             let c = deflate(data);
             let d = inflate(&c, 1 << 20).unwrap();
-            assert_eq!(d, data, "deflate roundtrip failed for {:?}", &data[..data.len().min(16)]);
+            assert_eq!(
+                d,
+                data,
+                "deflate roundtrip failed for {:?}",
+                &data[..data.len().min(16)]
+            );
         }
     }
 
@@ -819,10 +874,20 @@ mod tests {
             let expected = plain.as_bytes();
             // Raw DEFLATE from zlib (dynamic/stored blocks).
             let d = inflate(&hex(deflate_hex), 1 << 20).unwrap();
-            assert_eq!(&d, expected, "deflate vector mismatch for {:?}", &plain[..plain.len().min(24)]);
+            assert_eq!(
+                &d,
+                expected,
+                "deflate vector mismatch for {:?}",
+                &plain[..plain.len().min(24)]
+            );
             // gzip container from zlib.
             let g = gunzip(&hex(gzip_hex), 1 << 20).unwrap();
-            assert_eq!(&g, expected, "gzip vector mismatch for {:?}", &plain[..plain.len().min(24)]);
+            assert_eq!(
+                &g,
+                expected,
+                "gzip vector mismatch for {:?}",
+                &plain[..plain.len().min(24)]
+            );
         }
     }
 

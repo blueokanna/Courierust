@@ -40,7 +40,6 @@ impl Sequence {
         self.value += 1;
         Ok(v)
     }
-
 }
 
 /// Build the AEAD nonce: `iv XOR (0^4 || seq_be8)` (RFC 8446 §5.3).
@@ -80,7 +79,13 @@ pub(crate) fn seal_record(
     if ct_len > u16::MAX as usize {
         return Err(TlsError::Protocol("record too large".into()));
     }
-    let header = [CONTENT_APPLICATION_DATA, 0x03, 0x03, (ct_len >> 8) as u8, ct_len as u8];
+    let header = [
+        CONTENT_APPLICATION_DATA,
+        0x03,
+        0x03,
+        (ct_len >> 8) as u8,
+        ct_len as u8,
+    ];
     let encrypted = suite
         .seal(&keys.key[..suite.key_len()], &nonce, &header, &inner)
         .ok_or_else(|| TlsError::Internal("AEAD seal failed".into()))?;
@@ -109,8 +114,8 @@ pub(crate) fn open_record(
     let nonce = build_nonce(&keys.iv, seq);
     let inner = suite
         .open(&keys.key[..suite.key_len()], &nonce, header, encrypted)
-        .ok_or_else(|| TlsError::Alert {
-            level: 2, // fatal
+        .ok_or(TlsError::Alert {
+            level: 2,        // fatal
             description: 20, // bad_record_mac
         })?;
     if inner.len() < 2 {
@@ -164,8 +169,8 @@ mod tests {
             };
             let plaintext = b"hello TLS 1.3 record layer";
             for seq in 0..3u64 {
-                let rec = seal_record(suite, &keys, seq, CONTENT_HANDSHAKE, plaintext)
-                    .expect("seal");
+                let rec =
+                    seal_record(suite, &keys, seq, CONTENT_HANDSHAKE, plaintext).expect("seal");
                 let mut header = [0u8; 5];
                 header.copy_from_slice(&rec[..5]);
                 let encrypted = &rec[5..];
@@ -225,8 +230,16 @@ mod tests {
         let _ = nonce;
         let inner: Vec<u8> = vec![0x01, 0x02, 0x03, 0x00, 0x99]; // type 0x99 invalid
         let ct_len = inner.len() + 16;
-        let header = [CONTENT_APPLICATION_DATA, 0x03, 0x03, (ct_len >> 8) as u8, ct_len as u8];
-        let enc = suite.seal(&keys.key[..suite.key_len()], &iv, &header, &inner).unwrap();
+        let header = [
+            CONTENT_APPLICATION_DATA,
+            0x03,
+            0x03,
+            (ct_len >> 8) as u8,
+            ct_len as u8,
+        ];
+        let enc = suite
+            .seal(&keys.key[..suite.key_len()], &iv, &header, &inner)
+            .unwrap();
         assert!(open_record(suite, &keys, 0, &header, &enc).is_err());
     }
 }

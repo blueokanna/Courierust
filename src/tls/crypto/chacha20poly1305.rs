@@ -71,12 +71,7 @@ fn compute_tag(one_time_key: &[u8; 32], aad: &[u8], ct: &[u8]) -> [u8; TAG_LEN] 
 
 /// Open a sealed buffer (`ciphertext || tag`), verifying `aad`.
 /// Returns the plaintext, or `None` on a tag mismatch.
-pub fn open(
-    key: &[u8; 32],
-    nonce: &[u8; 12],
-    aad: &[u8],
-    sealed: &[u8],
-) -> Option<Vec<u8>> {
+pub fn open(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], sealed: &[u8]) -> Option<Vec<u8>> {
     if sealed.len() < TAG_LEN {
         return None;
     }

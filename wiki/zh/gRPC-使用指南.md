@@ -109,4 +109,4 @@ match client.call("/x.Y/Z", Bytes::from("x")) {
 - 每条消息 = `1 字节压缩标志 + 4 字节大端长度 + 负载`。
 - `grpc::frame_message(payload, false)` 帮你完成这个分帧。
 - `grpc::percent_decode(s)` 解码 `grpc-message` trailer 里百分号转义的 UTF-8。
-- `grpc::MAX_MESSAGE_SIZE`（4 MiB）是分帧层接受的单条消息大小上限。
+- `grpc::DEFAULT_MAX_MESSAGE_SIZE`（4 MiB）是分帧层接受的单条消息大小默认上限，且两端都可配置：客户端用 `GrpcClientConfig::max_message_size`，服务端用 `GrpcServer::max_message_size`。两端都会检查**未压缩**大小，因此压缩炸弹会被拒绝。

@@ -423,17 +423,12 @@ fn apply_extension(
             while q < seq.len() {
                 if let Some(e) = read_element(seq, &mut q) {
                     match e.tag {
-                        0x82 => {
-                            if let Ok(s) = core::str::from_utf8(e.content) {
-                                if !s.is_empty() {
-                                    dns_names.push(s.to_string());
-                                }
-                            }
-                        }
-                        0x87 => {
-                            if e.content.len() == 4 || e.content.len() == 16 {
-                                ip_names.push(e.content.to_vec());
-                            }
+                        0x82 => match core::str::from_utf8(e.content) {
+                            Ok(s) if !s.is_empty() => dns_names.push(s.to_string()),
+                            _ => {}
+                        },
+                        0x87 if e.content.len() == 4 || e.content.len() == 16 => {
+                            ip_names.push(e.content.to_vec());
                         }
                         _ => {}
                     }

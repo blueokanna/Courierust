@@ -79,7 +79,8 @@ fn open_idle_herd(addr: std::net::SocketAddr, n: usize) -> Vec<TcpStream> {
     let mut herd = Vec::with_capacity(n);
     for _ in 0..n {
         let mut s = TcpStream::connect(addr).unwrap();
-        s.write_all(b"GET /idle HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        s.write_all(b"GET /idle HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap();
         read_full_response(&mut s);
         herd.push(s);
     }
@@ -104,7 +105,8 @@ fn main() {
 
         // Warm the acceptor, then open the idle herd.
         let mut warm = TcpStream::connect(addr).unwrap();
-        warm.write_all(b"GET /warm HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        warm.write_all(b"GET /warm HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap();
         read_full_response(&mut warm);
         drop(warm);
 
@@ -124,18 +126,10 @@ fn main() {
         }
         samples.sort_unstable();
         let p50 = samples[reqs / 2].as_secs_f64() * 1_000_000.0;
-        let p75 = samples[(reqs as f64 * 0.75) as usize]
-            .as_secs_f64()
-            * 1_000_000.0;
-        let p90 = samples[(reqs as f64 * 0.90) as usize]
-            .as_secs_f64()
-            * 1_000_000.0;
-        let p95 = samples[(reqs as f64 * 0.95) as usize]
-            .as_secs_f64()
-            * 1_000_000.0;
-        let p99 = samples[(reqs as f64 * 0.99) as usize]
-            .as_secs_f64()
-            * 1_000_000.0;
+        let p75 = samples[(reqs as f64 * 0.75) as usize].as_secs_f64() * 1_000_000.0;
+        let p90 = samples[(reqs as f64 * 0.90) as usize].as_secs_f64() * 1_000_000.0;
+        let p95 = samples[(reqs as f64 * 0.95) as usize].as_secs_f64() * 1_000_000.0;
+        let p99 = samples[(reqs as f64 * 0.99) as usize].as_secs_f64() * 1_000_000.0;
 
         println!(
             "model={model} idle={idle} workers=2 reqs={reqs} p50_us={p50:.1} p75_us={p75:.1} p90_us={p90:.1} p95_us={p95:.1} p99_us={p99:.1}",
@@ -166,9 +160,9 @@ fn main() {
     }
     let t0 = Instant::now();
     let mut done = 0;
-    for mut s in slow.iter_mut() {
+    for s in slow.iter_mut() {
         s.write_all(b"\r\n").unwrap();
-        read_full_response(&mut s);
+        read_full_response(s);
         done += 1;
     }
     println!(

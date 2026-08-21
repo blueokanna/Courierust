@@ -1,4 +1,11 @@
 //! Shared benchmark timing and concurrency helpers.
+//!
+//! This module is compiled into every bench binary (`throughput`,
+//! `compare`, `concurrency`, `metrics`), and each binary only uses a
+//! subset of the helpers (e.g. `throughput` does not report per-request
+//! allocations). Items here are intentionally shared rather than dead.
+
+#![allow(dead_code)]
 
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
@@ -30,8 +37,8 @@ impl Timing {
         if self.samples.is_empty() {
             return None;
         }
-        let position = ((self.samples.len() - 1) as f64 * percentile.clamp(0.0, 1.0)).round()
-            as usize;
+        let position =
+            ((self.samples.len() - 1) as f64 * percentile.clamp(0.0, 1.0)).round() as usize;
         Some(self.samples[position].as_secs_f64() * 1_000_000.0)
     }
 }
@@ -41,7 +48,7 @@ fn sample_plan(requests: usize, max_samples: usize) -> (usize, usize) {
     let stride = if sample_count == 0 {
         1
     } else {
-        (requests + sample_count - 1) / sample_count
+        requests.div_ceil(sample_count)
     };
     (sample_count, stride)
 }
@@ -97,16 +104,17 @@ where
     Reset: Fn(),
     Snapshot: Fn() -> usize,
 {
-    assert!(requests > 0, "a benchmark case must have at least one request");
+    assert!(
+        requests > 0,
+        "a benchmark case must have at least one request"
+    );
     let active_workers = workers.max(1).min(requests);
     let base = requests / active_workers;
     let remainder = requests % active_workers;
     let counts: Vec<usize> = (0..active_workers)
         .map(|index| base + usize::from(index < remainder))
         .collect();
-    let jobs: Vec<Box<dyn FnMut() + Send>> = (0..active_workers)
-        .map(make_worker)
-        .collect();
+    let jobs: Vec<Box<dyn FnMut() + Send>> = (0..active_workers).map(make_worker).collect();
 
     let ready = Arc::new(Barrier::new(active_workers + 1));
     let start_line = Arc::new(Barrier::new(active_workers + 1));

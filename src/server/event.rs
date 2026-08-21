@@ -191,10 +191,7 @@ impl IncrRequest {
 
     /// Try to produce the next request. Reads from `socket` as needed
     /// (non-blocking); returns `Ok(None)` when more data is required.
-    pub(crate) fn next_request(
-        &mut self,
-        socket: &TcpStream,
-    ) -> Result<Option<Request<Body>>> {
+    pub(crate) fn next_request(&mut self, socket: &TcpStream) -> Result<Option<Request<Body>>> {
         loop {
             if let Phase::Done = self.phase {
                 return Ok(Some(self.finish_request()?));
@@ -609,7 +606,9 @@ pub(crate) fn serve_event(
 
     // Event worker threads.
     let workers = if config.event_workers == 0 {
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
     } else {
         config.event_workers
     };

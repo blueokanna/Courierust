@@ -27,9 +27,7 @@ impl Read for &TcpStream {
             // the socket timeout machinery under load. A read error never
             // consumes bytes, so treating it as "no data yet" is safe and
             // prevents spurious connection kills.
-            Err(e) if e.raw_os_error() == Some(997) => {
-                Err(Error::new(ErrorKind::WouldBlock))
-            }
+            Err(e) if e.raw_os_error() == Some(997) => Err(Error::new(ErrorKind::WouldBlock)),
             Err(e) => Err(e.into()),
         }
     }
@@ -99,7 +97,9 @@ enum ConnStreamKind {
         socket: Arc<TcpStream>,
         /// The TLS 1.3 stream. Guarded because the shared `&ConnStream`
         /// transport used by the h1/h2 codecs must reach `&mut` access.
-        tls: std::sync::Mutex<crate::tls::TlsStream<Arc<TcpStream>, Arc<TcpStream>>>,
+        /// Boxed so the `Plain` variant stays small (the TLS stream is
+        /// several hundred bytes).
+        tls: Box<std::sync::Mutex<crate::tls::TlsStream<Arc<TcpStream>, Arc<TcpStream>>>>,
     },
 }
 
@@ -131,7 +131,7 @@ impl ConnStream {
             peer,
             inner: ConnStreamKind::Tls {
                 socket,
-                tls: std::sync::Mutex::new(tls),
+                tls: Box::new(std::sync::Mutex::new(tls)),
             },
         })
     }
@@ -146,7 +146,7 @@ impl ConnStream {
             peer,
             inner: ConnStreamKind::Tls {
                 socket,
-                tls: std::sync::Mutex::new(tls),
+                tls: Box::new(std::sync::Mutex::new(tls)),
             },
         }
     }
@@ -170,8 +170,7 @@ impl ConnStream {
     pub(crate) fn peek(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         match &self.inner {
             ConnStreamKind::Plain(s) => s.peek(buf),
-            ConnStreamKind::Tls { .. } => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            ConnStreamKind::Tls { .. } => Err(std::io::Error::other(
                 "peek is not supported on TLS streams",
             )),
         }

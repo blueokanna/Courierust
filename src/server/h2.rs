@@ -263,7 +263,12 @@ fn apply_liveness(
 fn server_config(config: &ServerConfig) -> H2Config {
     let mut c = H2Config {
         client: false,
-        auto_release_credit: false, // released as the handler consumes
+        // Return receive credit to the peer as request-body DATA frames
+        // arrive (batched by `Connection::release_data`). Memory stays
+        // bounded by `ServerConfig::max_body`, which the serve loop
+        // enforces while buffering each request body. Configurable so a
+        // strict window (no automatic replenishment) can be enforced.
+        auto_release_credit: config.auto_release_credit,
         ..Default::default()
     };
     c.local_settings.max_header_list_size = config.max_header_list as u32;

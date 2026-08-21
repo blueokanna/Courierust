@@ -100,7 +100,9 @@ impl CipherSuite {
             }
             CipherSuite::TlsChaCha20Poly1305Sha256 => {
                 let k: [u8; 32] = key.try_into().ok()?;
-                Some(super::crypto::chacha20poly1305::seal(&k, nonce, aad, plaintext))
+                Some(super::crypto::chacha20poly1305::seal(
+                    &k, nonce, aad, plaintext,
+                ))
             }
         }
     }
@@ -155,12 +157,7 @@ impl Transcript {
 
 /// Derive-Secret (RFC 8446 §7.1):
 /// HKDF-Expand-Label(secret, label, transcript_hash, Hash.length).
-fn derive_secret(
-    h: SuiteHash,
-    secret: &[u8],
-    label: &[u8],
-    transcript_hash: &[u8],
-) -> Vec<u8> {
+fn derive_secret(h: SuiteHash, secret: &[u8], label: &[u8], transcript_hash: &[u8]) -> Vec<u8> {
     let mut d = h.new_digest();
     expand_label(d.as_mut(), secret, label, transcript_hash, h.hash_len())
 }
@@ -218,11 +215,7 @@ pub(crate) struct KeySchedule {
 impl KeySchedule {
     /// Compute the handshake-stage secrets from the ECDHE shared secret
     /// and the ClientHello..ServerHello transcript.
-    pub(crate) fn handshake(
-        suite: CipherSuite,
-        ecdhe: &[u8; 32],
-        transcript_hash: &[u8],
-    ) -> Self {
+    pub(crate) fn handshake(suite: CipherSuite, ecdhe: &[u8; 32], transcript_hash: &[u8]) -> Self {
         let h = suite.hash();
         // early_secret = HKDF-Extract(0, 0)  (no PSK)
         let zeros = vec![0u8; h.hash_len()];
@@ -250,10 +243,7 @@ impl KeySchedule {
 
     /// Compute the master secret and application traffic secrets after
     /// the server Finished (transcript hash up to and including it).
-    pub(crate) fn application(
-        &mut self,
-        transcript_hash: &[u8],
-    ) -> Result<(), super::TlsError> {
+    pub(crate) fn application(&mut self, transcript_hash: &[u8]) -> Result<(), super::TlsError> {
         let h = self.suite.hash();
         let empty_hash = {
             let mut d = h.new_digest();
@@ -325,9 +315,10 @@ mod tests {
     /// ECDHE = 8bd4054f..., transcript hash (CH||SH) = 860c06ed...
     #[test]
     fn rfc8448_key_schedule_sha256() {
-        let ecdhe: [u8; 32] = hex("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d")
-            .try_into()
-            .unwrap();
+        let ecdhe: [u8; 32] =
+            hex("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d")
+                .try_into()
+                .unwrap();
         let th: [u8; 32] = hex("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8")
             .try_into()
             .unwrap();
@@ -342,12 +333,16 @@ mod tests {
         );
         // The master secret is derived from the handshake secret and the
         // "derived" label (verified independently).
-        let ks = ks;
         let empty = {
             let mut d = CipherSuite::TlsAes128GcmSha256.hash().new_digest();
             d.finalize()
         };
-        let derived2 = derive_secret(CipherSuite::TlsAes128GcmSha256.hash(), ks.handshake_secret.clone().as_slice(), b"derived", &empty);
+        let derived2 = derive_secret(
+            CipherSuite::TlsAes128GcmSha256.hash(),
+            ks.handshake_secret.clone().as_slice(),
+            b"derived",
+            &empty,
+        );
         let master = hkdf_extract(
             &mut CipherSuite::TlsAes128GcmSha256.hash().new_digest(),
             &derived2,

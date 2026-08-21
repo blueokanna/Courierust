@@ -67,6 +67,13 @@ pub struct ServerConfig {
     /// (RFC 9113 §6.5.2; 0 = unlimited). Streams beyond this limit are
     /// rejected with `REFUSED_STREAM`.
     pub h2_max_concurrent_streams: u32,
+    /// h2: return receive flow-control credit to the peer as request-body
+    /// DATA frames arrive (batched by the connection). With this enabled
+    /// (the default) the peer can stream arbitrarily large request bodies
+    /// up to [`Self::max_body`]; with it disabled, the peer is limited to
+    /// the advertised window unless the application releases credit
+    /// itself.
+    pub auto_release_credit: bool,
 }
 
 impl Default for ServerConfig {
@@ -85,6 +92,7 @@ impl Default for ServerConfig {
             h2_ping_timeout: Some(Duration::from_secs(15)),
             h2_idle_timeout: Some(Duration::from_secs(300)),
             h2_max_concurrent_streams: 1024,
+            auto_release_credit: true,
         }
     }
 }

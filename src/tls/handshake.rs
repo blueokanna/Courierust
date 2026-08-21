@@ -134,8 +134,6 @@ impl<'a> Cur<'a> {
     }
 }
 
-
-
 /// A parsed extension: type + content.
 struct Ext<'a> {
     ext_type: u16,
@@ -294,13 +292,17 @@ fn parse_server_hello(body: &[u8]) -> TlsResult<ServerHelloInfo> {
         return Err(TlsError::Protocol("bad SH legacy version".into()));
     }
     let mut random = [0u8; 32];
-    random.copy_from_slice(c.take(32).ok_or_else(|| TlsError::Protocol("bad SH".into()))?);
+    random.copy_from_slice(
+        c.take(32)
+            .ok_or_else(|| TlsError::Protocol("bad SH".into()))?,
+    );
     // legacy_session_id (echoed)
     let sid_len = c.u8().ok_or_else(|| TlsError::Protocol("bad SH".into()))? as usize;
     if sid_len > 32 {
         return Err(TlsError::Protocol("bad SH session id".into()));
     }
-    c.take(sid_len).ok_or_else(|| TlsError::Protocol("bad SH".into()))?;
+    c.take(sid_len)
+        .ok_or_else(|| TlsError::Protocol("bad SH".into()))?;
     // cipher suite
     let suite_wire = c.u16().ok_or_else(|| TlsError::Protocol("bad SH".into()))?;
     let suite = CipherSuite::from_wire(suite_wire)
@@ -310,14 +312,17 @@ fn parse_server_hello(body: &[u8]) -> TlsResult<ServerHelloInfo> {
     if comp != 0 {
         return Err(TlsError::Protocol("bad SH compression".into()));
     }
-    let exts = parse_extensions(c.rest()).ok_or_else(|| TlsError::Protocol("bad SH exts".into()))?;
+    let exts =
+        parse_extensions(c.rest()).ok_or_else(|| TlsError::Protocol("bad SH exts".into()))?;
     let mut key_share = None;
     let mut saw_supported_versions = false;
     for e in exts {
         match e.ext_type {
             EXT_SUPPORTED_VERSIONS => {
                 let mut v = Cur::new(e.content);
-                let ver = v.u16().ok_or_else(|| TlsError::Protocol("bad SH ver".into()))?;
+                let ver = v
+                    .u16()
+                    .ok_or_else(|| TlsError::Protocol("bad SH ver".into()))?;
                 if ver != 0x0304 {
                     return Err(TlsError::Protocol("server does not speak TLS 1.3".into()));
                 }
@@ -325,13 +330,21 @@ fn parse_server_hello(body: &[u8]) -> TlsResult<ServerHelloInfo> {
             }
             EXT_KEY_SHARE => {
                 let mut v = Cur::new(e.content);
-                let group = v.u16().ok_or_else(|| TlsError::Protocol("bad SH ks".into()))?;
-                let klen = v.u16().ok_or_else(|| TlsError::Protocol("bad SH ks".into()))? as usize;
+                let group = v
+                    .u16()
+                    .ok_or_else(|| TlsError::Protocol("bad SH ks".into()))?;
+                let klen = v
+                    .u16()
+                    .ok_or_else(|| TlsError::Protocol("bad SH ks".into()))?
+                    as usize;
                 if group != GROUP_X25519 || klen != 32 {
                     return Err(TlsError::Protocol("unexpected key share".into()));
                 }
                 let mut k = [0u8; 32];
-                k.copy_from_slice(v.take(32).ok_or_else(|| TlsError::Protocol("bad SH ks".into()))?);
+                k.copy_from_slice(
+                    v.take(32)
+                        .ok_or_else(|| TlsError::Protocol("bad SH ks".into()))?,
+                );
                 key_share = Some(k);
             }
             _ => {}
@@ -357,11 +370,19 @@ fn parse_encrypted_extensions(body: &[u8]) -> TlsResult<Option<Vec<u8>>> {
     for e in exts {
         if e.ext_type == EXT_ALPN {
             let mut c = Cur::new(e.content);
-            let list_len = c.u16().ok_or_else(|| TlsError::Protocol("bad alpn".into()))? as usize;
-            let list = c.take(list_len).ok_or_else(|| TlsError::Protocol("bad alpn".into()))?;
+            let list_len =
+                c.u16()
+                    .ok_or_else(|| TlsError::Protocol("bad alpn".into()))? as usize;
+            let list = c
+                .take(list_len)
+                .ok_or_else(|| TlsError::Protocol("bad alpn".into()))?;
             let mut lc = Cur::new(list);
-            let plen = lc.u8().ok_or_else(|| TlsError::Protocol("bad alpn".into()))? as usize;
-            let proto = lc.take(plen).ok_or_else(|| TlsError::Protocol("bad alpn".into()))?;
+            let plen =
+                lc.u8()
+                    .ok_or_else(|| TlsError::Protocol("bad alpn".into()))? as usize;
+            let proto = lc
+                .take(plen)
+                .ok_or_else(|| TlsError::Protocol("bad alpn".into()))?;
             if !lc.done() {
                 return Err(TlsError::Protocol("bad alpn".into()));
             }
@@ -379,19 +400,33 @@ fn parse_encrypted_extensions(body: &[u8]) -> TlsResult<Option<Vec<u8>>> {
 /// DER entries (leaf first).
 fn parse_certificate_list(body: &[u8]) -> TlsResult<Vec<Vec<u8>>> {
     let mut c = Cur::new(body);
-    let ctx_len = c.u8().ok_or_else(|| TlsError::Protocol("bad cert".into()))? as usize;
-    c.take(ctx_len).ok_or_else(|| TlsError::Protocol("bad cert".into()))?;
-    let list_len = c.u24().ok_or_else(|| TlsError::Protocol("bad cert".into()))?;
-    let list = c.take(list_len).ok_or_else(|| TlsError::Protocol("bad cert".into()))?;
+    let ctx_len = c
+        .u8()
+        .ok_or_else(|| TlsError::Protocol("bad cert".into()))? as usize;
+    c.take(ctx_len)
+        .ok_or_else(|| TlsError::Protocol("bad cert".into()))?;
+    let list_len = c
+        .u24()
+        .ok_or_else(|| TlsError::Protocol("bad cert".into()))?;
+    let list = c
+        .take(list_len)
+        .ok_or_else(|| TlsError::Protocol("bad cert".into()))?;
     let mut lc = Cur::new(list);
     let mut out = Vec::new();
     while !lc.done() {
-        let cert_len = lc.u24().ok_or_else(|| TlsError::Protocol("bad cert".into()))?;
-        let cert = lc.take(cert_len).ok_or_else(|| TlsError::Protocol("bad cert".into()))?;
+        let cert_len = lc
+            .u24()
+            .ok_or_else(|| TlsError::Protocol("bad cert".into()))?;
+        let cert = lc
+            .take(cert_len)
+            .ok_or_else(|| TlsError::Protocol("bad cert".into()))?;
         out.push(cert.to_vec());
         // Skip entry extensions.
-        let ext_len = lc.u16().ok_or_else(|| TlsError::Protocol("bad cert".into()))? as usize;
-        lc.take(ext_len).ok_or_else(|| TlsError::Protocol("bad cert".into()))?;
+        let ext_len = lc
+            .u16()
+            .ok_or_else(|| TlsError::Protocol("bad cert".into()))? as usize;
+        lc.take(ext_len)
+            .ok_or_else(|| TlsError::Protocol("bad cert".into()))?;
     }
     Ok(out)
 }
@@ -409,7 +444,10 @@ fn parse_cert_verify(body: &[u8]) -> TlsResult<CertVerify> {
     let mut c = Cur::new(body);
     let scheme = c.u16().ok_or_else(|| TlsError::Protocol("bad CV".into()))?;
     let sig_len = c.u16().ok_or_else(|| TlsError::Protocol("bad CV".into()))? as usize;
-    let signature = c.take(sig_len).ok_or_else(|| TlsError::Protocol("bad CV".into()))?.to_vec();
+    let signature = c
+        .take(sig_len)
+        .ok_or_else(|| TlsError::Protocol("bad CV".into()))?
+        .to_vec();
     if !c.done() {
         return Err(TlsError::Protocol("bad CV".into()));
     }
@@ -437,9 +475,11 @@ pub(crate) fn verify_cert_verify(
     handshake_hash: &[u8],
     client: bool,
 ) -> TlsResult<()> {
-    use super::crypto::rsa::{RsaPublicKey, verify_rsa_pkcs1v15, verify_rsa_pss};
+    use super::crypto::rsa::{verify_rsa_pkcs1v15, verify_rsa_pss, RsaPublicKey};
     use super::crypto::{ecdsa, ed25519};
-    use super::x509::der::{OID_EC_PUBLIC_KEY, OID_ED25519, OID_RSA_ENCRYPTION, parse_rsa_public_key};
+    use super::x509::der::{
+        parse_rsa_public_key, OID_EC_PUBLIC_KEY, OID_ED25519, OID_RSA_ENCRYPTION,
+    };
 
     let msg = cert_verify_message(handshake_hash, client);
     let hash = {
@@ -477,7 +517,9 @@ pub(crate) fn verify_cert_verify(
         if ok {
             Ok(())
         } else {
-            Err(TlsError::Certificate("RSA signature verification failed".into()))
+            Err(TlsError::Certificate(
+                "RSA signature verification failed".into(),
+            ))
         }
     } else if spki.oid == OID_EC_PUBLIC_KEY {
         // P-256 uncompressed point: 0x04 || X(32) || Y(32)
@@ -491,11 +533,15 @@ pub(crate) fn verify_cert_verify(
         if ecdsa::verify_der(&qx, &qy, &hash, &cv.signature) {
             Ok(())
         } else {
-            Err(TlsError::Certificate("ECDSA signature verification failed".into()))
+            Err(TlsError::Certificate(
+                "ECDSA signature verification failed".into(),
+            ))
         }
     } else if spki.oid == OID_ED25519 {
         if cv.scheme != 0x0807 || spki.key.len() != 32 {
-            return Err(TlsError::Certificate("unsupported Ed25519 signature".into()));
+            return Err(TlsError::Certificate(
+                "unsupported Ed25519 signature".into(),
+            ));
         }
         let mut pk = [0u8; 32];
         pk.copy_from_slice(&spki.key);
@@ -508,7 +554,9 @@ pub(crate) fn verify_cert_verify(
         if ed25519::verify(&pk, &msg, &sig) {
             Ok(())
         } else {
-            Err(TlsError::Certificate("Ed25519 signature verification failed".into()))
+            Err(TlsError::Certificate(
+                "Ed25519 signature verification failed".into(),
+            ))
         }
     } else {
         Err(TlsError::Certificate("unknown key type".into()))
@@ -520,7 +568,11 @@ pub(crate) fn verify_cert_verify(
 // ---------------------------------------------------------------------
 
 /// Compute the Finished verify_data.
-pub(crate) fn finished_verify_data(ks: &KeySchedule, secret: &[u8], transcript_hash: &[u8]) -> Vec<u8> {
+pub(crate) fn finished_verify_data(
+    ks: &KeySchedule,
+    secret: &[u8],
+    transcript_hash: &[u8],
+) -> Vec<u8> {
     let fk = ks.finished_key(secret);
     let mut d = ks.suite().hash().new_digest();
     hmac(d.as_mut(), &fk, transcript_hash)
@@ -576,7 +628,8 @@ impl ClientHandshake {
         let mut messages = Vec::new();
         let mut rest = &plaintext[..];
         while !rest.is_empty() {
-            let m = parse_hs(rest).ok_or_else(|| TlsError::Protocol("bad handshake stream".into()))?;
+            let m =
+                parse_hs(rest).ok_or_else(|| TlsError::Protocol("bad handshake stream".into()))?;
             let total = 4 + m.body.len();
             messages.push((m.msg_type, m.body.to_vec()));
             rest = &rest[total..];
@@ -679,10 +732,7 @@ impl ClientHandshake {
         let read = ks.server_application_keys();
         Ok(HandshakeResult {
             suite: sh.suite,
-            keys: AppKeys {
-                write,
-                read,
-            },
+            keys: AppKeys { write, read },
             alpn: negotiated_alpn,
             server_name: self.server_name.clone(),
             peer_cert: Some(peer_cert_der),
@@ -784,11 +834,19 @@ impl ServerHandshake {
         cert_body.push(0); // certificate_request_context (empty)
         let mut entry_list = Vec::new();
         for c in &self.identity.cert_chain {
-            entry_list.extend_from_slice(&[(c.len() >> 16) as u8, (c.len() >> 8) as u8, c.len() as u8]);
+            entry_list.extend_from_slice(&[
+                (c.len() >> 16) as u8,
+                (c.len() >> 8) as u8,
+                c.len() as u8,
+            ]);
             entry_list.extend_from_slice(c);
             entry_list.extend_from_slice(&[0x00, 0x00]); // entry extensions
         }
-        cert_body.extend_from_slice(&[(entry_list.len() >> 16) as u8, (entry_list.len() >> 8) as u8, entry_list.len() as u8]);
+        cert_body.extend_from_slice(&[
+            (entry_list.len() >> 16) as u8,
+            (entry_list.len() >> 8) as u8,
+            entry_list.len() as u8,
+        ]);
         cert_body.extend_from_slice(&entry_list);
         let cert = encode_hs(HS_CERTIFICATE, &cert_body);
 
@@ -814,7 +872,9 @@ impl ServerHandshake {
             None => {
                 // No signing identity configured — reject (server must
                 // authenticate).
-                return Err(TlsError::Certificate("no server identity configured".into()));
+                return Err(TlsError::Certificate(
+                    "no server identity configured".into(),
+                ));
             }
         };
         transcript.update(&cv);
@@ -841,7 +901,8 @@ impl ServerHandshake {
         let c_hs_keys = ks.client_handshake_keys();
         let plaintext = io.read_encrypted_handshake(ch.suite, &c_hs_keys)?;
         // Parse the (single) Finished message.
-        let m = parse_hs(&plaintext).ok_or_else(|| TlsError::Protocol("bad client flight".into()))?;
+        let m =
+            parse_hs(&plaintext).ok_or_else(|| TlsError::Protocol("bad client flight".into()))?;
         if m.msg_type != HS_FINISHED {
             return Err(TlsError::Protocol("expected client Finished".into()));
         }
@@ -859,10 +920,7 @@ impl ServerHandshake {
         let read = ks.client_application_keys();
         Ok(HandshakeResult {
             suite: ch.suite,
-            keys: AppKeys {
-                write,
-                read,
-            },
+            keys: AppKeys { write, read },
             alpn: negotiated_alpn,
             server_name: ch.server_name,
             peer_cert: None,
@@ -883,27 +941,33 @@ fn parse_client_hello(body: &[u8]) -> TlsResult<ClientHelloInfo> {
     let mut c = Cur::new(body);
     // legacy_version
     c.u16().ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
-    c.take(32).ok_or_else(|| TlsError::Protocol("bad CH".into()))?; // random
+    c.take(32)
+        .ok_or_else(|| TlsError::Protocol("bad CH".into()))?; // random
     let sid_len = c.u8().ok_or_else(|| TlsError::Protocol("bad CH".into()))? as usize;
     if sid_len > 32 {
         return Err(TlsError::Protocol("bad CH sid".into()));
     }
-    c.take(sid_len).ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
+    c.take(sid_len)
+        .ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
     // cipher suites
     let suites_len = c.u16().ok_or_else(|| TlsError::Protocol("bad CH".into()))? as usize;
-    if suites_len < 2 || suites_len % 2 != 0 {
+    if suites_len < 2 || !suites_len.is_multiple_of(2) {
         return Err(TlsError::Protocol("bad CH suites".into()));
     }
-    let suites = c.take(suites_len).ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
+    let suites = c
+        .take(suites_len)
+        .ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
     let mut offered: Vec<u16> = Vec::new();
     for w in suites.chunks(2) {
         offered.push(u16::from_be_bytes([w[0], w[1]]));
     }
     // compression
     let comp_len = c.u8().ok_or_else(|| TlsError::Protocol("bad CH".into()))? as usize;
-    c.take(comp_len).ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
+    c.take(comp_len)
+        .ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
 
-    let exts = parse_extensions(c.rest()).ok_or_else(|| TlsError::Protocol("bad CH exts".into()))?;
+    let exts =
+        parse_extensions(c.rest()).ok_or_else(|| TlsError::Protocol("bad CH exts".into()))?;
     let mut key_share = None;
     let mut server_name = None;
     let mut client_alpn: Vec<Vec<u8>> = Vec::new();
@@ -913,7 +977,9 @@ fn parse_client_hello(body: &[u8]) -> TlsResult<ClientHelloInfo> {
             EXT_SUPPORTED_VERSIONS => {
                 let mut v = Cur::new(e.content);
                 let list_len = v.u8().ok_or_else(|| TlsError::Protocol("bad CH".into()))? as usize;
-                let list = v.take(list_len).ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
+                let list = v
+                    .take(list_len)
+                    .ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
                 if list.contains(&0x03) && list.contains(&0x04) {
                     saw_versions = true;
                 }
@@ -921,12 +987,21 @@ fn parse_client_hello(body: &[u8]) -> TlsResult<ClientHelloInfo> {
             EXT_KEY_SHARE => {
                 let mut v = Cur::new(e.content);
                 let list_len = v.u16().ok_or_else(|| TlsError::Protocol("bad CH".into()))? as usize;
-                let list = v.take(list_len).ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
+                let list = v
+                    .take(list_len)
+                    .ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
                 let mut lc = Cur::new(list);
                 while !lc.done() {
-                    let group = lc.u16().ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
-                    let klen = lc.u16().ok_or_else(|| TlsError::Protocol("bad CH".into()))? as usize;
-                    let k = lc.take(klen).ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
+                    let group = lc
+                        .u16()
+                        .ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
+                    let klen = lc
+                        .u16()
+                        .ok_or_else(|| TlsError::Protocol("bad CH".into()))?
+                        as usize;
+                    let k = lc
+                        .take(klen)
+                        .ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
                     if group == GROUP_X25519 && klen == 32 {
                         let mut ks = [0u8; 32];
                         ks.copy_from_slice(k);
@@ -937,22 +1012,31 @@ fn parse_client_hello(body: &[u8]) -> TlsResult<ClientHelloInfo> {
             EXT_ALPN => {
                 let mut v = Cur::new(e.content);
                 let list_len = v.u16().ok_or_else(|| TlsError::Protocol("bad CH".into()))? as usize;
-                let list = v.take(list_len).ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
+                let list = v
+                    .take(list_len)
+                    .ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
                 let mut lc = Cur::new(list);
                 while !lc.done() {
                     let plen = lc.u8().ok_or_else(|| TlsError::Protocol("bad CH".into()))? as usize;
-                    let p = lc.take(plen).ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
+                    let p = lc
+                        .take(plen)
+                        .ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
                     client_alpn.push(p.to_vec());
                 }
             }
             EXT_SERVER_NAME => {
                 let mut v = Cur::new(e.content);
                 let list_len = v.u16().ok_or_else(|| TlsError::Protocol("bad CH".into()))? as usize;
-                let list = v.take(list_len).ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
+                let list = v
+                    .take(list_len)
+                    .ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
                 let mut lc = Cur::new(list);
                 if let Some(typ) = lc.u8() {
                     if typ == 0 {
-                        let nlen = lc.u16().ok_or_else(|| TlsError::Protocol("bad CH".into()))? as usize;
+                        let nlen = lc
+                            .u16()
+                            .ok_or_else(|| TlsError::Protocol("bad CH".into()))?
+                            as usize;
                         if let Some(name) = lc.take(nlen) {
                             if let Ok(s) = core::str::from_utf8(name) {
                                 server_name = Some(s.to_string());
@@ -982,7 +1066,11 @@ fn parse_client_hello(body: &[u8]) -> TlsResult<ClientHelloInfo> {
 }
 
 /// Build a ServerHello (full message) for the given suite and key share.
-pub(crate) fn build_server_hello(random: &[u8; 32], key_share: &[u8; 32], suite: CipherSuite) -> Vec<u8> {
+pub(crate) fn build_server_hello(
+    random: &[u8; 32],
+    key_share: &[u8; 32],
+    suite: CipherSuite,
+) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&[0x03, 0x03]);
     body.extend_from_slice(random);

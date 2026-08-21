@@ -109,4 +109,4 @@ match client.call("/x.Y/Z", Bytes::from("x")) {
 - Each message is `1 byte compressed-flag + 4 bytes big-endian length + payload`.
 - `grpc::frame_message(payload, false)` produces that framing for you.
 - `grpc::percent_decode(s)` decodes the percent-escaped `grpc-message` trailer value.
-- `grpc::MAX_MESSAGE_SIZE` (4 MiB) caps the framing layer's accepted message size.
+- `grpc::DEFAULT_MAX_MESSAGE_SIZE` (4 MiB) is the default ceiling for a single message accepted by the framing layer, and it is configurable on both sides: `GrpcClientConfig::max_message_size` for the client and `GrpcServer::max_message_size` for the server. The uncompressed size is checked on both ends, so a compression bomb is rejected.

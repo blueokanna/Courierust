@@ -73,7 +73,8 @@ pub fn expand_label(
 ) -> Vec<u8> {
     // length(2) || label_len(1) || "tls13 " + label || context_len(1) || context
     let label_with_prefix = b"tls13 ";
-    let mut info = Vec::with_capacity(2 + 1 + label_with_prefix.len() + label.len() + 1 + context.len());
+    let mut info =
+        Vec::with_capacity(2 + 1 + label_with_prefix.len() + label.len() + 1 + context.len());
     info.extend_from_slice(&(len as u16).to_be_bytes());
     info.push((label_with_prefix.len() + label.len()) as u8);
     info.extend_from_slice(label_with_prefix);
@@ -143,8 +144,7 @@ mod tests {
         let manual_info = [
             0x00, 0x20, // length 32
             0x09, // label len
-            b't', b'l', b's', b'1', b'3', b' ', b'k', b'e', b'y',
-            0x00, // context len
+            b't', b'l', b's', b'1', b'3', b' ', b'k', b'e', b'y', 0x00, // context len
         ];
         let expected = expand(&mut d, &secret, &manual_info, 32);
         assert_eq!(out, expected);

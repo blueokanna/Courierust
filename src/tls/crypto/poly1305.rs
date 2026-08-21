@@ -28,7 +28,7 @@ impl Poly1305 {
     pub fn new(key: &[u8; 32]) -> Self {
         let r = u128::from_le_bytes(key[0..16].try_into().unwrap()) & CLAMP;
         let r = [
-            ((r >> 0) & MASK26 as u128) as u64,
+            (r & MASK26 as u128) as u64,
             ((r >> 26) & MASK26 as u128) as u64,
             ((r >> 52) & MASK26 as u128) as u64,
             ((r >> 78) & MASK26 as u128) as u64,
@@ -195,16 +195,16 @@ impl Poly1305 {
         let w3 = ((h3 >> 18) | (h4 << 8)) & 0xffff_ffff;
 
         // tag = (h + s) mod 2^128.
-        let mut f = w0 as u64 + self.s[0] as u64;
+        let mut f = w0 + self.s[0] as u64;
         let w0 = (f & 0xffff_ffff) as u32;
         let c = f >> 32;
-        f = w1 as u64 + self.s[1] as u64 + c;
+        f = w1 + self.s[1] as u64 + c;
         let w1 = (f & 0xffff_ffff) as u32;
         let c = f >> 32;
-        f = w2 as u64 + self.s[2] as u64 + c;
+        f = w2 + self.s[2] as u64 + c;
         let w2 = (f & 0xffff_ffff) as u32;
         let c = f >> 32;
-        f = w3 as u64 + self.s[3] as u64 + c;
+        f = w3 + self.s[3] as u64 + c;
         let w3 = (f & 0xffff_ffff) as u32;
 
         let mut tag = [0u8; 16];

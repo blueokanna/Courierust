@@ -264,10 +264,30 @@ cargo bench --manifest-path benches/Cargo.toml --bench concurrency
 
 Every `RESULT|...` line carries `p50_us` … `p99_us`, and the report script (`scripts/generate_benchmark_report.sh`) turns them into a percentile table. These are loopback measurements; WAN / TLS / real-handler numbers depend on your deployment, which is exactly why the suite reports the full tail rather than a single mean.
 
+## Interop evidence
+
+The `benches` workspace also ships a dedicated **interop validation** suite
+(`cargo bench --manifest-path benches/Cargo.toml --bench interop`) that runs
+Courierust against the mainstream Rust HTTP stack over real sockets and
+asserts correct semantics — not just performance:
+
+- Courierust h1/h2c **client** → hyper h1/h2 **server**: path echo, POST
+  echo, keep-alive reuse, and h2 multiplexing (concurrent requests with
+  distinct paths must not be cross-wired);
+- hyper-util h1/h2c **client** → Courierust **server**, and reqwest
+  (blocking, h1 and h2c prior knowledge) → Courierust **server**;
+- 1 MiB request/response round-trips over h2c against a real hyper server
+  (flow-control window replenishment on both directions) and a slow-reader
+  sanity check.
+
+This runs in CI on every PR (`benchmark.yml`), so a real interop regression
+fails the pipeline. The mainstream crates are dev-only dependencies of the
+bench workspace; the `courierust` library itself stays zero-dependency.
+
 ## Tests
 
 - 115 unit tests: all HPACK RFC vectors (C.2/C.3/C.4/C.6), Huffman encode/decode (plus a decode output cap), frame codec, state machine, flow control, WUCS scheduling, JA3/JA4 comparison against published records, fingerprint parsing, TLS 1.3 handshake + RFC 8448 key schedule, X.25519/Ed25519/ECDSA/RSA primitives, and the DEFLATE/gzip codec (round-trips, CRC-32 vectors, corruption rejection, output-cap enforcement, and cross-checked against Python zlib output).
-- 36 integration tests: real loopback TCP round trips for h1/h2/HTTPS, keep-alive reuse, chunked, redirects, h2 concurrent multiplexing, streaming responses, gRPC unary/server/client/bidi streaming + error status + trailers + deadline enforcement + gzip round-trip, `grpc.health.v1.Health` `Check` + `Watch`, RFC 7540 §3.2 `h2c` Upgrade, TLS trust rejection + malformed-TLS-input survival, ALPN agreement enforcement, and two concurrency proofs (a slow stream does not block its connection's other streams; many idle streams consume one worker, not one per stream).
+- 37 integration tests: real loopback TCP round trips for h1/h2/HTTPS, keep-alive reuse, chunked, redirects, h2 concurrent multiplexing, streaming responses, large-body flow-control round trips, gRPC unary/server/client/bidi streaming + error status + trailers + deadline enforcement + gzip round-trip, `grpc.health.v1.Health` `Check` + `Watch`, RFC 7540 §3.2 `h2c` Upgrade, TLS trust rejection + malformed-TLS-input survival, ALPN agreement enforcement, and two concurrency proofs (a slow stream does not block its connection's other streams; many idle streams consume one worker, not one per stream).
 - 30 hardening tests: hostile-frame inputs (oversized frames, malformed SETTINGS/PING/WINDOW_UPDATE, flow-control window overflow, HPACK header-list and Huffman bombs, truncated/EOS Huffman, pseudo-header ordering, `content-length` mismatches, forbidden `transfer-encoding`/`connection`-specific headers, `SETTINGS_MAX_CONCURRENT_STREAMS` enforcement on both ends, `h2c` liveness: SETTINGS_TIMEOUT and keepalive dead-peer detection).
 
 ```bash

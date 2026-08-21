@@ -56,12 +56,8 @@ impl ChaCha20 {
         state[2] = 0x7962_2d32;
         state[3] = 0x6b20_6574;
         for i in 0..8 {
-            state[4 + i] = u32::from_le_bytes([
-                key[i * 4],
-                key[i * 4 + 1],
-                key[i * 4 + 2],
-                key[i * 4 + 3],
-            ]);
+            state[4 + i] =
+                u32::from_le_bytes([key[i * 4], key[i * 4 + 1], key[i * 4 + 2], key[i * 4 + 3]]);
         }
         state[12] = 0; // counter
         for i in 0..3 {
@@ -117,7 +113,9 @@ mod tests {
             0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
             0x1c, 0x1d, 0x1e, 0x1f,
         ];
-        let nonce = [0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x4a, 0x00, 0x00, 0x00, 0x00];
+        let nonce = [
+            0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x4a, 0x00, 0x00, 0x00, 0x00,
+        ];
         let chacha = ChaCha20::new(&key, &nonce);
         let mut block = [0u8; 64];
         chacha.block_at(1, &mut block);

@@ -603,11 +603,14 @@ impl<R: Read, W: Write> Connection<R, W> {
             return Err(Error::canceled("stream not writable"));
         }
         stream.send_done = true;
-        self.send_queue.entry(stream_id).or_default().push_back(Chunk {
-            data: Bytes::new(),
-            end_stream: true,
-            trailers: Some(fields.clone()),
-        });
+        self.send_queue
+            .entry(stream_id)
+            .or_default()
+            .push_back(Chunk {
+                data: Bytes::new(),
+                end_stream: true,
+                trailers: Some(fields.clone()),
+            });
         self.maybe_schedule(stream_id);
         Ok(())
     }
@@ -668,14 +671,24 @@ impl<R: Read, W: Write> Connection<R, W> {
     /// WINDOW_UPDATE frames.
     pub fn release_data(&mut self, stream_id: u32, n: usize) {
         let n = n as i64;
+        // Batch credit back at half-window granularity so the local
+        // window is never exhausted between receiving data and emitting
+        // the WINDOW_UPDATE (a single max-size frame must always fit).
         let stream_release_threshold = (self.local.initial_window_size as i64 / 2).max(16 * 1024);
         let mut emit_stream = 0i64;
         if let Some(s) = self.streams.get_mut(&stream_id) {
-            s.recv_window = s.recv_window.saturating_add(n);
-            s.recv_unreleased = s.recv_unreleased.saturating_sub(n).max(0);
+            // `recv_unreleased` was incremented by the DATA handler; grant
+            // the peer credit back in batches and reflect it in the local
+            // window only when the WINDOW_UPDATE is actually emitted, so
+            // `recv_window` stays the real enforcement limit (RFC 9113
+            // §6.9).
             if s.recv_unreleased >= stream_release_threshold {
                 emit_stream = s.recv_unreleased;
                 s.recv_unreleased = 0;
+                s.recv_window = s
+                    .recv_window
+                    .saturating_add(emit_stream)
+                    .min(MAX_FLOW_WINDOW);
             }
         }
         if emit_stream > 0 {
@@ -684,12 +697,13 @@ impl<R: Read, W: Write> Connection<R, W> {
                 increment: emit_stream.min(i64::from(u32::MAX)) as u32,
             });
         }
-        self.conn_recv_window.release(n);
+        // Connection-level credit, batched at half the 64 KiB window.
         self.conn_pending_release += n;
-        let conn_threshold = 65535i64;
+        let conn_threshold = 32 * 1024i64;
         if self.conn_pending_release >= conn_threshold {
             let inc = self.conn_pending_release.min(i64::from(u32::MAX)) as u32;
             self.conn_pending_release = 0;
+            self.conn_recv_window.release(inc as i64);
             self.pending_frames.push_back(Frame::WindowUpdate {
                 stream_id: 0,
                 increment: inc,
@@ -1102,10 +1116,8 @@ impl<R: Read, W: Write> Connection<R, W> {
                         // RFC 9113 §6.5.3: a SETTINGS ACK must not carry a
                         // payload. Frame parsing already rejects non-empty
                         // ACK payloads at length 0, but defend again here.
-                        return self.conn_error(
-                            ErrorCode::FrameSizeError,
-                            "SETTINGS ACK with payload",
-                        );
+                        return self
+                            .conn_error(ErrorCode::FrameSizeError, "SETTINGS ACK with payload");
                     }
                     self.settings_ack_pending = false;
                     Ok(())
@@ -1417,7 +1429,7 @@ impl<R: Read, W: Write> Connection<R, W> {
             end_stream: p.end_stream,
             priority,
         });
-        if self.streams.get(&sid).map_or(false, |s| s.is_closed()) {
+        if self.streams.get(&sid).is_some_and(|s| s.is_closed()) {
             self.events
                 .push_back(Event::StreamClosed { stream_id: sid });
             self.close_stream(sid);
@@ -1458,7 +1470,11 @@ impl<R: Read, W: Write> Connection<R, W> {
                 // a request-smuggling vector if forwarded (CWE-444).
                 if matches!(
                     n,
-                    "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding" | "upgrade"
+                    "connection"
+                        | "keep-alive"
+                        | "proxy-connection"
+                        | "transfer-encoding"
+                        | "upgrade"
                 ) {
                     return self.conn_error(
                         ErrorCode::ProtocolError,
@@ -1470,21 +1486,14 @@ impl<R: Read, W: Write> Connection<R, W> {
                 if n == "te" {
                     let v = f.value.to_str().unwrap_or("");
                     if !v.eq_ignore_ascii_case("trailers") {
-                        return self.conn_error(
-                            ErrorCode::ProtocolError,
-                            "TE header must be 'trailers'",
-                        );
+                        return self
+                            .conn_error(ErrorCode::ProtocolError, "TE header must be 'trailers'");
                     }
                 }
                 // RFC 9113 §8.1: framing fields must not appear in
                 // trailers (content-length smuggling vector).
-                if is_trailer
-                    && matches!(n, "content-length" | "host" | "trailer" | "te")
-                {
-                    return self.conn_error(
-                        ErrorCode::ProtocolError,
-                        "framing field in trailers",
-                    );
+                if is_trailer && matches!(n, "content-length" | "host" | "trailer" | "te") {
+                    return self.conn_error(ErrorCode::ProtocolError, "framing field in trailers");
                 }
                 continue;
             }
@@ -1561,10 +1570,8 @@ impl<R: Read, W: Write> Connection<R, W> {
                     );
                 }
                 if !has_authority {
-                    return self.conn_error(
-                        ErrorCode::ProtocolError,
-                        "CONNECT requires :authority",
-                    );
+                    return self
+                        .conn_error(ErrorCode::ProtocolError, "CONNECT requires :authority");
                 }
             } else {
                 if method.is_none() {
@@ -1721,11 +1728,16 @@ impl<R: Read, W: Write> Connection<R, W> {
         });
         self.events
             .push_back(Event::PeerSettings(self.peer.clone()));
-        // Reschedule streams whose send window grew.
+        // Reschedule streams whose send window grew. `can_send()` is not
+        // the right filter here: it is false once `send_done` is set,
+        // which happens when the final chunk is *queued* (END_STREAM)
+        // while its bytes are still buffered. A stream is schedulable
+        // whenever it still has buffered data (RFC 9113 §5.2: flow
+        // control applies to the queued bytes).
         let ids: Vec<u32> = self
             .streams
             .iter()
-            .filter(|s| s.can_send())
+            .filter(|s| s.send_buffered > 0)
             .map(|s| s.id)
             .collect();
         for id in ids {
@@ -1739,10 +1751,13 @@ impl<R: Read, W: Write> Connection<R, W> {
             if !self.conn_send_window.increase(increment) {
                 return self.conn_error(ErrorCode::FlowControlError, "connection window overflow");
             }
+            // Re-schedule streams with buffered data (see the comment in
+            // `on_settings`: `can_send()` would wrongly exclude streams
+            // whose END_STREAM chunk is queued behind buffered bytes).
             let ids: Vec<u32> = self
                 .streams
                 .iter()
-                .filter(|s| s.can_send())
+                .filter(|s| s.send_buffered > 0)
                 .map(|s| s.id)
                 .collect();
             for id in ids {
@@ -1816,10 +1831,9 @@ impl<R: Read, W: Write> Connection<R, W> {
             match value {
                 None => value = Some(n),
                 Some(prev) if prev != n => {
-                    return Err(self.protocol_err(
-                        ErrorCode::ProtocolError,
-                        "conflicting content-length",
-                    ))
+                    return Err(
+                        self.protocol_err(ErrorCode::ProtocolError, "conflicting content-length")
+                    )
                 }
                 _ => {}
             }
@@ -1837,7 +1851,7 @@ impl<R: Read, W: Write> Connection<R, W> {
                 Some(expected) => s.recv_body_len != expected,
                 None => false,
             },
-            Some(s) => s.content_length.map_or(false, |c| c != 0),
+            Some(s) => s.content_length.is_some_and(|c| c != 0),
             None => false,
         };
         if bad {

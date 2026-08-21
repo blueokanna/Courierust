@@ -294,9 +294,7 @@ fn hyper_server(http2: bool) -> std::net::SocketAddr {
                 };
                 let io = TokioIo::new(stream);
                 let svc = service_fn(|_req: hyper::Request<Incoming>| async {
-                    Ok::<_, Infallible>(hyper::Response::new(Full::new(Bytes::from_static(
-                        b"ok",
-                    ))))
+                    Ok::<_, Infallible>(hyper::Response::new(Full::new(Bytes::from_static(b"ok"))))
                 });
                 let builder = if http2 {
                     AutoBuilder::new(TokioExecutor::new()).http2_only()

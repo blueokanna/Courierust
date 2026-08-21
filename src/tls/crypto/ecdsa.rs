@@ -134,7 +134,12 @@ fn fe_mul(a: Fe, b: Fe) -> Fe {
 /// 2^256 ≡ 2^224 - 2^192 - 2^96 + 1 (mod p).
 fn reduce8(mut t: [u64; 8]) -> Fe {
     // c = 2^224 - 2^192 - 2^96 + 1 = 2^256 - p, as 4 LE limbs.
-    const C: [u64; 4] = [1, 0xffff_ffff_0000_0000, 0xffff_ffff_ffff_ffff, 0x0000_0000_ffff_fffe];
+    const C: [u64; 4] = [
+        1,
+        0xffff_ffff_0000_0000,
+        0xffff_ffff_ffff_ffff,
+        0x0000_0000_ffff_fffe,
+    ];
     for _ in 0..16 {
         let hi = [t[4], t[5], t[6], t[7]];
         if hi == [0; 4] {
@@ -252,10 +257,7 @@ fn point_double(p: Point) -> Point {
     // E = 3·A + a·Z^4 with a = -3: 3·(A - Z^4).
     let z1_2 = fe_sq(p.z);
     let z1_4 = fe_sq(z1_2);
-    let three_a = fe_sub(
-        fe_add(fe_add(a, a), a),
-        fe_add(fe_add(z1_4, z1_4), z1_4),
-    );
+    let three_a = fe_sub(fe_add(fe_add(a, a), a), fe_add(fe_add(z1_4, z1_4), z1_4));
     let f = fe_sq(three_a);
     let x3 = fe_sub(f, fe_add(d, d));
     let mut c8 = fe_add(c, c);
@@ -400,10 +402,7 @@ pub fn verify_raw(qx: &[u8; 32], qy: &[u8; 32], digest: &[u8], r: &[u8; 32], s: 
 /// ECDSA P-256 signing (RFC 6979 §3.2 style): returns `(r, s)` as
 /// 32-byte big-endian values. `d` is the 32-byte private scalar and
 /// `digest` the 32-byte message digest.
-pub(crate) fn sign(
-    d: &[u8; 32],
-    digest: &[u8; 32],
-) -> Option<(Vec<u8>, Vec<u8>)> {
+pub(crate) fn sign(d: &[u8; 32], digest: &[u8; 32]) -> Option<(Vec<u8>, Vec<u8>)> {
     let n = BigInt::from_le_limbs(&N);
     let one = BigInt::from_u64(1);
     let d_int = BigInt::from_be_bytes(d);
@@ -425,10 +424,7 @@ pub(crate) fn sign(
         z: FE_ONE,
     };
     let kg = scalar_mult(g, &k);
-    let x1 = match affine_x(kg) {
-        Some(x) => x,
-        None => return None,
-    };
+    let x1 = affine_x(kg)?;
     let r = BigInt::from_be_bytes(&be(x1)).rem(&n);
     if r.is_zero() {
         return None;
@@ -641,12 +637,7 @@ mod tests {
     #[test]
     fn field_reduction_properties() {
         // p - 1 + 1 == 0 mod p.
-        let p_minus_1: Fe = [
-            P[0] - 1,
-            P[1],
-            P[2],
-            P[3],
-        ];
+        let p_minus_1: Fe = [P[0] - 1, P[1], P[2], P[3]];
         let sum = fe_add(p_minus_1, FE_ONE);
         assert_eq!(sum, FE_ZERO);
         // p - 1 - (p - 1) == 0.
@@ -664,12 +655,8 @@ mod tests {
     fn ecdsa_rfc6979_vector() {
         // A well-known ECDSA P-256 test vector (RFC 6979 §A.2.5,
         // SHA-256, k = 0x... first case) — public key and signature.
-        let qx = hex(
-            "60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6",
-        );
-        let qy = hex(
-            "7903FE1008B8BC99A41AE9E95628BC64F2F1B20C2D7E9F5177A3C294D4462299",
-        );
+        let qx = hex("60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6");
+        let qy = hex("7903FE1008B8BC99A41AE9E95628BC64F2F1B20C2D7E9F5177A3C294D4462299");
         let msg = b"sample";
         // Message hash (SHA-256 of "sample").
         let digest = {

@@ -239,10 +239,8 @@ fn driver(
         // A deferred command still counts as work: the only way a stream
         // slot frees is by polling (streams closing), so the driver must
         // not park in recv_timeout while one is pending.
-        let has_work = got_cmd
-            || !deferred.is_empty()
-            || !pending.is_empty()
-            || !stream_bodies.is_empty();
+        let has_work =
+            got_cmd || !deferred.is_empty() || !pending.is_empty() || !stream_bodies.is_empty();
         if has_work {
             match conn.poll() {
                 Ok(true) => last_rx = std::time::Instant::now(),
@@ -1001,7 +999,7 @@ fn parse_head_headers(head: &[u8]) -> Result<(StatusCode, Version, HeaderMap)> {
 /// RFC 4648 base64url (no padding).
 pub(crate) fn base64url_encode(data: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0];
         let b1 = chunk.get(1).copied().unwrap_or(0);

@@ -660,11 +660,7 @@ pub trait StreamingService: Send + Sync + 'static {
 
 impl<F> StreamingService for F
 where
-    F: Fn(
-            &str,
-            &mut dyn Iterator<Item = Result<Bytes>>,
-            &crate::body::BodySender,
-        ) -> Result<()>
+    F: Fn(&str, &mut dyn Iterator<Item = Result<Bytes>>, &crate::body::BodySender) -> Result<()>
         + Send
         + Sync
         + 'static,
@@ -775,7 +771,7 @@ impl StreamingService for UnaryAdapter {
         let req = reqs.next().transpose()?.unwrap_or_default();
         let resp = self.0.call(method, req)?;
         // Raw message; the handler's framing thread adds the gRPC frame.
-        tx.send(Bytes::from(resp))?;
+        tx.send(resp)?;
         Ok(())
     }
 }
@@ -819,9 +815,9 @@ impl Deadline {
         let Some(v) = headers.get("grpc-timeout") else {
             return Ok(Self(None));
         };
-        let s = v.to_str().map_err(|_| {
-            Error::grpc(status::INVALID_ARGUMENT, "malformed grpc-timeout value")
-        })?;
+        let s = v
+            .to_str()
+            .map_err(|_| Error::grpc(status::INVALID_ARGUMENT, "malformed grpc-timeout value"))?;
         if s.len() < 2 {
             return Err(Error::grpc(
                 status::INVALID_ARGUMENT,
@@ -1017,10 +1013,7 @@ impl Handler for GrpcHandler {
                 }));
                 let mapped = match outcome {
                     Ok(r) => r,
-                    Err(_) => Err((
-                        status::INTERNAL,
-                        "service handler panicked".to_string(),
-                    )),
+                    Err(_) => Err((status::INTERNAL, "service handler panicked".to_string())),
                 };
                 let _ = result_tx.send(mapped);
                 // Dropping `started_tx3` (and, on the way out, the
@@ -1040,9 +1033,7 @@ impl Handler for GrpcHandler {
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                         WaitOutcome::DeadlineExceeded
                     }
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        WaitOutcome::Finished
-                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => WaitOutcome::Finished,
                 }
             }
             None => {

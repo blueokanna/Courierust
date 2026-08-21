@@ -134,22 +134,10 @@ fn bench_h1_sequential(payload: Payload, requests: usize, server_threads: usize)
         || {},
         || 0,
     );
-    print_result(
-        "h1_sequential",
-        "h1",
-        "sequential",
-        payload,
-        1,
-        timing,
-    );
+    print_result("h1_sequential", "h1", "sequential", payload, 1, timing);
 }
 
-fn bench_h1_parallel(
-    payload: Payload,
-    requests: usize,
-    workers: usize,
-    server_threads: usize,
-) {
+fn bench_h1_parallel(payload: Payload, requests: usize, workers: usize, server_threads: usize) {
     let address = spawn_server(payload_bytes(payload), false, server_threads);
     let base_url = Arc::new(format!("http://{address}"));
     let clients = Arc::new((0..workers).map(|_| Client::new()).collect::<Vec<_>>());
@@ -180,12 +168,7 @@ fn bench_h1_parallel(
     );
 }
 
-fn bench_h2_multiplex(
-    payload: Payload,
-    requests: usize,
-    workers: usize,
-    server_threads: usize,
-) {
+fn bench_h2_multiplex(payload: Payload, requests: usize, workers: usize, server_threads: usize) {
     let address = spawn_server(payload_bytes(payload), true, server_threads);
     let base_url = Arc::new(format!("http://{address}"));
     let client = Client::with_config(ClientConfig {
@@ -286,9 +269,10 @@ fn load_test_identity() -> (crate_tls::Identity, crate_tls::RootStore) {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     let cert_path = std::path::Path::new(&manifest).join("../tests/certs/server_cert.der");
     let key_path = std::path::Path::new(&manifest).join("../tests/certs/server_key.der");
-    let cert = std::fs::read(&cert_path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", cert_path.display()));
-    let key = std::fs::read(&key_path).unwrap_or_else(|e| panic!("read {}: {e}", key_path.display()));
+    let cert =
+        std::fs::read(&cert_path).unwrap_or_else(|e| panic!("read {}: {e}", cert_path.display()));
+    let key =
+        std::fs::read(&key_path).unwrap_or_else(|e| panic!("read {}: {e}", key_path.display()));
     let identity = crate_tls::Identity {
         cert_chain: vec![cert.clone()],
         private_key: key,
@@ -303,8 +287,8 @@ fn load_test_identity() -> (crate_tls::Identity, crate_tls::RootStore) {
 /// crate's own TLS stack — the "real protocol, real crypto" case that
 /// loopback h2c benchmarks cannot speak to.
 fn bench_https(requests: usize, payload: Payload, server_threads: usize) {
-    use courierust::server::TlsSettings as ServerTls;
     use courierust::client::TlsSettings as ClientTls;
+    use courierust::server::TlsSettings as ServerTls;
 
     let (identity, roots) = load_test_identity();
     let body = payload_bytes(payload);

@@ -5,6 +5,13 @@
 //! the PEM originals and `scripts/` docs):
 //!   subject/issuer = CN=localhost, SAN = DNS:localhost, IP:127.0.0.1,
 //!   valid 2026-08-20 .. 2036-08-17, key = Ed25519.
+//!
+//! Each integration-test binary includes this module as its own copy, and
+//! a helper used by only one binary would otherwise trip `dead_code`
+//! under CI's `-D warnings`. Items here are pub for cross-binary reuse,
+//! not for external consumption.
+
+#![allow(dead_code)]
 
 /// DER-encoded self-signed certificate (CN=localhost).
 pub const SERVER_CERT_DER: &[u8] = &[

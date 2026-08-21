@@ -43,11 +43,11 @@ pub struct Aes {
 
 impl Aes {
     /// Expand `key` (16 or 32 bytes) into a round-key schedule.
-    pub fn new(key: &[u8]) -> Result<Self, ()> {
+    pub fn new(key: &[u8]) -> Option<Self> {
         let nk = match key.len() {
             16 => 4,
             32 => 8,
-            _ => return Err(()),
+            _ => return None,
         };
         let nr = nk + 6; // 10 for 128, 14 for 256
         let mut w: alloc::vec::Vec<[u8; 4]> = alloc::vec::Vec::with_capacity(nk * (nr + 1));
@@ -59,10 +59,20 @@ impl Aes {
         for i in nk..nk * (nr + 1) {
             let mut temp = w[i - 1];
             if i % nk == 0 {
-                temp = [SBOX[temp[1] as usize], SBOX[temp[2] as usize], SBOX[temp[3] as usize], SBOX[temp[0] as usize]];
+                temp = [
+                    SBOX[temp[1] as usize],
+                    SBOX[temp[2] as usize],
+                    SBOX[temp[3] as usize],
+                    SBOX[temp[0] as usize],
+                ];
                 temp[0] ^= RCON[(i / nk - 1) % RCON.len()];
             } else if nk > 6 && i % nk == 4 {
-                temp = [SBOX[temp[0] as usize], SBOX[temp[1] as usize], SBOX[temp[2] as usize], SBOX[temp[3] as usize]];
+                temp = [
+                    SBOX[temp[0] as usize],
+                    SBOX[temp[1] as usize],
+                    SBOX[temp[2] as usize],
+                    SBOX[temp[3] as usize],
+                ];
             }
             let prev = w[i - nk];
             w.push([
@@ -80,7 +90,7 @@ impl Aes {
             }
             round_keys.push(block);
         }
-        Ok(Self { round_keys })
+        Some(Self { round_keys })
     }
 
     /// Encrypt one 16-byte block in place.
@@ -183,22 +193,22 @@ mod tests {
         assert_eq!(
             &aes.round_keys[1][..],
             &[
-                0xd6, 0xaa, 0x74, 0xfd, 0xd2, 0xaf, 0x72, 0xfa, 0xda, 0xa6, 0x78, 0xf1, 0xd6,
-                0xab, 0x76, 0xfe,
+                0xd6, 0xaa, 0x74, 0xfd, 0xd2, 0xaf, 0x72, 0xfa, 0xda, 0xa6, 0x78, 0xf1, 0xd6, 0xab,
+                0x76, 0xfe,
             ][..]
         );
         assert_eq!(
             &aes.round_keys[2][..],
             &[
-                0xb6, 0x92, 0xcf, 0x0b, 0x64, 0x3d, 0xbd, 0xf1, 0xbe, 0x9b, 0xc5, 0x00, 0x68,
-                0x30, 0xb3, 0xfe,
+                0xb6, 0x92, 0xcf, 0x0b, 0x64, 0x3d, 0xbd, 0xf1, 0xbe, 0x9b, 0xc5, 0x00, 0x68, 0x30,
+                0xb3, 0xfe,
             ][..]
         );
         assert_eq!(
             &aes.round_keys[3][..],
             &[
-                0xb6, 0xff, 0x74, 0x4e, 0xd2, 0xc2, 0xc9, 0xbf, 0x6c, 0x59, 0x0c, 0xbf, 0x04,
-                0x69, 0xbf, 0x41,
+                0xb6, 0xff, 0x74, 0x4e, 0xd2, 0xc2, 0xc9, 0xbf, 0x6c, 0x59, 0x0c, 0xbf, 0x04, 0x69,
+                0xbf, 0x41,
             ][..]
         );
     }
@@ -216,15 +226,15 @@ mod tests {
         assert_eq!(
             &aes.round_keys[2][..],
             &[
-                0xa5, 0x73, 0xc2, 0x9f, 0xa1, 0x76, 0xc4, 0x98, 0xa9, 0x7f, 0xce, 0x93, 0xa5,
-                0x72, 0xc0, 0x9c,
+                0xa5, 0x73, 0xc2, 0x9f, 0xa1, 0x76, 0xc4, 0x98, 0xa9, 0x7f, 0xce, 0x93, 0xa5, 0x72,
+                0xc0, 0x9c,
             ][..]
         );
         assert_eq!(
             &aes.round_keys[3][..],
             &[
-                0x16, 0x51, 0xa8, 0xcd, 0x02, 0x44, 0xbe, 0xda, 0x1a, 0x5d, 0xa4, 0xc1, 0x06,
-                0x40, 0xba, 0xde,
+                0x16, 0x51, 0xa8, 0xcd, 0x02, 0x44, 0xbe, 0xda, 0x1a, 0x5d, 0xa4, 0xc1, 0x06, 0x40,
+                0xba, 0xde,
             ][..]
         );
     }

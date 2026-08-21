@@ -261,10 +261,20 @@ cargo bench --manifest-path benches/Cargo.toml --bench concurrency
 
 每条 `RESULT|...` 都带 `p50_us` … `p99_us`，报告脚本（`scripts/generate_benchmark_report.sh`）可生成分位表。这些是 loopback 测量；WAN / TLS / 真实 handler 的数字取决于你的部署——这正是套件要报完整尾部而非单一均值的原因。
 
+## 互操作证据
+
+`benches` 工作区还附带一套专门的**互操作验证**（`cargo bench --manifest-path benches/Cargo.toml --bench interop`）：在真实 socket 上让 Courierust 与主流 Rust HTTP 栈互通并断言语义正确（而非只测性能）：
+
+- Courierust h1/h2c **客户端** → hyper h1/h2 **服务端**：路径回显、POST 回显、keep-alive 复用、h2 多路复用（并发不同路径不得串线）；
+- hyper-util h1/h2c **客户端** → Courierust **服务端**，以及 reqwest（blocking，h1 与 h2c prior knowledge）→ Courierust **服务端**；
+- 对真实 hyper 服务端的 1 MiB 请求/响应往返（双向流控窗口补充）与慢读 sanity 检查。
+
+该套件在每个 PR 的 CI（`benchmark.yml`）中运行，真实互操作回归会让流水线失败。主流 crate 仅是 bench 工作区的 dev 依赖；`courierust` 库本身保持零依赖。
+
 ## 测试
 
 - 单元测试 115 个：覆盖 HPACK 全部 RFC 向量（C.2/C.3/C.4/C.6）、Huffman 编解码（含解码输出上限）、帧编解码、状态机、流控、WUCS 调度、JA3/JA4 公开记录比对、指纹解析、TLS 1.3 握手与 RFC 8448 密钥调度、X.25519/Ed25519/ECDSA/RSA 原语，以及 DEFLATE/gzip 编解码（往返、CRC-32 向量、损坏拒绝、输出上限、与 Python zlib 输出交叉验证）。
-- 集成测试 36 个：真实 TCP 环回上的 h1/h2/HTTPS 请求往返、keep-alive 复用、chunked、重定向、h2 并发多路复用、流式响应、gRPC unary/服务端流/客户端流/双向流与错误状态/trailers/deadline 执行、gzip 往返、`grpc.health.v1.Health` `Check` + `Watch`、RFC 7540 §3.2 `h2c` Upgrade、TLS 信任拒绝 + 畸形 TLS 输入存活、ALPN 一致强制，以及两个并发证明（慢流不阻塞同连接其他流；大量空闲流按连接而非按流占 worker）。
+- 集成测试 37 个：真实 TCP 环回上的 h1/h2/HTTPS 请求往返、keep-alive 复用、chunked、重定向、h2 并发多路复用、流式响应、大体积流控往返、gRPC unary/服务端流/客户端流/双向流与错误状态/trailers/deadline 执行、gzip 往返、`grpc.health.v1.Health` `Check` + `Watch`、RFC 7540 §3.2 `h2c` Upgrade、TLS 信任拒绝 + 畸形 TLS 输入存活、ALPN 一致强制，以及两个并发证明（慢流不阻塞同连接其他流；大量空闲流按连接而非按流占 worker）。
 - 加固测试 30 个：恶意帧输入（超长帧、畸形 SETTINGS/PING/WINDOW_UPDATE、流控窗口溢出、HPACK 头表与 Huffman 炸弹、截断/EOS Huffman、伪头顺序、`content-length` 不一致、非法 `transfer-encoding`/`connection` 系头、两端 `SETTINGS_MAX_CONCURRENT_STREAMS` 强制、`h2c` 存活检测：SETTINGS_TIMEOUT 与 keepalive 死对端检测）。
 
 ```bash

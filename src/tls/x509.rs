@@ -5,9 +5,9 @@
 //! bundle any root certificates (no third-party data): production code
 //! must load its trust anchors (e.g. from an OS store or a PEM bundle).
 
+use crate::tls::TlsError;
 use alloc::string::String;
 use alloc::vec::Vec;
-use crate::tls::TlsError;
 
 /// A DER-encoded certificate.
 #[derive(Debug, Clone)]
@@ -244,7 +244,7 @@ pub fn hostname_matches(name: &str, dns_names: &[String], ip_names: &[Vec<u8>]) 
             std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
             std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
         };
-        return ip_names.iter().any(|i| *i == bytes);
+        return ip_names.contains(&bytes);
     }
     if dns_names.is_empty() {
         return false;
@@ -311,11 +311,7 @@ pub fn has_server_auth_eku(cert: &Certificate) -> bool {
 /// with its issuer's public key, CA/basic-constraints and key-usage
 /// enforcement for non-leaf certificates, and a trust-anchor check
 /// against the supplied [`RootStore`].
-pub fn validate_chain(
-    roots: &RootStore,
-    chain: &[Vec<u8>],
-    now: i64,
-) -> crate::tls::TlsResult<()> {
+pub fn validate_chain(roots: &RootStore, chain: &[Vec<u8>], now: i64) -> crate::tls::TlsResult<()> {
     if chain.is_empty() {
         return Err(TlsError::Certificate("empty certificate chain".into()));
     }
@@ -342,7 +338,9 @@ pub fn validate_chain(
             return Err(TlsError::Certificate("issuer/subject name mismatch".into()));
         }
         if !verify_cert_signature(child, &parent.spki) {
-            return Err(TlsError::Certificate("certificate signature invalid".into()));
+            return Err(TlsError::Certificate(
+                "certificate signature invalid".into(),
+            ));
         }
         // Every non-leaf in the presented chain must be a CA.
         if child.is_ca != Some(true) {
@@ -415,9 +413,13 @@ pub fn validate_chain(
 /// issuer's SPKI.
 fn verify_cert_signature(cert: &Certificate, issuer: &Spki) -> bool {
     use crate::tls::crypto::hash::{Digest, Sha256, Sha384};
-    use crate::tls::crypto::rsa::{RsaPublicKey, DIGEST_INFO_SHA256, DIGEST_INFO_SHA384, DIGEST_INFO_SHA512};
+    use crate::tls::crypto::rsa::{
+        RsaPublicKey, DIGEST_INFO_SHA256, DIGEST_INFO_SHA384, DIGEST_INFO_SHA512,
+    };
     use crate::tls::crypto::{ecdsa, ed25519};
-    use crate::tls::x509::der::{OID_EC_PUBLIC_KEY, OID_ED25519, OID_RSA_ENCRYPTION, parse_rsa_public_key};
+    use crate::tls::x509::der::{
+        parse_rsa_public_key, OID_EC_PUBLIC_KEY, OID_ED25519, OID_RSA_ENCRYPTION,
+    };
 
     match cert.sig_alg {
         SigAlg::RsaSha256 | SigAlg::RsaSha384 | SigAlg::RsaSha512 => {
@@ -441,7 +443,7 @@ fn verify_cert_signature(cert: &Certificate, issuer: &Spki) -> bool {
                 }
                 _ => {
                     // SHA-512
-                    let mut h = Sha512Digest::new();
+                    let mut h = Sha512Digest::create();
                     h.update(&cert.tbs);
                     h.finalize()
                 }
@@ -496,7 +498,7 @@ fn verify_cert_signature(cert: &Certificate, issuer: &Spki) -> bool {
 /// SHA-512 digest adapter for certificate signatures.
 struct Sha512Digest;
 impl Sha512Digest {
-    fn new() -> crate::tls::crypto::ed25519::Sha512 {
+    fn create() -> crate::tls::crypto::ed25519::Sha512 {
         crate::tls::crypto::ed25519::Sha512::new()
     }
 }
