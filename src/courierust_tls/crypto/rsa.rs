@@ -427,12 +427,10 @@ pub struct RsaPublicKey {
 }
 
 impl RsaPublicKey {
-    /// Maximum accepted RSA key material (bytes). Real keys are at most
-    /// 8192 bits (1024 bytes); a hostile certificate with a
-    /// multi-megabyte modulus or exponent would otherwise drive the
-    /// Montgomery setup (`R = 2^(64k) mod n`, quadratic in limb count)
-    /// and the exponent loop into a CPU-exhaustion DoS during
-    /// certificate-chain verification.
+    /// Max accepted RSA key material (bytes). Real keys are ≤ 8192 bits;
+    /// a hostile cert with a multi-MB modulus/exponent would otherwise
+    /// drive Montgomery setup (quadratic in limb count) into a CPU DoS
+    /// during chain verification.
     const MAX_KEY_BYTES: usize = 1024;
 
     /// RSAVP1: `s^e mod n`.

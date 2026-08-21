@@ -1085,12 +1085,12 @@ fn https_redirect_preserves_scheme() {
 }
 
 // ---------------------------------------------------------------------
-// Event-driven server (Windows): idle connections must not hold workers
+// Event-driven server (default on every platform): idle connections must
+// not hold workers
 // ---------------------------------------------------------------------
 
 /// Read one complete raw HTTP/1.1 response (head + Content-Length body)
 /// from a socket.
-#[cfg(windows)]
 fn read_raw_response(stream: &mut std::net::TcpStream) -> String {
     use std::io::Read;
     let mut buf = Vec::new();
@@ -1123,7 +1123,6 @@ fn read_raw_response(stream: &mut std::net::TcpStream) -> String {
     String::from_utf8_lossy(&buf[..he + cl]).to_string()
 }
 
-#[cfg(windows)]
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
@@ -1133,7 +1132,6 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// promptly (idle connections park on the poller, consuming zero
 /// workers).
 #[test]
-#[cfg(windows)]
 fn event_many_idle_connections_do_not_block_workers() {
     use std::io::Write;
     use std::net::TcpStream;

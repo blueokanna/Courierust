@@ -1,44 +1,24 @@
 //! Event-driven HTTP/1.1 server (every platform).
 //!
-//! The classic "one pool job per connection" model burns a worker thread
-//! for every idle keep-alive / SSE / long-poll connection, so a handful
-//! of slow clients can exhaust a fixed pool. This module replaces that
-//! with an I/O event loop:
+//! The classic one-pool-job-per-connection model burns a worker per idle
+//! keep-alive / SSE / slow-loris connection. Here an event loop parks
+//! idle plain-HTTP connections on a readiness poller (Winsock `select` /
+//! POSIX `poll`) so they consume **zero** workers, and hands ready ones
+//! to event workers in batches. Key mechanics:
 //!
-//! * A dedicated **accept thread** accepts sockets and hands them (in
-//!   non-blocking mode) to the event loop. It never reads, peeks, sleeps
-//!   or classifies, so a slow client can never stall the accept path.
-//! * A dedicated **event-loop thread** owns a
-//!   [`crate::courierust_net::poller::Poller`] (Winsock `select` on
-//!   Windows, POSIX `poll` elsewhere) and parks *idle* connections — a
-//!   connection with no data to read or write consumes **zero** worker
-//!   threads. The event loop classifies each new connection (TLS / h2 /
-//!   h1) from its first bytes with a non-blocking peek, so even
-//!   classification never holds a worker.
-//! * A **self-pipe** (loopback socket pair) lets the accept thread and
-//!   the workers interrupt the event loop's blocking poll the instant a
-//!   control message is queued. Control messages therefore never wait
-//!   for a poll tick: a freshly re-registered keep-alive connection is
-//!   polled again immediately, which keeps per-request latency out of the
-//!   poll-timeout path.
-//! * When a connection becomes readable, the event loop hands it to one
-//!   of a small set of **event workers** in *batches* (a single channel
-//!   message carries up to [`DISPATCH_BATCH`] ready ids), so a burst of
-//!   ready connections does not serialize one channel send + recv per
-//!   connection.
-//! * Each worker runs an **incremental request parser** that resumes
-//!   exactly where it left off, so a slow sender (partial request) is
-//!   parked again instead of holding a worker.
-//! * After the response is written the connection returns to the poller
-//!   for the next request (keep-alive), again consuming no worker.
-//! * Connections that make no progress for [`ServerConfig::idle_timeout`]
-//!   are closed, bounding the resources a herd of idle / slow-loris
-//!   connections can consume.
+//! * A dedicated accept thread only accepts; classification (TLS / h2 /
+//!   h1) is a non-blocking peek in the event loop, so a slow client
+//!   never stalls the accept path.
+//! * A **self-pipe** (loopback socket pair) lets workers/accept thread
+//!   interrupt the event loop's blocking poll the instant a control
+//!   message is queued — messages never wait for a poll tick, keeping
+//!   per-request latency out of the poll-timeout path.
+//! * Workers run an **incremental request parser** that resumes where it
+//!   left off, so a partial request is parked again, not held.
+//! * Connections idle for [`ServerConfig::idle_timeout`] are reaped.
 //!
-//! Honest scope: TLS and HTTP/2 connections still use the blocking pool
-//! model; the event loop handles plain HTTP/1.1. A synchronous handler
-//! that blocks for a long time still occupies a worker — exactly as with
-//! any synchronous server (async handler support is future work).
+//! Scope: TLS and HTTP/2 connections still use the blocking pool; a
+//! long-blocking synchronous handler still occupies a worker.
 
 use crate::courierust_body::Body;
 use crate::courierust_bytes::Bytes;

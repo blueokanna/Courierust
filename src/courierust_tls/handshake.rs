@@ -577,8 +577,7 @@ pub(crate) fn finished_verify_data(
 /// Client-side handshake driver.
 /// Fill `buf` from OS entropy, failing the handshake when the source is
 /// unavailable. Never proceed with zeroed bytes: an all-zero X25519
-/// private key yields a predictable ECDHE shared secret and silently
-/// breaks the session's confidentiality (both as client and as server).
+/// private key makes the ECDHE shared secret predictable.
 fn fill_entropy(buf: &mut [u8]) -> TlsResult<()> {
     if super::crypto::rng::fill_random(buf) {
         Ok(())

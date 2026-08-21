@@ -398,15 +398,9 @@ impl<R: Read, W: Write> Connection<R, W> {
         self.poll_available(1)
     }
 
-    /// Flush outbound data and process up to `max_frames` complete inbound
-    /// frames that are already available on the transport.
-    ///
-    /// The old driver contract processed exactly one frame per call. That
-    /// made a multiplexed connection pay a full read/timeout/flush cycle for
-    /// every SETTINGS, HEADERS, and DATA frame, even when the peer had
-    /// already written the whole response. Batching is deliberately bounded
-    /// so a busy peer cannot starve command handling or response dispatch.
-    /// A transport timeout ends the batch; it is not a connection error.
+    /// Flush outbound and process up to `max_frames` buffered inbound
+    /// frames in one call (bounded so a busy peer cannot starve command
+    /// handling). A transport timeout ends the batch, not the connection.
     pub fn poll_available(&mut self, max_frames: usize) -> Result<bool> {
         if self.closed {
             return Ok(false);

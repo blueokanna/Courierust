@@ -1,27 +1,15 @@
-//! I/O readiness poller for the event-driven server.
+//! I/O readiness poller for the event-driven server: parks thousands of
+//! idle connections without one thread each.
 //!
-//! Lets a small worker pool park thousands of idle connections instead of
-//! holding one thread per connection:
+//! * **Windows**: Winsock `select` (batches of 64). Only the first batch
+//!   waits for the full timeout; later batches use zero timeout so a
+//!   ready socket in batch *k* is not delayed by earlier batches.
+//! * **Unix**: POSIX `poll` (no batch limit).
 //!
-//! * **Windows** wraps the Winsock2 `select()` call directly — a
-//!   zero-dependency way to wait on many sockets at once. `select` is
-//!   used instead of `WSAPoll` because `WSAPoll` rejects sockets with
-//!   `WSAEINVAL` in some environments; sockets are polled in batches of
-//!   `FD_SETSIZE` (64). Only the *first* batch waits for the full
-//!   timeout; every later batch uses a zero timeout so a socket that is
-//!   ready in batch *k* is never delayed by the timeouts of batches
-//!   0..k-1 (which would multiply tail latency by the batch count).
-//! * **Unix** wraps the POSIX `poll()` call, which has no 64-socket batch
-//!   limit and does not mutate its timeout argument.
-//!
-//! Both backends accept an optional *wake* descriptor (a loopback socket
-//! pair used by the event loop as a self-pipe). The wake descriptor is
-//! watched for readability in **every** batch, so a worker or the accept
-//! thread can interrupt a blocking poll with a single byte — control
-//! messages no longer wait for the next poll tick.
-//!
-//! The server falls back to the per-connection blocking pool model only
-//! when `ServerConfig::event_driven` is explicitly disabled.
+//! Both accept an optional *wake* descriptor (the event loop's
+//! self-pipe) watched in every batch, so a worker or the accept thread
+//! can interrupt a blocking poll with one byte — control messages never
+//! wait for a poll tick.
 
 #![allow(unsafe_code)]
 

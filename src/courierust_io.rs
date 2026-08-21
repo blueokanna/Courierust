@@ -141,18 +141,11 @@ impl<R: Read> BufReader<R> {
         Ok(())
     }
 
-    /// Read as much as possible into `out`, stopping on a transport
-    /// timeout/would-block. Returns the number of bytes appended.
-    /// Unlike [`Self::read_exact_into`], a timeout mid-read does not
-    /// discard the bytes already consumed — the caller keeps the buffer
-    /// and resumes on the next call. This is what makes frame decoding
-    /// atomic across polls (HTTP/2).
-    ///
-    /// A *clean* EOF (the peer closed the connection) is reported as
-    /// [`ErrorKind::UnexpectedEof`] rather than "no data yet": the h2
-    /// connection layer must be able to distinguish a dead peer from a
-    /// silent one, otherwise its poll loops spin forever on a closed
-    /// socket (and a pool worker is never released).
+    /// Read as much as possible into `out`, stopping on timeout/
+    /// would-block; a mid-read timeout keeps consumed bytes for the next
+    /// call (atomic frame decode across polls). Clean EOF is reported as
+    /// [`ErrorKind::UnexpectedEof`] so the h2 layer can tell a dead peer
+    /// from a silent one (otherwise poll loops spin on a closed socket).
     pub fn read_more(&mut self, out: &mut [u8]) -> Result<usize> {
         let mut filled = 0;
         while filled < out.len() {
@@ -287,13 +280,9 @@ impl<W: Write> BufWriter<W> {
         Ok(self.inner)
     }
 
-    /// Write a whole slice, buffering as needed.
-    ///
-    /// A transport `write` may return a **short count** (a TCP send
-    /// buffer can fill mid-write), so the direct path loops until every
-    /// byte is out. Returning early on a short write would silently drop
-    /// the tail of a request/response — data corruption that only shows
-    /// up under real network backpressure.
+    /// Write a whole slice, buffering as needed. The direct path loops
+    /// over short writes (a TCP send buffer can fill mid-write; returning
+    /// early would silently truncate the response).
     pub fn write_all(&mut self, data: &[u8]) -> Result<()> {
         // Large writes bypass the buffer when it is empty.
         if self.buf.is_empty() && data.len() >= self.buf.capacity() {
@@ -386,16 +375,10 @@ impl Write for VecWriter {
     }
 }
 
-/// A per-connection scratch buffer pool.
-///
-/// This is the crate's core allocation discipline: every hot decode
-/// path (HTTP/1.1 header blocks, bodies, chunk framing) draws its
-/// working buffers from a [`Scratch`] owned by the connection instead of
-/// the global allocator. After warm-up, steady-state message processing
-/// performs **zero allocations** — the buffers are recycled in place.
-///
-/// Keep one `Scratch` per connection (or per worker) and pass it down to
-/// the codec functions that accept `&mut Scratch`.
+/// Per-connection scratch buffers: hot decode paths (header blocks,
+/// bodies, chunk framing) recycle these instead of the global allocator,
+/// so steady-state message processing performs zero allocations. Keep
+/// one per connection/worker and pass it to the codec functions.
 #[derive(Default)]
 pub struct Scratch {
     /// Reused for line-oriented reads ([`BufReader::read_until_into`]).

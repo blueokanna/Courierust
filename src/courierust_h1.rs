@@ -29,7 +29,9 @@ pub struct RequestLine {
     pub version: Version,
 }
 
-/// Strict RFC 9112 §3 request parser preventing smuggling across all paths
+/// Parse a request line (`METHOD SP target SP HTTP/x.y`). Strict RFC 9112
+/// §3: exactly three tokens, version required; trailing junk is rejected
+/// so a proxy and this server cannot disagree on message boundaries.
 pub fn parse_request_line(line: &[u8]) -> Result<RequestLine> {
     let line = trim_crlf(line);
     let mut parts = line.split(|&b| b == b' ');
@@ -327,15 +329,12 @@ pub fn read_body_chunked_scratch<R: Read>(
     Ok(Bytes::from(core::mem::take(out)))
 }
 
-/// Decode a chunked body into `out`. Chunk sizes are validated against
-/// `max` with saturating arithmetic so a hostile size line can never
-/// overflow past the limit (remote DoS guard).
-///
-/// This is the single authority for chunked decoding on the blocking
-/// path. The event-driven incremental parser (`courierust_server::event`)
-/// shares [`parse_chunk_size`] and the same framing rules so the two
-/// paths can never disagree on what a request means (a disagreement is a
-/// request-smuggling vector when either side sits behind a proxy).
+/// Decode a chunked body into `out`. Sizes are validated against `max`
+/// with saturating arithmetic (hostile lengths cannot overflow the
+/// limit). The single authority for chunked framing — the event-driven
+/// incremental parser shares [`parse_chunk_size`] and the same rules so
+/// the blocking and event paths can never disagree on a request's
+/// meaning (a disagreement is a smuggling vector behind a proxy).
 fn read_body_chunked_into<R: Read>(
     reader: &mut BufReader<R>,
     max: usize,
@@ -375,15 +374,10 @@ fn read_body_chunked_into<R: Read>(
     Ok(())
 }
 
-/// Parse a chunk-size line: `1A`, `1A;ext`, `1A ;ext`, or any amount of
-/// surrounding whitespace. The size itself must be pure hexadecimal —
-/// anything else (trailing garbage after the digits, a second hex token)
-/// is rejected. Chunk extensions after `;` are ignored. Returns `None`
-/// on malformed or overflowing input.
-///
-/// Shared by the blocking server/client decoder and the event-driven
-/// incremental parser so both paths accept and reject exactly the same
-/// byte sequences.
+/// Parse a chunk-size line (`1A`, `1A;ext`, optional whitespace). The
+/// size must be pure hex; trailing garbage or overflow returns `None`.
+/// Shared by the blocking and event-driven parsers so both paths accept
+/// and reject exactly the same byte sequences.
 pub(crate) fn parse_chunk_size(line: &[u8]) -> Option<usize> {
     let before_ext = match line.iter().position(|&b| b == b';') {
         Some(i) => &line[..i],

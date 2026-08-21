@@ -42,12 +42,10 @@ pub const TLS_VERSION_1_3: u16 = 0x0304;
 /// TLS version identifier for TLS 1.2 (legacy_record_version / fallback).
 pub const TLS_VERSION_1_2: u16 = 0x0303;
 
-/// Upper bound on the accumulated decrypted handshake bytes. The
-/// protocol's handshake length field is 24 bits (max ~16 MiB), so a
-/// peer that keeps streaming handshake records without ever completing a
-/// message is hostile — without this cap the receive buffer would grow
-/// without bound (memory-exhaustion DoS on both the client and the
-/// server).
+/// Upper bound on accumulated decrypted handshake bytes. The protocol's
+/// handshake length field is 24 bits (~16 MiB max), so a peer streaming
+/// handshake records without completing a message is hostile — without
+/// this cap the receive buffer would grow without bound (memory DoS).
 const MAX_HANDSHAKE_BUFFER: usize = 16 * 1024 * 1024;
 
 /// A parsed `ClientHello` summary (used by server-side ALPN/SNI and by

@@ -180,14 +180,10 @@ fn start_inner(
     })
 }
 
-/// The driver's socket read timeout. It must be short enough that a
-/// command queued while the driver is blocked waiting for response data
-/// is served promptly: with a long timeout, requests arriving on a busy
-/// multiplexed connection wait out the whole read before the driver
-/// drains the command channel (a multi-hundred-millisecond P99 spike
-/// under concurrency). 5 ms bounds that stall to ~5 ms; responses are
-/// still read the instant their bytes arrive (socket readiness interrupts
-/// the read), so this does not add latency to the response path.
+/// Driver socket read timeout: short enough that commands queued while
+/// the driver waits for response data are served promptly (a long read
+/// would cause a multi-hundred-ms P99 spike under multiplexing). 5 ms
+/// bounds that stall; responses are still read the instant they arrive.
 const DRIVER_READ_TIMEOUT: Duration = Duration::from_millis(5);
 
 fn driver(
