@@ -12,18 +12,18 @@
 //!
 //! Run: `cargo run --example https`
 
-use courierust::body::Body;
-use courierust::client::{Client, ClientConfig, TlsSettings as ClientTls};
-use courierust::http::request::Request;
-use courierust::http::response::Response;
-use courierust::server::{Server, ServerConfig, TlsSettings as ServerTls};
+use courierust::courierust_body::Body;
+use courierust::courierust_client::{Client, ClientConfig, TlsSettings as ClientTls};
+use courierust::courierust_http::request::Request;
+use courierust::courierust_http::response::Response;
+use courierust::courierust_server::{Server, ServerConfig, TlsSettings as ServerTls};
 
 const CERT_DER: &[u8] = include_bytes!("../tests/certs/server_cert.der");
 const KEY_DER: &[u8] = include_bytes!("../tests/certs/server_key.der");
 
 fn main() -> courierust::Result<()> {
     // --- HTTPS server -------------------------------------------------
-    let identity = courierust::tls::Identity {
+    let identity = courierust::courierust_tls::Identity {
         cert_chain: vec![CERT_DER.to_vec()],
         private_key: KEY_DER.to_vec(),
         is_rsa: false, // Ed25519
@@ -41,15 +41,15 @@ fn main() -> courierust::Result<()> {
     let _handle = server.serve_background(|req: Request<Body>| -> Response<Body> {
         let mut resp = Response::with_status(200.into());
         resp.headers.insert(
-            courierust::http::header::HeaderName::from_lowercase("content-type"),
-            courierust::http::header::HeaderValue::from_static("text/plain"),
+            courierust::courierust_http::header::HeaderName::from_lowercase("content-type"),
+            courierust::courierust_http::header::HeaderValue::from_static("text/plain"),
         );
         resp.body = Body::Bytes(req.body.collect().unwrap_or_default());
         resp
     })?;
 
     // --- HTTPS client -------------------------------------------------
-    let mut roots = courierust::tls::RootStore::new();
+    let mut roots = courierust::courierust_tls::RootStore::new();
     roots.add_der(CERT_DER.to_vec());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

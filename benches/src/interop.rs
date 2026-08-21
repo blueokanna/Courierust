@@ -19,12 +19,12 @@
 //! The mainstream crates are dev-only dependencies of this bench
 //! workspace; the `courierust` library itself stays zero-dependency.
 
-use courierust::body::Body;
-use courierust::bytes::Bytes;
-use courierust::client::{Client, ClientConfig};
-use courierust::http::request::Request;
-use courierust::http::response::Response;
-use courierust::server::{Server, ServerConfig};
+use courierust::courierust_body::Body;
+use courierust::courierust_bytes::Bytes;
+use courierust::courierust_client::{Client, ClientConfig};
+use courierust::courierust_http::request::Request;
+use courierust::courierust_http::response::Response;
+use courierust::courierust_server::{Server, ServerConfig};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;

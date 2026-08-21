@@ -7,10 +7,10 @@ The server accepts connections and submits each one as a job to a **work-stealin
 A handler is any `Fn(Request<Body>) -> Response<Body> + Send + Sync + 'static`. Closures work out of the box:
 
 ```rust
-use courierust::body::Body;
-use courierust::bytes::Bytes;
-use courierust::http::request::Request;
-use courierust::http::response::Response;
+use courierust::courierust_body::Body;
+use courierust::courierust_bytes::Bytes;
+use courierust::courierust_http::request::Request;
+use courierust::courierust_http::response::Response;
 
 let handler = |req: Request<Body>| -> Response<Body> {
     let mut resp = Response::with_status(200.into());
@@ -22,10 +22,10 @@ let handler = |req: Request<Body>| -> Response<Body> {
 For anything non-trivial, use a struct (the fields are your own application state):
 
 ```rust
-use courierust::body::Body;
-use courierust::bytes::Bytes;
-use courierust::http::request::Request;
-use courierust::http::response::Response;
+use courierust::courierust_body::Body;
+use courierust::courierust_bytes::Bytes;
+use courierust::courierust_http::request::Request;
+use courierust::courierust_http::response::Response;
 use std::sync::Arc;
 
 // `Db` here is your own application type, not something from the crate.
@@ -35,7 +35,7 @@ struct App {
 }
 
 // Any type implementing the Handler trait works:
-impl courierust::server::Handler for App {
+impl courierust::courierust_server::Handler for App {
     fn handle(&self, req: Request<Body>) -> Response<Body> {
         match req.uri.as_str() {
             "/health" => Response::with_status(200.into()),
@@ -52,7 +52,7 @@ impl courierust::server::Handler for App {
 ## Configuration
 
 ```rust
-use courierust::server::{Server, ServerConfig};
+use courierust::courierust_server::{Server, ServerConfig};
 use std::time::Duration;
 
 let cfg = ServerConfig {
@@ -91,7 +91,7 @@ Return a `Body::Channel` and the server streams it with flow-control backpressur
 
 ```rust
 let handler = |_req: Request<Body>| -> Response<Body> {
-    let (tx, body) = courierust::body::channel();
+    let (tx, body) = courierust::courierust_body::channel();
     std::thread::spawn(move || {
         for i in 0..100 {
             // tx.send blocks if the receiver is dropped; returns Result.

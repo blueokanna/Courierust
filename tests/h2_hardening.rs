@@ -4,13 +4,13 @@
 
 mod common;
 
-use courierust::body::Body;
-use courierust::bytes::Bytes;
-use courierust::client::{Client, ClientConfig};
-use courierust::http::header::{HeaderName, HeaderValue};
-use courierust::http::method::Method;
-use courierust::http::request::Request;
-use courierust::server::{Server, ServerConfig};
+use courierust::courierust_body::Body;
+use courierust::courierust_bytes::Bytes;
+use courierust::courierust_client::{Client, ClientConfig};
+use courierust::courierust_http::header::{HeaderName, HeaderValue};
+use courierust::courierust_http::method::Method;
+use courierust::courierust_http::request::Request;
+use courierust::courierust_server::{Server, ServerConfig};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
@@ -43,12 +43,12 @@ fn settings_frame() -> Vec<u8> {
 
 /// HPACK-encode a header block using the crate's own encoder.
 fn hpack(fields: &[(HeaderName, HeaderValue)]) -> Vec<u8> {
-    let mut enc = courierust::hpack::Encoder::new();
-    let list: Vec<courierust::hpack::HeaderField> = fields
+    let mut enc = courierust::courierust_hpack::Encoder::new();
+    let list: Vec<courierust::courierust_hpack::HeaderField> = fields
         .iter()
-        .map(|(n, v)| courierust::hpack::HeaderField::new(n.clone(), v.clone()))
+        .map(|(n, v)| courierust::courierust_hpack::HeaderField::new(n.clone(), v.clone()))
         .collect();
-    let mut out = courierust::bytes::BytesMut::new();
+    let mut out = courierust::courierust_bytes::BytesMut::new();
     enc.encode(&list, &mut out);
     out.to_vec()
 }
@@ -146,8 +146,9 @@ fn spawn_h2_server(max_header_list: usize) -> SocketAddr {
     let server = Server::bind_with_config("127.0.0.1:0", config).unwrap();
     let addr = server.local_addr().unwrap();
     let handle = server
-        .serve_background(|req: courierust::http::request::Request<Body>| {
-            let mut resp = courierust::http::response::Response::<Body>::with_status(200.into());
+        .serve_background(|req: courierust::courierust_http::request::Request<Body>| {
+            let mut resp =
+                courierust::courierust_http::response::Response::<Body>::with_status(200.into());
             let body = req.body.collect().unwrap();
             resp.body = Body::Bytes(body);
             resp
@@ -392,8 +393,9 @@ fn h2c_upgrade_roundtrip_and_reuse() {
     .unwrap();
     let addr = server.local_addr().unwrap();
     let handle = server
-        .serve_background(|req: courierust::http::request::Request<Body>| {
-            let mut resp = courierust::http::response::Response::<Body>::with_status(200.into());
+        .serve_background(|req: courierust::courierust_http::request::Request<Body>| {
+            let mut resp =
+                courierust::courierust_http::response::Response::<Body>::with_status(200.into());
             resp.headers.insert(
                 HeaderName::from_lowercase("x-method"),
                 HeaderValue::from_bytes(req.method.as_str().as_bytes()).unwrap(),
@@ -450,8 +452,9 @@ fn h2c_upgrade_declined_falls_back_to_h1() {
     .unwrap();
     let addr = server.local_addr().unwrap();
     let handle = server
-        .serve_background(|req: courierust::http::request::Request<Body>| {
-            let mut resp = courierust::http::response::Response::<Body>::with_status(200.into());
+        .serve_background(|req: courierust::courierust_http::request::Request<Body>| {
+            let mut resp =
+                courierust::courierust_http::response::Response::<Body>::with_status(200.into());
             let body = req.body.collect().unwrap();
             resp.body = Body::Bytes(body);
             resp
@@ -469,7 +472,10 @@ fn h2c_upgrade_declined_falls_back_to_h1() {
     let client = Client::with_config(cfg);
     let resp = client.get(&format!("http://{addr}/plain")).unwrap();
     assert_eq!(resp.status.as_u16(), 200);
-    assert_eq!(resp.version, courierust::http::version::Version::HTTP_11);
+    assert_eq!(
+        resp.version,
+        courierust::courierust_http::version::Version::HTTP_11
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -761,7 +767,7 @@ fn h2_rejects_truncated_huffman() {
     peer.send_preface_and_settings();
     let full = {
         let mut v = Vec::new();
-        courierust::hpack::huffman::encode(b"hello", &mut v);
+        courierust::courierust_hpack::huffman::encode(b"hello", &mut v);
         v
     };
     assert!(full.len() > 2, "huffman('hello') must span >2 bytes");
@@ -822,8 +828,9 @@ fn h2_rejects_data_exceeding_flow_window() {
     .unwrap();
     let addr = server.local_addr().unwrap();
     let handle = server
-        .serve_background(|req: courierust::http::request::Request<Body>| {
-            let mut resp = courierust::http::response::Response::<Body>::with_status(200.into());
+        .serve_background(|req: courierust::courierust_http::request::Request<Body>| {
+            let mut resp =
+                courierust::courierust_http::response::Response::<Body>::with_status(200.into());
             let body = req.body.collect().unwrap();
             resp.body = Body::Bytes(body);
             resp
@@ -874,13 +881,17 @@ fn h2_rejects_excessive_concurrent_streams() {
     .unwrap();
     let addr = server.local_addr().unwrap();
     let handle = server
-        .serve_background(|_req: courierust::http::request::Request<Body>| {
-            // Never completes (no END_STREAM from the peer), so streams 1
-            // and 3 stay open.
-            let mut resp = courierust::http::response::Response::<Body>::with_status(200.into());
-            resp.body = Body::Bytes(Bytes::from_static(b"ok"));
-            resp
-        })
+        .serve_background(
+            |_req: courierust::courierust_http::request::Request<Body>| {
+                // Never completes (no END_STREAM from the peer), so streams 1
+                // and 3 stay open.
+                let mut resp = courierust::courierust_http::response::Response::<Body>::with_status(
+                    200.into(),
+                );
+                resp.body = Body::Bytes(Bytes::from_static(b"ok"));
+                resp
+            },
+        )
         .unwrap();
     std::mem::forget(handle);
 
@@ -921,17 +932,21 @@ fn h2_client_respects_peer_concurrent_stream_limit() {
     let active2 = active.clone();
     let max2 = max_seen.clone();
     let handle = server
-        .serve_background(move |_req: courierust::http::request::Request<Body>| {
-            let now = active2.fetch_add(1, Ordering::SeqCst) + 1;
-            max2.fetch_max(now, Ordering::SeqCst);
-            // Hold the stream open briefly so the client's deferral is
-            // actually exercised (2 streams are in flight at any time).
-            std::thread::sleep(Duration::from_millis(60));
-            active2.fetch_sub(1, Ordering::SeqCst);
-            let mut resp = courierust::http::response::Response::<Body>::with_status(200.into());
-            resp.body = Body::Bytes(Bytes::from_static(b"ok"));
-            resp
-        })
+        .serve_background(
+            move |_req: courierust::courierust_http::request::Request<Body>| {
+                let now = active2.fetch_add(1, Ordering::SeqCst) + 1;
+                max2.fetch_max(now, Ordering::SeqCst);
+                // Hold the stream open briefly so the client's deferral is
+                // actually exercised (2 streams are in flight at any time).
+                std::thread::sleep(Duration::from_millis(60));
+                active2.fetch_sub(1, Ordering::SeqCst);
+                let mut resp = courierust::courierust_http::response::Response::<Body>::with_status(
+                    200.into(),
+                );
+                resp.body = Body::Bytes(Bytes::from_static(b"ok"));
+                resp
+            },
+        )
         .unwrap();
     std::mem::forget(handle);
 
@@ -948,7 +963,8 @@ fn h2_client_respects_peer_concurrent_stream_limit() {
         let c = client.clone();
         let b = base.clone();
         handles.push(std::thread::spawn(move || {
-            let req = courierust::http::request::Request::<Body>::new(Method::GET, "/bench");
+            let req =
+                courierust::courierust_http::request::Request::<Body>::new(Method::GET, "/bench");
             let resp = c.execute(&format!("{b}/bench"), req).unwrap();
             assert_eq!(resp.status.as_u16(), 200);
         }));

@@ -8,11 +8,11 @@
 //! allocation the whole process makes (including the benchmark harness
 //! itself), so numbers are comparable across libraries.
 
-use courierust::body::Body;
-use courierust::client::{Client, ClientConfig};
-use courierust::http::request::Request;
-use courierust::http::response::Response;
-use courierust::server::{Server, ServerConfig};
+use courierust::courierust_body::Body;
+use courierust::courierust_client::{Client, ClientConfig};
+use courierust::courierust_http::request::Request;
+use courierust::courierust_http::response::Response;
+use courierust::courierust_server::{Server, ServerConfig};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -63,7 +63,7 @@ fn courierust_server() -> std::net::SocketAddr {
     let handle = server
         .serve_background(|_req: Request<Body>| -> Response<Body> {
             let mut resp = Response::with_status(200.into());
-            resp.body = Body::Bytes(courierust::bytes::Bytes::from_static(b"ok"));
+            resp.body = Body::Bytes(courierust::courierust_bytes::Bytes::from_static(b"ok"));
             resp
         })
         .unwrap();
@@ -215,7 +215,7 @@ fn courierust_h2_client() {
     let handle = server
         .serve_background(|_req: Request<Body>| -> Response<Body> {
             let mut resp = Response::with_status(200.into());
-            resp.body = Body::Bytes(courierust::bytes::Bytes::from_static(b"ok"));
+            resp.body = Body::Bytes(courierust::courierust_bytes::Bytes::from_static(b"ok"));
             resp
         })
         .unwrap();
@@ -245,7 +245,7 @@ fn reqwest_h2_client() {
     let handle = server
         .serve_background(|_req: Request<Body>| -> Response<Body> {
             let mut resp = Response::with_status(200.into());
-            resp.body = Body::Bytes(courierust::bytes::Bytes::from_static(b"ok"));
+            resp.body = Body::Bytes(courierust::courierust_bytes::Bytes::from_static(b"ok"));
             resp
         })
         .unwrap();

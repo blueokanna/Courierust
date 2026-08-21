@@ -4,12 +4,12 @@
 //!
 //! Run with `cargo run --example priority`.
 
-use courierust::body::Body;
-use courierust::client::{Client, ClientConfig};
-use courierust::h2::priority::Priority;
-use courierust::http::request::Request;
-use courierust::http::response::Response;
-use courierust::server::{Server, ServerConfig};
+use courierust::courierust_body::Body;
+use courierust::courierust_client::{Client, ClientConfig};
+use courierust::courierust_h2::priority::Priority;
+use courierust::courierust_http::request::Request;
+use courierust::courierust_http::response::Response;
+use courierust::courierust_server::{Server, ServerConfig};
 use std::time::Instant;
 
 fn main() -> courierust::Result<()> {
@@ -23,7 +23,7 @@ fn main() -> courierust::Result<()> {
         // Slight delay so streams actually interleave on the wire.
         std::thread::sleep(std::time::Duration::from_millis(5));
         let mut resp = Response::with_status(200.into());
-        resp.body = Body::Bytes(courierust::bytes::Bytes::from_static(b"ok"));
+        resp.body = Body::Bytes(courierust::courierust_bytes::Bytes::from_static(b"ok"));
         resp
     })?;
 
@@ -49,7 +49,7 @@ fn main() -> courierust::Result<()> {
         let c = client.clone();
         let u = url.clone();
         lows.push(std::thread::spawn(move || {
-            let req = Request::new(courierust::http::method::Method::GET, "/low");
+            let req = Request::new(courierust::courierust_http::method::Method::GET, "/low");
             let _ = c.execute_priority(&u, req, low);
         }));
     }
@@ -57,7 +57,7 @@ fn main() -> courierust::Result<()> {
     // ...then a single high-urgency request. WUCS must not let the low
     // backlog starve it.
     let start = Instant::now();
-    let req = Request::new(courierust::http::method::Method::GET, "/high");
+    let req = Request::new(courierust::courierust_http::method::Method::GET, "/high");
     let resp = client.execute_priority(&url, req, high)?;
     let elapsed = start.elapsed();
     assert_eq!(resp.status.as_u16(), 200);

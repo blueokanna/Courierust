@@ -5,7 +5,7 @@ The client is multi-core by construction: HTTP/1.1 keep-alive connections are po
 ## Configuration
 
 ```rust
-use courierust::client::{Client, ClientConfig};
+use courierust::courierust_client::{Client, ClientConfig};
 use std::time::Duration;
 
 let cfg = ClientConfig {
@@ -54,11 +54,11 @@ let resp = client.post("http://127.0.0.1:8080/submit", vec![1u8, 2, 3])?;
 ## Request with headers, and inspect the response
 
 ```rust
-use courierust::body::Body;
-use courierust::bytes::Bytes;
-use courierust::http::header::{HeaderName, HeaderValue};
-use courierust::http::method::Method;
-use courierust::http::request::Request;
+use courierust::courierust_body::Body;
+use courierust::courierust_bytes::Bytes;
+use courierust::courierust_http::header::{HeaderName, HeaderValue};
+use courierust::courierust_http::method::Method;
+use courierust::courierust_http::request::Request;
 
 let mut req = Request::new(Method::POST, "/api/items?page=2");
 req.headers.insert(
@@ -95,7 +95,7 @@ let resp = client.get("http://short.example/start")?;
 For HTTP/2 you can attach a priority to each request. The server schedules streams with a WUCS scheduler: urgency `0..=7` (0 = highest), `incremental` for streams that can be consumed as data arrives.
 
 ```rust
-use courierust::h2::priority::Priority;
+use courierust::courierust_h2::priority::Priority;
 
 // Parse from the wire format ("u=1, i") or build directly:
 let prio = Priority { urgency: 1, incremental: true };
@@ -114,7 +114,7 @@ A streaming (`Channel`) response body is consumed chunk by chunk with `try_next_
 let resp = client.get("http://127.0.0.1:8080/events")?;
 let mut body = resp.body;
 while let Some(chunk) = body.try_next_chunk()? {
-    // chunk: courierust::bytes::Bytes
+    // chunk: courierust::courierust_bytes::Bytes
     eprintln!("chunk: {} bytes", chunk.len());
 }
 ```
@@ -137,5 +137,5 @@ match client.get("http://127.0.0.1:9/") {
 
 ## What you should know
 
-- **No TLS.** The built-in connector speaks `http://` only. To use HTTPS, wrap any TLS stream in `courierust::io::Read`/`io::Write` and drive the codec yourself (see [Fingerprints](Fingerprints) for the ClientHello parameters to hand to your TLS library).
+- **No TLS.** The built-in connector speaks `http://` only. To use HTTPS, wrap any TLS stream in `courierust::courierust_io::Read`/`io::Write` and drive the codec yourself (see [Fingerprints](Fingerprints) for the ClientHello parameters to hand to your TLS library).
 - **Streaming request bodies are HTTP/2-only.** `Client::execute` materializes a `Body::Channel` request body into memory before sending; true upload streaming is a future extension.

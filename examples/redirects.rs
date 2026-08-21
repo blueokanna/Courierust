@@ -3,12 +3,12 @@
 //!
 //! Run with `cargo run --example redirects`.
 
-use courierust::body::Body;
-use courierust::client::Client;
-use courierust::http::header::{HeaderName, HeaderValue};
-use courierust::http::request::Request;
-use courierust::http::response::Response;
-use courierust::server::{Server, ServerConfig};
+use courierust::courierust_body::Body;
+use courierust::courierust_client::Client;
+use courierust::courierust_http::header::{HeaderName, HeaderValue};
+use courierust::courierust_http::request::Request;
+use courierust::courierust_http::response::Response;
+use courierust::courierust_server::{Server, ServerConfig};
 use std::sync::Arc;
 
 fn main() -> courierust::Result<()> {
@@ -41,7 +41,7 @@ fn main() -> courierust::Result<()> {
                 HeaderName::from_lowercase("x-final"),
                 HeaderValue::from_static("yes"),
             );
-            resp.body = Body::Bytes(courierust::bytes::Bytes::from_static(b"landed"));
+            resp.body = Body::Bytes(courierust::courierust_bytes::Bytes::from_static(b"landed"));
             resp
         }
     })?;

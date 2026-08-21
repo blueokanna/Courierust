@@ -5,8 +5,8 @@ gRPC is HTTP/2 + length-prefixed binary messages + a status carried in trailers 
 ## Unary call with raw bytes
 
 ```rust
-use courierust::bytes::Bytes;
-use courierust::grpc::GrpcClient;
+use courierust::courierust_bytes::Bytes;
+use courierust::courierust_grpc::GrpcClient;
 
 let client = GrpcClient::new("http://127.0.0.1:50051")?;
 
@@ -29,7 +29,7 @@ assert_eq!(reply, "echo:ping"); // whatever your server returns
 For your own protobuf types, implement the two traits:
 
 ```rust
-use courierust::grpc::codec::{DecodeMessage, EncodeMessage};
+use courierust::courierust_grpc::codec::{DecodeMessage, EncodeMessage};
 use courierust::Result;
 
 // Generated/protobuf message, e.g. `HelloRequest { name: String }`
@@ -54,10 +54,10 @@ Then `client.call_unary::<HelloRequest, HelloResponse>(...)`.
 ## Server-streaming (multiple messages in one response)
 
 ```rust
-use courierust::grpc::GrpcClient;
+use courierust::courierust_grpc::GrpcClient;
 
 let client = GrpcClient::new("http://127.0.0.1:50051")?;
-let mut stream = client.call_stream("/chat.Chat/Updates", courierust::bytes::Bytes::from("join"))?;
+let mut stream = client.call_stream("/chat.Chat/Updates", courierust::courierust_bytes::Bytes::from("join"))?;
 
 while let Some(msg) = stream.next_message()? {
     println!("msg: {}", msg.to_str()?);
@@ -71,14 +71,14 @@ while let Some(msg) = stream.next_message()? {
 A gRPC service is any `Fn(&str, Bytes) -> Result<Bytes> + Send + Sync + 'static` (or a type implementing the `Service` trait):
 
 ```rust
-use courierust::bytes::Bytes;
-use courierust::grpc::GrpcServer;
+use courierust::courierust_bytes::Bytes;
+use courierust::courierust_grpc::GrpcServer;
 
 let server = GrpcServer::bind("127.0.0.1:50051", |method: &str, req: Bytes| {
     match method {
         "/echo.Echo/Say" => Ok(Bytes::from(format!("echo:{}", req.to_str()?))),
         _ => Err(courierust::Error::grpc(
-            courierust::grpc::status::UNIMPLEMENTED,
+            courierust::courierust_grpc::status::UNIMPLEMENTED,
             "unknown method",
         )),
     }
@@ -87,7 +87,7 @@ let addr = server.local_addr()?;
 let _handle = server.serve_background()?; // or server.serve()? to block
 ```
 
-Returning `Err` with a `grpc` error code maps to `grpc-status` / `grpc-message` on the wire. All standard codes are in `courierust::grpc::status` (`OK`, `CANCELLED`, `INVALID_ARGUMENT`, `NOT_FOUND`, `INTERNAL`, `UNIMPLEMENTED`, `UNAVAILABLE`, …).
+Returning `Err` with a `grpc` error code maps to `grpc-status` / `grpc-message` on the wire. All standard codes are in `courierust::courierust_grpc::status` (`OK`, `CANCELLED`, `INVALID_ARGUMENT`, `NOT_FOUND`, `INTERNAL`, `UNIMPLEMENTED`, `UNAVAILABLE`, …).
 
 ## Error handling on the client
 

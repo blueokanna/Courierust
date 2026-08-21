@@ -4,7 +4,7 @@
 
 > 中英文手把手教程见 [Wiki](https://github.com/blueokanna/Courierust/wiki)。
 
-`courierust` 的协议核心（`http` / `hpack` / `h2` / `fingerprint` / `crypto` / `bytes` / `io`）在 `no_std + alloc` 下即可编译，**不依赖任何第三方库**。`std` feature（默认开启）在此基础上补上多线程网络层：工作窃取线程池、TCP 适配、客户端、服务器与 gRPC。
+`courierust` 的协议核心（`courierust_http` / `courierust_hpack` / `courierust_h2` / `courierust_fingerprint` / `courierust_crypto` / `courierust_bytes` / `courierust_io`）在 `no_std + alloc` 下即可编译，**不依赖任何第三方库**。`std` feature（默认开启）在此基础上补上多线程网络层：工作窃取线程池、TCP 适配、客户端、服务器与 gRPC。
 
 这不是对某个现成库的封装，帧编解码、HPACK 头压缩、流状态机、流控、优先级调度、指纹构造都是从头实现的。
 
@@ -38,14 +38,14 @@
 
 ### std 网络层
 
-- **工作窃取线程池**（`pool`）：每个 worker 一条本地 LIFO 栈 + 全局 FIFO 窃取队列；任务可嵌套提交，窃取时优先挑空闲最久的 worker。
-- **客户端**（`client`）：
+- **工作窃取线程池**（`courierust_pool`）：每个 worker 一条本地 LIFO 栈 + 全局 FIFO 窃取队列；任务可嵌套提交，窃取时优先挑空闲最久的 worker。
+- **客户端**（`courierust_client`）：
   - HTTP/1.1 keep-alive 连接池按 authority 分组，按 worker 分片（各自持锁，避免全局争用）；
   - HTTP/2 连接同样按 worker 分片 + 轮询分发，多路复用；
   - 重定向跟随（301/302/303 自动转 GET）、超时、`User-Agent` 等配置项。
-- **服务器**（`server`）：每个 accept 的连接作为任务投递到工作窃取池，连接处理跨核并行。
-- **gRPC**（`grpc`）：HTTP/2 + 长度前缀消息帧 + `grpc-status`/`grpc-message` 处理；protobuf 编解码刻意留给你（实现 `EncodeMessage` / `DecodeMessage`，或直接用字节 API）。
-- **流式响应**（`body`）：channel 背靠背的 `Body::Channel`，服务器可跨线程推送响应体块。
+- **服务器**（`courierust_server`）：每个 accept 的连接作为任务投递到工作窃取池，连接处理跨核并行。
+- **gRPC**（`courierust_grpc`）：HTTP/2 + 长度前缀消息帧 + `grpc-status`/`grpc-message` 处理；protobuf 编解码刻意留给你（实现 `EncodeMessage` / `DecodeMessage`，或直接用字节 API）。
+- **流式响应**（`courierust_body`）：channel 背靠背的 `Body::Channel`，服务器可跨线程推送响应体块。
 
 ## 多核与调度：真正花心思的地方
 
@@ -74,7 +74,7 @@ RFC 9218 用 8 个 urgency 级别替代了旧版依赖树。我们把它实现�
 ### 客户端
 
 ```rust
-use courierust::client::{Client, ClientConfig};
+use courierust::courierust_client::{Client, ClientConfig};
 
 let client = Client::new();
 
@@ -89,7 +89,7 @@ let resp = client.post("http://127.0.0.1:8080/submit", "hello".as_bytes())?;
 指定 HTTP/2（h2c 前导知识）与优先级：
 
 ```rust
-use courierust::h2::priority::Priority;
+use courierust::courierust_h2::priority::Priority;
 
 let mut cfg = ClientConfig::default();
 cfg.http2 = true;
@@ -102,10 +102,10 @@ let resp = client.execute_priority("http://127.0.0.1:8080/api", request, prio)?;
 ### 服务器
 
 ```rust
-use courierust::server::{Server, ServerConfig};
-use courierust::http::request::Request;
-use courierust::http::response::Response;
-use courierust::body::Body;
+use courierust::courierust_server::{Server, ServerConfig};
+use courierust::courierust_http::request::Request;
+use courierust::courierust_http::response::Response;
+use courierust::courierust_body::Body;
 
 let mut cfg = ServerConfig::default();
 cfg.http2 = true; // 同时服务 h2c 与 h1.1
@@ -121,8 +121,8 @@ server.serve(|req: Request<Body>| -> Response<Body> {
 ### gRPC
 
 ```rust
-use courierust::grpc::{GrpcClient, GrpcServer};
-use courierust::bytes::Bytes;
+use courierust::courierust_grpc::{GrpcClient, GrpcServer};
+use courierust::courierust_bytes::Bytes;
 
 // 服务器端：实现 Service（或直接传闭包）
 let server = GrpcServer::bind("127.0.0.1:50051", |method: &str, req: Bytes| {
@@ -141,11 +141,11 @@ let reply = client.call("helloworld.Greeter/SayHello", Bytes::from("world"))?;
 因此 `https://` 成为同一套客户端/服务端的一等公民能力：
 
 ```rust
-use courierust::client::{Client, ClientConfig, TlsSettings as ClientTls};
-use courierust::server::{Server, ServerConfig, TlsSettings as ServerTls};
+use courierust::courierust_client::{Client, ClientConfig, TlsSettings as ClientTls};
+use courierust::courierust_server::{Server, ServerConfig, TlsSettings as ServerTls};
 
 // 服务端：用你的证书链 + 私钥开 HTTPS。
-let identity = courierust::tls::Identity {
+let identity = courierust::courierust_tls::Identity {
     cert_chain: vec![cert_der],        // 叶子在前（DER）
     private_key: key_der,              // PKCS#8 或 PKCS#1（DER）
     is_rsa: false,                     // Ed25519/ECDSA 为 false
@@ -160,7 +160,7 @@ let server_cfg = ServerConfig {
 };
 
 // 客户端：信任你的根证书并开启 TLS。
-let mut roots = courierust::tls::RootStore::new();
+let mut roots = courierust::courierust_tls::RootStore::new();
 roots.add_der(root_der);                // 或用 RootStore::add_pem(...)
 let client_cfg = ClientConfig {
     tls: Some(ClientTls {
@@ -187,7 +187,7 @@ key-usage、RFC 6125 主机名校验含 IP SAN、可插拔根证书库）。
 TLS 握手参数完全由你掌控（包括内置 TLS 层）：
 
 ```rust
-use courierust::fingerprint::{chrome_tls_profile, ja3_hash, ja4, h2::ChromeH2Fingerprint};
+use courierust::courierust_fingerprint::{chrome_tls_profile, ja3_hash, ja4, h2::ChromeH2Fingerprint};
 
 let profile = chrome_tls_profile();
 assert_eq!(ja3_hash(&profile), "cd08e31494f9531f560d64c695473da9");
@@ -225,23 +225,25 @@ courierust = { version = "0.1", default-features = false }
 
 ## 目录结构
 
+所有公共模块都以 crate 名做前缀（`courierust_`），这样任何模块路径都不会与第三方 crate（如 `h2`、`http`、`bytes`、`grpc`、`tls`）冲突：
+
 ```
 src/
-├── http/        # HTTP/1.1 消息模型（请求/响应/头/URI/状态码）      [no_std]
-├── hpack/       # HPACK：表驱动 Huffman + 静态/动态索引表           [no_std]
-├── h2/          # HTTP/2 帧、SETTINGS、流状态机、流控、WUCS、PRIORITY_UPDATE [no_std]
-├── fingerprint/ # JA3 / JA4 / Chrome HTTP/2 指纹                    [no_std]
-├── crypto/      # 自带 MD5 / SHA-256（指纹用）                      [no_std]
-├── bytes/       # 字节缓冲（BytesMut）                              [no_std]
-├── io/          # Read/Write trait（no_std 版）                     [no_std]
-├── error/       # 统一错误类型
-├── pool/        # 工作窃取线程池                                    [std]
-├── net/         # TCP → io trait 适配                               [std]
-├── body/        # 流式响应体（channel）                             [std]
-├── h1/          # HTTP/1.1 线上编解码                                [std]
-├── client/      # h1 连接池 + h2 驱动                                [std]
-├── server/      # 基于工作窃取池的服务器                             [std]
-└── grpc/        # gRPC 帧 + 状态 + codec trait                       [std]
+├── courierust_http/        # HTTP/1.1 消息模型（请求/响应/头/URI/状态码）      [no_std]
+├── courierust_hpack/       # HPACK：表驱动 Huffman + 静态/动态索引表           [no_std]
+├── courierust_h2/          # HTTP/2 帧、SETTINGS、流状态机、流控、WUCS、PRIORITY_UPDATE [no_std]
+├── courierust_fingerprint/ # JA3 / JA4 / Chrome HTTP/2 指纹                    [no_std]
+├── courierust_crypto/      # 自带 MD5 / SHA-256（指纹用）                      [no_std]
+├── courierust_bytes/       # 字节缓冲（BytesMut）                              [no_std]
+├── courierust_io/          # Read/Write trait（no_std 版）                     [no_std]
+├── courierust_error/       # 统一错误类型
+├── courierust_pool/        # 工作窃取线程池                                    [std]
+├── courierust_net/         # TCP → io trait 适配                               [std]
+├── courierust_body/        # 流式响应体（channel）                             [std]
+├── courierust_h1/          # HTTP/1.1 线上编解码                                [std]
+├── courierust_client/      # h1 连接池 + h2 驱动                                [std]
+├── courierust_server/      # 基于工作窃取池的服务器                             [std]
+└── courierust_grpc/        # gRPC 帧 + 状态 + codec trait                       [std]
 ```
 
 ## 基准测试

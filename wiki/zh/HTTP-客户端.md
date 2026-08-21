@@ -5,7 +5,7 @@
 ## 配置
 
 ```rust
-use courierust::client::{Client, ClientConfig};
+use courierust::courierust_client::{Client, ClientConfig};
 use std::time::Duration;
 
 let cfg = ClientConfig {
@@ -54,11 +54,11 @@ let resp = client.post("http://127.0.0.1:8080/submit", vec![1u8, 2, 3])?;
 ## 带请求头的 Request 与响应检查
 
 ```rust
-use courierust::body::Body;
-use courierust::bytes::Bytes;
-use courierust::http::header::{HeaderName, HeaderValue};
-use courierust::http::method::Method;
-use courierust::http::request::Request;
+use courierust::courierust_body::Body;
+use courierust::courierust_bytes::Bytes;
+use courierust::courierust_http::header::{HeaderName, HeaderValue};
+use courierust::courierust_http::method::Method;
+use courierust::courierust_http::request::Request;
 
 let mut req = Request::new(Method::POST, "/api/items?page=2");
 req.headers.insert(
@@ -96,7 +96,7 @@ let resp = client.get("http://short.example/start")?;
 HTTP/2 下可以给每个请求指定优先级。服务器端用 WUCS 调度器调度流：urgency `0..=7`（0 最高），`incremental` 表示数据到达即可消费的流。
 
 ```rust
-use courierust::h2::priority::Priority;
+use courierust::courierust_h2::priority::Priority;
 
 // 从线上格式解析（"u=1, i"）或直接构造：
 let prio = Priority { urgency: 1, incremental: true };
@@ -115,7 +115,7 @@ let resp = client.execute_priority("http://127.0.0.1:8080", req, prio)?;
 let resp = client.get("http://127.0.0.1:8080/events")?;
 let mut body = resp.body;
 while let Some(chunk) = body.try_next_chunk()? {
-    // chunk: courierust::bytes::Bytes
+    // chunk: courierust::courierust_bytes::Bytes
     eprintln!("chunk: {} bytes", chunk.len());
 }
 ```
@@ -138,5 +138,5 @@ match client.get("http://127.0.0.1:9/") {
 
 ## 你需要知道的限制
 
-- **没有内置 TLS**。内置连接器只认 `http://`。要 HTTPS，把任意 TLS 流包上 `courierust::io::Read`/`io::Write` 再驱动编解码（ClientHello 参数见[浏览器指纹](浏览器指纹)）。
+- **没有内置 TLS**。内置连接器只认 `http://`。要 HTTPS，把任意 TLS 流包上 `courierust::courierust_io::Read`/`io::Write` 再驱动编解码（ClientHello 参数见[浏览器指纹](浏览器指纹)）。
 - **流式请求体仅 HTTP/2 可靠**。`Client::execute` 会把 `Body::Channel` 请求体先完整读进内存再发送；真正的上传流式是后续扩展。

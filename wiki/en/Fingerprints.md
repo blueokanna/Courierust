@@ -5,7 +5,7 @@ Servers that care about bot traffic fingerprint the **TLS ClientHello** (JA3 / J
 ## JA3
 
 ```rust
-use courierust::fingerprint::{chrome_tls_profile, ja3_hash, ja3_string};
+use courierust::courierust_fingerprint::{chrome_tls_profile, ja3_hash, ja3_string};
 
 let profile = chrome_tls_profile(); // a TlsProfile, the ClientHello parameters
 let s = ja3_string(&profile);       // "771,4865-4866-...,0-...,23,0-29-..."
@@ -21,7 +21,7 @@ assert_eq!(ja3_hash(&profile), "cd08e31494f9531f560d64c695473da9");
 ## JA4
 
 ```rust
-use courierust::fingerprint::ja4;
+use courierust::courierust_fingerprint::ja4;
 
 let f = ja4(&profile);
 // format: t<version>d<ciphers>h<extensions><alpn>_<SNI hash>_<cipher hash>
@@ -35,7 +35,7 @@ GREASE values are filtered automatically (the JA4 spec requires it), so `chrome_
 `TlsProfile` is plain data — you can build your own:
 
 ```rust
-use courierust::fingerprint::TlsProfile;
+use courierust::courierust_fingerprint::TlsProfile;
 
 let custom = TlsProfile {
     tls_version: 0x0304, // TLS 1.3
@@ -53,7 +53,7 @@ Feed these values into your TLS library's ClientHello builder.
 Beyond TLS, Chrome is identified by its HTTP/2 behavior. The `ChromeH2Fingerprint` type carries the long-standing Chromium defaults:
 
 ```rust
-use courierust::fingerprint::h2::ChromeH2Fingerprint;
+use courierust::courierust_fingerprint::h2::ChromeH2Fingerprint;
 
 let fp = ChromeH2Fingerprint::chrome();
 
@@ -61,19 +61,19 @@ let fp = ChromeH2Fingerprint::chrome();
 let entries = fp.settings_entries(); // Vec<Setting>
 
 // Apply onto a Settings object, or build a whole h2 Config:
-let mut my_settings = courierust::h2::settings::Settings::default();
+let mut my_settings = courierust::courierust_h2::settings::Settings::default();
 fp.apply_to_settings(&mut my_settings);
 let h2_cfg = fp.h2_config(); // client-role h2::connection::Config
 
 // Header blocks are ordered pseudo-headers first, then lowercased-sorted:
-let ordered = courierust::fingerprint::h2::order_headers_chrome(&fields);
+let ordered = courierust::courierust_fingerprint::h2::order_headers_chrome(&fields);
 ```
 
 The fingerprint fields are all public and configurable (`header_table_size`, `enable_push`, `max_concurrent_streams`, `initial_window_size`, `max_header_list_size`, `connection_window_update`, `sort_headers`), so you can match a specific Chrome build. Chromium tweaks these occasionally — keep them in sync with the build you're impersonating.
 
 ## Wiring it to a real TLS stack
 
-Because the codec is generic over `courierust::io::Read` / `courierust::io::Write`, you can:
+Because the codec is generic over `courierust::courierust_io::Read` / `courierust::courierust_io::Write`, you can:
 
 1. Build a `TlsProfile` (Chrome's, or yours).
 2. Hand the ClientHello parameters to your TLS library (rustls, native-tls, or an FFI to OpenSSL/BoringSSL).

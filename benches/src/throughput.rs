@@ -6,14 +6,14 @@
 
 mod metrics;
 
-use courierust::body::Body;
-use courierust::bytes::Bytes;
-use courierust::client::{Client, ClientConfig};
-use courierust::h2::priority::Priority;
-use courierust::http::request::Request;
-use courierust::http::response::Response;
-use courierust::server::{Server, ServerConfig};
-use courierust::tls as crate_tls;
+use courierust::courierust_body::Body;
+use courierust::courierust_bytes::Bytes;
+use courierust::courierust_client::{Client, ClientConfig};
+use courierust::courierust_h2::priority::Priority;
+use courierust::courierust_http::request::Request;
+use courierust::courierust_http::response::Response;
+use courierust::courierust_server::{Server, ServerConfig};
+use courierust::courierust_tls as crate_tls;
 use metrics::{run_concurrent, run_sequential, Timing, MAX_SAMPLES};
 use std::sync::Arc;
 use std::time::Instant;
@@ -83,8 +83,8 @@ fn courierust_get(client: &Client, base_url: &str, path: &str, expected_bytes: u
     // streaming body for the network layer. `path` is a runtime `&str`,
     // so build an owned `PathAndQuery` (only `&'static str` converts
     // implicitly).
-    let pq = courierust::http::uri::PathAndQuery::from_bytes(path.as_bytes()).unwrap();
-    let req = courierust::http::request::Request::get(pq).with_body(Body::Empty);
+    let pq = courierust::courierust_http::uri::PathAndQuery::from_bytes(path.as_bytes()).unwrap();
+    let req = courierust::courierust_http::request::Request::get(pq).with_body(Body::Empty);
     let response = client.execute(base_url, req).unwrap();
     assert_courierust_response(response, expected_bytes);
 }
@@ -216,7 +216,7 @@ fn bench_h2_priority(requests: usize, server_threads: usize) {
         urgency: 7,
         incremental: false,
     };
-    let request = courierust::http::request::Request::get("/priority");
+    let request = courierust::courierust_http::request::Request::get("/priority");
     let _ = client
         .execute_priority(&base_url, request.clone().with_body(Body::Empty), high)
         .unwrap();
@@ -287,8 +287,8 @@ fn load_test_identity() -> (crate_tls::Identity, crate_tls::RootStore) {
 /// crate's own TLS stack — the "real protocol, real crypto" case that
 /// loopback h2c benchmarks cannot speak to.
 fn bench_https(requests: usize, payload: Payload, server_threads: usize) {
-    use courierust::client::TlsSettings as ClientTls;
-    use courierust::server::TlsSettings as ServerTls;
+    use courierust::courierust_client::TlsSettings as ClientTls;
+    use courierust::courierust_server::TlsSettings as ServerTls;
 
     let (identity, roots) = load_test_identity();
     let body = payload_bytes(payload);

@@ -4,11 +4,11 @@
 //!
 //! Run with `cargo run --example streaming`.
 
-use courierust::body::Body;
-use courierust::client::{Client, ClientConfig};
-use courierust::http::request::Request;
-use courierust::http::response::Response;
-use courierust::server::{Server, ServerConfig};
+use courierust::courierust_body::Body;
+use courierust::courierust_client::{Client, ClientConfig};
+use courierust::courierust_http::request::Request;
+use courierust::courierust_http::response::Response;
+use courierust::courierust_server::{Server, ServerConfig};
 use std::time::Duration;
 
 fn main() -> courierust::Result<()> {
@@ -20,11 +20,13 @@ fn main() -> courierust::Result<()> {
     let server = Server::bind_with_config("127.0.0.1:0", server_cfg)?;
     let addr = server.local_addr()?;
     let _handle = server.serve_background(|_req: Request<Body>| -> Response<Body> {
-        let (tx, body) = courierust::body::channel();
+        let (tx, body) = courierust::courierust_body::channel();
         std::thread::spawn(move || {
             for i in 0..10 {
                 if tx
-                    .send(courierust::bytes::Bytes::from(format!("event {i}\n")))
+                    .send(courierust::courierust_bytes::Bytes::from(format!(
+                        "event {i}\n"
+                    )))
                     .is_err()
                 {
                     break; // client went away
@@ -34,8 +36,8 @@ fn main() -> courierust::Result<()> {
         });
         let mut resp = Response::with_status(200.into());
         resp.headers.insert(
-            courierust::http::header::HeaderName::from_lowercase("content-type"),
-            courierust::http::header::HeaderValue::from_static("text/event-stream"),
+            courierust::courierust_http::header::HeaderName::from_lowercase("content-type"),
+            courierust::courierust_http::header::HeaderValue::from_static("text/event-stream"),
         );
         resp.body = body;
         resp

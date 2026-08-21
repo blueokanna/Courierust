@@ -4,7 +4,7 @@
 
 > Hands-on tutorials (English & 中文) live on the [wiki](https://github.com/blueokanna/Courierust/wiki).
 
-The protocol core (`http` / `hpack` / `h2` / `fingerprint` / `crypto` / `bytes` / `io`) compiles under `no_std + alloc` with **no dependencies at all**. The `std` feature (on by default) layers the threaded networking on top: a work-stealing thread pool, TCP adapters, client, server, and gRPC.
+The protocol core (`courierust_http` / `courierust_hpack` / `courierust_h2` / `courierust_fingerprint` / `courierust_crypto` / `courierust_bytes` / `courierust_io`) compiles under `no_std + alloc` with **no dependencies at all**. The `std` feature (on by default) layers the threaded networking on top: a work-stealing thread pool, TCP adapters, client, server, and gRPC.
 
 None of this wraps an existing library. Frame codecs, HPACK header compression, the stream state machine, flow control, priority scheduling, and fingerprint construction are all implemented from scratch.
 
@@ -38,14 +38,14 @@ The mainstream Rust HTTP ecosystem (hyper / h2 / h3 and friends) is excellent, b
 
 ### std networking layer
 
-- **Work-stealing thread pool** (`pool`): per-worker LIFO cache + global FIFO steal queue; jobs can spawn jobs; stealing prefers the worker idle the longest.
-- **Client** (`client`):
+- **Work-stealing thread pool** (`courierust_pool`): per-worker LIFO cache + global FIFO steal queue; jobs can spawn jobs; stealing prefers the worker idle the longest.
+- **Client** (`courierust_client`):
   - HTTP/1.1 keep-alive connection pool grouped by authority and sharded per worker (per-shard locks instead of a global mutex);
   - HTTP/2 connections also sharded per worker with round-robin distribution and multiplexing;
   - Redirect following (301/302/303 → GET), timeouts, `User-Agent`, etc.
-- **Server** (`server`): each accepted connection becomes a pool job, so connection handling scales across cores.
-- **gRPC** (`grpc`): HTTP/2 + length-prefixed message framing + `grpc-status` / `grpc-message` handling, with unary, server-streaming, client-streaming and bidi calls on both sides. `gzip` message compression is implemented from scratch (RFC 1951/1952: full DEFLATE decompression for any producer, fixed-Huffman LZ77 compression) and negotiated per gRPC A6. Deadlines (`grpc-timeout`) are enforced server-side, metadata and interceptors are supported, `dns:///` targets round-robin, and the `grpc.health.v1.Health` service provides `Check` and `Watch`. Protobuf is deliberately left to you — implement `EncodeMessage` / `DecodeMessage` for your types, or use the raw-bytes API.
-- **Streaming bodies** (`body`): channel-backed `Body::Channel` lets handlers push response chunks from another thread.
+- **Server** (`courierust_server`): each accepted connection becomes a pool job, so connection handling scales across cores.
+- **gRPC** (`courierust_grpc`): HTTP/2 + length-prefixed message framing + `grpc-status` / `grpc-message` handling, with unary, server-streaming, client-streaming and bidi calls on both sides. `gzip` message compression is implemented from scratch (RFC 1951/1952: full DEFLATE decompression for any producer, fixed-Huffman LZ77 compression) and negotiated per gRPC A6. Deadlines (`grpc-timeout`) are enforced server-side, metadata and interceptors are supported, `dns:///` targets round-robin, and the `grpc.health.v1.Health` service provides `Check` and `Watch`. Protobuf is deliberately left to you — implement `EncodeMessage` / `DecodeMessage` for your types, or use the raw-bytes API.
+- **Streaming bodies** (`courierust_body`): channel-backed `Body::Channel` lets handlers push response chunks from another thread.
 
 ## The parts that actually took work: multi-core and scheduling
 
@@ -74,7 +74,7 @@ The client pool is not one `HashMap` under a global lock. Each worker holds its 
 ### Client
 
 ```rust
-use courierust::client::{Client, ClientConfig};
+use courierust::courierust_client::{Client, ClientConfig};
 
 let client = Client::new();
 
@@ -89,7 +89,7 @@ let resp = client.post("http://127.0.0.1:8080/submit", "hello".as_bytes())?;
 Opt into HTTP/2 (h2c prior knowledge) and set priorities:
 
 ```rust
-use courierust::h2::priority::Priority;
+use courierust::courierust_h2::priority::Priority;
 
 let mut cfg = ClientConfig::default();
 cfg.http2 = true;
@@ -102,10 +102,10 @@ let resp = client.execute_priority("http://127.0.0.1:8080/api", request, prio)?;
 ### Server
 
 ```rust
-use courierust::server::{Server, ServerConfig};
-use courierust::http::request::Request;
-use courierust::http::response::Response;
-use courierust::body::Body;
+use courierust::courierust_server::{Server, ServerConfig};
+use courierust::courierust_http::request::Request;
+use courierust::courierust_http::response::Response;
+use courierust::courierust_body::Body;
 
 let mut cfg = ServerConfig::default();
 cfg.http2 = true; // serves h2c and h1.1 on the same port
@@ -121,8 +121,8 @@ server.serve(|req: Request<Body>| -> Response<Body> {
 ### gRPC
 
 ```rust
-use courierust::grpc::{GrpcClient, GrpcServer};
-use courierust::bytes::Bytes;
+use courierust::courierust_grpc::{GrpcClient, GrpcServer};
+use courierust::courierust_bytes::Bytes;
 
 // Server side: implement Service (or just pass a closure)
 let server = GrpcServer::bind("127.0.0.1:50051", |method: &str, req: Bytes| {
@@ -142,11 +142,11 @@ implementation (RFC 8446), so `https://` is a first-class capability of
 the same client and server:
 
 ```rust
-use courierust::client::{Client, ClientConfig, TlsSettings as ClientTls};
-use courierust::server::{Server, ServerConfig, TlsSettings as ServerTls};
+use courierust::courierust_client::{Client, ClientConfig, TlsSettings as ClientTls};
+use courierust::courierust_server::{Server, ServerConfig, TlsSettings as ServerTls};
 
 // Server: serve HTTPS with your certificate chain + private key.
-let identity = courierust::tls::Identity {
+let identity = courierust::courierust_tls::Identity {
     cert_chain: vec![cert_der],        // leaf first (DER)
     private_key: key_der,              // PKCS#8 or PKCS#1 (DER)
     is_rsa: false,                     // false for Ed25519/ECDSA
@@ -161,7 +161,7 @@ let server_cfg = ServerConfig {
 };
 
 // Client: trust your roots and enable TLS.
-let mut roots = courierust::tls::RootStore::new();
+let mut roots = courierust::courierust_tls::RootStore::new();
 roots.add_der(root_der);                // or RootStore::add_pem(...)
 let client_cfg = ClientConfig {
     tls: Some(ClientTls {
@@ -190,7 +190,7 @@ The TLS handshake parameters are fully yours to control (including via
 the built-in TLS layer):
 
 ```rust
-use courierust::fingerprint::{chrome_tls_profile, ja3_hash, ja4, h2::ChromeH2Fingerprint};
+use courierust::courierust_fingerprint::{chrome_tls_profile, ja3_hash, ja4, h2::ChromeH2Fingerprint};
 
 let profile = chrome_tls_profile();
 assert_eq!(ja3_hash(&profile), "cd08e31494f9531f560d64c695473da9");
@@ -228,23 +228,27 @@ Things this crate deliberately does *not* do, so you know before you commit:
 
 ## Layout
 
+Every public module is prefixed with the crate's name (`courierust_`) so no
+module path collides with a third-party crate (e.g. `h2`, `http`, `bytes`,
+`grpc`, `tls`):
+
 ```
 src/
-├── http/        # HTTP/1.1 message model (request/response/headers/URI/status)  [no_std]
-├── hpack/       # HPACK: table-driven Huffman + static/dynamic index tables      [no_std]
-├── h2/          # HTTP/2 frames, SETTINGS, stream state machine, flow control, WUCS, PRIORITY_UPDATE  [no_std]
-├── fingerprint/ # JA3 / JA4 / Chrome HTTP/2 fingerprints                        [no_std]
-├── crypto/      # self-contained MD5 / SHA-256 (used by fingerprints)            [no_std]
-├── bytes/       # byte buffers (BytesMut)                                        [no_std]
-├── io/          # Read/Write traits (no_std flavor)                              [no_std]
-├── error/       # unified error type
-├── pool/        # work-stealing thread pool                                      [std]
-├── net/         # TCP → io trait adapters                                        [std]
-├── body/        # streaming response bodies (channel)                            [std]
-├── h1/          # HTTP/1.1 on-the-wire codec                                      [std]
-├── client/      # h1 pool + h2 driver                                            [std]
-├── server/      # work-stealing-pool-backed server                               [std]
-└── grpc/        # gRPC framing + status + codec traits                           [std]
+├── courierust_http/        # HTTP/1.1 message model (request/response/headers/URI/status)  [no_std]
+├── courierust_hpack/       # HPACK: table-driven Huffman + static/dynamic index tables      [no_std]
+├── courierust_h2/          # HTTP/2 frames, SETTINGS, stream state machine, flow control, WUCS, PRIORITY_UPDATE  [no_std]
+├── courierust_fingerprint/ # JA3 / JA4 / Chrome HTTP/2 fingerprints                        [no_std]
+├── courierust_crypto/      # self-contained MD5 / SHA-256 (used by fingerprints)            [no_std]
+├── courierust_bytes/       # byte buffers (BytesMut)                                        [no_std]
+├── courierust_io/          # Read/Write traits (no_std flavor)                              [no_std]
+├── courierust_error/       # unified error type
+├── courierust_pool/        # work-stealing thread pool                                      [std]
+├── courierust_net/         # TCP → io trait adapters                                        [std]
+├── courierust_body/        # streaming response bodies (channel)                            [std]
+├── courierust_h1/          # HTTP/1.1 on-the-wire codec                                      [std]
+├── courierust_client/      # h1 pool + h2 driver                                            [std]
+├── courierust_server/      # work-stealing-pool-backed server                               [std]
+└── courierust_grpc/        # gRPC framing + status + codec traits                           [std]
 ```
 
 ## Benchmarks

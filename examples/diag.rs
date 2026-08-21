@@ -1,8 +1,8 @@
-use courierust::body::Body;
-use courierust::client::{Client, ClientConfig};
-use courierust::http::request::Request;
-use courierust::http::response::Response;
-use courierust::server::{Server, ServerConfig};
+use courierust::courierust_body::Body;
+use courierust::courierust_client::{Client, ClientConfig};
+use courierust::courierust_http::request::Request;
+use courierust::courierust_http::response::Response;
+use courierust::courierust_server::{Server, ServerConfig};
 
 fn main() -> courierust::Result<()> {
     let server_cfg = ServerConfig {
@@ -28,7 +28,7 @@ fn main() -> courierust::Result<()> {
     let resp = client.get(&url)?;
     println!("GET  {} -> {}", url, resp.status);
 
-    let mut req = Request::new(courierust::http::method::Method::POST, "/echo");
+    let mut req = Request::new(courierust::courierust_http::method::Method::POST, "/echo");
     req.body = Body::Bytes("hello over h2".into());
     let resp = client.execute(&format!("http://{addr}/echo"), req)?;
     let echoed = resp.body.collect()?;

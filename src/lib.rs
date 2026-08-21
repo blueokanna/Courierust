@@ -1,10 +1,16 @@
 //! Courierust — a self-contained HTTP/1.1 + HTTP/2 + gRPC stack.
 //!
-//! The protocol core (`http`, `hpack`, `h2`, `fingerprint`, `crypto`,
-//! `bytes`, `io`) compiles on `no_std + alloc` with **zero** third-party
-//! dependencies. The `std` feature (enabled by default) adds the threaded
-//! networking layer: `pool` (work-stealing scheduler), `net`, `client`,
-//! `server` and `grpc`.
+//! The protocol core (`courierust_http`, `courierust_hpack`,
+//! `courierust_h2`, `courierust_fingerprint`, `courierust_crypto`,
+//! `courierust_bytes`, `courierust_io`) compiles on `no_std + alloc`
+//! with **zero** third-party dependencies. The `std` feature (enabled by
+//! default) adds the threaded networking layer: `courierust_pool`
+//! (work-stealing scheduler), `courierust_net`, `courierust_client`,
+//! `courierust_server` and `courierust_grpc`.
+//!
+//! Every public module carries the crate's `courierust_` prefix so no
+//! module path collides with a third-party crate of the same short name
+//! (e.g. `h2`, `http`, `bytes`, `grpc`, `tls`).
 //!
 //! Design highlights:
 //!
@@ -28,13 +34,13 @@
 //!   fed to an external TLS layer of your choice.
 //!
 //! TLS 1.3 (RFC 8446) is implemented from scratch under the `std`
-//! feature (`tls` module) — client and server handshakes, X.25519 key
-//! exchange, AES-GCM / ChaCha20-Poly1305 record protection, and X.509
-//! chain validation — so `https://` is a first-class capability on both
-//! the client and the server. The protocol core (`http`, `hpack`, `h2`,
-//! `fingerprint`, `crypto`, `bytes`, `io`) stays `no_std + alloc` with
-//! zero third-party dependencies; the transport traits let the same
-//! codecs also run over an externally supplied TLS stream.
+//! feature (`courierust_tls` module) — client and server handshakes,
+//! X.25519 key exchange, AES-GCM / ChaCha20-Poly1305 record protection,
+//! and X.509 chain validation — so `https://` is a first-class
+//! capability on both the client and the server. The protocol core stays
+//! `no_std + alloc` with zero third-party dependencies; the transport
+//! traits let the same codecs also run over an externally supplied TLS
+//! stream.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(unsafe_code)]
@@ -46,31 +52,31 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
-pub mod bytes;
-pub mod crypto;
-pub mod error;
-pub mod fingerprint;
-pub mod h2;
-pub mod hpack;
-pub mod http;
-pub mod io;
+pub mod courierust_bytes;
+pub mod courierust_crypto;
+pub mod courierust_error;
+pub mod courierust_fingerprint;
+pub mod courierust_h2;
+pub mod courierust_hpack;
+pub mod courierust_http;
+pub mod courierust_io;
 #[cfg(feature = "std")]
-pub mod tls;
+pub mod courierust_tls;
 
 #[cfg(feature = "std")]
-pub mod body;
+pub mod courierust_body;
 #[cfg(feature = "std")]
-pub mod client;
+pub mod courierust_client;
 #[cfg(feature = "std")]
-pub mod grpc;
+pub mod courierust_grpc;
 #[cfg(feature = "std")]
-pub mod h1;
+pub mod courierust_h1;
 #[cfg(feature = "std")]
-pub mod net;
+pub mod courierust_net;
 #[cfg(feature = "std")]
-pub mod pool;
+pub mod courierust_pool;
 #[cfg(feature = "std")]
-pub mod server;
+pub mod courierust_server;
 
-pub use bytes::Bytes;
-pub use error::{Error, ErrorKind, Result};
+pub use courierust_bytes::Bytes;
+pub use courierust_error::{Error, ErrorKind, Result};

@@ -7,10 +7,10 @@
 handler 是任意 `Fn(Request<Body>) -> Response<Body> + Send + Sync + 'static`。闭包直接可用：
 
 ```rust
-use courierust::body::Body;
-use courierust::bytes::Bytes;
-use courierust::http::request::Request;
-use courierust::http::response::Response;
+use courierust::courierust_body::Body;
+use courierust::courierust_bytes::Bytes;
+use courierust::courierust_http::request::Request;
+use courierust::courierust_http::response::Response;
 
 let handler = |req: Request<Body>| -> Response<Body> {
     let mut resp = Response::with_status(200.into());
@@ -22,10 +22,10 @@ let handler = |req: Request<Body>| -> Response<Body> {
 复杂逻辑用结构体实现 `Handler` trait（字段是你自己的应用状态）：
 
 ```rust
-use courierust::body::Body;
-use courierust::bytes::Bytes;
-use courierust::http::request::Request;
-use courierust::http::response::Response;
+use courierust::courierust_body::Body;
+use courierust::courierust_bytes::Bytes;
+use courierust::courierust_http::request::Request;
+use courierust::courierust_http::response::Response;
 use std::sync::Arc;
 
 // `Db` 是你自己的应用类型，不是 crate 提供的。
@@ -34,7 +34,7 @@ struct App {
     db: Arc<dyn Db>,
 }
 
-impl courierust::server::Handler for App {
+impl courierust::courierust_server::Handler for App {
     fn handle(&self, req: Request<Body>) -> Response<Body> {
         match req.uri.as_str() {
             "/health" => Response::with_status(200.into()),
@@ -51,7 +51,7 @@ impl courierust::server::Handler for App {
 ## 配置
 
 ```rust
-use courierust::server::{Server, ServerConfig};
+use courierust::courierust_server::{Server, ServerConfig};
 use std::time::Duration;
 
 let cfg = ServerConfig {
@@ -90,7 +90,7 @@ drop(handle);
 
 ```rust
 let handler = |_req: Request<Body>| -> Response<Body> {
-    let (tx, body) = courierust::body::channel();
+    let (tx, body) = courierust::courierust_body::channel();
     std::thread::spawn(move || {
         for i in 0..100 {
             // tx.send 在接收端被丢弃时失败，返回 Result。

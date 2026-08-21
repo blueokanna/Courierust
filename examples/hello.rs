@@ -1,8 +1,8 @@
-use courierust::body::Body;
-use courierust::client::{Client, ClientConfig};
-use courierust::http::request::Request;
-use courierust::http::response::Response;
-use courierust::server::{Server, ServerConfig};
+use courierust::courierust_body::Body;
+use courierust::courierust_client::{Client, ClientConfig};
+use courierust::courierust_http::request::Request;
+use courierust::courierust_http::response::Response;
+use courierust::courierust_server::{Server, ServerConfig};
 
 fn main() -> courierust::Result<()> {
     // --- server ---
@@ -19,8 +19,8 @@ fn main() -> courierust::Result<()> {
     let _handle = server.serve_background(|req: Request<Body>| -> Response<Body> {
         let mut resp = Response::with_status(200.into());
         resp.headers.insert(
-            courierust::http::header::HeaderName::from_lowercase("content-type"),
-            courierust::http::header::HeaderValue::from_static("text/plain"),
+            courierust::courierust_http::header::HeaderName::from_lowercase("content-type"),
+            courierust::courierust_http::header::HeaderValue::from_static("text/plain"),
         );
         let body = req.body.collect().unwrap_or_default();
         resp.body = Body::Bytes(body);

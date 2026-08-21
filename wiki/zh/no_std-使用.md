@@ -6,15 +6,15 @@
 
 | 模块 | 内容 |
 |---|---|
-| `http` | 请求/响应/方法/状态码/头/URI |
-| `hpack` | 编码器/解码器、Huffman、静态+动态表 |
-| `h2` | 帧、SETTINGS、流、流控、WUCS、`PRIORITY_UPDATE` |
-| `fingerprint` | JA3 / JA4 / Chrome HTTP/2 profile |
-| `crypto` | MD5、SHA-256 |
-| `bytes` / `io` | 字节缓冲、Read/Write trait |
-| `error` | 统一错误类型 |
+| `courierust_http` | 请求/响应/方法/状态码/头/URI |
+| `courierust_hpack` | 编码器/解码器、Huffman、静态+动态表 |
+| `courierust_h2` | 帧、SETTINGS、流、流控、WUCS、`PRIORITY_UPDATE` |
+| `courierust_fingerprint` | JA3 / JA4 / Chrome HTTP/2 profile |
+| `courierust_crypto` | MD5、SHA-256 |
+| `courierust_bytes` / `courierust_io` | 字节缓冲、Read/Write trait |
+| `courierust_error` | 统一错误类型 |
 
-需要 `std`（在默认 feature 后面）的：`pool`、`net`、`body`、`client`、`server`、`h1`、`grpc`。
+需要 `std`（在默认 feature 后面）的：`courierust_pool`、`courierust_net`、`courierust_body`、`courierust_client`、`courierust_server`、`courierust_h1`、`courierust_grpc`。
 
 ## 开启方式
 
@@ -36,12 +36,12 @@ cargo build --no-default-features --lib
 一个最简 HTTP/2 客户端会话，一帧一帧地推进：
 
 ```rust
-use courierust::bytes::BytesMut;
-use courierust::h2::connection::{Config, Connection};
-use courierust::h2::priority::Priority;
-use courierust::io::{BufReader, BufWriter};
+use courierust::courierust_bytes::BytesMut;
+use courierust::courierust_h2::connection::{Config, Connection};
+use courierust::courierust_h2::priority::Priority;
+use courierust::courierust_io::{BufReader, BufWriter};
 
-// 为你的传输层实现 crate::io::Read / crate::io::Write。
+// 为你的传输层实现 crate::courierust_io::Read / crate::courierust_io::Write。
 struct MyTransport; // ... Read + Write 实现 ...
 
 let reader = BufReader::new(MyTransport, 4096);
@@ -68,13 +68,13 @@ loop {
 }
 ```
 
-`Connection` 对 `crate::io::Read`/`Write` 泛型化，同样的代码既能驱动 TCP、TLS，也能驱动 UART 式字节流。
+`Connection` 对 `crate::courierust_io::Read`/`Write` 泛型化，同样的代码既能驱动 TCP、TLS，也能驱动 UART 式字节流。
 
 ## 无 std 的哈希
 
 ```rust
-use courierust::crypto::md5::md5_hex;
-use courierust::crypto::sha256::sha256_hex;
+use courierust::courierust_crypto::md5::md5_hex;
+use courierust::courierust_crypto::sha256::sha256_hex;
 
 let h = md5_hex(b"hello");    // "5d41402abc4b2a76b9719d911017c592"
 let h = sha256_hex(b"hello"); // "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"

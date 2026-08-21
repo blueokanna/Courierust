@@ -10,12 +10,12 @@
 //! Run: `cargo bench --bench concurrency` (or
 //! `cargo run --release --bench concurrency`).
 
-use courierust::body::Body;
-use courierust::bytes::Bytes;
-use courierust::client::{Client, ClientConfig};
-use courierust::http::request::Request;
-use courierust::http::response::Response;
-use courierust::server::{Server, ServerConfig};
+use courierust::courierust_body::Body;
+use courierust::courierust_bytes::Bytes;
+use courierust::courierust_client::{Client, ClientConfig};
+use courierust::courierust_http::request::Request;
+use courierust::courierust_http::response::Response;
+use courierust::courierust_server::{Server, ServerConfig};
 use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -35,8 +35,8 @@ fn env_usize(name: &str, default: usize) -> usize {
 fn handler(_req: Request<Body>) -> Response<Body> {
     let mut resp = Response::with_status(200.into());
     resp.headers.insert(
-        courierust::http::header::HeaderName::from_lowercase("content-length"),
-        courierust::http::header::HeaderValue::from_static("2"),
+        courierust::courierust_http::header::HeaderName::from_lowercase("content-length"),
+        courierust::courierust_http::header::HeaderValue::from_static("2"),
     );
     resp.body = Body::Bytes(Bytes::from_static(b"ok"));
     resp

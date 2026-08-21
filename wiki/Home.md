@@ -1,6 +1,6 @@
 # Courierust
 
-A self-contained HTTP/1.1 + HTTP/2 + gRPC stack for Rust with **zero third-party dependencies**. The protocol core (`http`, `hpack`, `h2`, `fingerprint`, `crypto`) compiles under `no_std + alloc`; the `std` layer adds a work-stealing thread pool, a multi-core client, a server, and gRPC.
+A self-contained HTTP/1.1 + HTTP/2 + gRPC stack for Rust with **zero third-party dependencies**. The protocol core (`courierust_http`, `courierust_hpack`, `courierust_h2`, `courierust_fingerprint`, `courierust_crypto`) compiles under `no_std + alloc`; the `std` layer adds a work-stealing thread pool, a multi-core client, a server, and gRPC. All public modules carry the `courierust_` prefix so none of them collide with third-party crates of the same short name.
 
 This wiki is a hands-on guide. Every code sample below is real API usage — copy it, paste it, run it.
 

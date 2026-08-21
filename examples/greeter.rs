@@ -1,8 +1,8 @@
 //! End-to-end gRPC demo: a background gRPC server plus a client that
 //! calls it. Run with `cargo run --example greeter`.
 
-use courierust::bytes::Bytes;
-use courierust::grpc::{GrpcClient, GrpcServer};
+use courierust::courierust_bytes::Bytes;
+use courierust::courierust_grpc::{GrpcClient, GrpcServer};
 
 fn main() -> courierust::Result<()> {
     // --- server ---
@@ -19,7 +19,7 @@ fn main() -> courierust::Result<()> {
         }
         "/greeter.Greeter/Count" => Ok(Bytes::from(format!("{} chars", req.len()))),
         _ => Err(courierust::Error::grpc(
-            courierust::grpc::status::UNIMPLEMENTED,
+            courierust::courierust_grpc::status::UNIMPLEMENTED,
             "unknown method",
         )),
     })?;

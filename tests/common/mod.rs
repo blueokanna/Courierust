@@ -51,8 +51,8 @@ pub const SERVER_KEY_DER: &[u8] = &[
 pub const NOW: i64 = 1_800_000_000; // 2027-01-14T00:00:00Z
 
 /// Build the TLS server identity for the test certificate.
-pub fn server_identity() -> courierust::tls::Identity {
-    courierust::tls::Identity {
+pub fn server_identity() -> courierust::courierust_tls::Identity {
+    courierust::courierust_tls::Identity {
         cert_chain: vec![SERVER_CERT_DER.to_vec()],
         private_key: SERVER_KEY_DER.to_vec(),
         is_rsa: false,
@@ -60,8 +60,8 @@ pub fn server_identity() -> courierust::tls::Identity {
 }
 
 /// A root store that trusts the test certificate.
-pub fn root_store() -> courierust::tls::RootStore {
-    let mut roots = courierust::tls::RootStore::new();
+pub fn root_store() -> courierust::courierust_tls::RootStore {
+    let mut roots = courierust::courierust_tls::RootStore::new();
     roots.add_der(SERVER_CERT_DER.to_vec());
     roots
 }

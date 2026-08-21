@@ -5,8 +5,8 @@ gRPC = HTTP/2 + 长度前缀的二进制消息 + 由 trailer（`grpc-status` / `
 ## 原始字节 unary 调用
 
 ```rust
-use courierust::bytes::Bytes;
-use courierust::grpc::GrpcClient;
+use courierust::courierust_bytes::Bytes;
+use courierust::courierust_grpc::GrpcClient;
 
 let client = GrpcClient::new("http://127.0.0.1:50051")?;
 
@@ -29,7 +29,7 @@ assert_eq!(reply, "echo:ping"); // 取决于服务器返回
 自己的 protobuf 类型实现两个 trait 即可：
 
 ```rust
-use courierust::grpc::codec::{DecodeMessage, EncodeMessage};
+use courierust::courierust_grpc::codec::{DecodeMessage, EncodeMessage};
 use courierust::Result;
 
 // 生成的/protobuf 消息，例如 `HelloRequest { name: String }`
@@ -54,10 +54,10 @@ impl DecodeMessage for HelloRequest {
 ## 服务端流（一个响应多条消息）
 
 ```rust
-use courierust::grpc::GrpcClient;
+use courierust::courierust_grpc::GrpcClient;
 
 let client = GrpcClient::new("http://127.0.0.1:50051")?;
-let mut stream = client.call_stream("/chat.Chat/Updates", courierust::bytes::Bytes::from("join"))?;
+let mut stream = client.call_stream("/chat.Chat/Updates", courierust::courierust_bytes::Bytes::from("join"))?;
 
 while let Some(msg) = stream.next_message()? {
     println!("msg: {}", msg.to_str()?);
@@ -71,14 +71,14 @@ while let Some(msg) = stream.next_message()? {
 gRPC 服务是任意 `Fn(&str, Bytes) -> Result<Bytes> + Send + Sync + 'static`（或实现 `Service` trait 的类型）：
 
 ```rust
-use courierust::bytes::Bytes;
-use courierust::grpc::GrpcServer;
+use courierust::courierust_bytes::Bytes;
+use courierust::courierust_grpc::GrpcServer;
 
 let server = GrpcServer::bind("127.0.0.1:50051", |method: &str, req: Bytes| {
     match method {
         "/echo.Echo/Say" => Ok(Bytes::from(format!("echo:{}", req.to_str()?))),
         _ => Err(courierust::Error::grpc(
-            courierust::grpc::status::UNIMPLEMENTED,
+            courierust::courierust_grpc::status::UNIMPLEMENTED,
             "unknown method",
         )),
     }
@@ -87,7 +87,7 @@ let addr = server.local_addr()?;
 let _handle = server.serve_background()?; // 或 server.serve()? 阻塞
 ```
 
-返回带 `grpc` 错误码的 `Err` 会映射为线上的 `grpc-status` / `grpc-message`。全部标准错误码都在 `courierust::grpc::status` 里（`OK`、`CANCELLED`、`INVALID_ARGUMENT`、`NOT_FOUND`、`INTERNAL`、`UNIMPLEMENTED`、`UNAVAILABLE` 等）。
+返回带 `grpc` 错误码的 `Err` 会映射为线上的 `grpc-status` / `grpc-message`。全部标准错误码都在 `courierust::courierust_grpc::status` 里（`OK`、`CANCELLED`、`INVALID_ARGUMENT`、`NOT_FOUND`、`INTERNAL`、`UNIMPLEMENTED`、`UNAVAILABLE` 等）。
 
 ## 客户端错误处理
 

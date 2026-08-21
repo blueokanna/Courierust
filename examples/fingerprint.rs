@@ -4,8 +4,8 @@
 //!
 //! Run with `cargo run --example fingerprint`.
 
-use courierust::fingerprint::h2::ChromeH2Fingerprint;
-use courierust::fingerprint::{chrome_tls_profile, ja3_hash, ja3_string, ja4};
+use courierust::courierust_fingerprint::h2::ChromeH2Fingerprint;
+use courierust::courierust_fingerprint::{chrome_tls_profile, ja3_hash, ja3_string, ja4};
 
 fn main() {
     let profile = chrome_tls_profile();

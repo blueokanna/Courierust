@@ -6,11 +6,11 @@
 //!
 //! Run with `cargo run --example protocol_core`.
 
-use courierust::bytes::BytesMut;
-use courierust::h2::connection::{Config as H2Config, Connection};
-use courierust::h2::priority::Priority;
-use courierust::hpack::{Decoder, Encoder, HeaderField};
-use courierust::http::header::{HeaderName, HeaderValue};
+use courierust::courierust_bytes::BytesMut;
+use courierust::courierust_h2::connection::{Config as H2Config, Connection};
+use courierust::courierust_h2::priority::Priority;
+use courierust::courierust_hpack::{Decoder, Encoder, HeaderField};
+use courierust::courierust_http::header::{HeaderName, HeaderValue};
 use std::sync::mpsc;
 
 /// A read-only in-memory pipe (inbound side of a connection).
@@ -23,7 +23,7 @@ struct Sink {
     tx: mpsc::Sender<Vec<u8>>,
 }
 
-impl courierust::io::Read for Pipe {
+impl courierust::courierust_io::Read for Pipe {
     fn read(&mut self, buf: &mut [u8]) -> courierust::Result<usize> {
         match self.rx.try_recv() {
             Ok(v) => {
@@ -36,7 +36,7 @@ impl courierust::io::Read for Pipe {
     }
 }
 
-impl courierust::io::Write for Sink {
+impl courierust::courierust_io::Write for Sink {
     fn write(&mut self, buf: &[u8]) -> courierust::Result<usize> {
         self.tx
             .send(buf.to_vec())
@@ -96,7 +96,11 @@ fn main() -> courierust::Result<()> {
 
     let sid = conn.open_request(Priority::default())?;
     conn.send_headers(sid, &fields, false)?; // body follows
-    conn.send_data(sid, courierust::bytes::Bytes::from_static(b"hello"), true)?;
+    conn.send_data(
+        sid,
+        courierust::courierust_bytes::Bytes::from_static(b"hello"),
+        true,
+    )?;
     conn.flush()?; // writes preface + SETTINGS + HEADERS + DATA into a2b
 
     // Confirm the bytes actually left the client into the pipe.
@@ -110,8 +114,8 @@ fn main() -> courierust::Result<()> {
     let _ = b2a; // the peer side (would feed b2a_rx) is not exercised here
 
     // ---- hashes used by the fingerprint builders ----
-    use courierust::crypto::md5::md5_hex;
-    use courierust::crypto::sha256::sha256_hex;
+    use courierust::courierust_crypto::md5::md5_hex;
+    use courierust::courierust_crypto::sha256::sha256_hex;
     println!("md5(hello)    = {}", md5_hex(b"hello"));
     println!("sha256(hello) = {}", sha256_hex(b"hello"));
 
