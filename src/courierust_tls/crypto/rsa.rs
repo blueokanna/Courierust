@@ -427,8 +427,22 @@ pub struct RsaPublicKey {
 }
 
 impl RsaPublicKey {
+    /// Maximum accepted RSA key material (bytes). Real keys are at most
+    /// 8192 bits (1024 bytes); a hostile certificate with a
+    /// multi-megabyte modulus or exponent would otherwise drive the
+    /// Montgomery setup (`R = 2^(64k) mod n`, quadratic in limb count)
+    /// and the exponent loop into a CPU-exhaustion DoS during
+    /// certificate-chain verification.
+    const MAX_KEY_BYTES: usize = 1024;
+
     /// RSAVP1: `s^e mod n`.
     fn raw_verify(&self, signature: &[u8]) -> Option<Vec<u8>> {
+        if self.n.is_empty() || self.e.is_empty() {
+            return None;
+        }
+        if self.n.len() > Self::MAX_KEY_BYTES || self.e.len() > Self::MAX_KEY_BYTES {
+            return None;
+        }
         let n = BigInt::from_be_bytes(&self.n);
         let s = BigInt::from_be_bytes(signature);
         if s.cmp(&n) != core::cmp::Ordering::Less {
@@ -753,5 +767,25 @@ mod tests {
         // The digest-info prefixes embed the digest length; validate.
         assert_eq!(DIGEST_INFO_SHA256.len(), 19);
         assert_eq!(DIGEST_INFO_SHA384.len(), 19);
+    }
+
+    /// A hostile certificate with an oversized RSA modulus (or exponent)
+    /// must be rejected up front — Montgomery setup and the exponent
+    /// loop are quadratic in key size, so without the cap a malicious
+    /// peer could pin the verifier's CPU during chain validation.
+    #[test]
+    fn oversized_key_rejected() {
+        let key = RsaPublicKey {
+            n: vec![0xAB; RsaPublicKey::MAX_KEY_BYTES + 1],
+            e: vec![0x01, 0x00, 0x01],
+        };
+        let sig = vec![0u8; 32];
+        assert!(!key.verify_pkcs1v15(DIGEST_INFO_SHA256, &[0u8; 32], &sig));
+
+        let key = RsaPublicKey {
+            n: vec![0xAB; 16],
+            e: vec![0x01; RsaPublicKey::MAX_KEY_BYTES + 1],
+        };
+        assert!(!key.verify_pkcs1v15(DIGEST_INFO_SHA256, &[0u8; 32], &sig));
     }
 }

@@ -544,17 +544,10 @@ impl EventConn {
 /// Serialize a response (head + body, chunked for channel bodies) into
 /// wire bytes and decide keep-alive.
 fn build_response(resp: Response<Body>, config: &ServerConfig) -> Result<(Vec<u8>, bool)> {
+    // `keep_alive_requested` already applies the exact-token `Connection`
+    // semantics (a `closex` token does not close); no separate substring
+    // check here, or the two paths would disagree.
     let keep_alive = courierust_h1::keep_alive_requested(resp.version, &resp.headers)
-        && !resp
-            .headers
-            .get("connection")
-            .map(|v| {
-                v.to_str()
-                    .unwrap_or("")
-                    .to_ascii_lowercase()
-                    .contains("close")
-            })
-            .unwrap_or(false)
         && resp.version != Version::HTTP_10;
 
     let mut out_headers = HeaderMap::with_capacity(resp.headers.len() + 3);

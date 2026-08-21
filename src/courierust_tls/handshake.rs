@@ -575,6 +575,20 @@ pub(crate) fn finished_verify_data(
 // ---------------------------------------------------------------------
 
 /// Client-side handshake driver.
+/// Fill `buf` from OS entropy, failing the handshake when the source is
+/// unavailable. Never proceed with zeroed bytes: an all-zero X25519
+/// private key yields a predictable ECDHE shared secret and silently
+/// breaks the session's confidentiality (both as client and as server).
+fn fill_entropy(buf: &mut [u8]) -> TlsResult<()> {
+    if super::crypto::rng::fill_random(buf) {
+        Ok(())
+    } else {
+        Err(TlsError::Internal(
+            "cryptographic RNG unavailable; refusing to generate a predictable key".into(),
+        ))
+    }
+}
+
 pub(crate) struct ClientHandshake {
     pub(crate) alpn: Vec<Vec<u8>>,
     pub(crate) server_name: Option<String>,
@@ -590,12 +604,15 @@ impl ClientHandshake {
         roots: &super::x509::RootStore,
         now: i64,
     ) -> TlsResult<HandshakeResult> {
-        // 1. ClientHello
+        // 1. ClientHello. Entropy is mandatory: continuing with a failed
+        //    OS entropy source would yield an all-zero X25519 private
+        //    key (predictable ECDHE → compromised session keys), so the
+        //    handshake fails closed instead.
         let mut random = [0u8; 32];
-        super::crypto::rng::fill_random(&mut random);
-        let (priv_key, pub_key) = x25519::keypair(&mut |b| {
-            super::crypto::rng::fill_random(b);
-        });
+        fill_entropy(&mut random)?;
+        let mut priv_key = [0u8; 32];
+        fill_entropy(&mut priv_key)?;
+        let pub_key = x25519::x25519(&priv_key, &x25519::BASE_POINT);
         let ch = build_client_hello(&random, &pub_key, &self.alpn, self.server_name.as_deref());
         io.write_plaintext_record(CONTENT_HANDSHAKE, &ch)?;
 
@@ -777,13 +794,15 @@ impl ServerHandshake {
         let mut transcript = Transcript::new(ch.suite.hash());
         transcript.update(&encode_hs(HS_CLIENT_HELLO, &ch_body));
 
-        // 2. ECDHE + ServerHello.
-        let (s_priv, s_pub) = x25519::keypair(&mut |b| {
-            super::crypto::rng::fill_random(b);
-        });
+        // 2. ECDHE + ServerHello. Same fail-closed entropy requirement as
+        //    the client: an all-zero server private key would make the
+        //    session keys predictable to a passive attacker.
+        let mut s_priv = [0u8; 32];
+        fill_entropy(&mut s_priv)?;
+        let s_pub = x25519::x25519(&s_priv, &x25519::BASE_POINT);
         let shared = x25519::x25519(&s_priv, &ch.key_share);
         let mut random = [0u8; 32];
-        super::crypto::rng::fill_random(&mut random);
+        fill_entropy(&mut random)?;
         let sh = build_server_hello(&random, &s_pub, ch.suite);
         io.write_plaintext_record(CONTENT_HANDSHAKE, &sh)?;
         let sh_body = sh[4..].to_vec();

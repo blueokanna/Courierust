@@ -77,17 +77,11 @@ pub(crate) fn serve(
             return crate::courierust_server::h2::serve_upgraded(stream, handler, config, resp);
         }
 
+        // `keep_alive_requested` applies exact-token `Connection`
+        // semantics (a `closex` token does not close) and already
+        // returns false for a close token; no separate substring check
+        // here, or this path and the event path would disagree.
         let keep_alive = courierust_h1::keep_alive_requested(resp.version, &resp.headers)
-            && !resp
-                .headers
-                .get("connection")
-                .map(|v| {
-                    v.to_str()
-                        .unwrap_or("")
-                        .to_ascii_lowercase()
-                        .contains("close")
-                })
-                .unwrap_or(false)
             && resp.version != Version::HTTP_10;
 
         // Build wire headers (drop hop-by-hop, add framing).

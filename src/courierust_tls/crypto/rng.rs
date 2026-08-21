@@ -115,12 +115,18 @@ impl ChaChaRng {
     fn reseed(&mut self) {
         let mut fresh = [0u8; 44];
         if fill_random(&mut fresh) {
+            // Mix the fresh entropy into the current state before
+            // swapping it in, so a partial read can never zero the state.
             self.fill_blocks_raw(&mut fresh, self.counter.wrapping_add(1));
+            self.key.copy_from_slice(&fresh[..32]);
+            self.nonce.copy_from_slice(&fresh[32..44]);
+            self.counter = 0;
+            self.since_reseed = 0;
         }
-        self.key.copy_from_slice(&fresh[..32]);
-        self.nonce.copy_from_slice(&fresh[32..44]);
-        self.counter = 0;
-        self.since_reseed = 0;
+        // If entropy is unavailable, keep the previous (already seeded)
+        // key — overwriting it with zeros would make the DRBG output
+        // predictable, which is strictly worse than continuing with the
+        // prior state.
     }
 
     fn fill_blocks_raw(&mut self, out: &mut [u8], start_counter: u32) {

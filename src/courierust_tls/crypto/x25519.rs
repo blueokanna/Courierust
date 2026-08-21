@@ -377,17 +377,20 @@ pub fn x25519(scalar: &[u8; 32], u: &[u8; 32]) -> [u8; 32] {
     fe_tobytes(result)
 }
 
-/// Generate a fresh X25519 key pair.
+/// The X25519 base point u-coordinate (RFC 7748 §5), exposed so callers
+/// can generate a key pair from a caller-owned random scalar.
+pub const BASE_POINT: [u8; 32] = [
+    9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// Generate a fresh X25519 key pair. The caller's `rng` must fill the
+/// secret with unpredictable bytes; the TLS handshake treats a failure
+/// to obtain entropy as fatal (an all-zero secret would make the ECDHE
+/// shared secret predictable).
 pub fn keypair(rng: &mut impl FnMut(&mut [u8])) -> ([u8; 32], [u8; 32]) {
     let mut secret = [0u8; 32];
     rng(&mut secret);
-    let public = x25519(
-        &secret,
-        &[
-            9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0,
-        ],
-    );
+    let public = x25519(&secret, &BASE_POINT);
     (secret, public)
 }
 

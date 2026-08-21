@@ -288,16 +288,35 @@ impl<W: Write> BufWriter<W> {
     }
 
     /// Write a whole slice, buffering as needed.
+    ///
+    /// A transport `write` may return a **short count** (a TCP send
+    /// buffer can fill mid-write), so the direct path loops until every
+    /// byte is out. Returning early on a short write would silently drop
+    /// the tail of a request/response — data corruption that only shows
+    /// up under real network backpressure.
     pub fn write_all(&mut self, data: &[u8]) -> Result<()> {
         // Large writes bypass the buffer when it is empty.
         if self.buf.is_empty() && data.len() >= self.buf.capacity() {
-            self.inner.write(data)?;
-            return Ok(());
+            return self.write_loop(data);
         }
         if self.buf.len() + data.len() > self.buf.capacity() {
             self.flush()?;
         }
         self.buf.extend_from_slice(data);
+        Ok(())
+    }
+
+    /// Write all of `data` to the inner writer, looping over partial
+    /// writes. A transport error is fatal (callers drop the connection),
+    /// so no retry/duplication can occur.
+    fn write_loop(&mut self, mut data: &[u8]) -> Result<()> {
+        while !data.is_empty() {
+            let n = self.inner.write(data)?;
+            if n == 0 {
+                return Err(Error::io("write made no progress"));
+            }
+            data = &data[n.min(data.len())..];
+        }
         Ok(())
     }
 
@@ -308,10 +327,19 @@ impl<W: Write> BufWriter<W> {
 }
 
 impl<W: Write> BufWriter<W> {
-    /// Flush the internal buffer to the inner writer.
+    /// Flush the internal buffer to the inner writer, looping over
+    /// partial writes, then flush the transport.
     pub fn flush(&mut self) -> Result<()> {
         if !self.buf.is_empty() {
-            self.inner.write(&self.buf)?;
+            let mut written = 0usize;
+            let len = self.buf.len();
+            while written < len {
+                let n = self.inner.write(&self.buf[written..])?;
+                if n == 0 {
+                    return Err(Error::io("write made no progress"));
+                }
+                written += n;
+            }
             self.buf.clear();
         }
         self.inner.flush()
@@ -435,5 +463,53 @@ mod tests {
         assert_eq!(w.buffered(), 4);
         w.flush().unwrap();
         assert_eq!(w.get_ref().0, b"abcd");
+    }
+
+    /// A transport whose `write` returns a short count — the way a real
+    /// TCP send buffer fills. `write_all`/`flush` must loop until every
+    /// byte is out, or large responses would be silently truncated under
+    /// backpressure.
+    #[test]
+    fn bufwriter_loops_over_partial_writes() {
+        struct ShortWriter {
+            out: Vec<u8>,
+            max_chunk: usize,
+        }
+        impl Write for ShortWriter {
+            fn write(&mut self, buf: &[u8]) -> Result<usize> {
+                let n = buf.len().min(self.max_chunk);
+                self.out.extend_from_slice(&buf[..n]);
+                Ok(n)
+            }
+            fn flush(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        // Direct path (large write ≥ capacity).
+        let mut w = BufWriter::new(
+            ShortWriter {
+                out: Vec::new(),
+                max_chunk: 3,
+            },
+            8,
+        );
+        w.write_all(&[0x41; 100]).unwrap();
+        w.flush().unwrap();
+        assert_eq!(w.get_ref().out, [0x41; 100]);
+
+        // Buffered path: small writes coalesce, then flush loops.
+        let mut w = BufWriter::new(
+            ShortWriter {
+                out: Vec::new(),
+                max_chunk: 2,
+            },
+            8,
+        );
+        for _ in 0..10 {
+            w.write_all(b"ab").unwrap();
+        }
+        w.flush().unwrap();
+        assert_eq!(w.get_ref().out, b"abababababababababab");
     }
 }
