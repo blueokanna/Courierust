@@ -108,6 +108,7 @@ fn hyper_server(http2: bool) -> std::net::SocketAddr {
                 let Ok((stream, _)) = listener.accept().await else {
                     break;
                 };
+                let _ = stream.set_nodelay(true);
                 let io = TokioIo::new(stream);
                 let svc = service_fn(|req: hyper::Request<Incoming>| async move {
                     let path = req.uri().path().to_string();

@@ -49,6 +49,10 @@ const MAX_H3_STREAMS: usize = 1024;
 const MAX_H3_UNI_STREAMS: usize = 3;
 const MAX_H3_PENDING_REQUESTS: usize = 256;
 const MAX_H3_CONNECTION_BUFFER: usize = 64 * 1024 * 1024;
+/// Upper bound on datagrams drained per poll wake. A peer that floods
+/// (or a zero-length datagram burst) must not starve the reactor's
+/// connection sweep — `on_tick`/response flushing runs between drains.
+const MAX_DATAGRAMS_PER_POLL: usize = 256;
 const ACK_DELAY: Duration = Duration::from_millis(2);
 const LOSS_DELAY: Duration = Duration::from_millis(250);
 /// Floor for the per-connection loss timeout once an RTT sample exists.
@@ -561,7 +565,9 @@ fn run_client_driver(
             Err(error) => return finish(conn, &socket, io_error(error.to_string())),
         };
         if ready.contains(&SOCKET_ID) {
-            loop {
+            // Bounded drain: mirror the server so a flood cannot starve
+            // `on_tick` / deadline handling between datagram batches.
+            for _ in 0..MAX_DATAGRAMS_PER_POLL {
                 match socket.recv(&mut datagram) {
                     Ok(n) => {
                         if n == 0 || n > MAX_DATAGRAM {
@@ -659,8 +665,18 @@ fn run_server(
             .wait(SERVER_IDLE_TIMEOUT_MS, Some(wake_fd))
             .map_err(|e| io_error(e.to_string()))?;
         if ready.contains(&SOCKET_ID) {
-            while let Ok((n, peer)) = socket.recv_from(&mut datagram) {
-                handle_server_datagram(&socket, &mut datagram[..n], peer, &mut state);
+            // Bounded drain: a flood (or zero-length datagrams) must not
+            // starve the connection sweep that runs after this loop,
+            // which is what flushes queued responses. Remaining data is
+            // picked up on the next poll (the socket stays ready).
+            for _ in 0..MAX_DATAGRAMS_PER_POLL {
+                match socket.recv_from(&mut datagram) {
+                    Ok((0, _)) => continue,
+                    Ok((n, peer)) if n <= MAX_DATAGRAM => {
+                        handle_server_datagram(&socket, &mut datagram[..n], peer, &mut state);
+                    }
+                    _ => break,
+                }
             }
         }
         if ready.contains(&WAKE_ID) {
@@ -1180,6 +1196,7 @@ impl ClientConnection {
     }
 
     fn on_tick(&mut self, socket: &UdpSocket) -> Result<()> {
+        self.transport.flush_acks(socket)?;
         self.transport.retransmit(socket)?;
         if !self.tls_initial_sent {
             self.transport
@@ -1783,6 +1800,7 @@ impl ServerConnection {
         if self.handshake_complete && !self.control_sent {
             self.send_control(socket)?;
         }
+        self.transport.flush_acks(socket)?;
         self.transport.retransmit(socket)
     }
 
@@ -3602,6 +3620,13 @@ impl QuicTransport {
             return Err(protocol("HTTP/3 response queue limit exceeded"));
         }
         self.queued_streams.push_back((id, wire, 0));
+        if std::env::var_os("COURIERUST_H3_DEBUG").is_some() {
+            eprintln!(
+                "H3SERVER wire-queued: stream={} len={}",
+                id,
+                self.queued_streams.back().map_or(0, |(_, b, _)| b.len())
+            );
+        }
         if let Some(stats) = self.stats.as_deref() {
             Stats::bump_peak(&stats.h3_queue_depth_peak, self.queued_streams.len());
         }
@@ -3640,6 +3665,18 @@ impl QuicTransport {
                 );
                 if let Err(error) = result {
                     if error.kind == ErrorKind::WouldBlock {
+                        if std::env::var_os("COURIERUST_H3_DEBUG").is_some()
+                            && wire.len() > 100 * 1024
+                        {
+                            eprintln!(
+                                "H3SERVER wire-deferred: stream={} offset={}/{} cwnd={} unacked={}",
+                                id,
+                                offset,
+                                wire.len(),
+                                self.congestion_window,
+                                self.unacknowledged_bytes()
+                            );
+                        }
                         self.queued_streams.push_front((id, wire, offset));
                         return Ok(());
                     }
@@ -3670,9 +3707,27 @@ impl QuicTransport {
             ranges,
             ecn: None,
         };
-        self.send_frames(socket, level, &[frame], false)?;
-        self.spaces[level].ack_pending = false;
-        self.spaces[level].ack_deadline = None;
+        match self.send_frames(socket, level, &[frame], false) {
+            Ok(()) => {
+                self.spaces[level].ack_pending = false;
+                self.spaces[level].ack_deadline = None;
+                Ok(())
+            }
+            // A full send buffer defers the ACK: `ack_pending` stays set,
+            // the peer's retransmission (or the next datagram) retries it.
+            // Treating this as fatal would tear the connection down over
+            // transient backpressure.
+            Err(error) if error.kind == ErrorKind::WouldBlock => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Retry any ACK deferred by a full send buffer. Called every tick so
+    /// a deferred ACK is not left waiting for the peer's retransmission.
+    fn flush_acks(&mut self, socket: &UdpSocket) -> Result<()> {
+        for level in [INITIAL, HANDSHAKE, APPLICATION] {
+            self.flush_ack(socket, level)?;
+        }
         Ok(())
     }
 
@@ -3923,15 +3978,25 @@ impl QuicTransport {
 }
 
 fn send_datagram(socket: &UdpSocket, peer: Option<SocketAddr>, wire: &[u8]) -> Result<()> {
-    match peer {
-        Some(peer) => socket
-            .send_to(wire, peer)
-            .map(|_| ())
-            .map_err(|e| io_error(e.to_string())),
-        None => socket
-            .send(wire)
-            .map(|_| ())
-            .map_err(|e| io_error(e.to_string())),
+    let result = match peer {
+        Some(peer) => socket.send_to(wire, peer),
+        None => socket.send(wire),
+    };
+    match result {
+        Ok(_) => Ok(()),
+        // A full UDP send buffer is transient backpressure, not a
+        // failure. Mapping it to WouldBlock keeps every deferral guard
+        // (retransmit re-queue, stream-chunk resume, crypto resume)
+        // working; mapping it to Io here is what let a loaded Linux
+        // runner treat a momentary EAGAIN as fatal and tear the
+        // connection down mid-transfer.
+        Err(e)
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            Err(Error::new(ErrorKind::WouldBlock))
+        }
+        Err(e) => Err(io_error(e.to_string())),
     }
 }
 

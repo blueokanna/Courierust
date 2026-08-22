@@ -47,6 +47,11 @@ jobs:
         shell: bash
         env:
           COURIERUST_NETWORK_URL: ${{ secrets.COURIERUST_REMOTE_URL }}
+          # Env-gated H3 diagnostics: printed only on error/cold paths, so
+          # a future connection-close failure carries the server's reason
+          # straight into the captured log instead of a bare "peer closed
+          # HTTP/3".
+          COURIERUST_H3_DEBUG: 1
         run: |
           suite_failed=0
 

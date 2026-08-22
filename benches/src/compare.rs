@@ -149,6 +149,12 @@ fn hyper_server(protocol: Protocol, payload: Payload) -> SocketAddr {
                 let Ok((stream, _)) = listener.accept().await else {
                     break;
                 };
+                // Fair loopback comparison: the Courierust server and
+                // every client set TCP_NODELAY; hyper's auto builder does
+                // not, and without it the 64 KiB rows stall ~40 ms per
+                // request (Linux delayed-ACK + Nagle) for no protocol
+                // reason.
+                let _ = stream.set_nodelay(true);
                 let body = body.clone();
                 let service = service_fn(move |request: hyper::Request<Incoming>| {
                     let body = body.clone();
