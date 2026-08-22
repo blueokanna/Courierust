@@ -679,6 +679,13 @@ fn run_server(
             if (!connection.handshake_complete && now >= connection.handshake_deadline)
                 || now.duration_since(connection.last_activity) >= connection.idle_timeout
             {
+                if std::env::var_os("COURIERUST_H3_DEBUG").is_some() {
+                    eprintln!(
+                        "H3SERVER conn-removed: handshake={} idle={:?}",
+                        connection.handshake_complete,
+                        now.duration_since(connection.last_activity),
+                    );
+                }
                 let _ = connection.transport.send_connection_close(
                     &socket,
                     0x1,
@@ -693,6 +700,9 @@ fn run_server(
                 continue;
             }
             if let Err(error) = connection.on_tick(&socket) {
+                if std::env::var_os("COURIERUST_H3_DEBUG").is_some() {
+                    eprintln!("H3SERVER on_tick error: {error}");
+                }
                 let _ = connection.transport.send_connection_close(
                     &socket,
                     0x1,
@@ -703,6 +713,15 @@ fn run_server(
                 continue;
             }
             while let Some(request) = connection.take_request() {
+                if std::env::var_os("COURIERUST_H3_DEBUG").is_some()
+                    && request.request.body.len().unwrap_or(0) > 100 * 1024
+                {
+                    eprintln!(
+                        "H3SERVER request-taken: stream={} pending={}",
+                        request.stream_id,
+                        connection.pending_requests.len()
+                    );
+                }
                 if active_tasks.load(Ordering::Acquire) >= task_limit {
                     connection.queue_service_unavailable(request.stream_id);
                     continue;
@@ -780,6 +799,9 @@ fn handle_server_datagram(
         }
         let failure = connection.on_datagram(socket, datagram).err();
         if let Some(error) = failure {
+            if std::env::var_os("COURIERUST_H3_DEBUG").is_some() {
+                eprintln!("H3SERVER conn-killed: {error}");
+            }
             let _ =
                 connection
                     .transport
@@ -1337,6 +1359,32 @@ impl ClientConnection {
             .map(|(&stream_id, _)| stream_id)
             .collect();
         for stream_id in expired {
+            if std::env::var_os("COURIERUST_H3_DEBUG").is_some() {
+                let offset = self
+                    .active
+                    .get(&stream_id)
+                    .map(|request| {
+                        (
+                            request.offset,
+                            request.wire.len(),
+                            request.response.is_some(),
+                        )
+                    })
+                    .unwrap_or((0, 0, false));
+                eprintln!(
+                    "H3CLIENT timeout: waiting={} active={} handshake={} control={} cwnd={} unacked={} stream_limit={} offset={} wire={} response={}",
+                    self.waiting.len(),
+                    self.active.len(),
+                    self.handshake_complete,
+                    self.control_received,
+                    self.transport.congestion_window,
+                    self.transport.unacknowledged_bytes(),
+                    self.transport.peer_stream_send_limit(stream_id),
+                    offset.0,
+                    offset.1,
+                    offset.2,
+                );
+            }
             self.fail_stream(stream_id, Error::new(ErrorKind::Timeout));
         }
     }
@@ -2383,6 +2431,15 @@ fn drain_request_frames(
             .ok_or_else(|| protocol("HTTP/3 request ended without HEADERS"))?;
         let request = request_from_fields(fields, core::mem::take(&mut stream.body))?;
         stream.completed = true;
+        if std::env::var_os("COURIERUST_H3_DEBUG").is_some()
+            && request.body.len().unwrap_or(0) > 100 * 1024
+        {
+            eprintln!(
+                "H3SERVER request-pushed: stream={} body={} finished=true",
+                stream.id,
+                request.body.len().unwrap_or(0)
+            );
+        }
         requests.push_back(PendingRequest {
             stream_id: stream.id,
             request,
@@ -3032,6 +3089,11 @@ struct SentPacket {
     retransmits: u8,
     ack_eliciting: bool,
     size: usize,
+    /// A retransmit blocked by the congestion window. Retried on the
+    /// next tick once ACKs free credit, not after a full loss timeout,
+    /// and not counted as a fresh loss (which would re-collapse the
+    /// window while the packet is merely waiting for credit).
+    pending_resend: bool,
 }
 
 struct QuicTransport {
@@ -3618,11 +3680,22 @@ impl QuicTransport {
         for (level, space) in self.spaces.iter_mut().enumerate() {
             let mut expired = Vec::new();
             for (&pn, packet) in &mut space.sent {
-                if packet.ack_eliciting && now.duration_since(packet.sent_at) >= loss_timeout {
-                    if packet.retransmits >= MAX_RETRANSMITS {
-                        return Err(protocol("QUIC packet loss exceeded retransmission limit"));
+                // A retransmit previously blocked by the congestion
+                // window is retried on the next tick (it does not count
+                // as a fresh loss and must not wait out a full loss
+                // timeout); only a fresh expiry increments the
+                // retransmit budget and halves the window.
+                let pending = packet.pending_resend;
+                if packet.ack_eliciting
+                    && (pending || now.duration_since(packet.sent_at) >= loss_timeout)
+                {
+                    if !pending {
+                        if packet.retransmits >= MAX_RETRANSMITS {
+                            return Err(protocol("QUIC packet loss exceeded retransmission limit"));
+                        }
+                        packet.retransmits += 1;
+                        lost = true;
                     }
-                    packet.retransmits += 1;
                     expired.push((
                         pn,
                         level,
@@ -3630,7 +3703,6 @@ impl QuicTransport {
                         packet.pad_initial,
                         packet.retransmits,
                     ));
-                    lost = true;
                 }
                 if expired.len() >= 8 {
                     break;
@@ -3653,10 +3725,11 @@ impl QuicTransport {
                 retransmits,
             ) {
                 Ok(()) => {}
-                // The congestion window is full. Put the packet back in
-                // `sent` so a later tick retries it with a fresh packet
-                // number once ACKs free credit — never tear the
-                // connection down over transient congestion.
+                // Congestion window full: keep the retransmit in `sent`
+                // flagged for an immediate retry on the next tick, so the
+                // moment ACKs free credit it goes out without waiting a
+                // full loss timeout. Never tear the connection down over
+                // transient congestion.
                 Err(error) if error.kind == ErrorKind::WouldBlock => {
                     let previous = self.spaces[level].sent.insert(
                         pn,
@@ -3667,6 +3740,7 @@ impl QuicTransport {
                             retransmits,
                             ack_eliciting: true,
                             size: 0,
+                            pending_resend: true,
                         },
                     );
                     debug_assert!(previous.is_none());
@@ -3787,6 +3861,7 @@ impl QuicTransport {
                     retransmits,
                     ack_eliciting,
                     size: wire.len(),
+                    pending_resend: false,
                 },
             );
         }

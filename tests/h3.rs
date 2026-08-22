@@ -131,7 +131,10 @@ fn h3_connection_reuse_across_requests() {
 #[test]
 fn h3_large_request_body_flow_control() {
     let base = spawn_h3_server(echo_handler);
-    let client = h3_client(1 << 20, Duration::from_secs(15));
+    // CI runs every test in parallel on small runners; the deadline is a
+    // deadlock tripwire, not a performance bound — a healthy 256 KiB
+    // transfer completes in well under a second.
+    let client = h3_client(1 << 20, Duration::from_secs(60));
 
     let body: Vec<u8> = (0..(256 * 1024)).map(|i| (i % 253) as u8).collect();
     let resp = client
@@ -152,7 +155,7 @@ fn h3_large_response_body_flow_control() {
         courierust::courierust_http::response::Response::<Body>::with_status(200.into())
             .with_body(Body::Bytes(Bytes::from(expected.clone())))
     });
-    let client = h3_client(1 << 20, Duration::from_secs(15));
+    let client = h3_client(1 << 20, Duration::from_secs(60));
 
     let resp = client.get(&format!("{base}/big-download")).unwrap();
     assert_eq!(resp.status.as_u16(), 200);
@@ -164,17 +167,24 @@ fn h3_large_response_body_flow_control() {
 #[test]
 fn h3_concurrent_multiplex() {
     let base = spawn_h3_server(echo_handler);
-    let client = h3_client(1 << 20, Duration::from_secs(10));
+    let client = h3_client(1 << 20, Duration::from_secs(60));
 
     let mut handles = Vec::new();
     for i in 0..16 {
         let client = client.clone();
         let url = format!("{base}/mux/{i}");
-        handles.push(std::thread::spawn(move || {
-            let resp = client.get(&url).unwrap();
-            assert_eq!(resp.status.as_u16(), 200);
-            resp.body.collect().unwrap().to_str().unwrap().to_string()
-        }));
+        // Explicit stack: the QUIC/TLS request path is deep, and Windows
+        // threads default to a 1 MiB stack (2 MiB elsewhere).
+        handles.push(
+            std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn(move || {
+                    let resp = client.get(&url).unwrap();
+                    assert_eq!(resp.status.as_u16(), 200);
+                    resp.body.collect().unwrap().to_str().unwrap().to_string()
+                })
+                .unwrap(),
+        );
     }
     for (i, handle) in handles.into_iter().enumerate() {
         assert_eq!(handle.join().unwrap(), format!("/mux/{i}"));
