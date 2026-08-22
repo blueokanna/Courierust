@@ -213,25 +213,51 @@ impl Server {
 
     /// Serve with the bound config, blocking.
     pub fn serve_with_config<H: Handler>(self, handler: H) -> std::io::Result<()> {
+        self.serve_inner(handler, None)
+    }
+
+    /// Shared serve implementation. When `ready` is supplied, it receives
+    /// the transport-setup outcome once every socket is bound, so a
+    /// background caller can start connecting without racing the reactor
+    /// thread. This matters for HTTP/3: the UDP socket is bound inside
+    /// `spawn_server`, which runs in this thread — a caller that connects
+    /// before that bind lands observes `Connection refused` on a freshly
+    /// bound TCP listener that has no UDP peer yet.
+    fn serve_inner<H: Handler>(
+        self,
+        handler: H,
+        ready: Option<&std::sync::mpsc::Sender<std::io::Result<()>>>,
+    ) -> std::io::Result<()> {
         let handler = Arc::new(handler);
         let config = self.config;
         let pool = self.pool;
-        let _http3 = if config.http3 {
+        let setup: std::io::Result<Option<_>> = (|| {
+            if !config.http3 {
+                return Ok(None);
+            }
             let tls = config.tls.as_ref().ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "ServerConfig.http3 requires a TLS identity",
                 )
             })?;
-            Some(crate::courierust_h3::runtime::spawn_server(
+            Ok(Some(crate::courierust_h3::runtime::spawn_server(
                 self.listener.local_addr()?,
                 tls,
                 handler.clone(),
                 config.clone(),
-            )?)
-        } else {
-            None
-        };
+            )?))
+        })();
+        if let Some(ready) = ready {
+            // Propagate a setup failure (e.g. an un-bindable HTTP/3 UDP
+            // port) so a background caller never waits forever.
+            let _ = ready.send(match &setup {
+                Ok(_) => Ok(()),
+                Err(error) => Err(std::io::Error::new(error.kind(), error.to_string())),
+            });
+        }
+        // Keep the HTTP/3 reactor handle alive for the whole serve loop.
+        let _http3 = setup?;
         if config.event_driven {
             return event::serve_event(self.listener, handler, config, pool);
         }
@@ -275,15 +301,23 @@ impl Server {
         Ok(())
     }
 
-    /// Serve in the background, returning immediately.
+    /// Serve in the background. The returned handle is only produced once
+    /// the server is actually listening: the TCP listener is bound eagerly
+    /// in `bind_with_config`, and an HTTP/3 server's UDP socket is bound
+    /// in the server thread before this returns — so callers may connect
+    /// to `local_addr()` immediately without racing the reactor.
     pub fn serve_background<H: Handler>(self, handler: H) -> std::io::Result<ServerHandle> {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("courierust-server".into())
             .spawn(move || {
-                let res = self.serve_with_config(handler);
+                let res = self.serve_inner(handler, Some(&ready_tx));
                 let _ = tx.send(res);
             })?;
+        // Block until the transport is ready, propagating a bind/setup
+        // failure (e.g. an un-bindable HTTP/3 UDP port) to the caller.
+        ready_rx.recv().unwrap_or(Ok(()))?;
         Ok(ServerHandle { done: rx })
     }
 }
