@@ -723,8 +723,8 @@ fn run_server(
                     );
                 }
                 if active_tasks.load(Ordering::Acquire) >= task_limit {
-                    connection.queue_service_unavailable(request.stream_id);
-                    continue;
+                    connection.push_request_front(request);
+                    break;
                 }
                 active_tasks.fetch_add(1, Ordering::AcqRel);
                 let tx = completed_tx.clone();
@@ -1902,6 +1902,10 @@ impl ServerConnection {
 
     fn take_request(&mut self) -> Option<PendingRequest> {
         self.pending_requests.pop_front()
+    }
+
+    fn push_request_front(&mut self, request: PendingRequest) {
+        self.pending_requests.push_front(request);
     }
 
     fn queue_response(&mut self, stream_id: u64, result: Result<Response<Body>>) {
