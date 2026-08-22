@@ -47,6 +47,13 @@ const MAX_CRYPTO_BUFFER: usize = 16 * 1024 * 1024;
 const MAX_STREAM_CHUNKS: usize = 4096;
 const MAX_H3_STREAMS: usize = 1024;
 const MAX_H3_UNI_STREAMS: usize = 3;
+/// Bounded history of completed request-stream ids. A stream's receive
+/// state is released as soon as its message is fully consumed (so the
+/// concurrent stream cap counts *live* streams, not the cumulative
+/// request count); this set lets a late retransmission be ignored without
+/// re-creating that state. The QUIC retransmission window is a few RTTs —
+/// far smaller than this cap — so evicting the oldest entry is safe.
+const MAX_COMPLETED_STREAMS: usize = 1024;
 const MAX_H3_PENDING_REQUESTS: usize = 256;
 const MAX_H3_CONNECTION_BUFFER: usize = 64 * 1024 * 1024;
 /// Upper bound on datagrams drained per poll wake. A peer that floods
@@ -1197,6 +1204,11 @@ impl ClientConnection {
 
     fn on_tick(&mut self, socket: &UdpSocket) -> Result<()> {
         self.transport.flush_acks(socket)?;
+        // Raise the advertised connection-level receive window as the
+        // application consumes data, so a long-lived connection is not
+        // capped at `initial_max_data` (which otherwise tears the
+        // connection down mid-transfer).
+        self.transport.replenish_connection_window(socket)?;
         self.transport.retransmit(socket)?;
         if !self.tls_initial_sent {
             self.transport
@@ -1497,8 +1509,10 @@ impl ClientConnection {
             let finished = {
                 let Some(request) = self.active.get_mut(&id) else {
                     // A response stream we already completed may receive a
-                    // retransmitted final packet after delivery; ignore it.
+                    // retransmitted final packet after delivery; ignore it
+                    // and drop the stub entry re-created above.
                     if id < 4 * self.next_stream_index {
+                        self.streams.remove(&id);
                         return Ok(());
                     }
                     return Err(protocol("HTTP/3 response on an unrequested stream"));
@@ -1525,6 +1539,10 @@ impl ClientConnection {
                 let response = request.response.take().expect("response just completed");
                 let _ = request.reply.send(Ok(response));
                 h3_close_stream(self.stats.as_ref(), &mut self.active_streams, id);
+                // Release the receive-side state now that the response is
+                // fully consumed; the guard above keeps late retransmits
+                // from re-creating it.
+                self.streams.remove(&id);
             }
         }
         self.ensure_buffer_budget()
@@ -1601,6 +1619,10 @@ struct ServerConnection {
     handshake_deadline: Instant,
     last_activity: Instant,
     streams: BTreeMap<u64, ReceiveStream>,
+    /// Recently completed request-stream ids, so a late retransmission is
+    /// dropped instead of re-creating receive state (see
+    /// `MAX_COMPLETED_STREAMS`).
+    completed_streams: VecDeque<u64>,
     pending_requests: VecDeque<PendingRequest>,
     qpack_decoder: DynamicTable,
     peer_transport: Option<TransportParameters>,
@@ -1653,6 +1675,7 @@ impl ServerConnection {
                 .unwrap_or_else(Instant::now),
             last_activity: Instant::now(),
             streams: BTreeMap::new(),
+            completed_streams: VecDeque::new(),
             pending_requests: VecDeque::new(),
             qpack_decoder: DynamicTable::new(0),
             peer_transport: None,
@@ -1801,6 +1824,10 @@ impl ServerConnection {
             self.send_control(socket)?;
         }
         self.transport.flush_acks(socket)?;
+        // Raise the advertised connection-level receive window as request
+        // bodies are consumed, so a long-lived connection is not capped
+        // at `initial_max_data`.
+        self.transport.replenish_connection_window(socket)?;
         self.transport.retransmit(socket)
     }
 
@@ -1888,6 +1915,12 @@ impl ServerConnection {
         } else if !stream_id::is_client_initiated(id) {
             return Err(protocol("request stream has invalid initiator"));
         }
+        if !stream_id::is_unidirectional(id)
+            && !self.streams.contains_key(&id)
+            && self.completed_streams.contains(&id)
+        {
+            return Ok(());
+        }
         if !self.streams.contains_key(&id)
             && self.streams.len() >= MAX_H3_STREAMS + MAX_H3_UNI_STREAMS
         {
@@ -1915,7 +1948,24 @@ impl ServerConnection {
             },
             &mut self.pending_requests,
         )?;
+        // Release the receive-side state once the request is fully
+        // consumed so the stream cap counts concurrent streams, not the
+        // cumulative request count (which previously tore the connection
+        // down after MAX_H3_STREAMS requests).
+        if stream.reassembly.finished() && stream.completed {
+            self.streams.remove(&id);
+            self.note_completed_stream(id);
+        }
         self.ensure_buffer_budget()
+    }
+
+    /// Remember a completed request stream so a late retransmission is
+    /// dropped without re-creating its receive state.
+    fn note_completed_stream(&mut self, id: u64) {
+        if self.completed_streams.len() >= MAX_COMPLETED_STREAMS {
+            self.completed_streams.pop_front();
+        }
+        self.completed_streams.push_back(id);
     }
 
     fn take_request(&mut self) -> Option<PendingRequest> {
@@ -3729,6 +3779,33 @@ impl QuicTransport {
             self.flush_ack(socket, level)?;
         }
         Ok(())
+    }
+
+    /// Replenish the connection-level receive window as the application
+    /// consumes received data. Once the peer has used more than half of
+    /// the currently advertised credit, advertise a fresh full window via
+    /// `MAX_DATA`, so a long-lived connection is never capped at
+    /// `initial_max_data` (previously the connection was torn down as soon
+    /// as the cumulative transfer exceeded it).
+    fn replenish_connection_window(&mut self, socket: &UdpSocket) -> Result<()> {
+        let headroom = self.local_max_data.saturating_sub(self.received_data);
+        if headroom > self.local_max_data / 2 {
+            return Ok(());
+        }
+        let new_limit = self
+            .received_data
+            .saturating_add(self.local_max_data)
+            .min(crate::courierust_quic::varint::MAX);
+        if new_limit <= self.local_max_data {
+            return Ok(());
+        }
+        self.local_max_data = new_limit;
+        match self.send_frames(socket, APPLICATION, &[QFrame::MaxData(new_limit)], false) {
+            Ok(()) => Ok(()),
+            // A full send buffer defers the update; retry on the next tick.
+            Err(error) if error.kind == ErrorKind::WouldBlock => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     fn retransmit(&mut self, socket: &UdpSocket) -> Result<()> {

@@ -126,6 +126,25 @@ fn h3_connection_reuse_across_requests() {
     }
 }
 
+/// A single pooled connection must survive far more requests than `MAX_H3_STREAMS` (1024)
+#[test]
+fn h3_pooled_connection_survives_many_requests() {
+    const REQUESTS: usize = 1024 + 128;
+    let base = spawn_h3_server(echo_handler);
+    let client = h3_client(1 << 20, Duration::from_secs(60));
+
+    for i in 0..REQUESTS {
+        let path = format!("/many/{i}");
+        let resp = client.get(&format!("{base}{path}")).unwrap();
+        assert_eq!(resp.status.as_u16(), 200, "status {i}");
+        assert_eq!(
+            resp.body.collect().unwrap().to_str().unwrap(),
+            path,
+            "path echo {i}"
+        );
+    }
+}
+
 /// A request body far larger than the initial congestion window
 /// (12 KiB) must be delivered in ACK-paced chunks, never truncated.
 #[test]
