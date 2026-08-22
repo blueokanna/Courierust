@@ -86,6 +86,8 @@ jobs:
             cargo bench --manifest-path benches/Cargo.toml --locked --bench concurrency
           run_suite interop interop.log \
             cargo bench --manifest-path benches/Cargo.toml --locked --bench interop
+          run_suite h3 h3.log \
+            cargo bench --manifest-path benches/Cargo.toml --locked --bench h3
 
           if [[ -n "${COURIERUST_NETWORK_URL:-}" ]]; then
             run_suite network network.log \
@@ -144,6 +146,7 @@ jobs:
           BENCHMARK_COMPARE_EXIT: ${{ steps.benchmarks.outputs.compare_exit }}
           BENCHMARK_CONCURRENCY_EXIT: ${{ steps.benchmarks.outputs.concurrency_exit }}
           BENCHMARK_INTEROP_EXIT: ${{ steps.benchmarks.outputs.interop_exit }}
+          BENCHMARK_H3_EXIT: ${{ steps.benchmarks.outputs.h3_exit }}
           BENCHMARK_NETWORK_EXIT: ${{ steps.benchmarks.outputs.network_exit }}
           BENCHMARK_FUZZ_EXIT: ${{ steps.fuzz.outputs.fuzz_exit }}
           COURIERUST_REMOTE_URL: ${{ secrets.COURIERUST_REMOTE_URL }}
@@ -155,6 +158,7 @@ jobs:
             interop.log \
             network.log \
             fuzz.log \
+            h3.log \
             Github_Action_Benchmark.md
 
       - name: Publish benchmark report to the run summary
@@ -178,6 +182,7 @@ jobs:
             interop.log
             network.log
             fuzz.log
+            h3.log
           if-no-files-found: error
 
   publish-report:

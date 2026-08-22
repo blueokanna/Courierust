@@ -4,8 +4,6 @@
 //! HTTP/1.1 keep-alive, HTTP/1.1 worker scaling, HTTP/2 multiplexing, and
 //! end-to-end HTTPS plus HTTP/2. Each case emits a machine-readable result.
 
-mod metrics;
-
 use courierust::courierust_body::Body;
 use courierust::courierust_bytes::Bytes;
 use courierust::courierust_client::{Client, ClientConfig};
@@ -14,7 +12,7 @@ use courierust::courierust_http::response::Response;
 use courierust::courierust_net::stats::Stats;
 use courierust::courierust_server::{Server, ServerConfig};
 use courierust::courierust_tls as crate_tls;
-use metrics::{run_concurrent, run_sequential, Timing, MAX_SAMPLES};
+use courierust_benchmark::metrics::{run_concurrent, run_sequential, Timing, MAX_SAMPLES};
 use std::sync::Arc;
 
 const EMPTY: Payload = Payload {
@@ -219,27 +217,36 @@ fn bench_h2_multiplex(payload: Payload, requests: usize, workers: usize, server_
         server_threads,
         timing,
     );
-    print_stats("h2c", &format!("h2_multiplex_w{workers}"), payload, workers, &server_stats);
-    print_stats("h2c", &format!("h2_multiplex_w{workers}"), payload, workers, &client_stats);
+    print_stats(
+        "h2c",
+        &format!("h2_multiplex_w{workers}"),
+        payload,
+        workers,
+        &server_stats,
+    );
+    print_stats(
+        "h2c",
+        &format!("h2_multiplex_w{workers}"),
+        payload,
+        workers,
+        &client_stats,
+    );
 }
 
 /// Load the test identity (self-signed Ed25519, CN=localhost) and return
-/// it. The DER files live under `tests/certs/`.
+/// it. The DER files live under `tests/certs/` and are compiled in, so
+/// the binary runs from any working directory.
+const SERVER_CERT_DER: &[u8] = include_bytes!("../../tests/certs/server_cert.der");
+const SERVER_KEY_DER: &[u8] = include_bytes!("../../tests/certs/server_key.der");
+
 fn load_test_identity() -> (crate_tls::Identity, crate_tls::RootStore) {
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-    let cert_path = std::path::Path::new(&manifest).join("../tests/certs/server_cert.der");
-    let key_path = std::path::Path::new(&manifest).join("../tests/certs/server_key.der");
-    let cert =
-        std::fs::read(&cert_path).unwrap_or_else(|e| panic!("read {}: {e}", cert_path.display()));
-    let key =
-        std::fs::read(&key_path).unwrap_or_else(|e| panic!("read {}: {e}", key_path.display()));
     let identity = crate_tls::Identity {
-        cert_chain: vec![cert.clone()],
-        private_key: key,
+        cert_chain: vec![SERVER_CERT_DER.to_vec()],
+        private_key: SERVER_KEY_DER.to_vec(),
         is_rsa: false,
     };
     let mut roots = crate_tls::RootStore::new();
-    roots.add_der(cert);
+    roots.add_der(SERVER_CERT_DER.to_vec());
     (identity, roots)
 }
 

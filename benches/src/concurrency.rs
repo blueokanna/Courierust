@@ -182,9 +182,7 @@ fn run_slow_sender_case(count: usize) {
     // Phase 1: open all connections and trickle their headers in
     // parallel. Each byte is preceded by a real delay, so the connection
     // is provably in the middle of a request while the probe runs.
-    let byte_delay = Duration::from_millis(
-        env_usize("COURIERUST_SLOW_BYTE_DELAY_MS", 10) as u64,
-    );
+    let byte_delay = Duration::from_millis(env_usize("COURIERUST_SLOW_BYTE_DELAY_MS", 10) as u64);
     let started = Instant::now();
     let mut handles = Vec::with_capacity(count);
     for index in 0..count {

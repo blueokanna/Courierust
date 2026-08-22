@@ -1,5 +1,6 @@
 //! Real-world interop validation: Courierust against the mainstream Rust
-//! HTTP stack (hyper server, hyper-util client, reqwest client).
+//! HTTP stack (hyper server, hyper-util client, reqwest client), plus
+//! HTTP/3 self-interop cases over QUIC v1 + TLS 1.3 on real UDP sockets.
 //!
 //! This is *not* a benchmark. Each case starts a real peer on a real
 //! socket and asserts correct end-to-end semantics:
@@ -9,7 +10,10 @@
 //! * HTTP/2 multiplexing correctness (concurrent requests with distinct
 //!   paths must not be cross-wired),
 //! * large-body integrity over h1 and h2 (flow-control / framing),
-//! * keep-alive reuse and chunked framing against a foreign peer.
+//! * keep-alive reuse and chunked framing against a foreign peer,
+//! * HTTP/3 (QUIC) round-trips, pooled connection reuse, large-body flow
+//!   control in both directions, and concurrent stream multiplexing
+//!   (self-interop: the H3 client and server are both this crate's).
 //!
 //! Run with `cargo bench --manifest-path benches/Cargo.toml --bench
 //! interop` (or `cargo run --release --manifest-path benches/Cargo.toml
@@ -179,19 +183,20 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-fn load_test_identity() -> (courierust::courierust_tls::Identity, courierust::courierust_tls::RootStore) {
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-    let cert_path = std::path::Path::new(&manifest).join("../tests/certs/server_cert.der");
-    let key_path = std::path::Path::new(&manifest).join("../tests/certs/server_key.der");
-    let cert = std::fs::read(&cert_path).unwrap_or_else(|e| panic!("read {}: {e}", cert_path.display()));
-    let key = std::fs::read(&key_path).unwrap_or_else(|e| panic!("read {}: {e}", key_path.display()));
+const SERVER_CERT_DER: &[u8] = include_bytes!("../../tests/certs/server_cert.der");
+const SERVER_KEY_DER: &[u8] = include_bytes!("../../tests/certs/server_key.der");
+
+fn load_test_identity() -> (
+    courierust::courierust_tls::Identity,
+    courierust::courierust_tls::RootStore,
+) {
     let identity = courierust::courierust_tls::Identity {
-        cert_chain: vec![cert.clone()],
-        private_key: key,
+        cert_chain: vec![SERVER_CERT_DER.to_vec()],
+        private_key: SERVER_KEY_DER.to_vec(),
         is_rsa: false,
     };
     let mut roots = courierust::courierust_tls::RootStore::new();
-    roots.add_der(cert);
+    roots.add_der(SERVER_CERT_DER.to_vec());
     (identity, roots)
 }
 
@@ -566,14 +571,13 @@ fn tls_rejects_hostname_mismatch() {
     let addr = courierust_tls_server(vec![b"http/1.1".to_vec()]);
     let (_, roots) = load_test_identity();
     let stream = std::net::TcpStream::connect(addr).expect("tcp connect for hostname test");
-    let connector = courierust::courierust_tls::TlsConnector::new(
-        courierust::courierust_tls::ClientConfig {
+    let connector =
+        courierust::courierust_tls::TlsConnector::new(courierust::courierust_tls::ClientConfig {
             roots,
             verify: true,
             alpn: vec![b"http/1.1".to_vec()],
             now: unix_now(),
-        },
-    );
+        });
     let err = connector
         .connect("not-localhost.invalid", &stream, &stream)
         .map(|_| ())
@@ -763,6 +767,163 @@ fn courierust_h2_client_survives_peer_goaway() {
     assert_eq!(resp.status.as_u16(), 200, "recovery status");
 }
 
+// ---------------------------------------------------------------------------
+// HTTP/3 self-interop cases (QUIC v1 + TLS 1.3 over loopback)
+//
+// The H3 client and server are both Courierust's own (there is no
+// mainstream H3 peer in this workspace), so these cases are a loopback
+// regression gate for the H3 path — the `h3` bench measures it, this
+// validates correctness. They run on real UDP sockets through the whole
+// stack: Retry address validation, QUIC handshake, QPACK, connection
+// reuse, flow control and stream multiplexing.
+// ---------------------------------------------------------------------------
+
+/// A Courierust HTTP/3 server echoing the request body (or the request
+/// path when the body is empty), over QUIC v1 + TLS 1.3.
+fn courierust_h3_server() -> std::net::SocketAddr {
+    let (identity, _) = load_test_identity();
+    let server = Server::bind_with_config(
+        "127.0.0.1:0",
+        ServerConfig {
+            http3: true,
+            tls: Some(ServerTls {
+                identity,
+                alpn: vec![b"h3".to_vec()],
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let addr = server.local_addr().unwrap();
+    let handle = server
+        .serve_background(|req: Request<Body>| -> Response<Body> {
+            let body = req.body.collect().unwrap_or_default();
+            let payload = if body.is_empty() {
+                Bytes::from(req.uri.as_str().to_string().into_bytes())
+            } else {
+                body
+            };
+            Response::<Body>::with_status(200.into()).with_body(Body::Bytes(payload))
+        })
+        .unwrap();
+    std::mem::forget(handle);
+    addr
+}
+
+/// A Courierust HTTP/3 client pinned to one pooled QUIC connection per
+/// authority (the reuse / multiplexing path under test).
+fn courierust_h3_client() -> Client {
+    let (_, roots) = load_test_identity();
+    Client::with_config(ClientConfig {
+        http3: true,
+        max_connections_per_host: 1,
+        connect_timeout: Some(Duration::from_secs(3)),
+        read_timeout: Some(Duration::from_secs(10)),
+        tls: Some(ClientTls {
+            roots,
+            verify: true,
+            alpn: vec![b"h3".to_vec()],
+            now: unix_now(),
+        }),
+        ..Default::default()
+    })
+}
+
+/// GET path echo and POST body echo over HTTP/3.
+fn h3_self_roundtrip() {
+    let addr = courierust_h3_server();
+    let client = courierust_h3_client();
+
+    let resp = client
+        .get(&format!("https://{addr}/h3hello"))
+        .map_err(|e| format!("h3 GET failed: {e}"))
+        .unwrap();
+    assert_eq!(resp.status.as_u16(), 200, "h3 GET status");
+    assert_eq!(
+        resp.body.collect().unwrap().to_str().unwrap(),
+        "/h3hello",
+        "h3 GET path echo"
+    );
+
+    let big: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+    let resp = client
+        .post(&format!("https://{addr}/h3echo"), big.clone())
+        .map_err(|e| format!("h3 POST failed: {e}"))
+        .unwrap();
+    assert_eq!(resp.status.as_u16(), 200, "h3 POST status");
+    assert_eq!(
+        &resp.body.collect().unwrap()[..],
+        &big[..],
+        "h3 POST body echo"
+    );
+}
+
+/// Sequential requests over the pooled H3 connection: the QUIC/TLS
+/// handshake is paid once, and every later request rides a fresh stream
+/// on the same connection.
+fn h3_self_connection_reuse() {
+    let addr = courierust_h3_server();
+    let client = courierust_h3_client();
+    for i in 0..20 {
+        let path = format!("/reuse/{i}");
+        let resp = client
+            .get(&format!("https://{addr}{path}"))
+            .map_err(|e| format!("h3 reuse request {i} failed: {e}"))
+            .unwrap();
+        assert_eq!(resp.status.as_u16(), 200, "h3 reuse status {i}");
+        assert_eq!(
+            resp.body.collect().unwrap().to_str().unwrap(),
+            path,
+            "h3 reuse path echo {i}"
+        );
+    }
+}
+
+/// A 256 KiB POST body and 256 KiB response over a fresh H3 connection:
+/// the body is far larger than the initial congestion window (12 KiB),
+/// so it must be delivered in ACK-paced chunks in both directions (the
+/// classic place QUIC stacks break).
+fn h3_self_large_body_flow_control() {
+    let addr = courierust_h3_server();
+    let client = courierust_h3_client();
+    let big: Vec<u8> = (0..(256 * 1024)).map(|i| (i % 253) as u8).collect();
+    let resp = client
+        .post(&format!("https://{addr}/h3-big"), big.clone())
+        .map_err(|e| format!("h3 big POST failed: {e}"))
+        .unwrap();
+    assert_eq!(resp.status.as_u16(), 200, "h3 big status");
+    let body = resp.body.collect().unwrap();
+    assert_eq!(
+        &body[..],
+        &big[..],
+        "h3 256 KiB body echo (flow control both directions)"
+    );
+}
+
+/// Concurrent requests multiplexed over one pooled H3 connection (the
+/// QUIC analog of h2's stream multiplexing).
+fn h3_self_multiplex_concurrent() {
+    let addr = courierust_h3_server();
+    let client = courierust_h3_client();
+    let mut handles = Vec::new();
+    for i in 0..16 {
+        let client = client.clone();
+        let url = format!("https://{addr}/mux/{i}");
+        handles.push(std::thread::spawn(move || {
+            let resp = client
+                .get(&url)
+                .map_err(|e| format!("h3 mux request {i} failed: {e}"))
+                .unwrap();
+            assert_eq!(resp.status.as_u16(), 200, "h3 mux status {i}");
+            resp.body.collect().unwrap().to_str().unwrap().to_string()
+        }));
+    }
+    for (i, handle) in handles.into_iter().enumerate() {
+        let body = handle.join().unwrap();
+        assert_eq!(body, format!("/mux/{i}"), "h3 mux path echo {i}");
+    }
+}
+
 fn main() {
     println!("courierust vs mainstream HTTP stack — interop validation");
     case(
@@ -806,6 +967,14 @@ fn main() {
         "courierust_h2_client_survives_peer_goaway",
         courierust_h2_client_survives_peer_goaway,
     );
+    // HTTP/3 self-interop (loopback regression gates for the H3 path).
+    case("h3_self_roundtrip", h3_self_roundtrip);
+    case("h3_self_connection_reuse", h3_self_connection_reuse);
+    case(
+        "h3_self_large_body_flow_control",
+        h3_self_large_body_flow_control,
+    );
+    case("h3_self_multiplex_concurrent", h3_self_multiplex_concurrent);
 
     let failures = FAILURES.load(Ordering::SeqCst);
     if failures == 0 {

@@ -5,15 +5,13 @@
 //! protocol, payload, worker count, and latency tail. No loopback result is
 //! reported by this binary as cross-machine evidence.
 
-mod metrics;
-
 use courierust::courierust_body::Body;
 use courierust::courierust_bytes::Bytes;
 use courierust::courierust_client::{Client, ClientConfig, TlsSettings as ClientTls};
 use courierust::courierust_http::request::Request;
 use courierust::courierust_http::response::Response;
 use courierust::courierust_server::{Server, ServerConfig, TlsSettings as ServerTls};
-use metrics::{run_concurrent, run_sequential, Timing, MAX_SAMPLES};
+use courierust_benchmark::metrics::{run_concurrent, run_sequential, Timing, MAX_SAMPLES};
 use std::sync::Arc;
 
 const DEFAULT_PAYLOAD: usize = 1024;

@@ -60,9 +60,7 @@ fn main() {
     let code = resp.status.as_u16();
     let body_len = resp.body.collect().map(|b| b.len()).unwrap_or(0);
     if code != 200 {
-        println!(
-            "TLSINTEROP|role=client|peer=external|protocol={proto}|status=failed|http={code}"
-        );
+        println!("TLSINTEROP|role=client|peer=external|protocol={proto}|status=failed|http={code}");
         std::process::exit(1);
     }
     println!(

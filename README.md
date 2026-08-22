@@ -202,7 +202,17 @@ exchange; RSA-PSS / RSA-PKCS#1 v1.5 / ECDSA P-256 / Ed25519 certificate
 signatures; full X.509 chain validation (validity windows, name
 chaining, signature verification, basic-constraints / key-usage,
 RFC 6125 hostname matching incl. IP SANs, plus a pluggable root store).
-Run `cargo run --example https` for a self-signed end-to-end demo.
+**TLS 1.3 only, by policy:** TLS 1.2 and earlier are explicitly rejected
+— a TLS 1.2 ClientHello is refused with no silent protocol downgrade
+(covered by an integration test), and 0-RTT / session resumption / PSK
+are never offered. For QUIC the ALPN must be `h3`; for HTTPS the ALPN
+must be `h2` or `http/1.1`.
+Run `cargo run --example https` for a self-signed end-to-end demo,
+`cargo run --example h3` for an HTTP/3 (QUIC v1 + TLS 1.3) end-to-end demo
+(cold connect vs pooled reuse, large-response flow control, concurrent
+multiplexing, certificate rejection), and `cargo run --example
+grpc_streaming` for the gRPC streaming shapes (server/client/bidi),
+deadlines, gzip compression negotiation and metadata/interceptors.
 
 ## Fingerprints: making a connection "look like" Chrome
 
@@ -295,7 +305,9 @@ cargo fuzz run h2_frame --fuzz-dir fuzz -- -max_total_time=20
 
 Every `RESULT|...` line carries `p50_us` … `p99_us`, and the report script (`scripts/generate_benchmark_report.sh`) turns them into a percentile table. These are loopback measurements; WAN / TLS / real-handler numbers depend on your deployment, which is exactly why the suite reports the full tail rather than a single mean.
 
-The h2c client data is workload-specific, not a claim of universal leadership. The 1 KiB single-worker result is only a small comparison point; multi-worker results must be read with their connection policy and tail latency. The Reqwest HTTP/2 baseline uses the **async** client — the blocking client's fixed ~41 ms wait on h2c large bodies was a harness artifact, so it is not used as performance evidence.
+The h2c client data is workload-specific, not a claim of universal leadership. The 1 KiB single-worker result is only a small comparison point; multi-worker results must be read with their connection policy and tail latency. The h2c large-body rows (1 MiB POST against the same hyper h2 server) are paced by the server's 64 KiB initial flow-control window (WINDOW_UPDATE round trips) and are **not valid for ratio claims** — reqwest retains a large fixed wait even with the async client, so the earlier "blocking-client artifact" framing was wrong.
+
+**Pool semantics differ between the two clients and must not be conflated:** Courierust's `max_connections_per_host` caps *live* connections per authority; reqwest's `pool_max_idle_per_host` caps *idle pooled* connections. Setting both to the same N is only equivalent for a sequential workload — under concurrency reqwest may open more than N live connections.
 
 **Worker-count guidance (measured, see the `STATS` rows):** HTTP/2 multiplexing sends all streams over one connection serviced by one driver thread. With `max_connections_per_host = 1`, throughput scales with workers up to ~4–8 and then _regresses_: 32 workers contend on the shared pool lock and the single driver's command channel faster than the driver can drain them. The `STATS` rows show `h2_connections=1` with `workers` concurrent streams — the serialization point. Prefer 4–8 client workers per h2 connection and scale connections, not workers, beyond that.
 
@@ -314,10 +326,25 @@ asserts correct semantics — not just performance:
 - 1 MiB request/response round-trips over h2c against a real hyper server
   (flow-control window replenishment on both directions) and a slow-reader
   sanity check.
+- **HTTP/3 self-interop** (the H3 client and server are both this crate's;
+  there is no mainstream H3 peer in the workspace): GET/POST round trips,
+  pooled connection reuse, 256 KiB request/response flow control in both
+  directions, and concurrent stream multiplexing over one QUIC connection
+  — a loopback regression gate for the H3 path (`benchmarks` run in
+  `benchmark.yml` too).
 
 This runs in CI on every PR (`benchmark.yml`), so a real interop regression
 fails the pipeline. The mainstream crates are dev-only dependencies of the
 bench workspace; the `courierust` library itself stays zero-dependency.
+
+The `compare` bench also runs an **HTTP/3 comparison** against the
+industry-standard **quinn + h3 crate**: both clients reuse one pooled QUIC
+connection against the same Courierust H3 server and measure warm
+per-request latency (1 KiB / 64 KiB). The quinn row is currently reported
+`not_available`: the independent quinn/rustls QUIC/TLS handshake does not
+complete against the Courierust server — a genuine cross-implementation
+interop gap that is reported rather than faked. Enabling it is tracked as
+an open item alongside the other independent-interop work.
 
 The self-interop suite only proves Courierust agrees with _itself_ on TLS.
 To prove the TLS layer against an independent implementation, a separate
@@ -337,8 +364,8 @@ protocol stack.
 
 ## Tests
 
-- 133 unit tests: all HPACK RFC vectors (C.2/C.3/C.4/C.6), Huffman encode/decode (plus a decode output cap), frame codec, state machine, flow control, WUCS scheduling, JA3/JA4 comparison against published records, fingerprint parsing, TLS 1.3 handshake + RFC 8448 key schedule, X.25519/Ed25519/ECDSA/RSA primitives, the DEFLATE/gzip codec (round-trips, CRC-32 vectors, corruption rejection, output-cap enforcement, and cross-checked against Python zlib output), and the poller's wake-descriptor (self-pipe) semantics.
-- 45 integration tests: real loopback TCP round trips for h1/h2/HTTPS, keep-alive reuse, chunked, redirects, h2 concurrent multiplexing, streaming responses, large-body flow-control round trips, gRPC unary/server/client/bidi streaming + error status + trailers + deadline enforcement + gzip round-trip, `grpc.health.v1.Health` `Check` + `Watch`, RFC 7540 §3.2 `h2c` Upgrade, TLS trust rejection + malformed-TLS-input survival + `verify:false` + hostname-mismatch rejection + ALPN agreement enforcement, and concurrency proofs: a slow stream does not block its connection's other streams; many idle streams consume one worker; an idle-connection herd does not block fresh requests; the event scheduler reaps slow-loris connections and enforces `max_connections`; server-streaming responses flush on a short cadence; and one h2 connection serves a concurrent burst without command starvation.
+- 170 unit tests: all HPACK RFC vectors (C.2/C.3/C.4/C.6), Huffman encode/decode (plus a decode output cap), frame codec, state machine, flow control, WUCS scheduling, JA3/JA4 comparison against published records, fingerprint parsing, TLS 1.3 handshake + RFC 8448 key schedule, X.25519/Ed25519/ECDSA/RSA primitives, the DEFLATE/gzip codec (round-trips, CRC-32 vectors, corruption rejection, output-cap enforcement, and cross-checked against Python zlib output), and the poller's wake-descriptor (self-pipe) semantics.
+- 61 integration tests: real loopback TCP round trips for h1/h2/HTTPS, keep-alive reuse, chunked, redirects, h2 concurrent multiplexing, streaming responses, large-body flow-control round trips, gRPC unary/server/client/bidi streaming + error status + trailers + deadline enforcement + gzip round-trip, `grpc.health.v1.Health` `Check` + `Watch`, RFC 7540 §3.2 `h2c` Upgrade, concurrency proofs (a slow stream does not block its connection's other streams; many idle streams consume one worker; an idle-connection herd does not block fresh requests; the event scheduler reaps slow-loris connections and enforces `max_connections`; server-streaming responses flush on a short cadence; one h2 connection serves a concurrent burst without command starvation), **TLS policy / hardening** (trust rejection, expired certificate, untrusted-issuer chain, self-signed-but-explicitly-trusted, hostname mismatch, ALPN agreement, TLS 1.2 ClientHello rejection — no silent downgrade, interrupted-handshake failure, malformed-TLS-input survival, `verify:false`), and **11 HTTP/3 integration tests** (QUIC v1 + TLS 1.3 over real UDP sockets through the public `Client`/`Server`): GET/POST round trips, pooled connection reuse, 256 KiB request/response flow control in both directions, concurrent multiplexing, per-request deadline enforcement, and H3 TLS security (untrusted / expired / wrong-chain / hostname-mismatch certificates all rejected at the handshake).
 - 30 hardening tests: hostile-frame inputs (oversized frames, malformed SETTINGS/PING/WINDOW_UPDATE, flow-control window overflow, HPACK header-list and Huffman bombs, truncated/EOS Huffman, pseudo-header ordering, `content-length` mismatches, forbidden `transfer-encoding`/`connection`-specific headers, `SETTINGS_MAX_CONCURRENT_STREAMS` enforcement on both ends, `h2c` liveness: SETTINGS_TIMEOUT and keepalive dead-peer detection).
 - 4 fuzz targets (`cargo-fuzz`): `h2_frame`, `hpack_block`, plus **`h1_request`** (the shared request/header/chunked path used by both server parsers) and **`h2_connection`** (the full h2 state machine driven by hostile frame streams in both roles). A nightly long-fuzz workflow runs each with a wall-clock budget; a PR-time smoke run covers the same targets in `benchmark.yml`.
 

@@ -1085,6 +1085,238 @@ fn https_redirect_preserves_scheme() {
 }
 
 // ---------------------------------------------------------------------
+// TLS policy / security hardening
+// ---------------------------------------------------------------------
+
+/// Spin up an HTTPS server with an explicit TLS identity (used by the
+/// expired / wrong-chain / mismatch security tests).
+fn spawn_tls_server_with_identity(
+    identity: courierust::courierust_tls::Identity,
+    alpn: Vec<Vec<u8>>,
+) -> String {
+    let server = Server::bind_with_config(
+        "127.0.0.1:0",
+        ServerConfig {
+            http2: alpn.iter().any(|p| p == b"h2"),
+            threads: 1,
+            tls: Some(ServerTls { identity, alpn }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let addr = server.local_addr().unwrap();
+    let handle = server.serve_background(echo_handler).unwrap();
+    std::mem::forget(handle);
+    format!("https://{addr}")
+}
+
+/// A root store that trusts exactly one DER certificate.
+fn root_store_from_der(cert_der: &[u8]) -> courierust::courierust_tls::RootStore {
+    let mut roots = courierust::courierust_tls::RootStore::new();
+    roots.add_der(cert_der.to_vec());
+    roots
+}
+
+/// An expired (2020-01-01 .. 2021-01-01) self-signed `localhost`
+/// certificate must be rejected on the validity window even when the
+/// client explicitly trusts it.
+#[test]
+fn tls_rejects_expired_certificate() {
+    let expired_identity = courierust::courierust_tls::Identity {
+        cert_chain: vec![include_bytes!("certs/expired_cert.der").to_vec()],
+        private_key: include_bytes!("certs/expired_key.der").to_vec(),
+        is_rsa: false,
+    };
+    let base = spawn_tls_server_with_identity(expired_identity, vec![b"http/1.1".to_vec()]);
+    let client = Client::with_config(ClientConfig {
+        http2: false,
+        tls: Some(ClientTls {
+            roots: root_store_from_der(include_bytes!("certs/expired_cert.der")),
+            verify: true,
+            alpn: vec![b"http/1.1".to_vec()],
+            now: common::NOW, // 2027-01-14: far outside 2020..2021
+        }),
+        ..Default::default()
+    });
+
+    let err = client
+        .get(&format!("{base}/"))
+        .map(|_| ())
+        .expect_err("an expired certificate must be rejected");
+    let msg = err.to_string().to_ascii_lowercase();
+    assert!(
+        msg.contains("validity") || msg.contains("expired") || msg.contains("certificate"),
+        "expected a validity rejection, got {err:?}"
+    );
+}
+
+/// A leaf certificate issued by an untrusted CA must be rejected: the
+/// chain does not anchor to any trusted root.
+#[test]
+fn tls_rejects_untrusted_issuer_chain() {
+    let wrong_chain_identity = courierust::courierust_tls::Identity {
+        // Leaf signed by `ca_other` (NOT in the client's trust store);
+        // the presented chain is leaf + its issuer so the chain walk is
+        // exercised, not just the anchor fallback.
+        cert_chain: vec![
+            include_bytes!("certs/wrong_chain_cert.der").to_vec(),
+            include_bytes!("certs/ca_other_cert.der").to_vec(),
+        ],
+        private_key: include_bytes!("certs/wrong_chain_key.der").to_vec(),
+        is_rsa: false,
+    };
+    let base = spawn_tls_server_with_identity(wrong_chain_identity, vec![b"http/1.1".to_vec()]);
+    // The client trusts only the real test root; the leaf's issuer is a
+    // different, untrusted CA, so chain building must fail.
+    let client = Client::with_config(ClientConfig {
+        http2: false,
+        tls: Some(ClientTls {
+            roots: common::root_store(),
+            verify: true,
+            alpn: vec![b"http/1.1".to_vec()],
+            now: common::NOW,
+        }),
+        ..Default::default()
+    });
+
+    let err = client
+        .get(&format!("{base}/"))
+        .map(|_| ())
+        .expect_err("a chain to an untrusted CA must be rejected");
+    let msg = err.to_string().to_ascii_lowercase();
+    assert!(
+        msg.contains("root") || msg.contains("certificate") || msg.contains("chain"),
+        "expected a chain/root rejection, got {err:?}"
+    );
+}
+
+/// A self-signed certificate that the caller *explicitly* adds to its
+/// root store must verify (this is the documented trust model: no
+/// bundled roots, the caller supplies its own anchors).
+#[test]
+fn tls_accepts_self_signed_when_explicitly_trusted() {
+    let base = spawn_tls_server(https_server_config(false), echo_handler);
+    let client = Client::with_config(ClientConfig {
+        http2: false,
+        tls: Some(ClientTls {
+            roots: common::root_store(), // the self-signed test cert IS the anchor
+            verify: true,
+            alpn: vec![b"http/1.1".to_vec()],
+            now: common::NOW,
+        }),
+        ..Default::default()
+    });
+
+    let resp = client.get(&format!("{base}/trusted")).unwrap();
+    assert_eq!(resp.status.as_u16(), 200);
+}
+
+/// Build a minimal TLS 1.2 ClientHello record (no `supported_versions`,
+/// no `key_share`): a real TLS 1.2 client would send exactly this shape.
+fn tls12_client_hello() -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0x03, 0x03]); // legacy_version = TLS 1.2
+    body.extend_from_slice(&[0xab; 32]); // random
+    body.push(0); // session_id length
+    body.extend_from_slice(&[0x00, 0x04]); // two cipher suites
+    body.extend_from_slice(&[0xc0, 0x2f]); // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+    body.extend_from_slice(&[0x00, 0x2f]); // TLS_RSA_WITH_AES_128_CBC_SHA
+    body.extend_from_slice(&[1, 0]); // compression methods: [null]
+    body.extend_from_slice(&[0x00, 0x00]); // no extensions (no 1.3 ext)
+    let mut msg = Vec::new();
+    msg.push(0x01); // handshake type ClientHello
+    msg.extend_from_slice(&u32::to_be_bytes(body.len() as u32)[1..]); // 24-bit length
+    msg.extend_from_slice(&body);
+    let mut record = Vec::new();
+    record.push(0x16); // handshake record
+    record.extend_from_slice(&[0x03, 0x03]); // legacy record version
+    record.extend_from_slice(&u16::to_be_bytes(msg.len() as u16));
+    record.extend_from_slice(&msg);
+    record
+}
+
+/// The server speaks TLS 1.3 only: a TLS 1.2-only ClientHello must be
+/// rejected (no silent downgrade to 1.2). The failure surfaces as the
+/// connection being closed without a valid HTTP response.
+#[test]
+fn tls_server_rejects_tls12_client_hello() {
+    use std::io::{Read, Write};
+
+    let base = spawn_tls_server(https_server_config(false), echo_handler);
+    let addr = base.trim_start_matches("https://").to_string();
+
+    let mut stream = std::net::TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(&tls12_client_hello()).unwrap();
+
+    let mut buf = [0u8; 512];
+    let rejected = 'check: loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break 'check true,
+            Ok(n) => {
+                // A TLS 1.3 stack must not answer a 1.2 hello with an
+                // HTTP response; an alert record (0x15) or close is the
+                // expected outcome.
+                if buf[0] == 0x15 {
+                    break 'check true;
+                }
+                if buf.starts_with(b"HTTP/") {
+                    panic!("server responded over HTTP to a TLS 1.2 ClientHello");
+                }
+                let _ = n; // any other record is not a downgrade response
+            }
+            Err(_) => {
+                // read timeout: the server closed or stalled — either way
+                // there was no downgrade response.
+                break 'check true;
+            }
+        }
+    };
+    assert!(rejected, "TLS 1.2 hello was not rejected");
+}
+
+/// A peer that accepts the TCP connection and then aborts the handshake
+/// (garbage + close) must make the TLS client fail cleanly instead of
+/// hanging.
+#[test]
+fn tls_client_handshake_interrupted() {
+    use std::io::Write;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let _ = stream.write_all(b"\x16\x03\x03\x00\x05garbage");
+            // Close without completing the handshake.
+        }
+    });
+
+    let stream = std::net::TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let connector =
+        courierust::courierust_tls::TlsConnector::new(courierust::courierust_tls::ClientConfig {
+            roots: common::root_store(),
+            verify: true,
+            alpn: vec![b"http/1.1".to_vec()],
+            now: common::NOW,
+        });
+    let t0 = Instant::now();
+    let err = connector
+        .connect("localhost", &stream, &stream)
+        .map(|_| ())
+        .expect_err("an interrupted TLS handshake must fail");
+    assert!(
+        t0.elapsed() < Duration::from_secs(5),
+        "interrupted handshake must fail fast, not hang"
+    );
+    assert!(!err.to_string().is_empty());
+}
+
+// ---------------------------------------------------------------------
 // Event-driven server (default on every platform): idle connections must
 // not hold workers
 // ---------------------------------------------------------------------

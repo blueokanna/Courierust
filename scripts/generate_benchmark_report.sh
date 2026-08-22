@@ -9,6 +9,7 @@ if [[ $# -eq 4 ]]; then
     concurrency_log=''
     network_log=''
     fuzz_log=''
+    h3_log=''
 elif [[ $# -eq 7 ]]; then
     throughput_log=$1
     compare_log=$2
@@ -17,8 +18,18 @@ elif [[ $# -eq 7 ]]; then
     network_log=$5
     fuzz_log=$6
     output=$7
+    h3_log=''
+elif [[ $# -eq 8 ]]; then
+    throughput_log=$1
+    compare_log=$2
+    concurrency_log=$3
+    interop_log=$4
+    network_log=$5
+    fuzz_log=$6
+    h3_log=$7
+    output=$8
 else
-    printf 'usage: %s THROUGHPUT_LOG COMPARE_LOG [CONCURRENCY_LOG] INTEROP_LOG [NETWORK_LOG] [FUZZ_LOG] OUTPUT\n' "$0" >&2
+    printf 'usage: %s THROUGHPUT_LOG COMPARE_LOG [CONCURRENCY_LOG] INTEROP_LOG [NETWORK_LOG] [FUZZ_LOG] [H3_LOG] OUTPUT\n' "$0" >&2
     exit 2
 fi
 
@@ -240,6 +251,35 @@ write_fuzz_table() {
     done <<< "$lines"
 }
 
+write_h3_table() {
+    local lines=$1
+    local line
+
+    if [[ -z "$lines" ]]; then
+        printf '| _No HTTP/3 result captured_ | | | | | | | | | | | |\n'
+        return
+    fi
+
+    printf '| Case | Mode | Workers | Requests | Elapsed ms | Connect ms | RPS | P50 us | P75 us | P90 us | P99 us | Samples |\n'
+    printf '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n'
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
+            "$(result_field "$line" case)" \
+            "$(result_field "$line" mode)" \
+            "$(result_field "$line" workers)" \
+            "$(result_field "$line" requests)" \
+            "$(result_field "$line" elapsed_ms)" \
+            "$(result_field "$line" connect_ms)" \
+            "$(result_field "$line" rps)" \
+            "$(result_field "$line" p50_us)" \
+            "$(result_field "$line" p75_us)" \
+            "$(result_field "$line" p90_us)" \
+            "$(result_field "$line" p99_us)" \
+            "$(result_field "$line" samples)"
+    done <<< "$lines"
+}
+
 write_stats_table() {
     local lines=$1
     local line
@@ -332,6 +372,7 @@ concurrency_status=${BENCHMARK_CONCURRENCY_EXIT:-not-recorded}
 interop_status=${BENCHMARK_INTEROP_EXIT:-not-recorded}
 network_status=${BENCHMARK_NETWORK_EXIT:-not-recorded}
 fuzz_status=${BENCHMARK_FUZZ_EXIT:-not-recorded}
+h3_status=${BENCHMARK_H3_EXIT:-not-recorded}
 
 throughput_results=$(extract_lines '^RESULT\|suite=throughput' "$throughput_log")
 tlsverify_results=$(extract_lines '^TLSVERIFY\|' "$throughput_log")
@@ -340,6 +381,7 @@ concurrency_results=$(extract_lines '^CONCURRENCY\|' "$concurrency_log")
 interop_results=$(extract_lines '^INTEROP\|' "$interop_log")
 network_results=$(extract_lines '^NETWORK\|' "$network_log")
 fuzz_results=$(extract_lines '^FUZZ\|' "$fuzz_log")
+h3_results=$(extract_lines '^RESULT\|suite=h3' "$h3_log")
 stats_results=$(extract_lines '^STATS\|' "$throughput_log")
 
 {
@@ -353,6 +395,7 @@ stats_results=$(extract_lines '^STATS\|' "$throughput_log")
     printf -- '- Comparison exit code: %s\n' "$compare_status"
     printf -- '- Concurrency exit code: %s\n' "$concurrency_status"
     printf -- '- Interop exit code: %s\n' "$interop_status"
+    printf -- '- HTTP/3 exit code: %s\n' "$h3_status"
     printf -- '- Cross-machine exit code: %s\n' "$network_status"
     printf -- '- Fuzz exit code: %s\n' "$fuzz_status"
     if [[ -n "${GITHUB_SERVER_URL:-}" && -n "${GITHUB_REPOSITORY:-}" && -n "${GITHUB_RUN_ID:-}" ]]; then
@@ -363,7 +406,8 @@ stats_results=$(extract_lines '^STATS\|' "$throughput_log")
 
     printf '\n%s\n\n' '## Evidence Rules'
     printf '%s\n' '- Rows marked `invalid` are retained for auditability but are excluded from performance conclusions.'
-    printf '%s\n' "- The Reqwest HTTP/2 baseline uses the async client (the blocking client's fixed ~41 ms wait on h2c large bodies was a harness artifact, not a performance property)."
+    printf '%s\n' '- The `*_h2c_large_body_to_hyper` rows measure a 1 MiB POST against the same hyper h2 server. Both clients are paced by the server 64 KiB initial flow-control window (WINDOW_UPDATE round trips), and reqwest retains a large fixed wait even in the async client — these rows are NOT valid for ratio claims.'
+    printf '%s\n' '- `quinn_h3_client_to_courierust` is reported `not_available` until the independent quinn+rustls QUIC/TLS handshake completes against the Courierust H3 server (a genuine interop gap, never faked).'
     printf '%s\n' '- Loopback is not cross-machine evidence. The cross-machine table is evidence only when `target_scope=remote` and `status=ok`.'
     printf '%s\n' '- TLS rows measure the built-in TLS 1.3 path; certificate, hostname, and ALPN checks must pass for the case to be valid. `negotiated_alpn` is reported; `session_resumption=n/a` because the stack does not implement PSK/0-RTT tickets yet.'
     printf '%s\n' '- Fuzz status is evidence only for the recorded target, run count, and duration; an unconfigured target is not a pass.'
@@ -377,6 +421,10 @@ stats_results=$(extract_lines '^STATS\|' "$throughput_log")
     write_compare_table "$compare_results"
     printf '\n%s\n\n' '## Concurrency and Slow Connections'
     write_concurrency_table "$concurrency_results"
+    printf '\n%s\n\n' '## HTTP/3 (QUIC)'
+    printf '%s\n' '- `h3_connect` is a cold request: QUIC handshake + TLS 1.3 + server Retry address validation on a fresh connection.'
+    printf '%s\n' '- `h3_sequential` and `h3_parallel` reuse the pooled per-authority QUIC connection (`mode=reuse`), so they measure the warm per-request cost of connection reuse.'
+    write_h3_table "$h3_results"
     printf '\n%s\n\n' '## Reactor / Connection / Stream Evidence'
     write_stats_table "$stats_results"
     printf '\n%s\n\n' '## Cross-Machine'
@@ -398,6 +446,10 @@ stats_results=$(extract_lines '^STATS\|' "$throughput_log")
     printf '%s\n' '### Concurrency'
     printf '%s\n' '~~~text'
     write_raw_block "$concurrency_log" '^(CONCURRENCY\|)'
+    printf '%s\n\n' '~~~'
+    printf '%s\n' '### HTTP/3 (QUIC)'
+    printf '%s\n' '~~~text'
+    write_raw_block "$h3_log" '^(RESULT\|suite=h3)'
     printf '%s\n\n' '~~~'
     printf '%s\n' '### Reactor / Connection / Stream Evidence'
     printf '%s\n' '~~~text'

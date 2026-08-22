@@ -51,6 +51,10 @@ const MAX_H3_PENDING_REQUESTS: usize = 256;
 const MAX_H3_CONNECTION_BUFFER: usize = 64 * 1024 * 1024;
 const ACK_DELAY: Duration = Duration::from_millis(2);
 const LOSS_DELAY: Duration = Duration::from_millis(250);
+/// Floor for the per-connection loss timeout once an RTT sample exists.
+/// See [`QuicTransport::loss_timeout`] for why a sub-millisecond floor
+/// is wrong on loopback / loaded machines.
+const LOSS_TIMEOUT_FLOOR: Duration = Duration::from_millis(25);
 const MAX_RETRANSMITS: u8 = 8;
 const RETRY_TOKEN_TTL: u64 = 30;
 const RETRY_CLOCK_SKEW: u64 = 5;
@@ -494,10 +498,6 @@ fn run_client_driver(
     let mut last_activity = Instant::now();
 
     loop {
-        // Drain commands first so the liveness checks below see every
-        // request that has been submitted (a command that arrives while
-        // the transport is driven is drained on the next iteration — its
-        // nudge wakes the poll, so it is never delayed by a full wait).
         let mut shutdown = false;
         while let Ok(cmd) = commands.try_recv() {
             match cmd {
@@ -527,9 +527,7 @@ fn run_client_driver(
         }
         let now = Instant::now();
         conn.check_timeouts(now);
-        // A stalled handshake with no request queued is left to the idle
-        // timeout (and the client's Drop shutdown); an unhandled request
-        // is reaped by its own deadline.
+
         if conn.has_work() {
             last_activity = now;
         } else if now.duration_since(last_activity) >= idle {
@@ -541,15 +539,10 @@ fn run_client_driver(
             );
             return Ok(());
         }
-        // A peer GOAWAY means the connection accepts no new streams; the
-        // pool must roll new dispatches over to a fresh connection.
         if conn.peer_goaway.is_some() {
             _accepting_guard.0.store(false, Ordering::Release);
         }
 
-        // Bound the poll: housekeeping tick while busy, the idle deadline
-        // while idle, and never past the nearest request deadline. Data
-        // and command wakeups interrupt the wait immediately.
         let mut wait_ms: i64 = if conn.has_work() || conn.transport.has_unacknowledged() {
             5
         } else {
@@ -584,7 +577,8 @@ fn run_client_driver(
                     }
                     Err(error)
                         if error.kind() == std::io::ErrorKind::WouldBlock
-                            || error.kind() == std::io::ErrorKind::TimedOut =>
+                            || error.kind() == std::io::ErrorKind::TimedOut
+                            || error.kind() == std::io::ErrorKind::ConnectionReset =>
                     {
                         break;
                     }
@@ -641,16 +635,10 @@ fn run_server(
     } else {
         config.threads.max(1)
     };
-    // Handler work runs on a shared work-stealing pool instead of a fresh
-    // OS thread per request (thread creation is a per-request allocation
-    // and scheduler cost that dominates under concurrency).
     let pool = crate::courierust_pool::ThreadPool::with_size(worker_count)
         .map_err(|e| io_error(e.to_string()))?;
     let task_limit = worker_count.saturating_mul(2);
     let active_tasks = Arc::new(AtomicUsize::new(0));
-    // Route packets by QUIC destination CID; the peer address is an extra
-    // ownership check, not the connection identity (NAT rebinding and two
-    // simultaneous connections from one address must not share state).
     let mut state = ServerState {
         connections: HashMap::new(),
         routes: HashMap::new(),
@@ -660,10 +648,6 @@ fn run_server(
         config,
     };
     let mut datagram = [0u8; MAX_DATAGRAM];
-
-    // Event-driven reactor: the UDP socket and a self-pipe wake are both
-    // watched by the poller, so an inbound datagram or a completed
-    // response wakes the loop immediately — no fixed sleep latency.
     let (wake_reader, wake_writer) = wakeup_pair().map_err(|e| io_error(e.to_string()))?;
     let wake_writer = Arc::new(wake_writer);
     let wake_fd = fd_of(&wake_reader);
@@ -3449,7 +3433,14 @@ impl QuicTransport {
             return LOSS_DELAY;
         };
         let variance = (self.rtt_variance * 4).max(Duration::from_millis(1));
-        (smoothed + variance + ACK_DELAY).max(Duration::from_millis(1))
+        // RFC 9002: PTO = smoothed_rtt + max(4*rttvar, granularity) +
+        // max_ack_delay. The floor absorbs scheduling jitter (Windows
+        // timer granularity, CPU contention from parallel connections):
+        // without it a loopback RTT of ~0.3 ms yields a ~3 ms loss
+        // timeout, so a single delayed ACK is misclassified as loss, the
+        // congestion window collapses to its 2400-byte floor, and a large
+        // body degrades to a crawl (one window per loss timeout).
+        (smoothed + variance + ACK_DELAY).max(LOSS_TIMEOUT_FLOOR)
     }
 
     fn on_loss(&mut self) {

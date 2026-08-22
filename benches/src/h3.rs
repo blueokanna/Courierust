@@ -23,21 +23,19 @@
 //! (`timeBeginPeriod`), which removed ~1 ms periodic `select()` wakeup
 //! stalls and was the single largest warm-latency win (p99 10.7 ms → ~0.3 ms).
 
-mod metrics;
-
 use courierust::courierust_client::{Client, ClientConfig, TlsSettings as ClientTls};
 use courierust::courierust_http::request::Request;
 use courierust::courierust_http::response::Response;
 use courierust::courierust_server::{Server, ServerConfig, TlsSettings as ServerTls};
-use metrics::{run_concurrent, run_sequential, Timing};
+use courierust_benchmark::metrics::{run_concurrent, run_sequential, Timing, MAX_SAMPLES};
 use std::time::Instant;
 
 const CERT_DER: &[u8] = include_bytes!("../../tests/certs/server_cert.der");
 const KEY_DER: &[u8] = include_bytes!("../../tests/certs/server_key.der");
 
-fn report(label: &str, timing: &Timing) {
+fn report(label: &str, workers: usize, timing: &Timing) {
     println!(
-        "RESULT|suite=h3|case={label}|protocol=h3|mode=reuse|payload=empty|bytes=0|workers=1|requests={}|elapsed_ms={:.3}|rps={:.1}|p50_us={}|p75_us={}|p90_us={}|p99_us={}|samples={}",
+        "RESULT|suite=h3|case={label}|protocol=h3|mode=reuse|payload=empty|bytes=0|workers={workers}|requests={}|elapsed_ms={:.3}|rps={:.1}|p50_us={:.1}|p75_us={:.1}|p90_us={:.1}|p99_us={:.1}|samples={}",
         timing.requests,
         timing.elapsed.as_secs_f64() * 1000.0,
         timing.requests_per_second(),
@@ -116,15 +114,15 @@ fn main() {
     }
 
     // 2. Warm sequential: every request reuses the pooled connection.
-    let mut seq = run_sequential(requests, 2048, || {
+    let mut seq = run_sequential(requests, MAX_SAMPLES, || {
         let _ = client.get(&url);
     });
     seq.sort_samples();
-    report("h3_sequential", &seq);
+    report("h3_sequential", 1, &seq);
 
     // 3. Warm concurrent: workers share the pooled connection(s) and
     //    multiplex request streams over QUIC.
-    let mut conc = run_concurrent(requests, workers, 2048, |_| {
+    let mut conc = run_concurrent(requests, workers, MAX_SAMPLES, |_| {
         let client = client.clone();
         let url = url.clone();
         Box::new(move || {
@@ -132,5 +130,5 @@ fn main() {
         })
     });
     conc.sort_samples();
-    report("h3_parallel", &conc);
+    report("h3_parallel", workers, &conc);
 }
