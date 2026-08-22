@@ -9,6 +9,7 @@ use crate::courierust_client::h1::H1Connection;
 use crate::courierust_client::h2::{H2Cmd, H2Conn};
 use crate::courierust_error::{Error, Result};
 use crate::courierust_h2::priority::Priority;
+use crate::courierust_h3::runtime::{H3Cmd, H3Conn};
 use crate::courierust_http::method::Method;
 use crate::courierust_http::request::Request;
 use crate::courierust_http::response::Response;
@@ -101,6 +102,10 @@ pub struct ClientConfig {
     /// idle time, so idle driver threads are reaped instead of
     /// accumulating with connection count.
     pub h2_idle_timeout: Option<Duration>,
+    /// h3: close a pooled QUIC connection with no in-flight requests
+    /// after this long idle, so idle driver threads are reaped instead of
+    /// accumulating with connection count.
+    pub h3_idle_timeout: Option<Duration>,
     /// Use the RFC 7540 §3.2 `h2c` Upgrade handshake instead of prior
     /// knowledge when opening an h2 connection to an `http://` host
     /// (interop with servers that only support Upgrade-based h2c). The
@@ -131,6 +136,7 @@ impl Default for ClientConfig {
             h2_ping_interval: Some(Duration::from_secs(30)),
             h2_ping_timeout: Some(Duration::from_secs(15)),
             h2_idle_timeout: Some(Duration::from_secs(300)),
+            h3_idle_timeout: Some(Duration::from_secs(300)),
             h2c_upgrade: false,
             stats: None,
         }
@@ -152,8 +158,35 @@ struct ClientInner {
     /// acquired after `h2_pool`; this keeps one slow authority from
     /// blocking an unrelated host while the per-host cap remains exact.
     pending_h2_opens: Mutex<HashMap<String, usize>>,
+    /// Live h3 (QUIC) connections per authority, selected by dispatch
+    /// reservations. Each entry is a driver thread that multiplexes every
+    /// request on one QUIC connection, so the TLS handshake is paid once
+    /// per pooled connection instead of once per request.
+    h3_pool: Mutex<HashMap<String, Vec<H3Conn>>>,
+    /// Signaled whenever an h3 connection open lands (or fails), so
+    /// callers waiting for the last connection slot wake instead of
+    /// polling.
+    h3_open_cv: std::sync::Condvar,
+    /// h3 connections currently being opened, keyed by authority.
+    pending_h3_opens: Mutex<HashMap<String, usize>>,
     /// Global request sequence (instrumentation).
     seq: AtomicUsize,
+}
+
+impl Drop for ClientInner {
+    fn drop(&mut self) {
+        // Stop every pooled h3 driver so its thread exits promptly once
+        // the client is gone (they would otherwise linger until the idle
+        // timeout). The driver replies with an error to anything it was
+        // mid-flight on, which is unreachable anyway.
+        let drivers: Vec<H3Conn> = {
+            let pools = self.h3_pool.lock().unwrap();
+            pools.values().flatten().cloned().collect()
+        };
+        for driver in drivers {
+            let _ = driver.send(H3Cmd::Shutdown);
+        }
+    }
 }
 
 /// An HTTP client.
@@ -199,6 +232,9 @@ impl Client {
                 h2_pool: Mutex::new(HashMap::new()),
                 h2_open_cv: std::sync::Condvar::new(),
                 pending_h2_opens: Mutex::new(HashMap::new()),
+                h3_pool: Mutex::new(HashMap::new()),
+                h3_open_cv: std::sync::Condvar::new(),
+                pending_h3_opens: Mutex::new(HashMap::new()),
                 seq: AtomicUsize::new(0),
             }),
         }
@@ -324,27 +360,10 @@ impl Client {
             if url.scheme != "https" {
                 return Err(Error::protocol("HTTP/3 requires an https:// URL"));
             }
-            let tls = self
-                .inner
-                .config
-                .tls
-                .as_ref()
-                .ok_or_else(|| Error::protocol("HTTP/3 requires TLS settings"))?;
-            return crate::courierust_h3::runtime::client_request(
-                addr,
-                &url.host,
-                &authority,
-                req,
-                crate::courierust_h3::runtime::ClientRequestOptions {
-                    roots: tls.roots.clone(),
-                    verify: tls.verify,
-                    now: tls.now,
-                    max_header_list: self.inner.config.max_header_list,
-                    max_body: self.inner.config.max_body,
-                    timeout: self.inner.config.read_timeout,
-                    stats: self.inner.config.stats.clone(),
-                },
-            );
+            if self.inner.config.tls.is_none() {
+                return Err(Error::protocol("HTTP/3 requires TLS settings"));
+            }
+            return self.execute_h3(url, &authority, addr, req);
         }
         if self.inner.config.http2 {
             if self.inner.config.h2c_upgrade && url.scheme == "http" {
@@ -456,6 +475,198 @@ impl Client {
         let (tx, rx) = std::sync::mpsc::channel();
         let cmd = build_h2_cmd(fields, req.body, priority, tx);
         self.send_h2_cmd(conn, authority, addr, tls.as_ref(), &url.host, cmd, rx)
+    }
+
+    /// Perform a request over a pooled h3 (QUIC) connection. The first
+    /// request for an authority opens a connection (QUIC handshake + TLS);
+    /// subsequent requests multiplex over the pooled connection, so the
+    /// per-request cost drops to a single QUIC round trip.
+    fn execute_h3(
+        &self,
+        url: &Url,
+        authority: &str,
+        addr: SocketAddr,
+        req: Request<Body>,
+    ) -> Result<Response<Body>> {
+        let tls = self
+            .inner
+            .config
+            .tls
+            .as_ref()
+            .ok_or_else(|| Error::protocol("HTTP/3 requires TLS settings"))?;
+        let options = crate::courierust_h3::runtime::ClientRequestOptions {
+            roots: tls.roots.clone(),
+            verify: tls.verify,
+            now: tls.now,
+            max_header_list: self.inner.config.max_header_list,
+            max_body: self.inner.config.max_body,
+            timeout: self.inner.config.read_timeout,
+            stats: self.inner.config.stats.clone(),
+        };
+        let conn = self.get_h3_conn(authority, addr, &url.host, &options)?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cmd = H3Cmd::Request {
+            request: req,
+            reply: tx,
+        };
+        self.send_h3_cmd(conn, authority, addr, &url.host, options, cmd, rx)
+    }
+
+    /// Select (or open) a pooled h3 connection for `authority`. Mirrors
+    /// `get_h2_conn`: opens outside the pool lock, caps per-authority
+    /// connections, and lets concurrent callers sleep on the condvar while
+    /// the last slot is being opened.
+    fn get_h3_conn(
+        &self,
+        authority: &str,
+        addr: SocketAddr,
+        hostname: &str,
+        options: &crate::courierust_h3::runtime::ClientRequestOptions,
+    ) -> Result<H3Conn> {
+        let max_connections = self.inner.config.max_connections_per_host.max(1);
+        loop {
+            let mut open = false;
+            let mut should_wait = false;
+            {
+                let mut pools = self.inner.h3_pool.lock().unwrap();
+                let mut pending = self.inner.pending_h3_opens.lock().unwrap();
+                let list = pools.entry(authority.to_string()).or_default();
+                list.retain(|c| c.accepting.load(Ordering::Acquire));
+                let least_loaded = list
+                    .iter()
+                    .filter(|c| c.accepting.load(Ordering::Acquire))
+                    .min_by_key(|c| c.reservations())
+                    .cloned();
+                if let Some(conn) = least_loaded {
+                    if conn.reservations() == 0 || list.len() >= max_connections {
+                        conn.reserve();
+                        return Ok(conn);
+                    }
+                }
+                let pending_count = pending.get(authority).copied().unwrap_or(0);
+                if list.len() + pending_count < max_connections {
+                    *pending.entry(authority.to_string()).or_default() += 1;
+                    open = true;
+                } else if pending_count > 0 {
+                    should_wait = true;
+                }
+            }
+            if !open {
+                if should_wait {
+                    let guard = self.inner.h3_pool.lock().unwrap();
+                    let (guard, _) = self
+                        .inner
+                        .h3_open_cv
+                        .wait_timeout(guard, Duration::from_millis(200))
+                        .expect("h3 pool lock poisoned");
+                    drop(guard);
+                    continue;
+                }
+                break;
+            }
+
+            // Open outside the pool lock (a QUIC connect + TLS handshake
+            // must not serialize every concurrent requester).
+            let opened = (|| -> Result<H3Conn> {
+                let conn = crate::courierust_h3::runtime::start_h3_driver(
+                    addr,
+                    hostname.to_string(),
+                    authority.to_string(),
+                    options.clone(),
+                    self.inner.config.h3_idle_timeout,
+                )?;
+                let mut pools = self.inner.h3_pool.lock().unwrap();
+                let mut pending = self.inner.pending_h3_opens.lock().unwrap();
+                let list = pools.entry(authority.to_string()).or_default();
+                list.retain(|c| c.accepting.load(Ordering::Acquire));
+                decrement_pending_h3_open(&mut pending, authority);
+                if list.len() < max_connections {
+                    list.push(conn.clone());
+                }
+                self.inner.h3_open_cv.notify_all();
+                Ok(conn)
+            })();
+            match opened {
+                Ok(conn) => {
+                    conn.reserve();
+                    return Ok(conn);
+                }
+                Err(e) => {
+                    let pools = self.inner.h3_pool.lock().unwrap();
+                    let mut pending = self.inner.pending_h3_opens.lock().unwrap();
+                    decrement_pending_h3_open(&mut pending, authority);
+                    self.inner.h3_open_cv.notify_all();
+                    drop(pools);
+                    return Err(e);
+                }
+            }
+        }
+
+        // Rare fallback after a long open race: block on the
+        // least-loaded live connection (its dispatch queue drains).
+        let mut pools = self.inner.h3_pool.lock().unwrap();
+        let list = pools.entry(authority.to_string()).or_default();
+        let conn = list
+            .iter()
+            .filter(|c| c.accepting.load(Ordering::Acquire))
+            .min_by_key(|c| c.reservations())
+            .cloned()
+            .ok_or_else(|| Error::canceled("no accepting h3 connection"))?;
+        conn.reserve();
+        Ok(conn)
+    }
+
+    /// Send a driver command, retrying once on a fresh connection if the
+    /// driver is gone, then wait for the reply.
+    //
+    // The `authority`/`addr`/`hostname`/`options` bundle is deliberately
+    // kept flat here (and in `get_h3_conn`) so the retry path can re-open
+    // a fresh connection with exactly the same parameters.
+    #[allow(clippy::too_many_arguments)]
+    fn send_h3_cmd(
+        &self,
+        conn: H3Conn,
+        authority: &str,
+        addr: SocketAddr,
+        hostname: &str,
+        options: crate::courierust_h3::runtime::ClientRequestOptions,
+        cmd: H3Cmd,
+        rx: std::sync::mpsc::Receiver<Result<Response<Body>>>,
+    ) -> Result<Response<Body>> {
+        match conn.send(cmd) {
+            Ok(()) => {
+                let result = rx
+                    .recv()
+                    .map_err(|_| Error::canceled("h3 driver closed the channel"))
+                    .and_then(|result| result);
+                conn.release();
+                result
+            }
+            Err(std::sync::mpsc::SendError(cmd)) => {
+                // The driver is gone; open a fresh connection and retry.
+                conn.accepting.store(false, Ordering::Release);
+                conn.release();
+                let fresh = self.get_h3_conn(authority, addr, hostname, &options)?;
+                fresh.reserve();
+                let (tx2, rx2) = std::sync::mpsc::channel();
+                let cmd2 = match cmd {
+                    H3Cmd::Request { request, .. } => H3Cmd::Request {
+                        request,
+                        reply: tx2,
+                    },
+                    H3Cmd::Shutdown => H3Cmd::Shutdown,
+                };
+                let result = match fresh.send(cmd2) {
+                    Ok(()) => rx2
+                        .recv()
+                        .map_err(|_| Error::canceled("h3 driver is gone"))
+                        .and_then(|result| result),
+                    Err(_) => Err(Error::canceled("h3 driver is gone")),
+                };
+                fresh.release();
+                result
+            }
+        }
     }
 
     /// Perform a request over an h2 connection established with the RFC
@@ -772,6 +983,19 @@ impl Client {
 }
 
 fn decrement_pending_h2_open(pending: &mut HashMap<String, usize>, authority: &str) {
+    let remove = match pending.get_mut(authority) {
+        Some(count) => {
+            *count = count.saturating_sub(1);
+            *count == 0
+        }
+        None => false,
+    };
+    if remove {
+        pending.remove(authority);
+    }
+}
+
+fn decrement_pending_h3_open(pending: &mut HashMap<String, usize>, authority: &str) {
     let remove = match pending.get_mut(authority) {
         Some(count) => {
             *count = count.saturating_sub(1);

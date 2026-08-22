@@ -724,10 +724,10 @@ pub(crate) fn serve_event(
     Ok(())
 }
 
-/// Create a loopback socket pair used as a self-pipe to wake the event
-/// loop out of a blocking poll. Pure std, cross-platform (Windows has no
+/// Create a loopback socket pair used as a self-pipe to wake a poller
+/// out of a blocking wait. Pure std, cross-platform (Windows has no
 /// native `socketpair`; a loopback pair is the portable equivalent).
-fn wakeup_pair() -> std::io::Result<(TcpStream, TcpStream)> {
+pub(crate) fn wakeup_pair() -> std::io::Result<(TcpStream, TcpStream)> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let writer = TcpStream::connect(listener.local_addr()?)?;
     let (reader, _) = listener.accept()?;
@@ -738,13 +738,13 @@ fn wakeup_pair() -> std::io::Result<(TcpStream, TcpStream)> {
 
 /// Write one byte to the wake pipe (best-effort; a full or failed write
 /// only loses an optimization, never correctness).
-fn wake_nudge(w: &TcpStream) {
+pub(crate) fn wake_nudge(w: &TcpStream) {
     let mut s: &TcpStream = w;
     let _ = std::io::Write::write(&mut s, &[1]);
 }
 
 /// Drain all pending wake bytes so the pipe cannot fire spuriously.
-fn drain_wake(r: &TcpStream) {
+pub(crate) fn drain_wake(r: &TcpStream) {
     let mut buf = [0u8; 64];
     loop {
         let mut s: &TcpStream = r;

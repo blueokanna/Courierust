@@ -10,11 +10,16 @@
 //! self-pipe) watched in every batch, so a worker or the accept thread
 //! can interrupt a blocking poll with one byte — control messages never
 //! wait for a poll tick.
+//!
+//! On Windows the process timer resolution is raised to 1 ms for its
+//! lifetime (see [`ensure_high_resolution_timer`]); Winsock `select`
+//! wakeups otherwise align to the coarse default system timer and add
+//! multi-millisecond latency even when a datagram is already queued.
 
 #![allow(unsafe_code)]
 
 use std::collections::HashMap;
-use std::net::TcpStream;
+use std::net::{TcpStream, UdpSocket};
 
 /// The platform socket descriptor type used by the poller.
 #[cfg(windows)]
@@ -26,8 +31,49 @@ pub(crate) type Fd = std::os::fd::RawFd;
 /// loop never treats this id as a connection.
 pub(crate) const WAKE_ID: usize = 0;
 
-/// The raw descriptor of a socket, whatever the platform.
+/// Raise the Windows timer resolution to 1 ms for the process lifetime
+/// (called once, idempotently, from the first `Poller`). `select()` and
+/// `sleep()` wakeups otherwise align to the coarse default timer (up to
+/// ~15.6 ms), which would add multi-millisecond latency to the poller
+/// even when a datagram is already queued. The resolution is never
+/// lowered again — the standard practice for latency-sensitive
+/// processes; the cost is a slightly higher timer interrupt rate.
+#[cfg(windows)]
+pub(crate) fn ensure_high_resolution_timer() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        // SAFETY: `timeBeginPeriod` is a documented Win32 multimedia
+        // timer API with no preconditions and no failure mode for
+        // period 1.
+        unsafe {
+            timeBeginPeriod(1);
+        }
+    });
+}
+
+#[cfg(windows)]
+#[link(name = "winmm")]
+extern "system" {
+    fn timeBeginPeriod(period: u32) -> u32;
+}
+
+/// The raw descriptor of a TCP socket, whatever the platform.
 pub(crate) fn fd_of(socket: &TcpStream) -> Fd {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        socket.as_raw_socket()
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::fd::AsRawFd;
+        socket.as_raw_fd()
+    }
+}
+
+/// The raw descriptor of a UDP socket, whatever the platform.
+pub(crate) fn udp_fd_of(socket: &UdpSocket) -> Fd {
     #[cfg(windows)]
     {
         use std::os::windows::io::AsRawSocket;
@@ -145,6 +191,8 @@ pub(crate) struct Poller {
 
 impl Poller {
     pub(crate) fn new() -> Self {
+        #[cfg(windows)]
+        ensure_high_resolution_timer();
         Self {
             fds: Vec::new(),
             index: HashMap::new(),

@@ -53,6 +53,11 @@ harness = false
 path = "src/network.rs"
 
 [[bench]]
+name = "h3"
+harness = false
+path = "src/h3.rs"
+
+[[bench]]
 name = "tls_interop"
 harness = false
 path = "src/tls_interop.rs"

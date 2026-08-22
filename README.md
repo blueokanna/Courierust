@@ -1,5 +1,9 @@
 # Courierust - [中文文档](README_CN.md)
 
+<p align="center">
+  <img src="assets/Courierust.png" alt="High-performance, self-contained Rust networking stack" width="20%">
+</p>
+
 > A self-contained HTTP/1.1 + HTTP/2 + gRPC protocol stack with zero third-party dependencies.
 
 > Hands-on tutorials (English & 中文) live on the [wiki](https://github.com/blueokanna/Courierust/wiki).
@@ -71,7 +75,7 @@ Each client connection owns its codec buffers and, for HTTP/2, one driver thread
 
 ### The event scheduler is a self-pipe, not a sleep-and-scan loop
 
-The default server path is an accept thread + an event-loop thread + a set of event workers. The trap: the event loop blocks in `select`/`poll`, but *control messages* (new connection, re-register a connection a worker just served) travel on an mpsc channel. If the loop only notices them on the next poll tick, every keep-alive round trip pays a full poll timeout (that was the original ~5 ms P99 spike). The fix is a **self-pipe**: a loopback socket pair whose read end is registered in the poller, so the accept thread and any worker can interrupt a blocking poll with one byte the instant a message is queued. Socket readiness (a client sending data) already wakes the poll immediately; with the self-pipe, *message* wakeups are immediate too, and the poll timeout only bounds the wait when nothing at all is happening — it is not in the request-latency path. Ready connections are dispatched to workers in **batches** (one channel message per 16 ids), and on Windows the `select` batching gives every batch after the first a zero timeout so a ready socket in batch *k* is never delayed by the timeouts of batches 0..k-1.
+The default server path is an accept thread + an event-loop thread + a set of event workers. The trap: the event loop blocks in `select`/`poll`, but _control messages_ (new connection, re-register a connection a worker just served) travel on an mpsc channel. If the loop only notices them on the next poll tick, every keep-alive round trip pays a full poll timeout (that was the original ~5 ms P99 spike). The fix is a **self-pipe**: a loopback socket pair whose read end is registered in the poller, so the accept thread and any worker can interrupt a blocking poll with one byte the instant a message is queued. Socket readiness (a client sending data) already wakes the poll immediately; with the self-pipe, _message_ wakeups are immediate too, and the poll timeout only bounds the wait when nothing at all is happening — it is not in the request-latency path. Ready connections are dispatched to workers in **batches** (one channel message per 16 ids), and on Windows the `select` batching gives every batch after the first a zero timeout so a ready socket in batch _k_ is never delayed by the timeouts of batches 0..k-1.
 
 Slow-loris and idle-herd protection is enforced before workers are ever involved: an incomplete request parks on the poller (zero workers), connections idle for `idle_timeout` are reaped, and `max_connections` caps the parked population outright.
 
@@ -238,7 +242,7 @@ Things this crate deliberately does not do:
 - **Event-driven server is default on every platform and HTTP/1.1-only.** `ServerConfig::event_driven` (default `true`) parks idle plain-HTTP connections on a readiness poller so a small worker pool serves many idle keep-alive / SSE / long-poll connections; TLS and HTTP/2 connections still use the blocking pool model (bounded by `handshake_timeout`, `h2_idle_timeout`, and worker count). Setting it to `false` restores the legacy **one-pool-job-per-connection** model; that path is deprecated for production use — it lets a herd of idle/slow connections exhaust the pool — and exists only for comparison and debugging. The default event path bounds resource use with `max_connections` (connection cap) and `idle_timeout`.
 - **Streaming request bodies are only reliable over HTTP/2** (h2 frames naturally). Over HTTP/1.1, either send the whole body at once (`Body::Bytes`) or build chunked framing yourself.
 - **gRPC does not include protobuf, `.proto` code generation, or `grpc.reflection`.** You implement the codec traits or wire in your own protobuf-generated code; reflection needs a protobuf schema inventory, which is external by design.
-- **A synchronous handler that blocks for a long time holds a worker** (event-driven or not) — exactly as with any synchronous server; use channel response bodies for streaming. Worker occupancy is **per-connection, not per-stream**: on one HTTP/2 connection, any number of idle streams (SSE / long-poll / gRPC server-streaming) occupy the same single worker, and a slow stream never blocks its connection's other streams — both are covered by integration tests. A large herd of *connections* is handled by the event scheduler (idle reaping + `max_connections`) rather than by adding workers.
+- **A synchronous handler that blocks for a long time holds a worker** (event-driven or not) — exactly as with any synchronous server; use channel response bodies for streaming. Worker occupancy is **per-connection, not per-stream**: on one HTTP/2 connection, any number of idle streams (SSE / long-poll / gRPC server-streaming) occupy the same single worker, and a slow stream never blocks its connection's other streams — both are covered by integration tests. A large herd of _connections_ is handled by the event scheduler (idle reaping + `max_connections`) rather than by adding workers.
 - **HTTPS is first-class**: the client and server ship a from-scratch TLS 1.3 implementation; `https://` needs a root store (supply your own — there is no bundled CA set). ALPN is enforced: a client configured for h2 speaking to a server that negotiates `http/1.1` — or that negotiates **no** ALPN at all — fails with a clear error instead of a silent protocol mismatch (RFC 9113 §3.3 requires ALPN `h2` over TLS).
 - Redirects, keep-alive reuse, and friends prioritize correctness over aggressive tuning.
 
@@ -293,7 +297,7 @@ Every `RESULT|...` line carries `p50_us` … `p99_us`, and the report script (`s
 
 The h2c client data is workload-specific, not a claim of universal leadership. The 1 KiB single-worker result is only a small comparison point; multi-worker results must be read with their connection policy and tail latency. The Reqwest HTTP/2 baseline uses the **async** client — the blocking client's fixed ~41 ms wait on h2c large bodies was a harness artifact, so it is not used as performance evidence.
 
-**Worker-count guidance (measured, see the `STATS` rows):** HTTP/2 multiplexing sends all streams over one connection serviced by one driver thread. With `max_connections_per_host = 1`, throughput scales with workers up to ~4–8 and then *regresses*: 32 workers contend on the shared pool lock and the single driver's command channel faster than the driver can drain them. The `STATS` rows show `h2_connections=1` with `workers` concurrent streams — the serialization point. Prefer 4–8 client workers per h2 connection and scale connections, not workers, beyond that.
+**Worker-count guidance (measured, see the `STATS` rows):** HTTP/2 multiplexing sends all streams over one connection serviced by one driver thread. With `max_connections_per_host = 1`, throughput scales with workers up to ~4–8 and then _regresses_: 32 workers contend on the shared pool lock and the single driver's command channel faster than the driver can drain them. The `STATS` rows show `h2_connections=1` with `workers` concurrent streams — the serialization point. Prefer 4–8 client workers per h2 connection and scale connections, not workers, beyond that.
 
 ## Interop evidence
 
@@ -315,7 +319,7 @@ This runs in CI on every PR (`benchmark.yml`), so a real interop regression
 fails the pipeline. The mainstream crates are dev-only dependencies of the
 bench workspace; the `courierust` library itself stays zero-dependency.
 
-The self-interop suite only proves Courierust agrees with *itself* on TLS.
+The self-interop suite only proves Courierust agrees with _itself_ on TLS.
 To prove the TLS layer against an independent implementation, a separate
 workflow (`tls-interop.yml`, script `scripts/tls_interop.sh`) drives
 **OpenSSL `s_server`** (Courierust client → OpenSSL), **`curl` / `openssl

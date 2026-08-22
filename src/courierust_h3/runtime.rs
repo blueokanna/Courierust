@@ -17,19 +17,21 @@ use crate::courierust_http::response::Response;
 use crate::courierust_http::status::StatusCode;
 use crate::courierust_http::uri::PathAndQuery;
 use crate::courierust_http::version::Version;
+use crate::courierust_net::poller::{fd_of, udp_fd_of, Poller, WAKE_ID};
 use crate::courierust_net::stats::Stats;
 use crate::courierust_quic::frame::Frame as QFrame;
 use crate::courierust_quic::packet::{self, LongType};
 use crate::courierust_quic::protection::{self, PacketKey};
 use crate::courierust_quic::stream as stream_id;
 use crate::courierust_quic::varint;
+use crate::courierust_server::event::{drain_wake, wake_nudge, wakeup_pair};
 use crate::courierust_server::{Handler, ServerConfig, TlsSettings};
 use crate::courierust_tls::quic::{QuicClient, QuicServer, TransportParameters};
 use crate::courierust_tls::RootStore;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -57,6 +59,14 @@ const H3_CONTROL_STREAM: u64 = h3frame::STREAM_TYPE_CONTROL;
 const H3_QPACK_ENCODER_STREAM: u64 = h3frame::STREAM_TYPE_QPACK_ENCODER;
 const H3_QPACK_DECODER_STREAM: u64 = h3frame::STREAM_TYPE_QPACK_DECODER;
 
+/// Server idle receive window: bounds how long the reactor parks on the
+/// poller with no datagram pending. Datagrams and the completed-response
+/// self-pipe both wake the poller immediately; this only paces idle
+/// periodic work (retransmit, response queue).
+const SERVER_IDLE_TIMEOUT_MS: i32 = 5;
+/// Poller id for the reactor's UDP socket (see `Poller::register`).
+const SOCKET_ID: usize = 1;
+
 type LevelIndex = usize;
 const INITIAL: LevelIndex = 0;
 const HANDSHAKE: LevelIndex = 1;
@@ -65,6 +75,7 @@ const APPLICATION: LevelIndex = 2;
 type OpenPacket = (LevelIndex, u64, Vec<QFrame>, usize);
 
 /// Limits and verification inputs for one synchronous HTTP/3 request.
+#[derive(Clone)]
 pub(crate) struct ClientRequestOptions {
     pub(crate) roots: RootStore,
     pub(crate) verify: bool,
@@ -297,22 +308,18 @@ pub(crate) fn spawn_server(
 
 /// Execute one synchronous HTTP/3 request. The UDP transport is still
 /// event-driven internally; this API only waits for the final response for
-/// compatibility with the crate's blocking client.
-pub(crate) fn client_request(
+/// Create a fresh QUIC/TLS client connection to `addr`. The socket is
+/// returned unconfigured so each caller picks its own wait strategy: the
+/// pooled driver registers the socket with the poller.
+fn build_client_connection(
     addr: SocketAddr,
     hostname: &str,
     authority: &str,
-    req: Request<Body>,
-    options: ClientRequestOptions,
-) -> Result<Response<Body>> {
+    options: &ClientRequestOptions,
+) -> Result<(UdpSocket, ClientConnection)> {
     if options.max_body == 0 {
         return Err(protocol("HTTP/3 max_body must be non-zero"));
     }
-    let _stats_guard = options.stats.clone().map(|stats| {
-        stats.h3_connections.fetch_add(1, Ordering::Relaxed);
-        stats.h3_connections_active.fetch_add(1, Ordering::Relaxed);
-        H3ActiveGuard { stats }
-    });
     let socket = UdpSocket::bind(match addr {
         SocketAddr::V4(_) => "0.0.0.0:0"
             .parse::<SocketAddr>()
@@ -321,10 +328,6 @@ pub(crate) fn client_request(
     })
     .map_err(|e| io_error(e.to_string()))?;
     socket.connect(addr).map_err(|e| io_error(e.to_string()))?;
-    socket
-        .set_nonblocking(true)
-        .map_err(|e| io_error(e.to_string()))?;
-
     let local_cid = random_cid()?;
     let server_cid = random_cid()?;
     let local_tp = transport_parameters_for_limits(options.max_header_list, options.max_body);
@@ -332,7 +335,7 @@ pub(crate) fn client_request(
         hostname,
         vec![b"h3".to_vec()],
         options.verify,
-        options.roots,
+        options.roots.clone(),
         options.now,
         local_tp.clone(),
         server_cid.clone(),
@@ -345,11 +348,10 @@ pub(crate) fn client_request(
         options.stats.clone(),
     )?;
     transport.set_local_transport(&local_tp);
-    let mut conn = ClientConnection::new(
+    let conn = ClientConnection::new(
         transport,
         tls,
         client_hello,
-        req,
         authority.to_string(),
         H3Limits {
             max_header_list: options.max_header_list,
@@ -357,51 +359,271 @@ pub(crate) fn client_request(
         },
         options.stats.clone(),
     )?;
-    let deadline = Instant::now() + options.timeout.unwrap_or(Duration::from_secs(60));
+    Ok((socket, conn))
+}
+
+/// A command submitted to a pooled h3 connection driver.
+pub(crate) enum H3Cmd {
+    Request {
+        request: Request<Body>,
+        reply: mpsc::Sender<Result<Response<Body>>>,
+    },
+    Shutdown,
+}
+
+/// Handle to a live pooled h3 connection driver (mirrors the h2 pool's
+/// `H2Conn`): dispatch sends a command through `tx` and nudges the
+/// driver's wake pipe so its poller returns immediately.
+#[derive(Clone)]
+pub(crate) struct H3Conn {
+    tx: mpsc::Sender<H3Cmd>,
+    wake: Arc<std::net::TcpStream>,
+    pub(crate) accepting: Arc<AtomicBool>,
+    reservations: Arc<AtomicUsize>,
+}
+
+impl H3Conn {
+    pub(crate) fn reserve(&self) {
+        self.reservations.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn release(&self) {
+        let _ = self
+            .reservations
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                Some(value.saturating_sub(1))
+            });
+    }
+
+    pub(crate) fn reservations(&self) -> usize {
+        self.reservations.load(Ordering::Acquire)
+    }
+
+    /// Submit a command and wake the driver's poller. The large `Err` is
+    /// std's `mpsc::SendError`, which carries the command back so the
+    /// caller can retry it on a fresh connection — boxing it would defeat
+    /// the retry.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn send(&self, cmd: H3Cmd) -> Result<(), mpsc::SendError<H3Cmd>> {
+        self.tx.send(cmd)?;
+        wake_nudge(&self.wake);
+        Ok(())
+    }
+}
+
+/// Flipped to `false` when the driver exits, so the pool stops dispatching
+/// to a connection whose thread is gone.
+struct DriverAcceptingGuard(Arc<AtomicBool>);
+
+impl Drop for DriverAcceptingGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Open a pooled h3 connection to `addr` and spawn its driver thread. The
+/// connection performs the QUIC/TLS handshake on first use; requests
+/// submitted before the handshake completes are queued and dispatched by
+/// the driver once the connection is usable. Subsequent requests reuse the
+/// connection (and its TLS session) for the lifetime of the pool entry.
+pub(crate) fn start_h3_driver(
+    addr: SocketAddr,
+    hostname: String,
+    authority: String,
+    options: ClientRequestOptions,
+    idle_timeout: Option<Duration>,
+) -> Result<H3Conn> {
+    let (socket, conn) = build_client_connection(addr, &hostname, &authority, &options)?;
+    let (tx, rx) = mpsc::channel::<H3Cmd>();
+    let accepting = Arc::new(AtomicBool::new(true));
+    let reservations = Arc::new(AtomicUsize::new(0));
+    let (wake_reader, wake_writer) = wakeup_pair().map_err(|e| io_error(e.to_string()))?;
+    let wake_writer = Arc::new(wake_writer);
+    if let Some(stats) = options.stats.as_deref() {
+        stats.h3_connections.fetch_add(1, Ordering::Relaxed);
+        stats.h3_connections_active.fetch_add(1, Ordering::Relaxed);
+    }
+    let stats = options.stats.clone();
+    let accepting2 = accepting.clone();
+    thread::Builder::new()
+        .name("courierust-h3-driver".into())
+        .spawn(move || {
+            let _ = run_client_driver(
+                socket,
+                conn,
+                rx,
+                wake_reader,
+                options,
+                accepting2,
+                idle_timeout,
+                stats,
+            );
+        })?;
+    Ok(H3Conn {
+        tx,
+        wake: wake_writer,
+        accepting,
+        reservations,
+    })
+}
+
+/// The pooled client connection's reactor: owns the socket and the
+/// multiplexing connection state, waits on the poller (socket + wake
+/// pipe), and serves every request dispatched to this connection. Runs
+/// until every in-flight request is done and the connection has been idle
+/// for `idle_timeout`, or until the connection fails.
+#[allow(clippy::too_many_arguments)]
+fn run_client_driver(
+    socket: UdpSocket,
+    mut conn: ClientConnection,
+    commands: mpsc::Receiver<H3Cmd>,
+    wake_reader: std::net::TcpStream,
+    options: ClientRequestOptions,
+    accepting: Arc<AtomicBool>,
+    idle_timeout: Option<Duration>,
+    stats: Option<Arc<Stats>>,
+) -> Result<()> {
+    let _stats_guard = stats.map(|stats| H3ActiveGuard { stats });
+    let _accepting_guard = DriverAcceptingGuard(accepting);
+    let _ = socket.set_nonblocking(true);
+    let idle = idle_timeout.unwrap_or(Duration::from_secs(300));
+    let mut poller = Poller::new();
+    poller.register(SOCKET_ID, udp_fd_of(&socket), false);
+    let wake_fd = fd_of(&wake_reader);
     let mut datagram = [0u8; MAX_DATAGRAM];
+    let mut last_activity = Instant::now();
+
     loop {
-        if Instant::now() >= deadline {
-            let _ =
-                conn.transport
-                    .send_connection_close(&socket, 0x1, None, "HTTP/3 request timeout");
-            return Err(Error::new(ErrorKind::Timeout));
+        // Drain commands first so the liveness checks below see every
+        // request that has been submitted (a command that arrives while
+        // the transport is driven is drained on the next iteration — its
+        // nudge wakes the poll, so it is never delayed by a full wait).
+        let mut shutdown = false;
+        while let Ok(cmd) = commands.try_recv() {
+            match cmd {
+                H3Cmd::Request { request, reply } => {
+                    if conn.peer_goaway.is_some() {
+                        let _ =
+                            reply.send(Err(Error::canceled("HTTP/3 connection received GOAWAY")));
+                        continue;
+                    }
+                    let deadline =
+                        Instant::now() + options.timeout.unwrap_or(Duration::from_secs(60));
+                    conn.queue_request(request, reply, deadline);
+                    last_activity = Instant::now();
+                }
+                H3Cmd::Shutdown => {
+                    shutdown = true;
+                    break;
+                }
+            }
         }
-        match socket.recv(&mut datagram) {
-            Ok(n) => {
-                if let Some(stats) = options.stats.as_deref() {
-                    stats.h3_udp_recv_syscalls.fetch_add(1, Ordering::Relaxed);
-                }
-                if n == 0 || n > MAX_DATAGRAM {
-                    return Err(protocol("invalid QUIC datagram length"));
-                }
-                if let Err(error) = conn.on_datagram(&socket, &datagram[..n]) {
-                    let _ = conn.transport.send_connection_close(
-                        &socket,
-                        0x1,
-                        None,
-                        &error.to_string(),
-                    );
-                    return Err(error);
-                }
-                if let Some(response) = conn.response.take() {
-                    return Ok(response);
+        if shutdown {
+            break;
+        }
+
+        if let Err(error) = conn.on_tick(&socket) {
+            return finish(conn, &socket, error);
+        }
+        let now = Instant::now();
+        conn.check_timeouts(now);
+        // A stalled handshake with no request queued is left to the idle
+        // timeout (and the client's Drop shutdown); an unhandled request
+        // is reaped by its own deadline.
+        if conn.has_work() {
+            last_activity = now;
+        } else if now.duration_since(last_activity) >= idle {
+            let _ = conn.transport.send_connection_close(
+                &socket,
+                0x1,
+                None,
+                "HTTP/3 client idle timeout",
+            );
+            return Ok(());
+        }
+        // A peer GOAWAY means the connection accepts no new streams; the
+        // pool must roll new dispatches over to a fresh connection.
+        if conn.peer_goaway.is_some() {
+            _accepting_guard.0.store(false, Ordering::Release);
+        }
+
+        // Bound the poll: housekeeping tick while busy, the idle deadline
+        // while idle, and never past the nearest request deadline. Data
+        // and command wakeups interrupt the wait immediately.
+        let mut wait_ms: i64 = if conn.has_work() || conn.transport.has_unacknowledged() {
+            5
+        } else {
+            50
+        };
+        if conn.is_idle() {
+            let remaining = idle.saturating_sub(now.duration_since(last_activity));
+            wait_ms = wait_ms.min(remaining.as_millis().min(i64::MAX as u128) as i64);
+        }
+        if let Some(deadline) = conn.earliest_deadline() {
+            let remaining = deadline.saturating_duration_since(now);
+            wait_ms = wait_ms.min(remaining.as_millis().min(i64::MAX as u128) as i64);
+        }
+        let ready = match poller.wait(wait_ms.max(1) as i32, Some(wake_fd)) {
+            Ok(ready) => ready,
+            Err(error) => return finish(conn, &socket, io_error(error.to_string())),
+        };
+        if ready.contains(&SOCKET_ID) {
+            loop {
+                match socket.recv(&mut datagram) {
+                    Ok(n) => {
+                        if n == 0 || n > MAX_DATAGRAM {
+                            return finish(conn, &socket, protocol("invalid QUIC datagram length"));
+                        }
+                        last_activity = Instant::now();
+                        if let Some(stats) = options.stats.as_deref() {
+                            stats.h3_udp_recv_syscalls.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if let Err(error) = conn.on_datagram(&socket, &mut datagram[..n]) {
+                            return finish(conn, &socket, error);
+                        }
+                    }
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            || error.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        break;
+                    }
+                    Err(error) => return finish(conn, &socket, io_error(error.to_string())),
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if let Err(error) = conn.on_tick(&socket) {
-                    let _ = conn.transport.send_connection_close(
-                        &socket,
-                        0x1,
-                        None,
-                        &error.to_string(),
-                    );
-                    return Err(error);
-                }
-                thread::sleep(Duration::from_millis(1));
-            }
-            Err(error) => return Err(io_error(error.to_string())),
+        }
+        if ready.contains(&WAKE_ID) {
+            drain_wake(&wake_reader);
         }
     }
+    let _ = conn
+        .transport
+        .send_connection_close(&socket, 0x1, None, "client shutdown");
+    conn.fail_all(Error::canceled("HTTP/3 connection closed"));
+    Ok(())
+}
+
+/// Close the connection and report `error` to every outstanding request.
+fn finish(mut conn: ClientConnection, socket: &UdpSocket, error: Error) -> Result<()> {
+    let _ = conn
+        .transport
+        .send_connection_close(socket, 0x1, None, &error.to_string());
+    conn.fail_all(error);
+    Ok(())
+}
+
+/// The reactor's shared mutable state: connection maps keyed by QUIC
+/// destination CID, the Retry protector, and the static server setup.
+/// Grouping them keeps datagram routing and the per-connection sweep on
+/// one coherent unit (high cohesion) without threading nine parameters
+/// through every call (low coupling).
+struct ServerState {
+    connections: HashMap<Vec<u8>, ServerConnection>,
+    routes: HashMap<Vec<u8>, Vec<u8>>,
+    retry_protector: RetryProtector,
+    identity: crate::courierust_tls::Identity,
+    alpn: Vec<Vec<u8>>,
+    config: ServerConfig,
 }
 
 fn run_server(
@@ -412,172 +634,64 @@ fn run_server(
     config: ServerConfig,
 ) -> Result<()> {
     let (completed_tx, completed_rx) = mpsc::channel::<CompletedResponse>();
-    let task_limit = if config.threads == 0 {
+    let worker_count = if config.threads == 0 {
         std::thread::available_parallelism()
             .map(|n| n.get().clamp(1, 8))
             .unwrap_or(4)
-            .saturating_mul(2)
     } else {
-        config.threads.max(1).saturating_mul(2)
+        config.threads.max(1)
     };
+    // Handler work runs on a shared work-stealing pool instead of a fresh
+    // OS thread per request (thread creation is a per-request allocation
+    // and scheduler cost that dominates under concurrency).
+    let pool = crate::courierust_pool::ThreadPool::with_size(worker_count)
+        .map_err(|e| io_error(e.to_string()))?;
+    let task_limit = worker_count.saturating_mul(2);
     let active_tasks = Arc::new(AtomicUsize::new(0));
-    let retry_protector = RetryProtector::new()?;
-    // Route packets by QUIC destination CID. The peer address is an
-    // additional ownership check, not the connection identity: NAT rebinding
-    // and two simultaneous connections from one address must not share state.
-    let mut connections: HashMap<Vec<u8>, ServerConnection> = HashMap::new();
-    let mut routes: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    // Route packets by QUIC destination CID; the peer address is an extra
+    // ownership check, not the connection identity (NAT rebinding and two
+    // simultaneous connections from one address must not share state).
+    let mut state = ServerState {
+        connections: HashMap::new(),
+        routes: HashMap::new(),
+        retry_protector: RetryProtector::new()?,
+        identity,
+        alpn,
+        config,
+    };
     let mut datagram = [0u8; MAX_DATAGRAM];
 
+    // Event-driven reactor: the UDP socket and a self-pipe wake are both
+    // watched by the poller, so an inbound datagram or a completed
+    // response wakes the loop immediately — no fixed sleep latency.
+    let (wake_reader, wake_writer) = wakeup_pair().map_err(|e| io_error(e.to_string()))?;
+    let wake_writer = Arc::new(wake_writer);
+    let wake_fd = fd_of(&wake_reader);
+    let mut poller = Poller::new();
+    poller.register(SOCKET_ID, udp_fd_of(&socket), false);
+
     loop {
-        let mut progressed = false;
-        loop {
-            match socket.recv_from(&mut datagram) {
-                Ok((n, peer)) => {
-                    progressed = true;
-                    if let Some(stats) = config.stats.as_deref() {
-                        stats.h3_udp_recv_syscalls.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if n == 0 || n > MAX_DATAGRAM {
-                        continue;
-                    }
-                    let destination = packet_destination_cid(&datagram[..n]);
-                    let route = destination
-                        .as_ref()
-                        .and_then(|cid| routes.get(cid))
-                        .cloned();
-                    if let Some(connection_id) = route {
-                        let Some(connection) = connections.get_mut(&connection_id) else {
-                            routes.retain(|_, target| target != &connection_id);
-                            continue;
-                        };
-                        if connection.transport.peer != Some(peer) {
-                            continue;
-                        }
-                        let failure = connection.on_datagram(&socket, &datagram[..n]).err();
-                        let failed = failure.is_some();
-                        if failed {
-                            if let Some(error) = failure {
-                                let _ = connection.transport.send_connection_close(
-                                    &socket,
-                                    0x1,
-                                    None,
-                                    &error.to_string(),
-                                );
-                            }
-                            connections.remove(&connection_id);
-                            routes.retain(|_, target| target != &connection_id);
-                            if let Some(stats) = config.stats.as_deref() {
-                                Stats::decrement(&stats.connections_active, 1);
-                                Stats::decrement(&stats.h3_connections_active, 1);
-                            }
-                        }
-                    } else {
-                        if let Ok(identity) = parse_long_header_identity(&datagram[..n]) {
-                            if identity.version != crate::courierust_quic::VERSION_1
-                                && identity.packet_type == LongType::Initial
-                                && n >= MIN_INITIAL_DATAGRAM
-                            {
-                                if let Ok(version_packet) =
-                                    encode_version_negotiation(&datagram[..n])
-                                {
-                                    if version_packet.len() <= n.saturating_mul(3) {
-                                        if let Some(stats) = config.stats.as_deref() {
-                                            stats
-                                                .h3_udp_send_syscalls
-                                                .fetch_add(1, Ordering::Relaxed);
-                                        }
-                                        let _ = socket.send_to(&version_packet, peer);
-                                    }
-                                }
-                            }
-                        }
-                        if config.max_connections != 0
-                            && connections.len() >= config.max_connections
-                        {
-                            continue;
-                        }
-                        if !looks_like_initial(&datagram[..n]) || n < MIN_INITIAL_DATAGRAM {
-                            continue;
-                        }
-                        let Ok(meta) = PacketMeta::parse(&datagram[..n], 8) else {
-                            continue;
-                        };
-                        let token = retry_protector.validate(peer, &meta.token);
-                        if token
-                            .as_ref()
-                            .is_none_or(|value| value.retry_dcid != meta.dcid)
-                        {
-                            let Ok(retry_dcid) = random_cid() else {
-                                continue;
-                            };
-                            let Ok(token) = retry_protector.mint(peer, &meta.dcid, &retry_dcid)
-                            else {
-                                continue;
-                            };
-                            let Ok(retry_packet) = encode_retry_packet(
-                                &datagram[..n],
-                                &meta.dcid,
-                                &retry_dcid,
-                                &token,
-                            ) else {
-                                continue;
-                            };
-                            // Retry is sent before address validation. Keep
-                            // this check explicit so a future token format
-                            // cannot accidentally become an amplifier.
-                            if retry_packet.len() <= n.saturating_mul(3) {
-                                if let Some(stats) = config.stats.as_deref() {
-                                    stats.h3_udp_send_syscalls.fetch_add(1, Ordering::Relaxed);
-                                }
-                                let _ = socket.send_to(&retry_packet, peer);
-                            }
-                            continue;
-                        }
-                        if let Ok((mut connection, initial)) = ServerConnection::accept(
-                            peer,
-                            &datagram[..n],
-                            identity.clone(),
-                            alpn.clone(),
-                            &config,
-                        ) {
-                            if connection.on_datagram(&socket, &initial).is_ok() {
-                                let connection_id = connection.transport.local_cid.clone();
-                                let initial_id = connection.transport.initial_dcid.clone();
-                                if routes.contains_key(&connection_id)
-                                    || routes.contains_key(&initial_id)
-                                {
-                                    continue;
-                                }
-                                if let Some(stats) = config.stats.as_deref() {
-                                    stats.connections_accepted.fetch_add(1, Ordering::Relaxed);
-                                    stats.connections_active.fetch_add(1, Ordering::Relaxed);
-                                    stats.h3_connections.fetch_add(1, Ordering::Relaxed);
-                                    stats.h3_connections_active.fetch_add(1, Ordering::Relaxed);
-                                }
-                                routes.insert(connection_id.clone(), connection_id.clone());
-                                routes.insert(initial_id, connection_id.clone());
-                                connections.insert(connection_id, connection);
-                            }
-                        }
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
+        let ready = poller
+            .wait(SERVER_IDLE_TIMEOUT_MS, Some(wake_fd))
+            .map_err(|e| io_error(e.to_string()))?;
+        if ready.contains(&SOCKET_ID) {
+            while let Ok((n, peer)) = socket.recv_from(&mut datagram) {
+                handle_server_datagram(&socket, &mut datagram[..n], peer, &mut state);
             }
         }
-
+        if ready.contains(&WAKE_ID) {
+            drain_wake(&wake_reader);
+        }
         while let Ok(completed) = completed_rx.try_recv() {
-            if let Some(connection) = connections.get_mut(&completed.connection_id) {
+            if let Some(connection) = state.connections.get_mut(&completed.connection_id) {
                 connection.queue_response(completed.stream_id, completed.response);
             }
             active_tasks.fetch_sub(1, Ordering::Relaxed);
-            progressed = true;
         }
 
         let now = Instant::now();
         let mut dead = Vec::new();
-        for (connection_id, connection) in connections.iter_mut() {
+        for (connection_id, connection) in state.connections.iter_mut() {
             if (!connection.handshake_complete && now >= connection.handshake_deadline)
                 || now.duration_since(connection.last_activity) >= connection.idle_timeout
             {
@@ -612,31 +726,80 @@ fn run_server(
                 active_tasks.fetch_add(1, Ordering::AcqRel);
                 let tx = completed_tx.clone();
                 let handler = handler.clone();
-                let max_body = config.max_body;
+                let max_body = state.config.max_body;
                 let connection_id = connection_id.clone();
-                let spawn = thread::Builder::new()
-                    .name("courierust-h3-handler".into())
-                    .spawn(move || {
-                        let response = match panic::catch_unwind(AssertUnwindSafe(|| {
-                            let response = handler.handle(request.request);
-                            materialize_response(response, max_body)
-                        })) {
-                            Ok(response) => response,
-                            Err(_) => Err(protocol("HTTP/3 request handler panicked")),
-                        };
-                        let _ = tx.send(CompletedResponse {
-                            connection_id,
-                            stream_id: request.stream_id,
-                            response,
-                        });
+                let wake = wake_writer.clone();
+                pool.spawn(move || {
+                    let response = match panic::catch_unwind(AssertUnwindSafe(|| {
+                        let response = handler.handle(request.request);
+                        materialize_response(response, max_body)
+                    })) {
+                        Ok(response) => response,
+                        Err(_) => Err(protocol("HTTP/3 request handler panicked")),
+                    };
+                    let _ = tx.send(CompletedResponse {
+                        connection_id,
+                        stream_id: request.stream_id,
+                        response,
                     });
-                if spawn.is_err() {
-                    active_tasks.fetch_sub(1, Ordering::Relaxed);
-                    connection.queue_service_unavailable(request.stream_id);
-                }
+                    // Wake the reactor so the completed response is
+                    // flushed without waiting for the next poll tick.
+                    wake_nudge(&wake);
+                });
             }
         }
         for connection_id in dead {
+            state.connections.remove(&connection_id);
+            state.routes.retain(|_, target| target != &connection_id);
+            if let Some(stats) = state.config.stats.as_deref() {
+                Stats::decrement(&stats.connections_active, 1);
+                Stats::decrement(&stats.h3_connections_active, 1);
+            }
+        }
+    }
+}
+
+/// Route one inbound UDP datagram: to an existing connection (by
+/// destination CID, address-checked), or through the Retry-based address
+/// validation and `ServerConnection::accept` path for a fresh Initial.
+fn handle_server_datagram(
+    socket: &UdpSocket,
+    datagram: &mut [u8],
+    peer: SocketAddr,
+    state: &mut ServerState,
+) {
+    let ServerState {
+        connections,
+        routes,
+        retry_protector,
+        identity,
+        alpn,
+        config,
+    } = state;
+    let n = datagram.len();
+    if let Some(stats) = config.stats.as_deref() {
+        stats.h3_udp_recv_syscalls.fetch_add(1, Ordering::Relaxed);
+    }
+    if n == 0 || n > MAX_DATAGRAM {
+        return;
+    }
+    let route = packet_destination_cid(datagram)
+        .and_then(|cid| routes.get::<[u8]>(cid))
+        .cloned();
+    if let Some(connection_id) = route {
+        let Some(connection) = connections.get_mut(&connection_id) else {
+            routes.retain(|_, target| target != &connection_id);
+            return;
+        };
+        if connection.transport.peer != Some(peer) {
+            return;
+        }
+        let failure = connection.on_datagram(socket, datagram).err();
+        if let Some(error) = failure {
+            let _ =
+                connection
+                    .transport
+                    .send_connection_close(socket, 0x1, None, &error.to_string());
             connections.remove(&connection_id);
             routes.retain(|_, target| target != &connection_id);
             if let Some(stats) = config.stats.as_deref() {
@@ -644,8 +807,75 @@ fn run_server(
                 Stats::decrement(&stats.h3_connections_active, 1);
             }
         }
-        if !progressed {
-            thread::sleep(Duration::from_millis(1));
+        return;
+    }
+    if let Ok(parsed) = parse_long_header_identity(datagram) {
+        if parsed.version != crate::courierust_quic::VERSION_1
+            && parsed.packet_type == LongType::Initial
+            && n >= MIN_INITIAL_DATAGRAM
+        {
+            if let Ok(version_packet) = encode_version_negotiation(datagram) {
+                if version_packet.len() <= n.saturating_mul(3) {
+                    if let Some(stats) = config.stats.as_deref() {
+                        stats.h3_udp_send_syscalls.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let _ = socket.send_to(&version_packet, peer);
+                }
+            }
+        }
+    }
+    if config.max_connections != 0 && connections.len() >= config.max_connections {
+        return;
+    }
+    if !looks_like_initial(datagram) || n < MIN_INITIAL_DATAGRAM {
+        return;
+    }
+    let Ok(meta) = PacketMeta::parse(datagram, 8) else {
+        return;
+    };
+    let token = retry_protector.validate(peer, &meta.token);
+    if token
+        .as_ref()
+        .is_none_or(|value| value.retry_dcid != meta.dcid)
+    {
+        let Ok(retry_dcid) = random_cid() else {
+            return;
+        };
+        let Ok(token) = retry_protector.mint(peer, &meta.dcid, &retry_dcid) else {
+            return;
+        };
+        let Ok(retry_packet) = encode_retry_packet(datagram, &meta.dcid, &retry_dcid, &token)
+        else {
+            return;
+        };
+        // Retry is sent before address validation; keep the 3x bound
+        // explicit so a future token format cannot become an amplifier.
+        if retry_packet.len() <= n.saturating_mul(3) {
+            if let Some(stats) = config.stats.as_deref() {
+                stats.h3_udp_send_syscalls.fetch_add(1, Ordering::Relaxed);
+            }
+            let _ = socket.send_to(&retry_packet, peer);
+        }
+        return;
+    }
+    if let Ok((mut connection, mut initial)) =
+        ServerConnection::accept(peer, datagram, identity.clone(), alpn.to_vec(), config)
+    {
+        if connection.on_datagram(socket, &mut initial[..]).is_ok() {
+            let connection_id = connection.transport.local_cid.clone();
+            let initial_id = connection.transport.initial_dcid.clone();
+            if routes.contains_key(&connection_id) || routes.contains_key(&initial_id) {
+                return;
+            }
+            if let Some(stats) = config.stats.as_deref() {
+                stats.connections_accepted.fetch_add(1, Ordering::Relaxed);
+                stats.connections_active.fetch_add(1, Ordering::Relaxed);
+                stats.h3_connections.fetch_add(1, Ordering::Relaxed);
+                stats.h3_connections_active.fetch_add(1, Ordering::Relaxed);
+            }
+            routes.insert(connection_id.clone(), connection_id.clone());
+            routes.insert(initial_id, connection_id.clone());
+            connections.insert(connection_id, connection);
         }
     }
 }
@@ -708,6 +938,26 @@ struct PendingRequest {
     request: Request<Body>,
 }
 
+/// A request queued on a pooled client connection, waiting for the
+/// handshake / peer SETTINGS to complete or for a free stream slot.
+struct WaitingRequest {
+    request: Request<Body>,
+    reply: mpsc::Sender<Result<Response<Body>>>,
+    deadline: Instant,
+}
+
+/// A request that owns a QUIC stream; `wire`/`offset` track the request
+/// bytes already handed to the transport (a full congestion window defers
+/// the remainder to a later tick). `response` accumulates the decoded
+/// response until the stream is finished.
+struct ActiveRequest {
+    wire: Vec<u8>,
+    offset: usize,
+    reply: mpsc::Sender<Result<Response<Body>>>,
+    response: Option<Response<Body>>,
+    deadline: Instant,
+}
+
 struct ClientConnection {
     transport: QuicTransport,
     tls: QuicClient,
@@ -716,16 +966,20 @@ struct ClientConnection {
     tls_server_hello: bool,
     handshake_complete: bool,
     control_sent: bool,
-    request_sent: bool,
-    request_wire: Vec<u8>,
-    request_offset: usize,
-    request: Option<Request<Body>>,
     authority: String,
     max_header_list: usize,
     peer_max_header_list: usize,
     max_body: usize,
+    /// Requests submitted but not yet placed on a QUIC stream (the
+    /// handshake or peer SETTINGS has not completed, or the per-connection
+    /// stream cap is momentarily full).
+    waiting: VecDeque<WaitingRequest>,
+    /// Requests with an allocated client-initiated bidirectional stream,
+    /// keyed by stream id.
+    active: BTreeMap<u64, ActiveRequest>,
+    /// Next client-initiated bidirectional stream index (id = 4 * index).
+    next_stream_index: u64,
     streams: BTreeMap<u64, ReceiveStream>,
-    response: Option<Response<Body>>,
     control_received: bool,
     peer_goaway: Option<u64>,
     qpack_decoder: DynamicTable,
@@ -742,7 +996,6 @@ impl ClientConnection {
         transport: QuicTransport,
         tls: QuicClient,
         client_hello: Vec<u8>,
-        request: Request<Body>,
         authority: String,
         limits: H3Limits,
         stats: Option<Arc<Stats>>,
@@ -758,16 +1011,14 @@ impl ClientConnection {
             tls_server_hello: false,
             handshake_complete: false,
             control_sent: false,
-            request_sent: false,
-            request_wire: Vec::new(),
-            request_offset: 0,
-            request: Some(request),
             authority,
             max_header_list: limits.max_header_list,
             peer_max_header_list: limits.max_header_list,
             max_body: limits.max_body,
+            waiting: VecDeque::new(),
+            active: BTreeMap::new(),
+            next_stream_index: 0,
             streams: BTreeMap::new(),
-            response: None,
             control_received: false,
             peer_goaway: None,
             qpack_decoder: DynamicTable::new(0),
@@ -780,7 +1031,7 @@ impl ClientConnection {
         })
     }
 
-    fn on_datagram(&mut self, socket: &UdpSocket, datagram: &[u8]) -> Result<()> {
+    fn on_datagram(&mut self, socket: &UdpSocket, datagram: &mut [u8]) -> Result<()> {
         self.last_activity = Instant::now();
         if let Some(version_negotiation) = version_negotiation_versions(datagram)? {
             if version_negotiation.dcid == self.transport.local_cid {
@@ -827,7 +1078,7 @@ impl ClientConnection {
         let mut consumed = 0usize;
         while consumed < datagram.len() {
             let Some((level, _pn, frames, packet_len)) =
-                self.transport.open(&datagram[consumed..])?
+                self.transport.open(&mut datagram[consumed..])?
             else {
                 break;
             };
@@ -885,7 +1136,7 @@ impl ClientConnection {
                                     packet_keys_from_flight(flight.application_write)?,
                                 );
                                 self.handshake_complete = true;
-                                self.send_application_start(socket)?;
+                                self.flush_requests(socket)?;
                             }
                         }
                     }
@@ -916,8 +1167,8 @@ impl ClientConnection {
             }
             self.transport.flush_ack(socket, level)?;
         }
-        if self.handshake_complete && self.control_received && !self.request_sent {
-            self.send_application_start(socket)?;
+        if self.handshake_complete && self.control_received {
+            self.flush_requests(socket)?;
         }
         Ok(())
     }
@@ -927,81 +1178,224 @@ impl ClientConnection {
         if !self.tls_initial_sent {
             self.transport
                 .send_crypto(socket, INITIAL, &self.client_hello)?;
-            self.tls_initial_sent = true;
-        }
-        if self.handshake_complete && !self.request_sent {
-            self.send_application_start(socket)?;
-        }
-        Ok(())
-    }
-
-    fn send_application_start(&mut self, socket: &UdpSocket) -> Result<()> {
-        if !self.control_sent {
-            let settings = h3frame::Frame::Settings(vec![
-                (h3frame::SETTINGS_QPACK_MAX_TABLE_CAPACITY, 0),
-                (h3frame::SETTINGS_QPACK_BLOCKED_STREAMS, 0),
-                (
-                    h3frame::SETTINGS_MAX_FIELD_SECTION_SIZE,
-                    self.max_header_list as u64,
-                ),
-            ])
-            .to_bytes();
-            self.transport
-                .send_stream(socket, APPLICATION, 2, &control_stream(settings), false)?;
-            self.transport.send_stream(
-                socket,
-                APPLICATION,
-                6,
-                &stream_type(H3_QPACK_ENCODER_STREAM),
-                false,
-            )?;
-            self.transport.send_stream(
-                socket,
-                APPLICATION,
-                10,
-                &stream_type(H3_QPACK_DECODER_STREAM),
-                false,
-            )?;
-            self.control_sent = true;
-        }
-        if !self.request_sent {
-            if !self.control_received {
-                return Ok(());
+            if self.transport.crypto_send_offsets[INITIAL] >= self.client_hello.len() as u64 {
+                self.tls_initial_sent = true;
             }
-            let request = self
-                .request
-                .take()
-                .ok_or_else(|| protocol("HTTP/3 request already consumed"))?;
-            let outbound_limit = self.max_header_list.min(self.peer_max_header_list);
-            self.request_wire =
-                build_request_wire(request, &self.authority, outbound_limit, self.max_body)?;
-            self.send_request_chunks(socket)?;
-            h3_open_stream(self.stats.as_ref(), &mut self.active_streams, 0);
-            self.request_sent = true;
+        }
+        if self.handshake_complete {
+            self.ensure_control_sent(socket)?;
+            self.flush_requests(socket)?;
+            // Resume request bodies deferred by the congestion window;
+            // remaining chunks go out once ACKs free credit.
+            let resumable: Vec<u64> = self
+                .active
+                .iter()
+                .filter(|(_, request)| request.offset < request.wire.len())
+                .map(|(&stream_id, _)| stream_id)
+                .collect();
+            for stream_id in resumable {
+                if let Some(request) = self.active.get_mut(&stream_id) {
+                    send_request_chunks(&mut self.transport, socket, stream_id, request)?;
+                }
+            }
         }
         Ok(())
     }
 
-    fn send_request_chunks(&mut self, socket: &UdpSocket) -> Result<()> {
-        while self.request_offset < self.request_wire.len() {
-            let take = (self.request_wire.len() - self.request_offset).min(1000);
-            let end = self.request_offset + take;
-            let fin = end == self.request_wire.len();
-            self.transport.send_stream_chunk(
-                socket,
-                APPLICATION,
-                0,
-                self.request_offset as u64,
-                &self.request_wire[self.request_offset..end],
-                fin,
-            )?;
-            self.request_offset = end;
+    /// Queue a request for dispatch once the connection can carry it. The
+    /// deadline covers the whole wait: handshake, peer SETTINGS and the
+    /// response.
+    fn queue_request(
+        &mut self,
+        request: Request<Body>,
+        reply: mpsc::Sender<Result<Response<Body>>>,
+        deadline: Instant,
+    ) {
+        self.waiting.push_back(WaitingRequest {
+            request,
+            reply,
+            deadline,
+        });
+    }
+
+    /// Send the three unidirectional control streams once. Idempotent
+    /// (`control_sent` guards a re-send); a full congestion window defers
+    /// to the next tick rather than failing the connection.
+    fn ensure_control_sent(&mut self, socket: &UdpSocket) -> Result<()> {
+        if self.control_sent {
+            return Ok(());
         }
-        if self.request_wire.is_empty() {
-            self.transport
-                .send_stream_chunk(socket, APPLICATION, 0, 0, &[], true)?;
+        let settings = h3frame::Frame::Settings(vec![
+            (h3frame::SETTINGS_QPACK_MAX_TABLE_CAPACITY, 0),
+            (h3frame::SETTINGS_QPACK_BLOCKED_STREAMS, 0),
+            (
+                h3frame::SETTINGS_MAX_FIELD_SECTION_SIZE,
+                self.max_header_list as u64,
+            ),
+        ])
+        .to_bytes();
+        // Control streams are tiny and idempotent; if the congestion
+        // window is momentarily full, defer and retry on the next tick
+        // (the peer deduplicates a re-send).
+        match self
+            .transport
+            .send_stream(socket, APPLICATION, 2, &control_stream(settings), false)
+        {
+            Ok(()) => {}
+            Err(error) if error.kind == ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        match self.transport.send_stream(
+            socket,
+            APPLICATION,
+            6,
+            &stream_type(H3_QPACK_ENCODER_STREAM),
+            false,
+        ) {
+            Ok(()) => {}
+            Err(error) if error.kind == ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        match self.transport.send_stream(
+            socket,
+            APPLICATION,
+            10,
+            &stream_type(H3_QPACK_DECODER_STREAM),
+            false,
+        ) {
+            Ok(()) => {}
+            Err(error) if error.kind == ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        self.control_sent = true;
+        Ok(())
+    }
+
+    /// Start every queued request the connection can currently carry:
+    /// the handshake and peer SETTINGS are done and a stream slot is
+    /// free. Requests larger than the peer's flow-control budget fail
+    /// cleanly instead of half-sending a body the peer can never accept.
+    fn flush_requests(&mut self, socket: &UdpSocket) -> Result<()> {
+        if !self.handshake_complete || !self.control_received {
+            return Ok(());
+        }
+        self.ensure_control_sent(socket)?;
+        if !self.control_sent {
+            return Ok(());
+        }
+        while let Some(request) = self.waiting.pop_front() {
+            if self.active.len() >= MAX_H3_STREAMS {
+                self.waiting.push_front(request);
+                break;
+            }
+            let stream_id = 4 * self.next_stream_index;
+            self.next_stream_index = self
+                .next_stream_index
+                .checked_add(1)
+                .ok_or_else(|| protocol("HTTP/3 stream id exhausted"))?;
+            let outbound_limit = self.max_header_list.min(self.peer_max_header_list);
+            let wire = match build_request_wire(
+                request.request,
+                &self.authority,
+                outbound_limit,
+                self.max_body,
+            ) {
+                Ok(wire) => wire,
+                Err(error) => {
+                    let _ = request.reply.send(Err(error));
+                    continue;
+                }
+            };
+            if wire.len() as u64 > self.transport.peer_stream_send_limit(stream_id) {
+                let _ = request
+                    .reply
+                    .send(Err(protocol("HTTP/3 request exceeds peer stream limit")));
+                continue;
+            }
+            let mut active = ActiveRequest {
+                wire,
+                offset: 0,
+                reply: request.reply,
+                response: None,
+                deadline: request.deadline,
+            };
+            if let Err(error) =
+                send_request_chunks(&mut self.transport, socket, stream_id, &mut active)
+            {
+                if error.kind != ErrorKind::WouldBlock {
+                    let _ = active.reply.send(Err(error));
+                    continue;
+                }
+            }
+            h3_open_stream(self.stats.as_ref(), &mut self.active_streams, stream_id);
+            self.active.insert(stream_id, active);
         }
         Ok(())
+    }
+
+    /// Deliver timeout errors to requests whose deadline has passed and
+    /// release their streams.
+    fn check_timeouts(&mut self, now: Instant) {
+        let mut expired: Vec<usize> = Vec::new();
+        for (index, request) in self.waiting.iter().enumerate() {
+            if request.deadline <= now {
+                expired.push(index);
+            }
+        }
+        for index in expired.into_iter().rev() {
+            let request = self.waiting.remove(index).expect("index in bounds");
+            let _ = request.reply.send(Err(Error::new(ErrorKind::Timeout)));
+        }
+        let expired: Vec<u64> = self
+            .active
+            .iter()
+            .filter(|(_, request)| request.deadline <= now)
+            .map(|(&stream_id, _)| stream_id)
+            .collect();
+        for stream_id in expired {
+            self.fail_stream(stream_id, Error::new(ErrorKind::Timeout));
+        }
+    }
+
+    /// Drop one active stream and report `error` to its caller.
+    fn fail_stream(&mut self, stream_id: u64, error: Error) {
+        if let Some(request) = self.active.remove(&stream_id) {
+            let _ = request.reply.send(Err(error));
+            h3_close_stream(self.stats.as_ref(), &mut self.active_streams, stream_id);
+            self.streams.remove(&stream_id);
+        }
+    }
+
+    /// Report `error` to every outstanding request and drop the streams.
+    /// Called when the connection becomes unusable.
+    fn fail_all(&mut self, error: Error) {
+        while let Some(request) = self.waiting.pop_front() {
+            let _ = request.reply.send(Err(error.clone()));
+        }
+        let stream_ids: Vec<u64> = self.active.keys().copied().collect();
+        for stream_id in stream_ids {
+            self.fail_stream(stream_id, error.clone());
+        }
+    }
+
+    /// Whether any request is outstanding (waiting or on a stream).
+    fn has_work(&self) -> bool {
+        !self.waiting.is_empty() || !self.active.is_empty()
+    }
+
+    /// Whether no request is outstanding (used for idle reaping).
+    fn is_idle(&self) -> bool {
+        self.waiting.is_empty() && self.active.is_empty()
+    }
+
+    /// The earliest request deadline, if any (bounds the driver's poll so
+    /// a timeout is delivered on time).
+    fn earliest_deadline(&self) -> Option<Instant> {
+        self.active
+            .values()
+            .map(|request| request.deadline)
+            .chain(self.waiting.iter().map(|request| request.deadline))
+            .min()
     }
 
     fn receive_stream(&mut self, id: u64, offset: u64, data: &[u8], fin: bool) -> Result<()> {
@@ -1017,8 +1411,6 @@ impl ClientConnection {
             }
         } else if !stream_id::is_client_initiated(id) {
             return Err(protocol("server response stream has invalid initiator"));
-        } else if stream_id::stream_index(id) >= MAX_H3_STREAMS as u64 {
-            return Err(protocol("HTTP/3 bidirectional stream limit exceeded"));
         }
         if !self.streams.contains_key(&id)
             && self.streams.len() >= MAX_H3_STREAMS + MAX_H3_UNI_STREAMS
@@ -1041,20 +1433,50 @@ impl ClientConnection {
                 .ok_or_else(|| protocol("HTTP/3 stream limit overflows usize"))?,
         )?;
         stream.frame_buf.extend_from_slice(&ready);
-        process_client_stream(
-            stream,
-            &mut self.control_received,
-            &mut self.peer_goaway,
-            &mut self.peer_max_header_list,
-            &mut self.qpack_decoder,
-            H3Limits {
-                max_header_list: self.max_header_list,
-                max_body: self.max_body,
-            },
-            &mut self.response,
-        )?;
-        if self.response.is_some() {
-            h3_close_stream(self.stats.as_ref(), &mut self.active_streams, id);
+        if stream_id::is_unidirectional(id) {
+            process_unidirectional_stream(
+                stream,
+                &mut self.control_received,
+                &mut self.peer_goaway,
+                &mut self.peer_max_header_list,
+                H3Limits {
+                    max_header_list: self.max_header_list,
+                    max_body: self.max_body,
+                },
+            )?;
+        } else {
+            let finished = {
+                let Some(request) = self.active.get_mut(&id) else {
+                    // A response stream we already completed may receive a
+                    // retransmitted final packet after delivery; ignore it.
+                    if id < 4 * self.next_stream_index {
+                        return Ok(());
+                    }
+                    return Err(protocol("HTTP/3 response on an unrequested stream"));
+                };
+                process_client_stream(
+                    stream,
+                    &mut self.control_received,
+                    &mut self.peer_goaway,
+                    &mut self.peer_max_header_list,
+                    &mut self.qpack_decoder,
+                    H3Limits {
+                        max_header_list: self.max_header_list,
+                        max_body: self.max_body,
+                    },
+                    &mut request.response,
+                )?;
+                request.response.is_some()
+            };
+            if finished {
+                let mut request = self
+                    .active
+                    .remove(&id)
+                    .expect("request present while receiving its response");
+                let response = request.response.take().expect("response just completed");
+                let _ = request.reply.send(Ok(response));
+                h3_close_stream(self.stats.as_ref(), &mut self.active_streams, id);
+            }
         }
         self.ensure_buffer_budget()
     }
@@ -1067,11 +1489,53 @@ impl ClientConnection {
     }
 
     fn buffered_bytes(&self) -> usize {
-        self.request_wire
-            .len()
+        let active = self
+            .active
+            .values()
+            .map(|request| request.wire.len().saturating_sub(request.offset))
+            .fold(0usize, usize::saturating_add);
+        let waiting = self
+            .waiting
+            .iter()
+            .map(|request| request.request.body.len().unwrap_or(0))
+            .fold(0usize, usize::saturating_add);
+        active
+            .saturating_add(waiting)
             .saturating_add(self.streams.values().map(ReceiveStream::buffered_len).sum())
             .saturating_add(self.transport.queued_bytes())
     }
+}
+
+/// Write the next chunk of a request body to its QUIC stream. `active.offset`
+/// already tracks every chunk written, so a full congestion window defers
+/// the remainder to a later tick instead of truncating the request.
+fn send_request_chunks(
+    transport: &mut QuicTransport,
+    socket: &UdpSocket,
+    stream_id: u64,
+    active: &mut ActiveRequest,
+) -> Result<()> {
+    while active.offset < active.wire.len() {
+        let take = (active.wire.len() - active.offset).min(1000);
+        let end = active.offset + take;
+        let fin = end == active.wire.len();
+        match transport.send_stream_chunk(
+            socket,
+            APPLICATION,
+            stream_id,
+            active.offset as u64,
+            &active.wire[active.offset..end],
+            fin,
+        ) {
+            Ok(()) => active.offset = end,
+            Err(error) if error.kind == ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(error),
+        }
+    }
+    if active.wire.is_empty() {
+        transport.send_stream_chunk(socket, APPLICATION, stream_id, 0, &[], true)?;
+    }
+    Ok(())
 }
 
 struct ServerConnection {
@@ -1095,6 +1559,8 @@ struct ServerConnection {
     handshake_crypto: CryptoReassembly,
     initial_tls: Vec<u8>,
     handshake_tls: Vec<u8>,
+    pending_initial: Vec<u8>,
+    pending_handshake: Vec<u8>,
     peer_goaway: Option<u64>,
     stats: Option<Arc<Stats>>,
     active_streams: BTreeSet<u64>,
@@ -1145,6 +1611,8 @@ impl ServerConnection {
             handshake_crypto: CryptoReassembly::default(),
             initial_tls: Vec::new(),
             handshake_tls: Vec::new(),
+            pending_initial: Vec::new(),
+            pending_handshake: Vec::new(),
             peer_goaway: None,
             stats: config.stats.clone(),
             active_streams: BTreeSet::new(),
@@ -1152,12 +1620,12 @@ impl ServerConnection {
         Ok((connection, initial.to_vec()))
     }
 
-    fn on_datagram(&mut self, socket: &UdpSocket, datagram: &[u8]) -> Result<()> {
+    fn on_datagram(&mut self, socket: &UdpSocket, datagram: &mut [u8]) -> Result<()> {
         self.last_activity = Instant::now();
         let mut consumed = 0usize;
         while consumed < datagram.len() {
             let Some((level, _pn, frames, packet_len)) =
-                self.transport.open(&datagram[consumed..])?
+                self.transport.open(&mut datagram[consumed..])?
             else {
                 break;
             };
@@ -1193,19 +1661,23 @@ impl ServerConnection {
                             if let Some(parameters) = self.peer_transport.as_ref() {
                                 self.transport.set_peer_transport(parameters);
                             }
-                            self.transport
-                                .send_crypto(socket, INITIAL, &flight.initial)?;
                             self.transport.set_handshake_keys(
                                 packet_keys_from_flight(flight.handshake_read)?,
                                 packet_keys_from_flight(flight.handshake_write)?,
                             );
-                            self.transport
-                                .send_crypto(socket, HANDSHAKE, &flight.handshake)?;
                             self.transport.set_application_keys(
                                 packet_keys_from_flight(flight.application_read)?,
                                 packet_keys_from_flight(flight.application_write)?,
                             );
+                            // Keep the TLS flight for incremental delivery:
+                            // a flight larger than the congestion window is
+                            // sent in pieces on successive ticks instead of
+                            // failing the handshake (see
+                            // `flush_pending_crypto`).
+                            self.pending_initial = flight.initial;
+                            self.pending_handshake = flight.handshake;
                             self.tls_ready = true;
+                            self.flush_pending_crypto(socket)?;
                         }
                     }
                     QFrame::Crypto { offset, data } if level == HANDSHAKE => {
@@ -1271,7 +1743,35 @@ impl ServerConnection {
     }
 
     fn on_tick(&mut self, socket: &UdpSocket) -> Result<()> {
+        // Deliver the TLS flight and control streams incrementally; both
+        // are deferred (never fatal) when the congestion window is full,
+        // so a large certificate or a busy path cannot tear the
+        // connection down.
+        self.flush_pending_crypto(socket)?;
+        if self.handshake_complete && !self.control_sent {
+            self.send_control(socket)?;
+        }
         self.transport.retransmit(socket)
+    }
+
+    /// Deliver the TLS flight incrementally. `send_crypto` resumes from
+    /// the last CRYPTO offset written, so this is safe to call on every
+    /// tick and becomes a no-op once both flights are fully delivered.
+    fn flush_pending_crypto(&mut self, socket: &UdpSocket) -> Result<()> {
+        if !self.pending_initial.is_empty() {
+            self.transport
+                .send_crypto(socket, INITIAL, &self.pending_initial)?;
+            if self.transport.crypto_send_offsets[INITIAL] < self.pending_initial.len() as u64 {
+                // The client cannot decrypt Handshake data before it has
+                // the full Initial flight; hold Handshake until then.
+                return Ok(());
+            }
+        }
+        if !self.pending_handshake.is_empty() {
+            self.transport
+                .send_crypto(socket, HANDSHAKE, &self.pending_handshake)?;
+        }
+        Ok(())
     }
 
     fn send_control(&mut self, socket: &UdpSocket) -> Result<()> {
@@ -1287,22 +1787,39 @@ impl ServerConnection {
             ),
         ])
         .to_bytes();
-        self.transport
-            .send_stream(socket, APPLICATION, 3, &control_stream(settings), false)?;
-        self.transport.send_stream(
+        // Control streams are tiny; the only way they can fail is a full
+        // congestion window. They are idempotent (the peer's reassembly
+        // deduplicates a retry), so defer and retry on a later tick.
+        match self
+            .transport
+            .send_stream(socket, APPLICATION, 3, &control_stream(settings), false)
+        {
+            Ok(()) => {}
+            Err(error) if error.kind == ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        match self.transport.send_stream(
             socket,
             APPLICATION,
             7,
             &stream_type(H3_QPACK_ENCODER_STREAM),
             false,
-        )?;
-        self.transport.send_stream(
+        ) {
+            Ok(()) => {}
+            Err(error) if error.kind == ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        match self.transport.send_stream(
             socket,
             APPLICATION,
             11,
             &stream_type(H3_QPACK_DECODER_STREAM),
             false,
-        )?;
+        ) {
+            Ok(()) => {}
+            Err(error) if error.kind == ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(error),
+        }
         self.control_sent = true;
         Ok(())
     }
@@ -1320,8 +1837,6 @@ impl ServerConnection {
             }
         } else if !stream_id::is_client_initiated(id) {
             return Err(protocol("request stream has invalid initiator"));
-        } else if stream_id::stream_index(id) >= MAX_H3_STREAMS as u64 {
-            return Err(protocol("HTTP/3 bidirectional stream limit exceeded"));
         }
         if !self.streams.contains_key(&id)
             && self.streams.len() >= MAX_H3_STREAMS + MAX_H3_UNI_STREAMS
@@ -1649,15 +2164,16 @@ impl ReceiveStream {
     }
 }
 
-fn process_server_stream(
+/// Process a unidirectional stream (control / QPACK encoder / QPACK
+/// decoder). Returns `true` when the stream was consumed, `false` when it
+/// is a bidirectional request/response stream that still needs draining.
+fn process_unidirectional_stream(
     stream: &mut ReceiveStream,
     control_received: &mut bool,
     peer_goaway: &mut Option<u64>,
     peer_max_header_list: &mut usize,
-    qpack_decoder: &mut DynamicTable,
     limits: H3Limits,
-    requests: &mut VecDeque<PendingRequest>,
-) -> Result<()> {
+) -> Result<bool> {
     if stream.stream_type.is_none() && stream_id::is_unidirectional(stream_id_of(stream)) {
         let (kind, used) = match varint::decode(&stream.frame_buf) {
             Ok(v) => v,
@@ -1667,7 +2183,7 @@ fn process_server_stream(
                         "HTTP/3 unidirectional stream ended before its type",
                     ));
                 }
-                return Ok(());
+                return Ok(true);
             }
             Err(error) => return Err(error),
         };
@@ -1680,8 +2196,11 @@ fn process_server_stream(
             return Err(protocol("unsupported HTTP/3 unidirectional stream type"));
         }
     }
-    if let Some(kind) = stream.stream_type {
-        if kind == H3_CONTROL_STREAM {
+    let Some(kind) = stream.stream_type else {
+        return Ok(stream_id::is_unidirectional(stream_id_of(stream)));
+    };
+    match kind {
+        H3_CONTROL_STREAM => {
             let mut pos = 0;
             while let Some(frame) = h3frame::Frame::decode(&stream.frame_buf, &mut pos)? {
                 if !stream.control_started {
@@ -1715,13 +2234,11 @@ fn process_server_stream(
             if stream.reassembly.finished() {
                 return Err(protocol("HTTP/3 control stream cannot be closed"));
             }
-            return Ok(());
+            Ok(true)
         }
-        if kind == H3_QPACK_ENCODER_STREAM {
-            // This endpoint advertises a zero QPACK dynamic-table capacity.
-            // Any encoder instruction would therefore be a peer violation;
-            // rejecting the bytes also prevents a peer from growing a table
-            // that the connection configuration did not budget for.
+        H3_QPACK_ENCODER_STREAM => {
+            // Both endpoints advertise a zero dynamic-table capacity, so
+            // any instruction bytes are a peer violation (and bounded).
             if stream.frame_buf.len() > limits.max_header_list {
                 return Err(protocol("QPACK encoder stream exceeds limit"));
             }
@@ -1731,29 +2248,50 @@ fn process_server_stream(
             if stream.reassembly.finished() {
                 return Err(protocol("HTTP/3 QPACK encoder stream cannot be closed"));
             }
-            return Ok(());
+            Ok(true)
         }
-        let mut pos = 0;
-        while pos < stream.frame_buf.len() {
-            let before = pos;
-            match qpack::decode_decoder_instruction(&stream.frame_buf, &mut pos) {
-                Ok(_) => {}
-                Err(error) if error.kind == ErrorKind::UnexpectedEof => {
-                    pos = before;
-                    break;
+        _ => {
+            // QPACK decoder stream: instructions are parsed and dropped
+            // (the dynamic table is disabled, so nothing is applied).
+            let mut pos = 0;
+            while pos < stream.frame_buf.len() {
+                let before = pos;
+                match qpack::decode_decoder_instruction(&stream.frame_buf, &mut pos) {
+                    Ok(_) => {}
+                    Err(error) if error.kind == ErrorKind::UnexpectedEof => {
+                        pos = before;
+                        break;
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
             }
+            if pos != 0 {
+                stream.frame_buf.drain(..pos);
+            }
+            if stream.reassembly.finished() {
+                return Err(protocol("HTTP/3 QPACK decoder stream cannot be closed"));
+            }
+            Ok(true)
         }
-        if pos != 0 {
-            stream.frame_buf.drain(..pos);
-        }
-        if stream.reassembly.finished() {
-            return Err(protocol("HTTP/3 QPACK decoder stream cannot be closed"));
-        }
-        return Ok(());
     }
-    if stream_id::is_unidirectional(stream_id_of(stream)) {
+}
+
+fn process_server_stream(
+    stream: &mut ReceiveStream,
+    control_received: &mut bool,
+    peer_goaway: &mut Option<u64>,
+    peer_max_header_list: &mut usize,
+    qpack_decoder: &mut DynamicTable,
+    limits: H3Limits,
+    requests: &mut VecDeque<PendingRequest>,
+) -> Result<()> {
+    if process_unidirectional_stream(
+        stream,
+        control_received,
+        peer_goaway,
+        peer_max_header_list,
+        limits,
+    )? {
         return Ok(());
     }
     drain_request_frames(
@@ -1776,95 +2314,13 @@ fn process_client_stream(
     limits: H3Limits,
     response: &mut Option<Response<Body>>,
 ) -> Result<()> {
-    if stream.stream_type.is_none() && stream_id::is_unidirectional(stream_id_of(stream)) {
-        let (kind, used) = match varint::decode(&stream.frame_buf) {
-            Ok(v) => v,
-            Err(error) if error.kind == ErrorKind::UnexpectedEof => {
-                if stream.reassembly.finished() {
-                    return Err(protocol(
-                        "HTTP/3 unidirectional stream ended before its type",
-                    ));
-                }
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        stream.frame_buf.drain(..used);
-        stream.stream_type = Some(kind);
-        if kind != H3_CONTROL_STREAM
-            && kind != H3_QPACK_ENCODER_STREAM
-            && kind != H3_QPACK_DECODER_STREAM
-        {
-            return Err(protocol("unsupported HTTP/3 unidirectional stream type"));
-        }
-    }
-    if let Some(kind) = stream.stream_type {
-        if kind == H3_CONTROL_STREAM {
-            let mut pos = 0;
-            while let Some(frame) = h3frame::Frame::decode(&stream.frame_buf, &mut pos)? {
-                if !stream.control_started {
-                    let h3frame::Frame::Settings(settings) = frame else {
-                        return Err(protocol("HTTP/3 SETTINGS must be the first control frame"));
-                    };
-                    if *control_received {
-                        return Err(protocol("duplicate HTTP/3 SETTINGS"));
-                    }
-                    validate_settings(&settings, limits.max_header_list, peer_max_header_list)?;
-                    stream.control_started = true;
-                    *control_received = true;
-                } else {
-                    match frame {
-                        h3frame::Frame::Settings(_) => {
-                            return Err(protocol("duplicate HTTP/3 SETTINGS"));
-                        }
-                        h3frame::Frame::GoAway(id) => {
-                            validate_goaway_id(id, *peer_goaway)?;
-                            *peer_goaway =
-                                Some(peer_goaway.map_or(id, |previous| previous.min(id)));
-                        }
-                        h3frame::Frame::Unknown { .. } => {}
-                        _ => return Err(protocol("invalid frame on HTTP/3 control stream")),
-                    }
-                }
-            }
-            if pos != 0 {
-                stream.frame_buf.drain(..pos);
-            }
-            if stream.reassembly.finished() {
-                return Err(protocol("HTTP/3 control stream cannot be closed"));
-            }
-            return Ok(());
-        }
-        if kind == H3_QPACK_ENCODER_STREAM {
-            if !stream.frame_buf.is_empty() {
-                return Err(protocol("QPACK dynamic table instructions are disabled"));
-            }
-            if stream.reassembly.finished() {
-                return Err(protocol("HTTP/3 QPACK encoder stream cannot be closed"));
-            }
-            return Ok(());
-        }
-        let mut pos = 0;
-        while pos < stream.frame_buf.len() {
-            let before = pos;
-            match qpack::decode_decoder_instruction(&stream.frame_buf, &mut pos) {
-                Ok(_) => {}
-                Err(error) if error.kind == ErrorKind::UnexpectedEof => {
-                    pos = before;
-                    break;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        if pos != 0 {
-            stream.frame_buf.drain(..pos);
-        }
-        if stream.reassembly.finished() {
-            return Err(protocol("HTTP/3 QPACK decoder stream cannot be closed"));
-        }
-        return Ok(());
-    }
-    if stream_id::is_unidirectional(stream_id_of(stream)) {
+    if process_unidirectional_stream(
+        stream,
+        control_received,
+        peer_goaway,
+        peer_max_header_list,
+        limits,
+    )? {
         return Ok(());
     }
     drain_response_frames(
@@ -2532,9 +2988,14 @@ fn version_negotiation_versions(buf: &[u8]) -> Result<Option<VersionNegotiationP
     if versions.is_empty() || !versions.len().is_multiple_of(4) {
         return Err(protocol("malformed QUIC Version Negotiation packet"));
     }
-    let versions = versions
-        .chunks_exact(4)
-        .map(|chunk| u32::from_be_bytes(chunk.try_into().expect("chunks_exact width")))
+    let (version_chunks, remainder) = versions.as_chunks::<4>();
+    debug_assert!(
+        remainder.is_empty(),
+        "version list length checked as multiple of 4"
+    );
+    let versions = version_chunks
+        .iter()
+        .map(|chunk| u32::from_be_bytes(*chunk))
         .collect();
     Ok(Some(VersionNegotiationPacket {
         dcid: identity.dcid,
@@ -2552,14 +3013,17 @@ fn looks_like_initial(buf: &[u8]) -> bool {
     })
 }
 
-fn packet_destination_cid(buf: &[u8]) -> Option<Vec<u8>> {
+/// The destination connection id of a packet as a slice into the
+/// datagram (zero allocation). Long headers carry it at `[6..]`; short
+/// headers always use the 8-byte CID this runtime generates.
+fn packet_destination_cid(buf: &[u8]) -> Option<&[u8]> {
     if buf.first().is_some_and(|first| first & 0x80 != 0) {
-        parse_long_header_identity(buf)
-            .ok()
-            .map(|identity| identity.dcid)
+        let dcid_len = *buf.get(5)? as usize;
+        let end = 6usize.checked_add(dcid_len)?;
+        (dcid_len <= 20 && end < buf.len()).then(|| &buf[6..end])
     } else {
         let end = 1usize.checked_add(8)?;
-        (buf.len() >= end).then(|| buf[1..end].to_vec())
+        (buf.len() >= end).then(|| &buf[1..end])
     }
 }
 
@@ -2633,50 +3097,16 @@ impl QuicTransport {
         initial_dcid: Vec<u8>,
         stats: Option<Arc<Stats>>,
     ) -> Result<Self> {
-        let (client, server) = protection::initial_pair(&initial_dcid)?;
-        Ok(Self {
-            server: false,
-            peer: None,
+        let (client_key, server_key) = protection::initial_pair(&initial_dcid)?;
+        Ok(Self::new(
             local_cid,
             remote_cid,
-            original_dcid: initial_dcid.clone(),
             initial_dcid,
-            initial_token: Vec::new(),
-            retry_seen: false,
-            initial_send: client,
-            initial_recv: server,
-            handshake_send: None,
-            handshake_recv: None,
-            application_send: None,
-            application_recv: None,
-            application_send_phase: false,
-            application_recv_phase: false,
-            spaces: [
-                PacketSpace::default(),
-                PacketSpace::default(),
-                PacketSpace::default(),
-            ],
-            crypto_send_offsets: [0; 3],
-            queued_streams: VecDeque::new(),
-            congestion_window: 12_000,
-            slow_start_threshold: usize::MAX,
-            smoothed_rtt: None,
-            rtt_variance: Duration::from_millis(0),
-            peer_max_data: 16 * 1024 * 1024,
-            peer_max_stream_data_bidi_local: 16 * 1024 * 1024,
-            peer_max_stream_data_bidi_remote: 16 * 1024 * 1024,
-            peer_max_stream_data_uni: 1024 * 1024,
-            peer_stream_limits: BTreeMap::new(),
-            sent_data: 0,
-            sent_stream_data: BTreeMap::new(),
-            local_max_data: MAX_H3_CONNECTION_BUFFER as u64,
-            local_max_stream_data_bidi_local: 16 * 1024 * 1024,
-            local_max_stream_data_bidi_remote: 16 * 1024 * 1024,
-            local_max_stream_data_uni: 1024 * 1024,
-            received_data: 0,
-            received_stream_data: BTreeMap::new(),
+            false,
+            client_key,
+            server_key,
             stats,
-        })
+        ))
     }
 
     fn server(
@@ -2685,9 +3115,31 @@ impl QuicTransport {
         initial_dcid: Vec<u8>,
         stats: Option<Arc<Stats>>,
     ) -> Result<Self> {
-        let (client, server) = protection::initial_pair(&initial_dcid)?;
-        Ok(Self {
-            server: true,
+        let (client_key, server_key) = protection::initial_pair(&initial_dcid)?;
+        Ok(Self::new(
+            local_cid,
+            remote_cid,
+            initial_dcid,
+            true,
+            server_key,
+            client_key,
+            stats,
+        ))
+    }
+
+    /// Shared constructor for both roles; only the role flag and the
+    /// initial-direction key swap differ between client and server.
+    fn new(
+        local_cid: Vec<u8>,
+        remote_cid: Vec<u8>,
+        initial_dcid: Vec<u8>,
+        server: bool,
+        initial_send: PacketKey,
+        initial_recv: PacketKey,
+        stats: Option<Arc<Stats>>,
+    ) -> Self {
+        Self {
+            server,
             peer: None,
             local_cid,
             remote_cid,
@@ -2695,8 +3147,8 @@ impl QuicTransport {
             initial_dcid,
             initial_token: Vec::new(),
             retry_seen: false,
-            initial_send: server,
-            initial_recv: client,
+            initial_send,
+            initial_recv,
             handshake_send: None,
             handshake_recv: None,
             application_send: None,
@@ -2728,7 +3180,7 @@ impl QuicTransport {
             received_data: 0,
             received_stream_data: BTreeMap::new(),
             stats,
-        })
+        }
     }
 
     fn set_handshake_keys(&mut self, recv: PacketKey, send: PacketKey) {
@@ -2789,6 +3241,22 @@ impl QuicTransport {
         self.local_max_stream_data_uni = parameters.initial_max_stream_data_uni;
     }
 
+    /// The peer's advertised send limit for `id` (its transport parameter,
+    /// raised by any `MAX_STREAM_DATA` we received).
+    fn peer_stream_send_limit(&self, id: u64) -> u64 {
+        let default_limit = if stream_id::is_unidirectional(id) {
+            self.peer_max_stream_data_uni
+        } else if stream_id::is_client_initiated(id) == !self.server {
+            self.peer_max_stream_data_bidi_remote
+        } else {
+            self.peer_max_stream_data_bidi_local
+        };
+        self.peer_stream_limits
+            .get(&id)
+            .copied()
+            .unwrap_or(default_limit)
+    }
+
     fn accept_stream_data(&mut self, id: u64, offset: u64, length: usize) -> Result<()> {
         if length == 0 {
             return Ok(());
@@ -2818,7 +3286,7 @@ impl QuicTransport {
         Ok(())
     }
 
-    fn open(&mut self, datagram: &[u8]) -> Result<Option<OpenPacket>> {
+    fn open(&mut self, datagram: &mut [u8]) -> Result<Option<OpenPacket>> {
         if datagram.len() < 21 || datagram.len() > MAX_DATAGRAM {
             return Err(protocol("invalid QUIC datagram size"));
         }
@@ -2852,52 +3320,37 @@ impl QuicTransport {
             .largest_received
             .map(|pn| pn.saturating_add(1))
             .unwrap_or(0);
-        let raw = datagram[..meta.packet_end].to_vec();
+        // Common case: current key with a single copy. The key-update path
+        // is only exercised when the current key fails.
+        let current_phase = if level == APPLICATION {
+            Some(self.application_recv_phase)
+        } else {
+            None
+        };
         let mut opened = None;
-        let mut candidates = vec![(key, false)];
-        if level == APPLICATION {
-            if let Ok(next) = candidates[0].0.next_key_phase() {
-                candidates.push((next, true));
-            }
+        if let Some((pn, plaintext)) =
+            open_packet_with_key(datagram, &meta, &key, expected, current_phase)?
+        {
+            opened = Some((pn, plaintext));
         }
-        for (candidate, next_phase) in candidates {
-            let mut protected = raw.clone();
-            let Ok(pn_len) = candidate.unprotect_header(
-                &mut protected,
-                meta.pn_offset,
-                meta.long_type.is_some(),
-            ) else {
-                continue;
-            };
-            if level == APPLICATION {
-                let phase = protected[0] & 0x04 != 0;
-                let expected_phase = if next_phase {
-                    !self.application_recv_phase
-                } else {
-                    self.application_recv_phase
-                };
-                if phase != expected_phase {
-                    continue;
+        let mut candidate = key;
+        let mut next_phase = false;
+        if opened.is_none() && level == APPLICATION {
+            if let Ok(next) = candidate.next_key_phase() {
+                if let Some((pn, plaintext)) = open_packet_with_key(
+                    datagram,
+                    &meta,
+                    &next,
+                    expected,
+                    Some(!self.application_recv_phase),
+                )? {
+                    opened = Some((pn, plaintext));
+                    candidate = next;
+                    next_phase = true;
                 }
             }
-            let payload_start = meta
-                .pn_offset
-                .checked_add(pn_len)
-                .ok_or_else(|| protocol("QUIC packet-number offset overflow"))?;
-            if payload_start > meta.packet_end {
-                return Err(protocol("QUIC packet number exceeds packet length"));
-            }
-            let pn = packet::decode_pn(&protected[meta.pn_offset..payload_start], expected, pn_len);
-            if let Ok(plaintext) = candidate.open(
-                pn,
-                &protected[..payload_start],
-                &protected[payload_start..meta.packet_end],
-            ) {
-                opened = Some((candidate, next_phase, pn, plaintext));
-                break;
-            }
         }
-        let Some((candidate, next_phase, pn, plaintext)) = opened else {
+        let Some((pn, plaintext)) = opened else {
             return Err(protocol("QUIC packet authentication failed"));
         };
         if level == APPLICATION && next_phase {
@@ -3013,17 +3466,23 @@ impl QuicTransport {
         if bytes.is_empty() {
             return Ok(());
         }
-        let mut offset = self.crypto_send_offsets[level];
-        for chunk in bytes.chunks(MAX_CRYPTO_CHUNK) {
+        let sent = usize::try_from(self.crypto_send_offsets[level])
+            .unwrap_or(usize::MAX)
+            .min(bytes.len());
+        for chunk in bytes[sent..].chunks(MAX_CRYPTO_CHUNK) {
+            let offset = self.crypto_send_offsets[level];
             let frame = QFrame::Crypto {
                 offset,
                 data: chunk.to_vec(),
             };
-            self.send_frames(socket, level, &[frame], level == INITIAL)?;
-            offset = offset
+            match self.send_frames(socket, level, &[frame], level == INITIAL) {
+                Ok(()) => {}
+                Err(error) if error.kind == ErrorKind::WouldBlock => return Ok(()),
+                Err(error) => return Err(error),
+            }
+            self.crypto_send_offsets[level] = offset
                 .checked_add(chunk.len() as u64)
                 .ok_or_else(|| protocol("QUIC CRYPTO send offset overflow"))?;
-            self.crypto_send_offsets[level] = offset;
         }
         Ok(())
     }
@@ -3052,19 +3511,7 @@ impl QuicTransport {
             let end = offset
                 .checked_add(bytes.len() as u64)
                 .ok_or_else(|| protocol("QUIC stream send offset overflow"))?;
-            let default_stream_limit = if stream_id::is_unidirectional(id) {
-                self.peer_max_stream_data_uni
-            } else if stream_id::is_client_initiated(id) == !self.server {
-                self.peer_max_stream_data_bidi_remote
-            } else {
-                self.peer_max_stream_data_bidi_local
-            };
-            let stream_limit = self
-                .peer_stream_limits
-                .get(&id)
-                .copied()
-                .unwrap_or(default_stream_limit);
-            if end > stream_limit {
+            if end > self.peer_stream_send_limit(id) {
                 return Err(protocol("QUIC peer stream flow-control limit exceeded"));
             }
             let previous = self.sent_stream_data.get(&id).copied().unwrap_or(0);
@@ -3206,8 +3653,35 @@ impl QuicTransport {
         if lost {
             self.on_loss();
         }
-        for (_, level, frames, pad_initial, retransmits) in resend {
-            self.send_frames_with_retransmits(socket, level, &frames, pad_initial, retransmits)?;
+        for (pn, level, frames, pad_initial, retransmits) in resend {
+            match self.send_frames_with_retransmits(
+                socket,
+                level,
+                &frames,
+                pad_initial,
+                retransmits,
+            ) {
+                Ok(()) => {}
+                // The congestion window is full. Put the packet back in
+                // `sent` so a later tick retries it with a fresh packet
+                // number once ACKs free credit — never tear the
+                // connection down over transient congestion.
+                Err(error) if error.kind == ErrorKind::WouldBlock => {
+                    let previous = self.spaces[level].sent.insert(
+                        pn,
+                        SentPacket {
+                            frames,
+                            pad_initial,
+                            sent_at: now,
+                            retransmits,
+                            ack_eliciting: true,
+                            size: 0,
+                        },
+                    );
+                    debug_assert!(previous.is_none());
+                }
+                Err(error) => return Err(error),
+            }
         }
         self.flush_queued_streams(socket)
     }
@@ -3336,6 +3810,12 @@ impl QuicTransport {
             .fold(0usize, usize::saturating_add)
     }
 
+    /// Whether any packet is in flight awaiting an ACK (drives the
+    /// driver's periodic retransmit pacing).
+    fn has_unacknowledged(&self) -> bool {
+        self.spaces.iter().any(|space| !space.sent.is_empty())
+    }
+
     fn send_wire(&self, socket: &UdpSocket, wire: &[u8]) -> Result<()> {
         if let Some(stats) = self.stats.as_deref() {
             stats.h3_udp_send_syscalls.fetch_add(1, Ordering::Relaxed);
@@ -3458,6 +3938,61 @@ fn decode_quic_frames(buf: &[u8]) -> Result<Vec<QFrame>> {
         frames.push(frame);
     }
     Ok(frames)
+}
+
+/// Try to open one packet with a specific key: header protection is
+/// removed in place on a single copy, then the AEAD tag is verified.
+/// Returns `Ok(None)` when the header cannot be unprotected or the tag
+/// does not verify (wrong key, key phase, or corrupted packet).
+fn open_packet_with_key(
+    datagram: &mut [u8],
+    meta: &PacketMeta,
+    key: &PacketKey,
+    expected_pn: u64,
+    expected_phase: Option<bool>,
+) -> Result<Option<(u64, Vec<u8>)>> {
+    let header_room = meta.pn_offset.saturating_add(4).min(datagram.len());
+    let saved = expected_phase
+        .is_some()
+        .then(|| datagram[..header_room].to_vec());
+    let Ok(pn_len) = key.unprotect_header(datagram, meta.pn_offset, meta.long_type.is_some())
+    else {
+        return Ok(None);
+    };
+    if let Some(expected_phase) = expected_phase {
+        let phase = datagram[0] & 0x04 != 0;
+        if phase != expected_phase {
+            if let Some(saved) = &saved {
+                datagram[..header_room].copy_from_slice(saved);
+            }
+            return Ok(None);
+        }
+    }
+    let payload_start = meta
+        .pn_offset
+        .checked_add(pn_len)
+        .ok_or_else(|| protocol("QUIC packet-number offset overflow"))?;
+    if payload_start > meta.packet_end {
+        return Err(protocol("QUIC packet number exceeds packet length"));
+    }
+    let pn = packet::decode_pn(
+        &datagram[meta.pn_offset..payload_start],
+        expected_pn,
+        pn_len,
+    );
+    match key.open(
+        pn,
+        &datagram[..payload_start],
+        &datagram[payload_start..meta.packet_end],
+    ) {
+        Ok(plaintext) => Ok(Some((pn, plaintext))),
+        Err(_) => {
+            if let Some(saved) = &saved {
+                datagram[..header_room].copy_from_slice(saved);
+            }
+            Ok(None)
+        }
+    }
 }
 
 struct PacketMeta {
@@ -3632,6 +4167,26 @@ mod tests {
         assert!(response_from_fields(fields, b"body".to_vec(), None).is_err());
     }
 
+    /// A pooled HTTP/3 client for loopback tests. Requests go through the
+    /// public `Client`, so the pool (driver thread + connection reuse) is
+    /// exercised exactly as in production.
+    fn h3_client(max_body: usize, timeout: Duration) -> crate::courierust_client::Client {
+        use crate::courierust_client::{Client, ClientConfig, TlsSettings as ClientTls};
+        Client::with_config(ClientConfig {
+            http3: true,
+            tls: Some(ClientTls {
+                roots: crate::courierust_tls::testdata::root_store(),
+                verify: true,
+                alpn: vec![b"h3".to_vec()],
+                now: crate::courierust_tls::testdata::NOW,
+            }),
+            max_header_list: 16 * 1024,
+            max_body,
+            read_timeout: Some(timeout),
+            ..Default::default()
+        })
+    }
+
     #[test]
     fn loopback_quic_tls_http3_round_trip() {
         let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3654,26 +4209,49 @@ mod tests {
         };
         let _server = spawn_server(addr, &tls, handler, config).unwrap();
 
-        let request = Request::<Body>::new(Method::GET, "/health");
-        let response = client_request(
-            addr,
-            "localhost",
-            &format!("localhost:{}", addr.port()),
-            request,
-            ClientRequestOptions {
-                roots: crate::courierust_tls::testdata::root_store(),
-                verify: true,
-                now: crate::courierust_tls::testdata::NOW,
-                max_header_list: 16 * 1024,
-                max_body: 1024 * 1024,
-                timeout: Some(Duration::from_secs(5)),
-                stats: None,
-            },
-        )
-        .unwrap();
+        let client = h3_client(1024 * 1024, Duration::from_secs(5));
+        let response = client
+            .get(&format!("https://localhost:{}/health", addr.port()))
+            .unwrap();
         assert_eq!(response.version, Version::HTTP_3);
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(response.body.as_bytes(), Some(&b"quic-ok"[..]));
+    }
+
+    #[test]
+    fn loopback_http3_connection_is_reused_across_requests() {
+        // The pool must multiplex sequential requests over one QUIC
+        // connection: after the handshake, response bodies arrive on
+        // fresh streams without a second handshake round.
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = tcp.local_addr().unwrap();
+        drop(tcp);
+        let identity = crate::courierust_tls::testdata::server_identity();
+        let tls = TlsSettings {
+            identity,
+            alpn: vec![b"h3".to_vec()],
+        };
+        let handler: Arc<dyn Handler> = Arc::new(|request: Request<Body>| {
+            let path = request.uri.as_str().to_string();
+            Response::<Body>::with_status(StatusCode::OK).with_body(Body::from(path))
+        });
+        let config = ServerConfig {
+            http3: true,
+            tls: Some(tls.clone()),
+            max_body: 1024 * 1024,
+            ..ServerConfig::default()
+        };
+        let _server = spawn_server(addr, &tls, handler, config).unwrap();
+
+        let client = h3_client(1024 * 1024, Duration::from_secs(5));
+        for i in 0..50 {
+            let path = format!("/req-{i}");
+            let response = client
+                .get(&format!("https://localhost:{}{path}", addr.port()))
+                .unwrap();
+            assert_eq!(response.status, StatusCode::OK);
+            assert_eq!(response.body.as_bytes(), Some(path.as_bytes()));
+        }
     }
 
     #[test]
@@ -3698,23 +4276,107 @@ mod tests {
             ..ServerConfig::default()
         };
         let _server = spawn_server(addr, &tls, handler, config).unwrap();
-        let response = client_request(
-            addr,
-            "localhost",
-            &format!("localhost:{}", addr.port()),
-            Request::<Body>::new(Method::GET, "/large"),
-            ClientRequestOptions {
-                roots: crate::courierust_tls::testdata::root_store(),
-                verify: true,
-                now: crate::courierust_tls::testdata::NOW,
-                max_header_list: 16 * 1024,
-                max_body: 128 * 1024,
-                timeout: Some(Duration::from_secs(10)),
-                stats: None,
-            },
-        )
-        .unwrap();
+        let client = h3_client(128 * 1024, Duration::from_secs(10));
+        let response = client
+            .get(&format!("https://localhost:{}/large", addr.port()))
+            .unwrap();
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(response.body.as_bytes(), Some(expected.as_slice()));
+    }
+
+    #[test]
+    fn loopback_http3_large_request_body_is_fully_delivered() {
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = tcp.local_addr().unwrap();
+        drop(tcp);
+        let identity = crate::courierust_tls::testdata::server_identity();
+        let tls = TlsSettings {
+            identity,
+            alpn: vec![b"h3".to_vec()],
+        };
+        // The request body is far larger than the initial congestion
+        // window (12 KB), so it must be delivered in ACK-paced chunks.
+        // This guards against regressions where a full window used to
+        // abort the request instead of deferring the remaining chunks.
+        let expected_len = 64 * 1024;
+        let handler: Arc<dyn Handler> = Arc::new(|request: Request<Body>| {
+            let received = request.body.collect().unwrap_or_default();
+            let reply = format!("len={}", received.len()).into_bytes();
+            Response::<Body>::with_status(StatusCode::OK).with_body(Body::from(reply))
+        });
+        let config = ServerConfig {
+            http3: true,
+            tls: Some(tls.clone()),
+            max_body: 128 * 1024,
+            ..ServerConfig::default()
+        };
+        let _server = spawn_server(addr, &tls, handler, config).unwrap();
+        let client = h3_client(128 * 1024, Duration::from_secs(15));
+        let body = vec![b'p'; expected_len];
+        let request = Request::<Body>::new(Method::POST, "/upload").with_body(Body::from(body));
+        let response = client
+            .execute(
+                &format!("https://localhost:{}/upload", addr.port()),
+                request,
+            )
+            .unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        let reply = response
+            .body
+            .as_bytes()
+            .and_then(|bytes| std::str::from_utf8(bytes).ok());
+        assert_eq!(reply, Some(format!("len={expected_len}").as_str()));
+    }
+
+    #[test]
+    fn loopback_http3_round_trip_latency() {
+        // A timing harness (not a correctness gate): reports the real
+        // per-request cost of the pooled HTTP/3 client once the QUIC/TLS
+        // handshake is amortized over the reused connection. Run with
+        // `-- --nocapture`.
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = tcp.local_addr().unwrap();
+        drop(tcp);
+        let identity = crate::courierust_tls::testdata::server_identity();
+        let tls = TlsSettings {
+            identity,
+            alpn: vec![b"h3".to_vec()],
+        };
+        let handler: Arc<dyn Handler> = Arc::new(|_request: Request<Body>| {
+            Response::<Body>::with_status(StatusCode::OK).with_body(Body::from("ok"))
+        });
+        let config = ServerConfig {
+            http3: true,
+            tls: Some(tls.clone()),
+            max_body: 1024 * 1024,
+            ..ServerConfig::default()
+        };
+        let _server = spawn_server(addr, &tls, handler, config).unwrap();
+
+        let client = h3_client(1024 * 1024, Duration::from_secs(5));
+        let url = format!("https://localhost:{}/bench", addr.port());
+        // Warm-up: the first requests pay the QUIC handshake and open the
+        // pooled connection.
+        for _ in 0..2 {
+            let _ = client.get(&url).unwrap();
+        }
+        let runs = 20;
+        let mut samples = Vec::with_capacity(runs);
+        let started = Instant::now();
+        for _ in 0..runs {
+            let t = Instant::now();
+            let response = client.get(&url).unwrap();
+            assert_eq!(response.body.as_bytes(), Some(&b"ok"[..]));
+            samples.push(t.elapsed());
+        }
+        let total = started.elapsed();
+        samples.sort_unstable();
+        let median = samples[runs / 2].as_micros();
+        let p99 = samples[(runs as f64 * 0.99) as usize - 1].as_micros();
+        println!(
+            "H3 pooled round trip: n={runs} total={:?} avg={}us median={median}us p99={p99}us",
+            total,
+            total.as_micros() / runs as u128
+        );
     }
 }
