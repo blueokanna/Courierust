@@ -16,6 +16,7 @@ use courierust::courierust_server::{Server, ServerConfig};
 use metrics::{run_concurrent, run_sequential, Timing, MAX_SAMPLES};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::Arc;
 
 const ONE_KIB: Payload = Payload {
     name: "1k",
@@ -108,7 +109,7 @@ fn courierust_server(protocol: Protocol, payload: Payload) -> SocketAddr {
 }
 
 fn hyper_server(protocol: Protocol, payload: Payload) -> SocketAddr {
-    use http_body_util::Full;
+    use http_body_util::{BodyExt, Full};
     use hyper::body::{Bytes as HyperBytes, Incoming};
     use hyper::service::service_fn;
     use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -133,9 +134,15 @@ fn hyper_server(protocol: Protocol, payload: Payload) -> SocketAddr {
                     break;
                 };
                 let body = body.clone();
-                let service = service_fn(move |_request: hyper::Request<Incoming>| {
+                let service = service_fn(move |request: hyper::Request<Incoming>| {
                     let body = body.clone();
-                    async move { Ok::<_, Infallible>(hyper::Response::new(Full::new(body))) }
+                    async move {
+                        // Consume uploads so the h2 flow-control window is
+                        // exercised and a large-body comparison cannot pass
+                        // merely because the peer discarded the request.
+                        let _ = BodyExt::collect(request.into_body()).await;
+                        Ok::<_, Infallible>(hyper::Response::new(Full::new(body)))
+                    }
                 });
                 let builder = match protocol {
                     Protocol::H1 => AutoBuilder::new(TokioExecutor::new()).http1_only(),
@@ -187,16 +194,38 @@ fn run_courierust_client(
     }
 }
 
-fn reqwest_client(protocol: Protocol, workers: usize) -> reqwest::blocking::Client {
-    let builder = reqwest::blocking::Client::builder().pool_max_idle_per_host(workers);
+/// A valid mainstream-client baseline. HTTP/1.1 uses reqwest's blocking
+/// client (a plain, fair comparison for keep-alive h1). HTTP/2 prior
+/// knowledge uses the *async* reqwest client driven through a tokio
+/// multi-thread runtime: the blocking client's fixed ~41 ms per-request
+/// wait on h2c large bodies is a harness artifact, not a performance
+/// property, so it is deliberately not used for the h2 rows.
+enum ReqwestClient {
+    Blocking(reqwest::blocking::Client),
+    Async(Arc<reqwest::Client>),
+}
+
+fn reqwest_client(protocol: Protocol, workers: usize) -> ReqwestClient {
     if protocol.uses_http2() {
-        builder.http2_prior_knowledge().build().unwrap()
+        let builder = reqwest::Client::builder().pool_max_idle_per_host(workers);
+        ReqwestClient::Async(Arc::new(builder.http2_prior_knowledge().build().unwrap()))
     } else {
-        builder.build().unwrap()
+        let builder = reqwest::blocking::Client::builder().pool_max_idle_per_host(workers);
+        ReqwestClient::Blocking(builder.build().unwrap())
     }
 }
 
-fn assert_reqwest_response(response: reqwest::blocking::Response, expected_bytes: usize) {
+fn assert_reqwest_response(
+    response: reqwest::Response,
+    expected_bytes: usize,
+    handle: &tokio::runtime::Handle,
+) {
+    assert_eq!(response.status().as_u16(), 200);
+    let body = handle.block_on(response.bytes()).unwrap();
+    assert_eq!(body.len(), expected_bytes);
+}
+
+fn assert_reqwest_blocking_response(response: reqwest::blocking::Response, expected_bytes: usize) {
     assert_eq!(response.status().as_u16(), 200);
     assert_eq!(response.bytes().unwrap().len(), expected_bytes);
 }
@@ -207,24 +236,170 @@ fn run_reqwest_client(
     payload: Payload,
     requests: usize,
     workers: usize,
+    handle: &tokio::runtime::Handle,
 ) -> Timing {
-    let client = reqwest_client(protocol, workers);
-    let url = format!("http://{address}/benchmark");
-    assert_reqwest_response(client.get(&url).send().unwrap(), payload.bytes);
-
-    if workers == 1 {
-        run_sequential(requests, MAX_SAMPLES, || {
-            assert_reqwest_response(client.get(&url).send().unwrap(), payload.bytes);
-        })
-    } else {
-        run_concurrent(requests, workers, MAX_SAMPLES, |_| {
-            let client = client.clone();
-            let url = url.clone();
-            Box::new(move || {
-                assert_reqwest_response(client.get(&url).send().unwrap(), payload.bytes);
-            })
-        })
+    let expected = payload.bytes;
+    match reqwest_client(protocol, workers) {
+        ReqwestClient::Blocking(client) => {
+            let url = format!("http://{address}/benchmark");
+            assert_reqwest_blocking_response(client.get(&url).send().unwrap(), expected);
+            if workers == 1 {
+                run_sequential(requests, MAX_SAMPLES, || {
+                    assert_reqwest_blocking_response(client.get(&url).send().unwrap(), expected);
+                })
+            } else {
+                run_concurrent(requests, workers, MAX_SAMPLES, |_| {
+                    let client = client.clone();
+                    let url = url.clone();
+                    Box::new(move || {
+                        assert_reqwest_blocking_response(
+                            client.get(&url).send().unwrap(),
+                            expected,
+                        );
+                    })
+                })
+            }
+        }
+        ReqwestClient::Async(client) => {
+            let url = format!("http://{address}/benchmark");
+            let handle = handle.clone();
+            assert_reqwest_response(
+                handle.block_on(client.get(&url).send()).unwrap(),
+                expected,
+                &handle,
+            );
+            if workers == 1 {
+                run_sequential(requests, MAX_SAMPLES, || {
+                    let url = url.clone();
+                    assert_reqwest_response(
+                        handle.block_on(client.get(&url).send()).unwrap(),
+                        expected,
+                        &handle,
+                    );
+                })
+            } else {
+                run_concurrent(requests, workers, MAX_SAMPLES, |_| {
+                    let client = client.clone();
+                    let url = url.clone();
+                    let handle = handle.clone();
+                    Box::new(move || {
+                        assert_reqwest_response(
+                            handle.block_on(client.get(&url).send()).unwrap(),
+                            expected,
+                            &handle,
+                        );
+                    })
+                })
+            }
+        }
     }
+}
+
+fn large_h2_body() -> Vec<u8> {
+    let bytes = env_usize("BENCH_H2_LARGE_BODY_BYTES", 1024 * 1024);
+    (0..bytes).map(|index| (index % 251) as u8).collect()
+}
+
+fn run_courierust_h2_large_body(
+    address: SocketAddr,
+    response_payload: Payload,
+    request_body: &[u8],
+    requests: usize,
+) -> Timing {
+    let client = Client::with_config(ClientConfig {
+        http2: true,
+        max_connections_per_host: 1,
+        ..Default::default()
+    });
+    let url = format!("http://{address}/large-body");
+    let request = || {
+        let req = Request::post("/large-body")
+            .with_body(Body::Bytes(Bytes::from(request_body.to_vec())));
+        assert_courierust_response(client.execute(&url, req).unwrap(), response_payload.bytes);
+    };
+    request();
+    run_sequential(requests, MAX_SAMPLES, request)
+}
+
+fn run_reqwest_h2_large_body(
+    address: SocketAddr,
+    response_payload: Payload,
+    request_body: &[u8],
+    requests: usize,
+    handle: &tokio::runtime::Handle,
+) -> Timing {
+    let client = Arc::new(
+        reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .pool_max_idle_per_host(1)
+            .build()
+            .unwrap(),
+    );
+    let url = format!("http://{address}/large-body");
+    let send = || {
+        let client = client.clone();
+        let url = url.clone();
+        let body = request_body.to_vec();
+        let response = handle.block_on(async move {
+            client.post(url).body(body).send().await.unwrap()
+        });
+        assert_reqwest_response(response, response_payload.bytes, handle);
+    };
+    send();
+    run_sequential(requests, MAX_SAMPLES, send)
+}
+
+fn compare_h2_large_body(
+    address: SocketAddr,
+    response_payload: Payload,
+    requests: usize,
+    repetitions: usize,
+    handle: &tokio::runtime::Handle,
+) {
+    let request_body = large_h2_body();
+    let (courierust_timing, reqwest_timing) = measure_pair(
+        repetitions,
+        || run_courierust_h2_large_body(address, response_payload, &request_body, requests),
+        || run_reqwest_h2_large_body(
+            address,
+            response_payload,
+            &request_body,
+            requests,
+            handle,
+        ),
+    );
+    print_result(
+        ResultMetadata {
+            case: "courierust_h2c_large_body_to_hyper",
+            layer: "client",
+            protocol: Protocol::H2c,
+            client: "courierust",
+            server: "hyper",
+            payload: response_payload,
+            workers: 1,
+            repetitions,
+            server_threads: 4,
+            pool_policy: "courierust_max_connections_per_host",
+            pool_value: 1,
+        },
+        courierust_timing,
+    );
+    print_result(
+        ResultMetadata {
+            case: "reqwest_async_h2c_large_body_to_hyper",
+            layer: "client",
+            protocol: Protocol::H2c,
+            client: "reqwest-async",
+            server: "hyper",
+            payload: response_payload,
+            workers: 1,
+            repetitions,
+            server_threads: 4,
+            pool_policy: "reqwest_pool_max_idle_per_host",
+            pool_value: 1,
+        },
+        reqwest_timing,
+    );
 }
 
 fn metric(value: Option<f64>) -> String {
@@ -247,20 +422,9 @@ fn print_result(metadata: ResultMetadata, mut timing: Timing) {
         pool_policy,
         pool_value,
     } = metadata;
-    let (status, reason) = if matches!(protocol, Protocol::H2c)
-        && client == "reqwest"
-        && payload.bytes == SIXTY_FOUR_KIB.bytes
-    {
-        (
-            "invalid",
-            "reqwest_blocking_h2c_64k_fixed_wait_not_performance_evidence",
-        )
-    } else {
-        ("valid", "-")
-    };
     timing.sort_samples();
     println!(
-        "RESULT|suite=compare|case={case}|layer={layer}|protocol={}|client={client}|server={server}|payload={}|bytes={}|workers={workers}|server_threads={server_threads}|pool_policy={pool_policy}|pool_value={pool_value}|repetitions={repetitions}|status={status}|reason={reason}|requests={}|elapsed_ms={:.3}|rps={:.1}|response_mbps={:.3}|p50_us={}|p75_us={}|p90_us={}|p95_us={}|p99_us={}|samples={}",
+        "RESULT|suite=compare|case={case}|layer={layer}|protocol={}|client={client}|server={server}|payload={}|bytes={}|workers={workers}|server_threads={server_threads}|pool_policy={pool_policy}|pool_value={pool_value}|repetitions={repetitions}|status=valid|reason=-|requests={}|elapsed_ms={:.3}|rps={:.1}|response_mbps={:.3}|p50_us={}|p75_us={}|p90_us={}|p95_us={}|p99_us={}|samples={}",
         protocol.name(),
         payload.name,
         payload.bytes,
@@ -373,11 +537,12 @@ fn compare_clients(
     requests: usize,
     workers: usize,
     repetitions: usize,
+    handle: &tokio::runtime::Handle,
 ) {
     let (courierust_timing, reqwest_timing) = measure_pair(
         repetitions,
         || run_courierust_client(protocol, address, payload, requests, workers),
-        || run_reqwest_client(protocol, address, payload, requests, workers),
+        || run_reqwest_client(protocol, address, payload, requests, workers, handle),
     );
     print_result(
         ResultMetadata {
@@ -421,11 +586,12 @@ fn compare_servers(
     payload: Payload,
     requests: usize,
     repetitions: usize,
+    handle: &tokio::runtime::Handle,
 ) {
     let (courierust_timing, hyper_timing) = measure_pair(
         repetitions,
-        || run_reqwest_client(protocol, courierust, payload, requests, 1),
-        || run_reqwest_client(protocol, hyper, payload, requests, 1),
+        || run_reqwest_client(protocol, courierust, payload, requests, 1, handle),
+        || run_reqwest_client(protocol, hyper, payload, requests, 1, handle),
     );
     print_result(
         ResultMetadata {
@@ -464,9 +630,19 @@ fn compare_servers(
 
 fn main() {
     let requests = env_usize("BENCH_REQUESTS", 2_000);
+    let large_body_requests = env_usize("BENCH_H2_LARGE_BODY_REQUESTS", requests.min(32));
     let parallel_requests = env_usize("BENCH_PARALLEL_REQUESTS", requests);
     let parallel_workers = env_usize("BENCH_COMPARE_WORKERS", 8);
     let repetitions = comparison_repetitions();
+    // One shared tokio runtime drives the async reqwest client used for
+    // the HTTP/2 rows (the valid replacement for blocking-reqwest-h2c,
+    // whose fixed per-request wait was not performance evidence).
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("tokio runtime for async reqwest");
+    let handle = runtime.handle().clone();
     println!("courierust comparison suite (loopback, shared-peer matrix)");
     println!(
         "META|suite=compare|requests_per_repetition={requests}|parallel_requests_per_repetition={parallel_requests}|parallel_workers={parallel_workers}|repetitions={repetitions}|max_samples={MAX_SAMPLES}"
@@ -477,8 +653,33 @@ fn main() {
         for payload in [ONE_KIB, SIXTY_FOUR_KIB] {
             let hyper = hyper_server(protocol, payload);
             let courierust = courierust_server(protocol, payload);
-            compare_clients(protocol, hyper, payload, requests, 1, repetitions);
-            compare_servers(protocol, courierust, hyper, payload, requests, repetitions);
+            compare_clients(
+                protocol,
+                hyper,
+                payload,
+                requests,
+                1,
+                repetitions,
+                &handle,
+            );
+            compare_servers(
+                protocol,
+                courierust,
+                hyper,
+                payload,
+                requests,
+                repetitions,
+                &handle,
+            );
+            if matches!(protocol, Protocol::H2c) && payload.bytes == SIXTY_FOUR_KIB.bytes {
+                compare_h2_large_body(
+                    hyper,
+                    payload,
+                    large_body_requests,
+                    repetitions,
+                    &handle,
+                );
+            }
             if payload.bytes == ONE_KIB.bytes {
                 compare_clients(
                     protocol,
@@ -487,9 +688,11 @@ fn main() {
                     parallel_requests,
                     parallel_workers,
                     repetitions,
+                    &handle,
                 );
             }
         }
     }
+    drop(runtime);
     println!("total: complete");
 }

@@ -42,6 +42,8 @@ const EXT_SIGNATURE_ALGORITHMS: u16 = 0x000d;
 const EXT_ALPN: u16 = 0x0010;
 const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 const EXT_KEY_SHARE: u16 = 0x0033;
+/// QUIC transport parameters (RFC 9001 section 5.2).
+pub(crate) const EXT_QUIC_TRANSPORT_PARAMETERS: u16 = 0x0039;
 
 /// Named group for X25519.
 const GROUP_X25519: u16 = 0x001d;
@@ -60,7 +62,7 @@ const SIGNATURE_SCHEMES: &[u16] = &[
 ];
 
 /// Encode a handshake message: type || length(3) || body.
-fn encode_hs(msg_type: u8, body: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_hs(msg_type: u8, body: &[u8]) -> Vec<u8> {
     let len = body.len() as u32;
     let mut out = Vec::with_capacity(4 + body.len());
     out.push(msg_type);
@@ -76,7 +78,7 @@ pub(crate) struct HsMessage<'a> {
 }
 
 /// Parse a single handshake message (4-byte header + body).
-fn parse_hs<'a>(buf: &'a [u8]) -> Option<HsMessage<'a>> {
+pub(crate) fn parse_hs<'a>(buf: &'a [u8]) -> Option<HsMessage<'a>> {
     if buf.len() < 4 {
         return None;
     }
@@ -218,6 +220,18 @@ pub(crate) fn build_client_hello(
     alpn: &[Vec<u8>],
     server_name: Option<&str>,
 ) -> Vec<u8> {
+    build_client_hello_with_transport_params(random, key_share, alpn, server_name, None)
+}
+
+/// Build a ClientHello with an optional QUIC transport-parameters
+/// extension. The ordinary TLS path passes `None`.
+pub(crate) fn build_client_hello_with_transport_params(
+    random: &[u8; 32],
+    key_share: &[u8; 32],
+    alpn: &[Vec<u8>],
+    server_name: Option<&str>,
+    transport_params: Option<&[u8]>,
+) -> Vec<u8> {
     let mut body = Vec::new();
     // legacy_version = 0x0303
     body.extend_from_slice(&[0x03, 0x03]);
@@ -287,6 +301,10 @@ pub(crate) fn build_client_hello(
         exts.push((EXT_ALPN, alpn_body));
     }
 
+    if let Some(params) = transport_params {
+        exts.push((EXT_QUIC_TRANSPORT_PARAMETERS, params.to_vec()));
+    }
+
     let mut ext_bytes = Vec::new();
     for (t, c) in exts {
         ext_bytes.extend_from_slice(&t.to_be_bytes());
@@ -304,15 +322,17 @@ pub(crate) fn build_client_hello(
 // ---------------------------------------------------------------------
 
 /// Result of parsing a ServerHello.
-struct ServerHelloInfo {
-    random: [u8; 32],
-    suite: CipherSuite,
-    key_share: [u8; 32],
+pub(crate) struct ServerHelloInfo {
+    pub(crate) random: [u8; 32],
+    pub(crate) suite: CipherSuite,
+    pub(crate) key_share: [u8; 32],
     /// The echoed legacy_session_id (must equal the one we sent).
-    session_id: Vec<u8>,
+    pub(crate) session_id: Vec<u8>,
+    /// QUIC transport parameters, when present.
+    pub(crate) transport_params: Option<Vec<u8>>,
 }
 
-fn parse_server_hello(body: &[u8]) -> TlsResult<ServerHelloInfo> {
+pub(crate) fn parse_server_hello(body: &[u8]) -> TlsResult<ServerHelloInfo> {
     let mut c = Cur::new(body);
     let legacy = c.u16().ok_or_else(|| TlsError::Protocol("bad SH".into()))?;
     if legacy != 0x0303 {
@@ -342,6 +362,7 @@ fn parse_server_hello(body: &[u8]) -> TlsResult<ServerHelloInfo> {
         parse_extensions(c.rest()).ok_or_else(|| TlsError::Protocol("bad SH exts".into()))?;
     let mut key_share = None;
     let mut saw_supported_versions = false;
+    let mut transport_params = None;
     for e in exts {
         match e.ext_type {
             EXT_SUPPORTED_VERSIONS => {
@@ -373,6 +394,14 @@ fn parse_server_hello(body: &[u8]) -> TlsResult<ServerHelloInfo> {
                 );
                 key_share = Some(k);
             }
+            EXT_QUIC_TRANSPORT_PARAMETERS => {
+                if transport_params.is_some() {
+                    return Err(TlsError::Protocol(
+                        "duplicate QUIC transport parameters".into(),
+                    ));
+                }
+                transport_params = Some(e.content.to_vec());
+            }
             _ => {}
         }
     }
@@ -384,6 +413,7 @@ fn parse_server_hello(body: &[u8]) -> TlsResult<ServerHelloInfo> {
         suite,
         key_share: key_share.unwrap(),
         session_id,
+        transport_params,
     })
 }
 
@@ -391,7 +421,7 @@ fn parse_server_hello(body: &[u8]) -> TlsResult<ServerHelloInfo> {
 // EncryptedExtensions parsing
 // ---------------------------------------------------------------------
 
-fn parse_encrypted_extensions(body: &[u8]) -> TlsResult<Option<Vec<u8>>> {
+pub(crate) fn parse_encrypted_extensions(body: &[u8]) -> TlsResult<Option<Vec<u8>>> {
     let exts = parse_extensions(body).ok_or_else(|| TlsError::Protocol("bad EE".into()))?;
     let mut alpn = None;
     for e in exts {
@@ -425,7 +455,7 @@ fn parse_encrypted_extensions(body: &[u8]) -> TlsResult<Option<Vec<u8>>> {
 
 /// Parse a TLS 1.3 Certificate message and return all certificate
 /// DER entries (leaf first).
-fn parse_certificate_list(body: &[u8]) -> TlsResult<Vec<Vec<u8>>> {
+pub(crate) fn parse_certificate_list(body: &[u8]) -> TlsResult<Vec<Vec<u8>>> {
     let mut c = Cur::new(body);
     let ctx_len = c
         .u8()
@@ -466,7 +496,7 @@ pub(crate) struct CertVerify {
     pub(crate) signature: Vec<u8>,
 }
 
-fn parse_cert_verify(body: &[u8]) -> TlsResult<CertVerify> {
+pub(crate) fn parse_cert_verify(body: &[u8]) -> TlsResult<CertVerify> {
     let mut c = Cur::new(body);
     let scheme = c.u16().ok_or_else(|| TlsError::Protocol("bad CV".into()))?;
     let sig_len = c.u16().ok_or_else(|| TlsError::Protocol("bad CV".into()))? as usize;
@@ -481,7 +511,7 @@ fn parse_cert_verify(body: &[u8]) -> TlsResult<CertVerify> {
 }
 
 /// The signature message for CertificateVerify (RFC 8446 §4.4.3).
-fn cert_verify_message(handshake_hash: &[u8], client: bool) -> Vec<u8> {
+pub(crate) fn cert_verify_message(handshake_hash: &[u8], client: bool) -> Vec<u8> {
     let context: &[u8] = if client {
         b"TLS 1.3, client CertificateVerify\x00"
     } else {
@@ -500,6 +530,7 @@ pub(crate) fn verify_cert_verify(
     spki: &super::x509::Spki,
     handshake_hash: &[u8],
     client: bool,
+    suite: CipherSuite,
 ) -> TlsResult<()> {
     use super::crypto::rsa::{verify_rsa_pkcs1v15, verify_rsa_pss, RsaPublicKey};
     use super::crypto::{ecdsa, ed25519};
@@ -509,7 +540,10 @@ pub(crate) fn verify_cert_verify(
 
     let msg = cert_verify_message(handshake_hash, client);
     let hash = {
-        let mut d = super::crypto::hash::Sha256::new();
+        let mut d: super::crypto::hash::BoxDigest = match suite.hash() {
+            super::key_schedule::SuiteHash::Sha256 => Box::<super::crypto::hash::Sha256>::default(),
+            super::key_schedule::SuiteHash::Sha384 => Box::<super::crypto::hash::Sha384>::default(),
+        };
         d.update(&msg);
         d.finalize()
     };
@@ -519,23 +553,17 @@ pub(crate) fn verify_cert_verify(
             .ok_or_else(|| TlsError::Certificate("bad RSA SPKI".into()))?;
         let key = RsaPublicKey { n, e };
         let ok = match cv.scheme {
-            0x0804 | 0x0401 => verify_rsa_pkcs1v15(&key, false, &hash, &cv.signature),
-            0x0805 | 0x0501 => {
-                let h384 = {
-                    let mut d = super::crypto::hash::Sha384::new();
-                    d.update(&msg);
-                    d.finalize()
-                };
-                verify_rsa_pkcs1v15(&key, true, &h384, &cv.signature)
+            0x0401 if suite.hash() == super::key_schedule::SuiteHash::Sha256 => {
+                verify_rsa_pkcs1v15(&key, false, &hash, &cv.signature)
             }
-            0x0809 => verify_rsa_pss(&key, false, &hash, &cv.signature),
-            0x080a => {
-                let h384 = {
-                    let mut d = super::crypto::hash::Sha384::new();
-                    d.update(&msg);
-                    d.finalize()
-                };
-                verify_rsa_pss(&key, true, &h384, &cv.signature)
+            0x0501 if suite.hash() == super::key_schedule::SuiteHash::Sha384 => {
+                verify_rsa_pkcs1v15(&key, true, &hash, &cv.signature)
+            }
+            0x0804 if suite.hash() == super::key_schedule::SuiteHash::Sha256 => {
+                verify_rsa_pss(&key, false, &hash, &cv.signature)
+            }
+            0x0805 if suite.hash() == super::key_schedule::SuiteHash::Sha384 => {
+                verify_rsa_pss(&key, true, &hash, &cv.signature)
             }
             _ => false,
         };
@@ -547,7 +575,11 @@ pub(crate) fn verify_cert_verify(
             ))
         }
     } else if spki.oid == OID_EC_PUBLIC_KEY {
-        if cv.scheme != 0x0403 || spki.key.len() != 65 || spki.key[0] != 0x04 {
+        let expected_scheme = match suite.hash() {
+            super::key_schedule::SuiteHash::Sha256 => 0x0403,
+            super::key_schedule::SuiteHash::Sha384 => 0x0503,
+        };
+        if cv.scheme != expected_scheme || spki.key.len() != 65 || spki.key[0] != 0x04 {
             return Err(TlsError::Certificate("unsupported EC signature".into()));
         }
         let mut qx = [0u8; 32];
@@ -609,7 +641,7 @@ pub(crate) fn finished_verify_data(
 /// Fill `buf` from OS entropy, failing the handshake when the source is
 /// unavailable. Never proceed with zeroed bytes: an all-zero X25519
 /// private key makes the ECDHE shared secret predictable.
-fn fill_entropy(buf: &mut [u8]) -> TlsResult<()> {
+pub(crate) fn fill_entropy(buf: &mut [u8]) -> TlsResult<()> {
     if super::crypto::rng::fill_random(buf) {
         Ok(())
     } else {
@@ -745,7 +777,7 @@ impl ClientHandshake {
         }
 
         // Verify the CertificateVerify signature.
-        verify_cert_verify(&cv, &spki, &cv_hash, false)?;
+        verify_cert_verify(&cv, &spki, &cv_hash, false, sh.suite)?;
 
         // Add CV to transcript.
         transcript.update(&encode_hs(HS_CERTIFICATE_VERIFY, &cv_body(&messages)));
@@ -914,7 +946,7 @@ impl ServerHandshake {
         // signs it verbatim).
         let cv_hash = transcript.current_hash();
         let sig_content = cert_verify_message(&cv_hash, false);
-        let cv = match super::server_sign(&self.identity, &sig_content)? {
+        let cv = match super::server_sign(&self.identity, &sig_content, ch.suite)? {
             Some((scheme, signature)) => {
                 let mut cv_body = Vec::new();
                 cv_body.extend_from_slice(&scheme.to_be_bytes());
@@ -982,19 +1014,21 @@ impl ServerHandshake {
 }
 
 /// Parsed ClientHello essentials.
-struct ClientHelloInfo {
-    suite: CipherSuite,
-    key_share: [u8; 32],
-    server_name: Option<String>,
+pub(crate) struct ClientHelloInfo {
+    pub(crate) suite: CipherSuite,
+    pub(crate) key_share: [u8; 32],
+    pub(crate) server_name: Option<String>,
     /// ALPN protocols offered by the client.
-    alpn: Vec<Vec<u8>>,
+    pub(crate) alpn: Vec<Vec<u8>>,
     /// The client's legacy_session_id (RFC 8446 §4.1.3: the server MUST
     /// echo it verbatim in the ServerHello, or a conforming client will
     /// abort with illegal_parameter).
-    session_id: Vec<u8>,
+    pub(crate) session_id: Vec<u8>,
+    /// QUIC transport parameters, when present.
+    pub(crate) transport_params: Option<Vec<u8>>,
 }
 
-fn parse_client_hello(body: &[u8]) -> TlsResult<ClientHelloInfo> {
+pub(crate) fn parse_client_hello(body: &[u8]) -> TlsResult<ClientHelloInfo> {
     let mut c = Cur::new(body);
     // legacy_version
     c.u16().ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
@@ -1031,6 +1065,7 @@ fn parse_client_hello(body: &[u8]) -> TlsResult<ClientHelloInfo> {
     let mut server_name = None;
     let mut client_alpn: Vec<Vec<u8>> = Vec::new();
     let mut saw_versions = false;
+    let mut transport_params = None;
     for e in exts {
         match e.ext_type {
             EXT_SUPPORTED_VERSIONS => {
@@ -1104,6 +1139,14 @@ fn parse_client_hello(body: &[u8]) -> TlsResult<ClientHelloInfo> {
                     }
                 }
             }
+            EXT_QUIC_TRANSPORT_PARAMETERS => {
+                if transport_params.is_some() {
+                    return Err(TlsError::Protocol(
+                        "duplicate QUIC transport parameters".into(),
+                    ));
+                }
+                transport_params = Some(e.content.to_vec());
+            }
             _ => {}
         }
     }
@@ -1122,6 +1165,7 @@ fn parse_client_hello(body: &[u8]) -> TlsResult<ClientHelloInfo> {
         session_id,
         server_name,
         alpn: client_alpn,
+        transport_params,
     })
 }
 
@@ -1132,6 +1176,18 @@ pub(crate) fn build_server_hello(
     key_share: &[u8; 32],
     suite: CipherSuite,
     session_id: &[u8],
+) -> Vec<u8> {
+    build_server_hello_with_transport_params(random, key_share, suite, session_id, None)
+}
+
+/// Build a ServerHello with an optional QUIC transport-parameters
+/// extension. The ordinary TLS path passes `None`.
+pub(crate) fn build_server_hello_with_transport_params(
+    random: &[u8; 32],
+    key_share: &[u8; 32],
+    suite: CipherSuite,
+    session_id: &[u8],
+    transport_params: Option<&[u8]>,
 ) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&[0x03, 0x03]);
@@ -1151,6 +1207,9 @@ pub(crate) fn build_server_hello(
     let mut versions = Vec::new();
     versions.extend_from_slice(&[0x03, 0x04]);
     exts.push((EXT_SUPPORTED_VERSIONS, versions));
+    if let Some(params) = transport_params {
+        exts.push((EXT_QUIC_TRANSPORT_PARAMETERS, params.to_vec()));
+    }
 
     let mut ext_bytes = Vec::new();
     for (t, c) in exts {

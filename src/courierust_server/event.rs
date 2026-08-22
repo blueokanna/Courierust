@@ -29,9 +29,11 @@ use crate::courierust_http::request::Request;
 use crate::courierust_http::response::Response;
 use crate::courierust_http::version::Version;
 use crate::courierust_net::poller::{fd_of, Fd, Poller, WAKE_ID};
+use crate::courierust_net::stats::Stats;
 use crate::courierust_server::{Handler, ServerConfig};
 use std::collections::{HashMap, HashSet};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread;
@@ -178,10 +180,13 @@ impl IncrRequest {
     /// into the buffer. Returns `Ok(true)` if any bytes were appended
     /// (the caller should keep parsing), `Ok(false)` if the socket would
     /// block with nothing new to parse.
-    fn fill(&mut self, socket: &TcpStream) -> Result<bool> {
+    fn fill(&mut self, socket: &TcpStream, reads: Option<&AtomicUsize>) -> Result<bool> {
         let mut tmp = [0u8; 8192];
         let mut got = false;
         loop {
+            if let Some(reads) = reads {
+                reads.fetch_add(1, Ordering::Relaxed);
+            }
             let mut r: &TcpStream = socket;
             match std::io::Read::read(&mut r, &mut tmp) {
                 Ok(0) => return Err(Error::eof()),
@@ -234,7 +239,11 @@ impl IncrRequest {
 
     /// Try to produce the next request. Reads from `socket` as needed
     /// (non-blocking); returns `Ok(None)` when more data is required.
-    pub(crate) fn next_request(&mut self, socket: &TcpStream) -> Result<Option<Request<Body>>> {
+    pub(crate) fn next_request(
+        &mut self,
+        socket: &TcpStream,
+        reads: Option<&AtomicUsize>,
+    ) -> Result<Option<Request<Body>>> {
         loop {
             if let Phase::Done = self.phase {
                 return Ok(Some(self.finish_request()?));
@@ -243,7 +252,7 @@ impl IncrRequest {
                 continue;
             }
             self.compact();
-            if !self.fill(socket)? {
+            if !self.fill(socket, reads)? {
                 return Ok(None);
             }
         }
@@ -454,16 +463,29 @@ struct EventConn {
     /// Write cursor into `out`.
     out_pos: usize,
     keep_alive: bool,
+    /// Transport read-call counter (h1 syscall evidence), when attached.
+    reads: Option<Arc<AtomicUsize>>,
+    /// Transport write-call counter (h1 syscall evidence), when attached.
+    writes: Option<Arc<AtomicUsize>>,
 }
 
 impl EventConn {
-    fn new(socket: TcpStream, body_limit: usize) -> Self {
+    fn new(socket: TcpStream, body_limit: usize, stats: Option<&Stats>) -> Self {
+        let (reads, writes) = match stats {
+            Some(s) => (
+                Some(s.h1_read_syscalls.clone()),
+                Some(s.h1_write_syscalls.clone()),
+            ),
+            None => (None, None),
+        };
         Self {
             socket: Arc::new(socket),
             reader: IncrRequest::new(body_limit),
             out: Vec::new(),
             out_pos: 0,
             keep_alive: true,
+            reads,
+            writes,
         }
     }
 
@@ -475,7 +497,10 @@ impl EventConn {
             if self.out_pos < self.out.len() {
                 return self.write_more();
             }
-            match self.reader.next_request(&self.socket)? {
+            match self
+                .reader
+                .next_request(&self.socket, self.reads.as_deref())?
+            {
                 Some(req) => {
                     let resp = handler.handle(req);
                     let (wire, keep_alive) = build_response(resp, config)?;
@@ -501,6 +526,9 @@ impl EventConn {
     /// Write pending output; returns the continuation.
     fn write_more(&mut self) -> Result<StepOutcome> {
         while self.out_pos < self.out.len() {
+            if let Some(writes) = &self.writes {
+                writes.fetch_add(1, Ordering::Relaxed);
+            }
             let mut w: &TcpStream = &self.socket;
             match std::io::Write::write(&mut w, &self.out[self.out_pos..]) {
                 Ok(0) => return Err(Error::eof()),
@@ -647,7 +675,7 @@ pub(crate) fn serve_event(
     // Event worker threads.
     let workers = if config.event_workers == 0 {
         std::thread::available_parallelism()
-            .map(|n| n.get())
+            .map(|n| n.get().clamp(1, 8))
             .unwrap_or(4)
     } else {
         config.event_workers
@@ -681,10 +709,11 @@ pub(crate) fn serve_event(
     // never stall the accept path.
     let a_msg_tx = msg_tx.clone();
     let a_wake = wake_writer.clone();
+    let a_stats = config.stats.clone();
     let accept_thread = thread::Builder::new()
         .name("courierust-accept".into())
         .spawn(move || {
-            accept_loop(listener, a_msg_tx, &a_wake);
+            accept_loop(listener, a_msg_tx, &a_wake, a_stats.as_deref());
         })?;
 
     let _ = accept_thread.join();
@@ -735,6 +764,7 @@ fn handle_msg(
     pending: &mut HashMap<usize, TcpStream>,
     activity: &mut HashMap<usize, Instant>,
     max_connections: usize,
+    stats: Option<&Stats>,
 ) {
     match msg {
         EventMsg::NewConn { id, stream } => {
@@ -752,6 +782,9 @@ fn handle_msg(
             if stream.set_nonblocking(true).is_err() {
                 return;
             }
+            if let Some(s) = stats {
+                s.connections_active.fetch_add(1, Ordering::Relaxed);
+            }
             let fd = fd_of(&stream);
             pending.insert(id, stream);
             activity.insert(id, Instant::now());
@@ -762,7 +795,11 @@ fn handle_msg(
             poller.register(id, fd, want_write);
         }
         EventMsg::Closed { id } => {
-            activity.remove(&id);
+            if activity.remove(&id).is_some() {
+                if let Some(s) = stats {
+                    Stats::decrement(&s.connections_active, 1);
+                }
+            }
         }
     }
 }
@@ -781,6 +818,8 @@ fn event_loop(
     let mut poller = Poller::new();
     let mut pending: HashMap<usize, TcpStream> = HashMap::new();
     let mut activity: HashMap<usize, Instant> = HashMap::new();
+    let stats = config.stats.clone();
+    let stats = stats.as_deref();
 
     let wake_fd = fd_of(&wake_reader);
     let poll_timeout = config.event_poll_timeout_ms.clamp(1, 1000) as i32;
@@ -788,18 +827,30 @@ fn event_loop(
 
     loop {
         // 1. Drain control messages (new connections / re-registrations /
-        //    closures).
+        //    closures). The depth of this drain is the control-queue
+        //    depth: how many control messages arrived while the loop was
+        //    busy (a herd of accepts/registers at once).
+        let mut drained = 0usize;
         loop {
             match msg_rx.try_recv() {
-                Ok(msg) => handle_msg(
-                    msg,
-                    &mut poller,
-                    &mut pending,
-                    &mut activity,
-                    config.max_connections,
-                ),
+                Ok(msg) => {
+                    drained += 1;
+                    handle_msg(
+                        msg,
+                        &mut poller,
+                        &mut pending,
+                        &mut activity,
+                        config.max_connections,
+                        stats,
+                    );
+                }
                 Err(TryRecvError::Disconnected) => return,
                 Err(TryRecvError::Empty) => break,
+            }
+        }
+        if drained > 0 {
+            if let Some(s) = stats {
+                Stats::bump_peak(&s.event_queue_depth_peak, drained);
             }
         }
 
@@ -816,6 +867,7 @@ fn event_loop(
                     &mut pending,
                     &mut activity,
                     config.max_connections,
+                    stats,
                 ),
                 Err(_) => return,
             }
@@ -847,23 +899,39 @@ fn event_loop(
             Ok(r) => r,
             Err(_) => continue,
         };
+        if let Some(s) = stats {
+            s.event_poll_syscalls.fetch_add(1, Ordering::Relaxed);
+        }
 
         // 4. A wake byte means a control message is queued. Drain the
         //    pipe (so it cannot fire spuriously) and the channel (so the
         //    message is applied before the next poll).
         if ready.contains(&WAKE_ID) {
+            if let Some(s) = stats {
+                s.event_wakeups.fetch_add(1, Ordering::Relaxed);
+            }
             drain_wake(&wake_reader);
+            let mut drained = 0usize;
             loop {
                 match msg_rx.try_recv() {
-                    Ok(msg) => handle_msg(
-                        msg,
-                        &mut poller,
-                        &mut pending,
-                        &mut activity,
-                        config.max_connections,
-                    ),
+                    Ok(msg) => {
+                        drained += 1;
+                        handle_msg(
+                            msg,
+                            &mut poller,
+                            &mut pending,
+                            &mut activity,
+                            config.max_connections,
+                            stats,
+                        );
+                    }
                     Err(TryRecvError::Disconnected) => return,
                     Err(TryRecvError::Empty) => break,
+                }
+            }
+            if drained > 0 {
+                if let Some(s) = stats {
+                    Stats::bump_peak(&s.event_queue_depth_peak, drained);
                 }
             }
         }
@@ -889,13 +957,20 @@ fn event_loop(
                         continue;
                     }
                     Err(_) => {
+                        // Peer error: the connection leaves the reactor.
                         activity.remove(&id);
+                        if let Some(s) = stats {
+                            Stats::decrement(&s.connections_active, 1);
+                        }
                         continue;
                     }
                 };
                 if n == 0 {
                     // Peer closed before sending anything.
                     activity.remove(&id);
+                    if let Some(s) = stats {
+                        Stats::decrement(&s.connections_active, 1);
+                    }
                     continue;
                 }
                 match classify(&prefix[..n]) {
@@ -908,6 +983,9 @@ fn event_loop(
                             let _ = crate::courierust_server::serve_accepted(stream, &*h, &c);
                         });
                         activity.remove(&id);
+                        if let Some(s) = stats {
+                            Stats::decrement(&s.connections_active, 1);
+                        }
                     }
                     Class::H2 => {
                         let _ = stream.set_nonblocking(false);
@@ -922,9 +1000,15 @@ fn event_loop(
                             );
                         });
                         activity.remove(&id);
+                        if let Some(s) = stats {
+                            Stats::decrement(&s.connections_active, 1);
+                        }
                     }
                     Class::H1 => {
-                        let conn = EventConn::new(stream, config.max_body);
+                        let conn = EventConn::new(stream, config.max_body, stats);
+                        if let Some(s) = stats {
+                            s.h1_connections.fetch_add(1, Ordering::Relaxed);
+                        }
                         registry.lock().unwrap().insert(id, conn);
                         to_dispatch.push(id);
                     }
@@ -935,6 +1019,9 @@ fn event_loop(
                     }
                     Class::Closed => {
                         activity.remove(&id);
+                        if let Some(s) = stats {
+                            Stats::decrement(&s.connections_active, 1);
+                        }
                     }
                 }
             } else {
@@ -968,7 +1055,11 @@ fn event_loop(
                 poller.unregister(id);
                 pending.remove(&id);
                 registry.lock().unwrap().remove(&id);
-                activity.remove(&id);
+                if activity.remove(&id).is_some() {
+                    if let Some(s) = stats {
+                        Stats::decrement(&s.connections_active, 1);
+                    }
+                }
             }
         }
     }
@@ -1029,10 +1120,14 @@ fn accept_loop(
     listener: std::net::TcpListener,
     msg_tx: Sender<EventMsg>,
     wake_writer: &Arc<TcpStream>,
+    stats: Option<&Stats>,
 ) {
     let mut next_id = 1usize;
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
+        if let Some(s) = stats {
+            s.connections_accepted.fetch_add(1, Ordering::Relaxed);
+        }
         let id = next_id;
         next_id += 1;
         let _ = msg_tx.send(EventMsg::NewConn { id, stream });

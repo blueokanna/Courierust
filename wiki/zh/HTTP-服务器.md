@@ -57,7 +57,7 @@ use std::time::Duration;
 let cfg = ServerConfig {
     // 同一端口同时服务 HTTP/2（前导知识）与 HTTP/1.1。
     http2: true,
-    // worker 线程数；0 = 逻辑核数。
+    // worker 线程数；0 = 有上限的自动设置（1-8）。
     threads: 0,
     read_timeout: Some(Duration::from_secs(120)),
     max_header_list: 1 << 20,
@@ -107,6 +107,8 @@ let handler = |_req: Request<Body>| -> Response<Body> {
 中途出错用 `tx.fail(err)` —— 连接会以 `INTERNAL_ERROR` 重置该流。
 
 ## 注意
+
+- 默认启用事件驱动连接路径。不完整或低速的明文 HTTP/1.1 连接会停放在轮询器中，不会一连接占用一个 worker。`max_connections` 默认是 1024，`0` 才是显式的无限制设置。`event_driven: false` 是旧版兼容模式，暴露到生产网络时必须配合有限的 `max_connections`。
 
 - 无响应体的 HTTP/1.1 响应会显式补 `Content-Length: 0`；长度未知时发 chunked。
 - 明文 HTTP/1.1 全平台默认走事件调度器：半截请求挂在轮询器上（零 worker），超过 `ServerConfig::idle_timeout` 的空转连接被回收，`max_connections` 封顶驻留连接数。TLS 与 HTTP/2 连接走阻塞池，由 `handshake_timeout` / `h2_idle_timeout` 约束。设 `event_driven: false` 恢复旧的每连接一池任务模型。

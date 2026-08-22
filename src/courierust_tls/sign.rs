@@ -5,8 +5,9 @@
 //! scheme. RSA uses PKCS#1 v1.5 or PSS; Ed25519 uses RFC 8032; ECDSA
 //! uses a deterministic RFC 6979 nonce.
 
-use super::crypto::hash::{Digest, Sha256};
+use super::crypto::hash::{Digest, Sha256, Sha384};
 use super::crypto::{ecdsa, ed25519, rsa};
+use super::key_schedule::{CipherSuite, SuiteHash};
 use super::x509::der::{expect_sequence, read_element};
 use super::{Identity, TlsError, TlsResult};
 use alloc::vec::Vec;
@@ -32,23 +33,32 @@ enum ParsedKey {
 pub(crate) fn sign_server_cert_verify(
     identity: &Identity,
     message: &[u8],
+    suite: CipherSuite,
 ) -> TlsResult<Option<(u16, Vec<u8>)>> {
     let key = parse_private_key(&identity.private_key)?;
     match key {
         ParsedKey::Rsa { n, d } => {
-            // Prefer RSA-PSS (rsa_pss_rsae_sha256) as required for
-            // modern interop; fall back to PKCS#1 v1.5 if PSS fails.
-            let mut h: super::crypto::hash::BoxDigest = Box::<Sha256>::default();
-            if let Some(sig) = rsa::sign_pss(h.as_mut(), &n, &d, message, 32) {
-                return Ok(Some((0x0804, sig)));
+            let (scheme_pss, scheme_pkcs1, salt_len, digest_info) = match suite.hash() {
+                SuiteHash::Sha256 => (0x0804, 0x0401, 32, rsa::DIGEST_INFO_SHA256),
+                SuiteHash::Sha384 => (0x0805, 0x0501, 48, rsa::DIGEST_INFO_SHA384),
+            };
+            let mut h: super::crypto::hash::BoxDigest = match suite.hash() {
+                SuiteHash::Sha256 => Box::<Sha256>::default(),
+                SuiteHash::Sha384 => Box::<Sha384>::default(),
+            };
+            if let Some(sig) = rsa::sign_pss(h.as_mut(), &n, &d, message, salt_len) {
+                return Ok(Some((scheme_pss, sig)));
             }
-            let mut h: super::crypto::hash::BoxDigest = Box::<Sha256>::default();
+            let mut h: super::crypto::hash::BoxDigest = match suite.hash() {
+                SuiteHash::Sha256 => Box::<Sha256>::default(),
+                SuiteHash::Sha384 => Box::<Sha384>::default(),
+            };
             let digest = {
                 h.update(message);
                 h.finalize()
             };
-            if let Some(sig) = rsa::sign_pkcs1v15(&n, &d, rsa::DIGEST_INFO_SHA256, &digest) {
-                return Ok(Some((0x0401, sig)));
+            if let Some(sig) = rsa::sign_pkcs1v15(&n, &d, digest_info, &digest) {
+                return Ok(Some((scheme_pkcs1, sig)));
             }
             Err(TlsError::Certificate("RSA signing failed".into()))
         }
@@ -57,7 +67,10 @@ pub(crate) fn sign_server_cert_verify(
             Ok(Some((0x0807, sig.to_vec())))
         }
         ParsedKey::EcP256 { d } => {
-            let mut h = Sha256::new();
+            let mut h: super::crypto::hash::BoxDigest = match suite.hash() {
+                SuiteHash::Sha256 => Box::<Sha256>::default(),
+                SuiteHash::Sha384 => Box::<Sha384>::default(),
+            };
             let digest = {
                 h.update(message);
                 let out = h.finalize();
@@ -68,7 +81,14 @@ pub(crate) fn sign_server_cert_verify(
             match ecdsa::sign(&d, &digest) {
                 Some((r, s)) => {
                     let der = encode_ecdsa_sig(&r, &s);
-                    Ok(Some((0x0403, der)))
+                    Ok(Some((
+                        if suite.hash() == SuiteHash::Sha256 {
+                            0x0403
+                        } else {
+                            0x0503
+                        },
+                        der,
+                    )))
                 }
                 None => Err(TlsError::Certificate("ECDSA signing failed".into())),
             }

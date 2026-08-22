@@ -26,10 +26,11 @@ pub mod crypto;
 pub mod x509;
 
 #[cfg(test)]
-mod testdata;
+pub(crate) mod testdata;
 
 mod handshake;
 mod key_schedule;
+pub(crate) mod quic;
 mod record;
 
 use alloc::string::String;
@@ -739,8 +740,9 @@ impl TlsAcceptor {
 pub(crate) fn server_sign(
     identity: &Identity,
     message: &[u8],
+    suite: key_schedule::CipherSuite,
 ) -> TlsResult<Option<(u16, Vec<u8>)>> {
-    sign::sign_server_cert_verify(identity, message)
+    sign::sign_server_cert_verify(identity, message, suite)
 }
 
 mod sign;

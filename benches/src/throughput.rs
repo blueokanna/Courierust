@@ -11,6 +11,7 @@ use courierust::courierust_bytes::Bytes;
 use courierust::courierust_client::{Client, ClientConfig};
 use courierust::courierust_http::request::Request;
 use courierust::courierust_http::response::Response;
+use courierust::courierust_net::stats::Stats;
 use courierust::courierust_server::{Server, ServerConfig};
 use courierust::courierust_tls as crate_tls;
 use metrics::{run_concurrent, run_sequential, Timing, MAX_SAMPLES};
@@ -51,12 +52,18 @@ fn payload_bytes(payload: Payload) -> Bytes {
     }
 }
 
-fn spawn_server(payload: Bytes, http2: bool, threads: usize) -> std::net::SocketAddr {
+fn spawn_server(
+    payload: Bytes,
+    http2: bool,
+    threads: usize,
+    stats: Option<std::sync::Arc<courierust::courierust_net::stats::Stats>>,
+) -> std::net::SocketAddr {
     let server = Server::bind_with_config(
         "127.0.0.1:0",
         ServerConfig {
             http2,
             threads,
+            stats,
             ..Default::default()
         },
     )
@@ -117,7 +124,7 @@ fn print_result(
 }
 
 fn bench_h1_sequential(payload: Payload, requests: usize, server_threads: usize) {
-    let address = spawn_server(payload_bytes(payload), false, server_threads);
+    let address = spawn_server(payload_bytes(payload), false, server_threads, None);
     let client = Client::new();
     let base_url = format!("http://{address}");
     courierust_get(&client, &base_url, "/bench", payload.bytes);
@@ -141,7 +148,7 @@ fn bench_h1_parallel(payload: Payload, requests: usize, workers: usize, server_t
     // one server worker. Keep enough workers for the client herd or the
     // sequential warm-up below can deadlock before measurement starts.
     let server_threads = server_threads.max(workers);
-    let address = spawn_server(payload_bytes(payload), false, server_threads);
+    let address = spawn_server(payload_bytes(payload), false, server_threads, None);
     let base_url = Arc::new(format!("http://{address}"));
     let clients = Arc::new((0..workers).map(|_| Client::new()).collect::<Vec<_>>());
 
@@ -165,12 +172,35 @@ fn bench_h1_parallel(payload: Payload, requests: usize, workers: usize, server_t
     );
 }
 
+/// Emit the reactor/connection/stream evidence collected for one case.
+fn print_stats(protocol: &str, case: &str, payload: Payload, workers: usize, stats: &Stats) {
+    println!(
+        "STATS|suite=throughput|protocol={protocol}|case={case}|payload={}|workers={workers}|{}",
+        payload.name,
+        stats.snapshot().render(),
+    );
+}
+
 fn bench_h2_multiplex(payload: Payload, requests: usize, workers: usize, server_threads: usize) {
-    let address = spawn_server(payload_bytes(payload), true, server_threads);
+    // Attach instrumentation to BOTH ends so the 32-worker case can be
+    // diagnosed from evidence: how many connections were really opened,
+    // how many streams ran on each, and how many read/write syscalls the
+    // transport performed. A 1-connection multiplex shows up here as
+    // `h2_connections=1` with `workers` concurrent streams — the
+    // single-driver serialization point behind the >8-worker regression.
+    let server_stats = Stats::new();
+    let client_stats = Stats::new();
+    let address = spawn_server(
+        payload_bytes(payload),
+        true,
+        server_threads,
+        Some(server_stats.clone()),
+    );
     let base_url = Arc::new(format!("http://{address}"));
     let client = Client::with_config(ClientConfig {
         http2: true,
         max_connections_per_host: 1,
+        stats: Some(client_stats.clone()),
         ..Default::default()
     });
     courierust_get(&client, &base_url, "/bench", payload.bytes);
@@ -189,6 +219,8 @@ fn bench_h2_multiplex(payload: Payload, requests: usize, workers: usize, server_
         server_threads,
         timing,
     );
+    print_stats("h2c", &format!("h2_multiplex_w{workers}"), payload, workers, &server_stats);
+    print_stats("h2c", &format!("h2_multiplex_w{workers}"), payload, workers, &client_stats);
 }
 
 /// Load the test identity (self-signed Ed25519, CN=localhost) and return
@@ -248,7 +280,7 @@ fn bench_https(requests: usize, payload: Payload, server_threads: usize) {
         http2: true,
         max_connections_per_host: 1,
         tls: Some(ClientTls {
-            roots,
+            roots: roots.clone(),
             verify: true,
             alpn: vec![b"h2".to_vec()],
             now,
@@ -270,6 +302,56 @@ fn bench_https(requests: usize, payload: Payload, server_threads: usize) {
         server_threads,
         timing,
     );
+    tls_verify_evidence(address, roots);
+}
+
+/// Emit the TLS verification evidence behind an HTTPS row: certificate
+/// and hostname validation both passed (otherwise the handshake would
+/// have failed), and the negotiated ALPN + cipher suite are reported as
+/// observed on the wire. `session_resumption` is `n/a` because the stack
+/// does not implement PSK/0-RTT/session tickets yet — reported, never
+/// assumed.
+fn tls_verify_evidence(address: std::net::SocketAddr, roots: crate_tls::RootStore) {
+    use courierust::courierust_tls::{ClientConfig as TlsClientConfig, TlsConnector};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let stream = std::net::TcpStream::connect(address);
+    let stream = match stream {
+        Ok(s) => s,
+        Err(e) => {
+            println!(
+                "TLSVERIFY|protocol=https+h2|cert_verified=false|hostname_verified=false|error=connect:{}",
+                e.to_string().replace('|', "/")
+            );
+            return;
+        }
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+    let connector = TlsConnector::new(TlsClientConfig {
+        roots,
+        verify: true,
+        alpn: vec![b"h2".to_vec()],
+        now,
+    });
+    match connector.connect("127.0.0.1", &stream, &stream) {
+        Ok(tls) => {
+            let negotiated = tls
+                .alpn()
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+                .unwrap_or_else(|| "none".to_string());
+            println!(
+                "TLSVERIFY|protocol=https+h2|cert_verified=true|hostname_verified=true|negotiated_alpn={negotiated}|session_resumption=n/a|cipher_suite=0x{:04x}",
+                tls.cipher_suite()
+            );
+        }
+        Err(e) => println!(
+            "TLSVERIFY|protocol=https+h2|cert_verified=false|hostname_verified=false|error={}",
+            e.to_string().replace('|', "/")
+        ),
+    }
 }
 
 fn main() {

@@ -360,6 +360,14 @@ impl<R: Read, W: Write> Connection<R, W> {
             && self.events.is_empty()
     }
 
+    /// Number of HTTP/2 streams that are not fully closed on this
+    /// connection. This is intentionally per-connection so instrumentation
+    /// can distinguish multiplexing from opening many parallel sockets.
+    #[inline]
+    pub fn open_stream_count(&self) -> usize {
+        self.streams.open_count()
+    }
+
     /// Pop the next event, if any.
     #[inline]
     pub fn next_event(&mut self) -> Option<Event> {

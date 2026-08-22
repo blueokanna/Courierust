@@ -149,6 +149,18 @@ fn run_idle_case(model: &'static str, idle: usize) {
     drop(herd);
 }
 
+/// The complete request header a slow connection trickles byte-by-byte.
+const SLOW_HEADER: &[u8] = b"GET /slow HTTP/1.1\r\nHost: benchmark\r\n\r\n";
+
+/// A genuinely slow sender: each connection delivers its request header
+/// one byte at a time with a real sleep between bytes, so the server must
+/// keep servicing a fast probe *while* `count` connections are
+/// mid-request. The previous version wrote the trailing CRLF all at once,
+/// so every "slow" connection finished in ~1 ms — it measured nothing.
+///
+/// The probe runs concurrently with the trickle; it must complete within
+/// `PROBE_TIMEOUT` or the event-driven scheduler is not actually keeping
+/// slow senders off the workers.
 fn run_slow_sender_case(count: usize) {
     let event_driven = true;
     let server = Server::bind_with_config(
@@ -166,19 +178,66 @@ fn run_slow_sender_case(count: usize) {
     let _handle = server
         .serve_background(handler)
         .expect("start slow sender server");
-    let mut herd = open_partial_herd(addr, count);
+
+    // Phase 1: open all connections and trickle their headers in
+    // parallel. Each byte is preceded by a real delay, so the connection
+    // is provably in the middle of a request while the probe runs.
+    let byte_delay = Duration::from_millis(
+        env_usize("COURIERUST_SLOW_BYTE_DELAY_MS", 10) as u64,
+    );
     let started = Instant::now();
+    let mut handles = Vec::with_capacity(count);
+    for index in 0..count {
+        let mut stream = TcpStream::connect(addr)
+            .unwrap_or_else(|e| panic!("connect slow connection {index}: {e}"));
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("set slow read timeout");
+        handles.push(std::thread::spawn(move || {
+            for &byte in SLOW_HEADER {
+                std::thread::sleep(byte_delay);
+                stream
+                    .write_all(&[byte])
+                    .unwrap_or_else(|e| panic!("slow trickle byte: {e}"));
+            }
+            read_full_response(&mut stream)
+        }));
+    }
+
+    // Phase 2: while every connection is still trickling (they cannot
+    // have finished: `count * SLOW_HEADER.len()` bytes remain after the
+    // first byte), a fast probe must complete promptly. This is the
+    // actual Slowloris-resistance assertion.
+    let probe_result = probe(addr);
+
+    // Phase 3: let the trickles finish and verify every slow sender gets
+    // its full response (the server did not stall or drop them).
     let mut completed = 0usize;
-    for stream in &mut herd {
-        if stream.write_all(b"\r\n").is_ok() && read_full_response(stream).is_ok() {
+    for handle in handles {
+        if handle.join().expect("slow sender thread panicked").is_ok() {
             completed += 1;
         }
     }
+    let probe_us = match &probe_result {
+        Ok(elapsed) => elapsed.as_secs_f64() * 1_000_000.0,
+        Err(_) => f64::NAN,
+    };
+    let probe_status = match probe_result {
+        Ok(_) => "probe_ok",
+        Err(error) => {
+            eprintln!("slow-sender herd blocked the fast path: {error}");
+            "probe_blocked"
+        }
+    };
     println!(
-        "CONCURRENCY|case=slow_sender_herd|model={}|platform={}|status={}|event_enabled={event_driven}|connections={count}|worker_threads=2|completed={completed}|wall_ms={:.2}",
-        if event_driven { "event" } else { "pool" },
+        "CONCURRENCY|case=slow_sender_herd|model=event|platform={}|status={}|event_enabled={event_driven}|connections={count}|worker_threads=2|completed={completed}|probe_status={probe_status}|probe_us={probe_us:.2}|byte_delay_us={}|wall_ms={:.2}",
         std::env::consts::OS,
-        if completed == count { "ok" } else { "partial" },
+        if completed == count && probe_status == "probe_ok" {
+            "ok"
+        } else {
+            "partial"
+        },
+        byte_delay.as_micros(),
         started.elapsed().as_secs_f64() * 1000.0,
     );
 }

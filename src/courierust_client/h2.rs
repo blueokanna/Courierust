@@ -14,6 +14,7 @@ use crate::courierust_http::header::{HeaderMap, HeaderName, HeaderValue};
 use crate::courierust_http::response::ResponseHead;
 use crate::courierust_http::status::StatusCode;
 use crate::courierust_http::version::Version;
+use crate::courierust_net::stats::{ActiveH2Streams, Counting, Stats};
 use crate::courierust_net::ConnStream;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -22,6 +23,10 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+/// An h2 driver connection wrapped in transport call counters (read /
+/// write syscall evidence), used whenever `ClientConfig::stats` is set.
+type DriverConn<'a> = Connection<Counting<&'a ConnStream>, Counting<&'a ConnStream>>;
 
 /// A response as delivered by the h2 driver, including trailers.
 pub struct H2Response {
@@ -131,10 +136,7 @@ const MAX_DEFERRED: usize = 1024;
 /// exhausted. A limit of 0 means unlimited (RFC 9113 §6.5.2). `pending`
 /// tracks every client-initiated stream whose response has not yet fully
 /// arrived, which is exactly the client's concurrent-stream count.
-fn stream_limit_reached(
-    conn: &Connection<&ConnStream, &ConnStream>,
-    pending: &HashMap<u32, Pending>,
-) -> bool {
+fn stream_limit_reached(conn: &DriverConn<'_>, pending: &HashMap<u32, Pending>) -> bool {
     let limit = conn.peer_settings().max_concurrent_streams as usize;
     limit != 0 && pending.len() >= limit
 }
@@ -169,9 +171,33 @@ fn start_inner(
     let accepting = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let accepting2 = accepting.clone();
     let reservations = Arc::new(AtomicUsize::new(0));
+    // Transport call counters: real ones when stats are attached, inert
+    // dummies otherwise (a relaxed atomic per read/write is far below
+    // the syscall cost it labels).
+    let (reads, writes) = match cfg.stats.as_deref() {
+        Some(s) => (s.h2_read_syscalls.clone(), s.h2_write_syscalls.clone()),
+        None => (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
+    };
+    if let Some(s) = cfg.stats.as_deref() {
+        s.h2_connections.fetch_add(1, Ordering::Relaxed);
+        s.h2_connections_active.fetch_add(1, Ordering::Relaxed);
+    }
+    let stats = cfg.stats.clone();
     thread::Builder::new()
         .name("courierust-h2-driver".into())
-        .spawn(move || driver(stream, rx, cfg, accepting2, seed, upgrade_reply))?;
+        .spawn(move || {
+            driver(
+                stream,
+                rx,
+                cfg,
+                accepting2,
+                seed,
+                upgrade_reply,
+                reads,
+                writes,
+                stats,
+            );
+        })?;
     Ok(H2Conn {
         tx,
         peer,
@@ -186,6 +212,17 @@ fn start_inner(
 /// bounds that stall; responses are still read the instant they arrive.
 const DRIVER_READ_TIMEOUT: Duration = Duration::from_millis(5);
 
+/// Decrements an h2 live-connection counter when the driver exits, on
+/// every path (RAII).
+struct ActiveGuard(Arc<AtomicUsize>);
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        Stats::decrement(&self.0, 1);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn driver(
     stream: ConnStream,
     rx: Receiver<H2Cmd>,
@@ -193,17 +230,33 @@ fn driver(
     accepting: Arc<AtomicBool>,
     seed: Vec<u8>,
     upgrade_reply: Option<Sender<Result<H2Response>>>,
+    reads: Arc<AtomicUsize>,
+    writes: Arc<AtomicUsize>,
+    stats: Option<Arc<Stats>>,
 ) {
     let _ = stream.configure(Some(DRIVER_READ_TIMEOUT));
+    let stats = stats.as_deref();
+    // Decrement the live-connection counter on every exit path (RAII).
+    let _active_guard = stats.map(|s| ActiveGuard(s.h2_connections_active.clone()));
     let mut conn = if seed.is_empty() {
-        Connection::new(&stream, &stream, h2_config(&cfg))
+        Connection::new(
+            Counting::new(&stream, reads.clone(), writes.clone()),
+            Counting::new(&stream, reads, writes),
+            h2_config(&cfg),
+        )
     } else {
-        Connection::new_with_seed(&stream, &stream, h2_config(&cfg), &seed)
+        Connection::new_with_seed(
+            Counting::new(&stream, reads.clone(), writes.clone()),
+            Counting::new(&stream, reads, writes),
+            h2_config(&cfg),
+            &seed,
+        )
     };
     let mut pending: HashMap<u32, Pending> = HashMap::new();
     let mut stream_bodies: HashMap<u32, StreamBody> = HashMap::new();
     let mut goaway = false;
     let mut deferred: VecDeque<H2Cmd> = VecDeque::new();
+    let mut stream_stats = ActiveH2Streams::new(stats);
 
     if let Some(reply) = upgrade_reply {
         if conn.register_upgrade_stream().is_ok() {
@@ -219,6 +272,9 @@ fn driver(
                     body_len: 0,
                 },
             );
+            if let Some(s) = stats {
+                s.h2_streams_total.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -237,6 +293,7 @@ fn driver(
             &mut stream_bodies,
             &mut goaway,
             &mut deferred,
+            stats,
         ) {
             cleanup(&mut conn, &mut pending, &mut stream_bodies);
             return;
@@ -251,11 +308,17 @@ fn driver(
                 &mut goaway,
                 &mut deferred,
                 cmd,
+                stats,
             ) {
                 cleanup(&mut conn, &mut pending, &mut stream_bodies);
                 return;
             }
         }
+
+        // Use the protocol stream table rather than the application pending
+        // map: a response body can already be delivered while its stream is
+        // still open and consuming flow-control credit.
+        stream_stats.set(conn.open_stream_count());
 
         let has_work =
             got_cmd || !deferred.is_empty() || !pending.is_empty() || !stream_bodies.is_empty();
@@ -283,6 +346,7 @@ fn driver(
                 &mut stream_bodies,
                 &mut goaway,
                 &mut deferred,
+                stats,
             ) {
                 cleanup(&mut conn, &mut pending, &mut stream_bodies);
                 return;
@@ -314,6 +378,7 @@ fn driver(
                         &mut goaway,
                         &mut deferred,
                         cmd,
+                        stats,
                     ) {
                         break;
                     }
@@ -342,6 +407,7 @@ fn driver(
                         &mut stream_bodies,
                         &mut goaway,
                         &mut deferred,
+                        stats,
                     ) {
                         break;
                     }
@@ -386,7 +452,7 @@ fn driver(
 /// Returns `false` when the driver should shut down.
 #[allow(clippy::too_many_arguments)]
 fn apply_liveness(
-    conn: &mut Connection<&ConnStream, &ConnStream>,
+    conn: &mut DriverConn<'_>,
     pending: &mut HashMap<u32, Pending>,
     accepting: &Arc<AtomicBool>,
     cfg: &ClientConfig,
@@ -453,12 +519,13 @@ fn apply_liveness(
 }
 
 fn handle_cmd(
-    conn: &mut Connection<&ConnStream, &ConnStream>,
+    conn: &mut DriverConn<'_>,
     pending: &mut HashMap<u32, Pending>,
     stream_bodies: &mut HashMap<u32, StreamBody>,
     goaway: &mut bool,
     deferred: &mut VecDeque<H2Cmd>,
     cmd: H2Cmd,
+    stats: Option<&Stats>,
 ) -> bool {
     match cmd {
         H2Cmd::Shutdown => {
@@ -495,6 +562,9 @@ fn handle_cmd(
             }
             match conn.open_request(priority) {
                 Ok(sid) => {
+                    if let Some(s) = stats {
+                        s.h2_streams_total.fetch_add(1, Ordering::Relaxed);
+                    }
                     let (body_tx, body_rx) = channel::<Result<Bytes>>();
                     let trailers = Arc::new(std::sync::Mutex::new(None));
                     let body_empty = body.is_none() && end_stream;
@@ -553,6 +623,9 @@ fn handle_cmd(
             }
             match conn.open_request(priority) {
                 Ok(sid) => {
+                    if let Some(s) = stats {
+                        s.h2_streams_total.fetch_add(1, Ordering::Relaxed);
+                    }
                     let (body_tx, body_rx) = channel::<Result<Bytes>>();
                     let trailers = Arc::new(std::sync::Mutex::new(None));
                     // Headers with END_STREAM clear; the body is streamed.
@@ -591,18 +664,19 @@ fn handle_cmd(
 /// budget was exhausted. Stops as soon as the budget is full again.
 /// Returns `false` if the driver must shut down.
 fn retry_deferred(
-    conn: &mut Connection<&ConnStream, &ConnStream>,
+    conn: &mut DriverConn<'_>,
     pending: &mut HashMap<u32, Pending>,
     stream_bodies: &mut HashMap<u32, StreamBody>,
     goaway: &mut bool,
     deferred: &mut VecDeque<H2Cmd>,
+    stats: Option<&Stats>,
 ) -> bool {
     while let Some(cmd) = deferred.pop_front() {
         if stream_limit_reached(conn, pending) {
             deferred.push_front(cmd);
             return true;
         }
-        if !handle_cmd(conn, pending, stream_bodies, goaway, deferred, cmd) {
+        if !handle_cmd(conn, pending, stream_bodies, goaway, deferred, cmd, stats) {
             return false;
         }
     }
@@ -612,10 +686,7 @@ fn retry_deferred(
 /// Feed streaming request-body chunks into the connection, respecting
 /// flow control. Chunks that cannot be queued yet are held for the next
 /// poll; a disconnected channel ends the stream.
-fn drain_stream_bodies(
-    conn: &mut Connection<&ConnStream, &ConnStream>,
-    bodies: &mut HashMap<u32, StreamBody>,
-) {
+fn drain_stream_bodies(conn: &mut DriverConn<'_>, bodies: &mut HashMap<u32, StreamBody>) {
     let mut done = Vec::new();
     for (&sid, b) in bodies.iter_mut() {
         if let Some(chunk) = b.pending_chunk.take() {
@@ -671,7 +742,7 @@ fn drain_stream_bodies(
 
 /// Drain and dispatch connection events to pending streams.
 fn drain_events(
-    conn: &mut Connection<&ConnStream, &ConnStream>,
+    conn: &mut DriverConn<'_>,
     pending: &mut HashMap<u32, Pending>,
     goaway: &mut bool,
     accepting: &Arc<AtomicBool>,
@@ -1044,7 +1115,7 @@ fn fail_all(pending: &mut HashMap<u32, Pending>, err: Error) {
 }
 
 fn cleanup(
-    _conn: &mut Connection<&ConnStream, &ConnStream>,
+    _conn: &mut DriverConn<'_>,
     pending: &mut HashMap<u32, Pending>,
     _bodies: &mut HashMap<u32, StreamBody>,
 ) {

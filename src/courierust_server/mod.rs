@@ -18,6 +18,7 @@ pub(crate) mod event;
 use crate::courierust_body::Body;
 use crate::courierust_http::request::Request;
 use crate::courierust_http::response::Response;
+use crate::courierust_net::stats::Stats;
 use crate::courierust_pool::ThreadPool;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
@@ -45,6 +46,9 @@ pub struct ServerConfig {
     pub max_body: usize,
     /// Serve HTTP/2 (prior knowledge) in addition to HTTP/1.1.
     pub http2: bool,
+    /// Enable HTTP/3 over QUIC on the same numeric port as the TCP listener.
+    /// Requires [`Self::tls`].
+    pub http3: bool,
     /// Number of worker threads.
     pub threads: usize,
     /// Optional TLS identity; when set, the server accepts HTTPS.
@@ -66,8 +70,9 @@ pub struct ServerConfig {
     /// request-latency path. Larger values cut idle wakeups; 0 falls back
     /// to the 50 ms default.
     pub event_poll_timeout_ms: u64,
-    /// Maximum number of concurrently open HTTP/1.1 connections the
-    /// event-driven scheduler will keep (0 = unlimited). New connections
+    /// Maximum number of concurrently open connections the server will keep.
+    /// The default is finite; `0` means unlimited and is intended only for
+    /// explicitly controlled deployments. New connections
     /// beyond this cap are closed immediately, bounding the file
     /// descriptors and parked slots a herd of idle / slow-loris clients
     /// can consume even before the idle timeout reaps them. This bounds
@@ -105,6 +110,11 @@ pub struct ServerConfig {
     /// the advertised window unless the application releases credit
     /// itself.
     pub auto_release_credit: bool,
+    /// Optional instrumentation: when set, the accept loop, event loop,
+    /// h1 workers and h2 connections update these counters (connection /
+    /// stream / reactor / syscall evidence for benchmarks). `None`
+    /// (default) disables the accounting entirely.
+    pub stats: Option<Arc<crate::courierust_net::stats::Stats>>,
 }
 
 impl Default for ServerConfig {
@@ -114,12 +124,13 @@ impl Default for ServerConfig {
             max_header_list: 1 << 20,
             max_body: 16 * 1024 * 1024,
             http2: true,
-            threads: 0, // 0 = auto (logical cores)
+            http3: false,
+            threads: 0, // 0 = bounded auto (up to eight workers)
             tls: None,
             event_driven: true,
             event_workers: 0,
             event_poll_timeout_ms: 50,
-            max_connections: 0,
+            max_connections: 1024,
             handshake_timeout: Some(Duration::from_secs(10)),
             idle_timeout: Some(Duration::from_secs(300)),
             h2_settings_timeout: Some(Duration::from_secs(10)),
@@ -128,6 +139,7 @@ impl Default for ServerConfig {
             h2_idle_timeout: Some(Duration::from_secs(300)),
             h2_max_concurrent_streams: 1024,
             auto_release_credit: true,
+            stats: None,
         }
     }
 }
@@ -161,7 +173,8 @@ impl Server {
         Ok(Self {
             listener,
             pool: Arc::new(
-                ThreadPool::new().unwrap_or_else(|_| ThreadPool::with_size(2).expect("pool")),
+                ThreadPool::with_size(recommended_workers())
+                    .unwrap_or_else(|_| ThreadPool::with_size(2).expect("pool")),
             ),
             config: ServerConfig::default(),
         })
@@ -174,9 +187,7 @@ impl Server {
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
         let size = if config.threads == 0 {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
+            recommended_workers()
         } else {
             config.threads
         };
@@ -205,16 +216,55 @@ impl Server {
         let handler = Arc::new(handler);
         let config = self.config;
         let pool = self.pool;
+        let _http3 = if config.http3 {
+            let tls = config.tls.as_ref().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "ServerConfig.http3 requires a TLS identity",
+                )
+            })?;
+            Some(crate::courierust_h3::runtime::spawn_server(
+                self.listener.local_addr()?,
+                tls,
+                handler.clone(),
+                config.clone(),
+            )?)
+        } else {
+            None
+        };
         if config.event_driven {
             return event::serve_event(self.listener, handler, config, pool);
         }
+        // Legacy pool model (event_driven = false): bound the number of
+        // concurrently open connections with `max_connections`, so even
+        // this deprecated path cannot be exhausted by a herd of idle /
+        // slow clients. The default event path is the supported one.
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         for stream in self.listener.incoming() {
             match stream {
                 Ok(stream) => {
+                    if let Some(s) = config.stats.as_deref() {
+                        s.connections_accepted
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if !try_reserve(&active, config.max_connections) {
+                        drop(stream);
+                        continue;
+                    }
                     let h = handler.clone();
                     let c = config.clone();
                     let p = pool.clone();
+                    let active = active.clone();
+                    if let Some(s) = config.stats.as_deref() {
+                        s.connections_active
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let permit = ConnectionPermit {
+                        active: active.clone(),
+                        stats: config.stats.clone(),
+                    };
                     p.spawn(move || {
+                        let _permit = permit;
                         // TLS handshakes (blocking) also run on the pool.
                         let _ = serve_accepted(stream, h.as_ref(), &c);
                     });
@@ -235,6 +285,52 @@ impl Server {
                 let _ = tx.send(res);
             })?;
         Ok(ServerHandle { done: rx })
+    }
+}
+
+fn recommended_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().clamp(1, 8))
+        .unwrap_or(4)
+}
+
+fn try_reserve(active: &std::sync::atomic::AtomicUsize, limit: usize) -> bool {
+    if limit == 0 {
+        active.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        return true;
+    }
+    let mut current = active.load(std::sync::atomic::Ordering::Acquire);
+    loop {
+        if current >= limit {
+            return false;
+        }
+        match active.compare_exchange_weak(
+            current,
+            current + 1,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// Own one legacy pool connection permit until the job exits. The pool
+/// catches panics at its worker boundary, so a decrement placed after the
+/// connection handler would be skipped on a panic and permanently consume
+/// the configured connection limit.
+struct ConnectionPermit {
+    active: Arc<std::sync::atomic::AtomicUsize>,
+    stats: Option<Arc<Stats>>,
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        Stats::decrement(&self.active, 1);
+        if let Some(stats) = self.stats.as_deref() {
+            Stats::decrement(&stats.connections_active, 1);
+        }
     }
 }
 

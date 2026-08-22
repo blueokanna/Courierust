@@ -282,9 +282,19 @@ impl KeySchedule {
         TrafficKeys::from_secret(self.suite, &self.c_ap)
     }
 
+    /// Raw client application traffic secret for QUIC packet protection.
+    pub(crate) fn client_application_secret(&self) -> &[u8] {
+        &self.c_ap
+    }
+
     /// Derive the server application AEAD keys.
     pub(crate) fn server_application_keys(&self) -> TrafficKeys {
         TrafficKeys::from_secret(self.suite, &self.s_ap)
+    }
+
+    /// Raw server application traffic secret for QUIC packet protection.
+    pub(crate) fn server_application_secret(&self) -> &[u8] {
+        &self.s_ap
     }
 
     /// The `finished_key` for a traffic secret (RFC 8446 §4.4.4).

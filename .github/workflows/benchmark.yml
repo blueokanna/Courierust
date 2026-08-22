@@ -109,6 +109,11 @@ jobs:
           : > fuzz.log
           rustup toolchain install nightly --profile minimal
           cargo +nightly install cargo-fuzz --locked
+          # PR-time smoke fuzz: each target gets a short wall-clock budget
+          # (20 s) rather than a fixed run count. It is a smoke check for
+          # gross crashes, not deep state-machine exploration — the
+          # long-running workflow (fuzz-long.yml) spends 30-120 minutes
+          # per target on the nightly schedule.
           # h2_frame / hpack_block: legacy targets. h1_request: the
           # shared HTTP/1 request path (request line, headers, chunked
           # framing) that both the blocking and event-driven parsers use.
@@ -116,7 +121,7 @@ jobs:
           # frame streams (client and server roles).
           for target in h2_frame hpack_block h1_request h2_connection; do
             started=$(date +%s)
-            cargo +nightly fuzz run --fuzz-dir fuzz "$target" -- -runs=20000 -max_len=16384 >> fuzz.log 2>&1
+            cargo +nightly fuzz run --fuzz-dir fuzz "$target" -- -max_total_time=20 -max_len=16384 -timeout=10 -rss_limit_mb=2048 >> fuzz.log 2>&1
             command_status=$?
             duration=$(( $(date +%s) - started ))
             if [[ "$command_status" -eq 0 ]]; then
@@ -125,7 +130,7 @@ jobs:
               status=failed
               fuzz_failed=1
             fi
-            printf 'FUZZ|target=%s|status=%s|runs=20000|duration_s=%s|corpus=fuzz/corpus/%s|reason=command_exit_%s\n' \
+            printf 'FUZZ|target=%s|status=%s|runs=smoke|duration_s=%s|corpus=fuzz/corpus/%s|reason=command_exit_%s\n' \
               "$target" "$status" "$duration" "$target" "$command_status" >> fuzz.log
           done
           cat fuzz.log

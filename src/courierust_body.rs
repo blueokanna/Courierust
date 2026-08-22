@@ -59,13 +59,26 @@ impl Body {
 
     /// Collect a channel body into a single [`Bytes`].
     pub fn collect(self) -> Result<Bytes> {
+        self.collect_limited(usize::MAX)
+    }
+
+    /// Collect a channel body while enforcing a hard byte limit.
+    ///
+    /// The limit is checked before each allocation/copy. This matters for
+    /// channel-backed bodies because their total size is otherwise unknown
+    /// and a producer can keep sending indefinitely.
+    pub fn collect_limited(self, max: usize) -> Result<Bytes> {
         match self {
             Self::Empty => Ok(Bytes::new()),
-            Self::Bytes(b) => Ok(b),
+            Self::Bytes(b) if b.len() <= max => Ok(b),
+            Self::Bytes(_) => Err(Error::overflow("body exceeds configured limit")),
             Self::Channel(rx) => {
                 let mut out = Vec::new();
                 while let Ok(chunk) = rx.recv() {
                     let b = chunk?;
+                    if b.len() > max.saturating_sub(out.len()) {
+                        return Err(Error::overflow("body exceeds configured limit"));
+                    }
                     out.extend_from_slice(&b);
                 }
                 Ok(Bytes::from(out))

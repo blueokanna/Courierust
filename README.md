@@ -233,13 +233,13 @@ Building with `--no-default-features` compiles only the protocol core, suitable 
 
 Things this crate deliberately does not do:
 
-- **No HTTP/3 / QUIC.** No external deps means no usable QUIC implementation (and QUIC needs a userspace UDP stack plus TLS 1.3; the TLS half exists, the transport does not).
-- **TLS: no PSK / 0-RTT resumption / session tickets / key update yet, and no mutual TLS.** A full 1-RTT handshake happens every time; NewSessionTicket from a peer is ignored; the server does not request client certificates.
-- **Event-driven server is default on every platform and HTTP/1.1-only.** `ServerConfig::event_driven` (default `true`) parks idle plain-HTTP connections on a readiness poller so a small worker pool serves many idle keep-alive / SSE / long-poll connections; TLS and HTTP/2 connections still use the blocking pool model (bounded by `handshake_timeout`, `h2_idle_timeout`, and worker count). Setting it to `false` restores the legacy one-pool-job-per-connection model for comparison and debugging.
+- **HTTP/3 / QUIC has a dependency-free built-in path, with a declared protocol boundary.** `courierust_h3` runs HTTP/3 request/response over a std UDP reactor with QUIC v1 packet protection, the built-in TLS 1.3 adapter, ALPN `h3`, bounded CRYPTO/stream reassembly, Retry integrity and token-bound address validation, Version Negotiation, pre-validation 3x anti-amplification, ACK ranges, fresh-packet-number retransmission, RTT/RTO sampling, a bounded congestion window, control/QPACK streams, trailers, and GOAWAY validation. It is not yet a complete Internet QUIC implementation: full PTO/time-threshold loss recovery, dynamic local `MAX_DATA`/`MAX_STREAM_DATA` credit updates, connection migration/path validation, stateless reset, 0-RTT/session tickets, automatic and bidirectional key update, QPACK blocked-stream acknowledgements, and independent implementation interoperability still require implementation and dedicated evidence. Do not advertise this path as universally interoperable until those gaps are closed.
+- **TLS: no PSK / 0-RTT resumption / session tickets / key update yet, and no mutual TLS.** A full 1-RTT handshake happens every time; NewSessionTicket from a peer is ignored; the server does not request client certificates. Benchmark TLS rows therefore report `session_resumption=n/a` rather than assuming it.
+- **Event-driven server is default on every platform and HTTP/1.1-only.** `ServerConfig::event_driven` (default `true`) parks idle plain-HTTP connections on a readiness poller so a small worker pool serves many idle keep-alive / SSE / long-poll connections; TLS and HTTP/2 connections still use the blocking pool model (bounded by `handshake_timeout`, `h2_idle_timeout`, and worker count). Setting it to `false` restores the legacy **one-pool-job-per-connection** model; that path is deprecated for production use — it lets a herd of idle/slow connections exhaust the pool — and exists only for comparison and debugging. The default event path bounds resource use with `max_connections` (connection cap) and `idle_timeout`.
 - **Streaming request bodies are only reliable over HTTP/2** (h2 frames naturally). Over HTTP/1.1, either send the whole body at once (`Body::Bytes`) or build chunked framing yourself.
 - **gRPC does not include protobuf, `.proto` code generation, or `grpc.reflection`.** You implement the codec traits or wire in your own protobuf-generated code; reflection needs a protobuf schema inventory, which is external by design.
 - **A synchronous handler that blocks for a long time holds a worker** (event-driven or not) — exactly as with any synchronous server; use channel response bodies for streaming. Worker occupancy is **per-connection, not per-stream**: on one HTTP/2 connection, any number of idle streams (SSE / long-poll / gRPC server-streaming) occupy the same single worker, and a slow stream never blocks its connection's other streams — both are covered by integration tests. A large herd of *connections* is handled by the event scheduler (idle reaping + `max_connections`) rather than by adding workers.
-- **HTTPS is first-class**: the client and server ship a from-scratch TLS 1.3 implementation; `https://` needs a root store (supply your own — there is no bundled CA set). ALPN is enforced: a client configured for h2 speaking to a server that negotiates `http/1.1` (or vice versa) fails with a clear error instead of a silent protocol mismatch.
+- **HTTPS is first-class**: the client and server ship a from-scratch TLS 1.3 implementation; `https://` needs a root store (supply your own — there is no bundled CA set). ALPN is enforced: a client configured for h2 speaking to a server that negotiates `http/1.1` — or that negotiates **no** ALPN at all — fails with a clear error instead of a silent protocol mismatch (RFC 9113 §3.3 requires ALPN `h2` over TLS).
 - Redirects, keep-alive reuse, and friends prioritize correctness over aggressive tuning.
 
 ## Layout
@@ -253,6 +253,8 @@ src/
 ├── courierust_http/        # HTTP/1.1 message model (request/response/headers/URI/status)  [no_std]
 ├── courierust_hpack/       # HPACK: table-driven Huffman + static/dynamic index tables      [no_std]
 ├── courierust_h2/          # HTTP/2 frames, SETTINGS, stream state machine, flow control, WUCS, PRIORITY_UPDATE  [no_std]
+├── courierust_quic/        # QUIC v1 packet/frame codecs, varint, connection ids, crypto tags [no_std]
+├── courierust_h3/          # HTTP/3: QPACK static/dynamic tables + H3 framing/stream roles   [no_std]
 ├── courierust_fingerprint/ # JA3 / JA4 / Chrome HTTP/2 fingerprints                        [no_std]
 ├── courierust_crypto/      # self-contained MD5 / SHA-256 (used by fingerprints)            [no_std]
 ├── courierust_bytes/       # byte buffers (BytesMut)                                        [no_std]
@@ -260,7 +262,7 @@ src/
 ├── courierust_error/       # unified error type
 ├── courierust_tls/         # TLS 1.3 (RFC 8446): handshake, record layer, X.509, HTTPS       [std]
 ├── courierust_pool/        # work-stealing thread pool                                      [std]
-├── courierust_net/         # TCP → io trait adapters                                        [std]
+├── courierust_net/         # TCP → io trait adapters, poller, optional stats instrumentation  [std]
 ├── courierust_body/        # streaming response bodies (channel)                            [std]
 ├── courierust_h1/          # HTTP/1.1 on-the-wire codec                                      [std]
 ├── courierust_client/      # h1 pool + h2 driver                                            [std]
@@ -278,18 +280,20 @@ The `benches/` package is a self-contained suite (no `criterion` required) that 
 - RFC 9218 priority scheduling;
 - a concurrency model comparison (idle-connection herd vs. worker pool) and a slow-sender herd benchmark.
 
-The benchmark workflow also records TLS end-to-end results, optional remote-host results from the `network` bench, and `cargo-fuzz` parser runs. The repository keeps the generated [Github_Action_Benchmark.md](Github_Action_Benchmark.md) report. Rows marked `invalid` remain in the raw evidence but are excluded from performance conclusions; in particular, Reqwest blocking + h2c + 64 KiB is invalid because its fixed ~41 ms wait is a harness/configuration anomaly.
+The benchmark workflow also records TLS end-to-end results (with a `TLSVERIFY` evidence row: `cert_verified`, `hostname_verified`, `negotiated_alpn`, `session_resumption`), reactor/connection/stream evidence (`STATS` rows: accepted/active connections, poll syscalls, wake-ups, event-queue depth, h2 streams, read/write syscalls), optional remote-host results from the `network` bench (including TLS and in-process rate-limiting scenarios), and `cargo-fuzz` parser runs. The repository keeps the generated [Github_Action_Benchmark.md](Github_Action_Benchmark.md) report.
 
 ```bash
 cargo bench --manifest-path benches/Cargo.toml --bench throughput
 cargo bench --manifest-path benches/Cargo.toml --bench concurrency
 cargo bench --manifest-path benches/Cargo.toml --bench network
-cargo fuzz run h2_frame --fuzz-dir fuzz -- -runs=10000
+cargo fuzz run h2_frame --fuzz-dir fuzz -- -max_total_time=20
 ```
 
 Every `RESULT|...` line carries `p50_us` … `p99_us`, and the report script (`scripts/generate_benchmark_report.sh`) turns them into a percentile table. These are loopback measurements; WAN / TLS / real-handler numbers depend on your deployment, which is exactly why the suite reports the full tail rather than a single mean.
 
-The h2c client data is workload-specific, not a claim of universal leadership. The 1 KiB single-worker result is only a small comparison point; multi-worker results must be read with their connection policy and tail latency. The anomalous Reqwest 64 KiB h2c rows are invalid evidence and must not be used to claim a large Courierust advantage.
+The h2c client data is workload-specific, not a claim of universal leadership. The 1 KiB single-worker result is only a small comparison point; multi-worker results must be read with their connection policy and tail latency. The Reqwest HTTP/2 baseline uses the **async** client — the blocking client's fixed ~41 ms wait on h2c large bodies was a harness artifact, so it is not used as performance evidence.
+
+**Worker-count guidance (measured, see the `STATS` rows):** HTTP/2 multiplexing sends all streams over one connection serviced by one driver thread. With `max_connections_per_host = 1`, throughput scales with workers up to ~4–8 and then *regresses*: 32 workers contend on the shared pool lock and the single driver's command channel faster than the driver can drain them. The `STATS` rows show `h2_connections=1` with `workers` concurrent streams — the serialization point. Prefer 4–8 client workers per h2 connection and scale connections, not workers, beyond that.
 
 ## Interop evidence
 

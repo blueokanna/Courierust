@@ -21,10 +21,12 @@
 
 use courierust::courierust_body::Body;
 use courierust::courierust_bytes::Bytes;
-use courierust::courierust_client::{Client, ClientConfig};
+use courierust::courierust_client::{Client, ClientConfig, TlsSettings as ClientTls};
+use courierust::courierust_http::header::{HeaderName, HeaderValue};
+use courierust::courierust_http::method::Method;
 use courierust::courierust_http::request::Request;
 use courierust::courierust_http::response::Response;
-use courierust::courierust_server::{Server, ServerConfig};
+use courierust::courierust_server::{Server, ServerConfig, TlsSettings as ServerTls};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -163,6 +165,83 @@ fn courierust_client(http2: bool) -> Client {
         ..Default::default()
     };
     Client::with_config(cfg)
+}
+
+// ---------------------------------------------------------------------------
+// TLS helpers (self-signed identity, CN=localhost, SAN DNS:localhost +
+// IP:127.0.0.1)
+// ---------------------------------------------------------------------------
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn load_test_identity() -> (courierust::courierust_tls::Identity, courierust::courierust_tls::RootStore) {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let cert_path = std::path::Path::new(&manifest).join("../tests/certs/server_cert.der");
+    let key_path = std::path::Path::new(&manifest).join("../tests/certs/server_key.der");
+    let cert = std::fs::read(&cert_path).unwrap_or_else(|e| panic!("read {}: {e}", cert_path.display()));
+    let key = std::fs::read(&key_path).unwrap_or_else(|e| panic!("read {}: {e}", key_path.display()));
+    let identity = courierust::courierust_tls::Identity {
+        cert_chain: vec![cert.clone()],
+        private_key: key,
+        is_rsa: false,
+    };
+    let mut roots = courierust::courierust_tls::RootStore::new();
+    roots.add_der(cert);
+    (identity, roots)
+}
+
+/// A Courierust HTTPS server echoing the request path; `alpn` is offered
+/// verbatim (so a test can force an h1-only or h2-only server).
+fn courierust_tls_server(alpn: Vec<Vec<u8>>) -> std::net::SocketAddr {
+    let (identity, _) = load_test_identity();
+    let http2 = alpn.iter().any(|p| p == b"h2");
+    let server = Server::bind_with_config(
+        "127.0.0.1:0",
+        ServerConfig {
+            http2,
+            tls: Some(ServerTls { identity, alpn }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let addr = server.local_addr().unwrap();
+    let handle = server
+        .serve_background(|req: Request<Body>| -> Response<Body> {
+            let path = req.uri.as_str().to_string();
+            let mut resp = Response::with_status(200.into());
+            resp.body = Body::Bytes(Bytes::from(path.into_bytes()));
+            resp
+        })
+        .unwrap();
+    std::mem::forget(handle);
+    addr
+}
+
+/// A Courierust HTTPS client. `verify` toggles certificate/hostname
+/// validation; `alpn` is offered verbatim.
+fn courierust_tls_client(
+    http2: bool,
+    roots: courierust::courierust_tls::RootStore,
+    verify: bool,
+    alpn: Vec<Vec<u8>>,
+) -> Client {
+    Client::with_config(ClientConfig {
+        http2,
+        max_connections_per_host: 1,
+        connect_timeout: Some(Duration::from_secs(3)),
+        tls: Some(ClientTls {
+            roots,
+            verify,
+            alpn,
+            now: unix_now(),
+        }),
+        ..Default::default()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +530,239 @@ fn courierust_h1_slow_reader_to_hyper_h1() {
     assert_eq!(&body[..], &big[..], "slow body echo");
 }
 
+// ---------------------------------------------------------------------------
+// TLS / ALPN / connection-lifecycle interop cases
+// ---------------------------------------------------------------------------
+
+/// A self-signed server certificate that the client does not trust must
+/// be rejected at the handshake (failed-cert case).
+fn tls_rejects_untrusted_certificate() {
+    let addr = courierust_tls_server(vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+    // Empty trust store + verify=true: nothing is trusted.
+    let client = courierust_tls_client(
+        true,
+        courierust::courierust_tls::RootStore::new(),
+        true,
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+    );
+    let err = client
+        .get(&format!("https://{addr}/untrusted"))
+        .map(|_| ())
+        .expect_err("untrusted self-signed certificate must be rejected");
+    assert!(
+        !err.to_string().is_empty(),
+        "rejection error must carry a message"
+    );
+    println!(
+        "TLSVERIFY|case=failed_certificate|protocol=https+h2|cert_verified=false|hostname_verified=not_evaluated|negotiated_alpn=none|session_resumption=n/a|error={}",
+        err.to_string().replace('|', "/")
+    );
+}
+
+/// A certificate valid but issued for `localhost` / `127.0.0.1` must be
+/// rejected when the peer's hostname does not match (hostname-mismatch
+/// case, RFC 6125).
+fn tls_rejects_hostname_mismatch() {
+    let addr = courierust_tls_server(vec![b"http/1.1".to_vec()]);
+    let (_, roots) = load_test_identity();
+    let stream = std::net::TcpStream::connect(addr).expect("tcp connect for hostname test");
+    let connector = courierust::courierust_tls::TlsConnector::new(
+        courierust::courierust_tls::ClientConfig {
+            roots,
+            verify: true,
+            alpn: vec![b"http/1.1".to_vec()],
+            now: unix_now(),
+        },
+    );
+    let err = connector
+        .connect("not-localhost.invalid", &stream, &stream)
+        .map(|_| ())
+        .expect_err("hostname mismatch must be rejected");
+    assert!(
+        !err.to_string().is_empty(),
+        "hostname rejection must carry a message"
+    );
+    println!(
+        "TLSVERIFY|case=hostname_mismatch|protocol=https+h1|cert_verified=true|hostname_verified=false|negotiated_alpn=none|session_resumption=n/a|error={}",
+        err.to_string().replace('|', "/")
+    );
+}
+
+/// A client that only offers `http/1.1` must negotiate it (ALPN
+/// downgrade) and complete the request over HTTP/1.1.
+fn tls_alpn_downgrade_to_h1() {
+    let addr = courierust_tls_server(vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+    let (_, roots) = load_test_identity();
+    let client = courierust_tls_client(false, roots, true, vec![b"http/1.1".to_vec()]);
+    let resp = client
+        .get(&format!("https://{addr}/downgrade"))
+        .expect("http/1.1 over TLS must succeed");
+    assert_eq!(resp.status.as_u16(), 200, "downgrade status");
+    assert_eq!(
+        resp.body.collect().unwrap().as_ref(),
+        b"/downgrade",
+        "downgrade path echo"
+    );
+    println!(
+        "TLSVERIFY|case=alpn_downgrade|protocol=https+h1|cert_verified=true|hostname_verified=true|negotiated_alpn=http/1.1|session_resumption=n/a|error=-"
+    );
+}
+
+/// A client configured for HTTP/2 against a server that does not offer
+/// h2 must fail (ALPN rejection) instead of silently speaking h2.
+fn tls_h2_alpn_rejected() {
+    let addr = courierust_tls_server(vec![b"http/1.1".to_vec()]);
+    let (_, roots) = load_test_identity();
+    let client = courierust_tls_client(true, roots, true, vec![b"h2".to_vec()]);
+    let err = client
+        .get(&format!("https://{addr}/h2"))
+        .map(|_| ())
+        .expect_err("h2 over an http/1.1-only server must fail");
+    assert!(
+        !err.to_string().is_empty(),
+        "ALPN rejection must carry a message"
+    );
+    println!(
+        "TLSVERIFY|case=alpn_rejected|protocol=https+h2|cert_verified=not_evaluated|hostname_verified=not_evaluated|negotiated_alpn=none|session_resumption=n/a|error={}",
+        err.to_string().replace('|', "/")
+    );
+}
+
+/// `Connection: close` must be honored: the server closes the connection
+/// after the response and the client still reads it completely; a later
+/// request on the same client works on a fresh connection.
+fn h1_connection_close_honored() {
+    let addr = courierust_server(false);
+    let client = courierust_client(false);
+    let mut req = Request::new(Method::GET, "/close");
+    req.headers.insert(
+        HeaderName::from_lowercase("connection"),
+        HeaderValue::from_static("close"),
+    );
+    let resp = client
+        .execute(&format!("http://{addr}/close"), req)
+        .expect("connection-close request must complete");
+    assert_eq!(resp.status.as_u16(), 200, "close request status");
+    assert_eq!(resp.body.collect().unwrap().as_ref(), b"/close");
+
+    let resp = client
+        .get(&format!("http://{addr}/after-close"))
+        .expect("client must recover on a fresh connection");
+    assert_eq!(
+        resp.body.collect().unwrap().as_ref(),
+        b"/after-close",
+        "post-close request"
+    );
+}
+
+/// A hyper h2 server that can be told to send GOAWAY (graceful shutdown)
+/// on demand. Returns the address and a shutdown signal.
+fn hyper_h2_server_graceful() -> (std::net::SocketAddr, tokio::sync::watch::Sender<bool>) {
+    use http_body_util::Full;
+    use hyper::body::{Bytes as HBytes, Incoming};
+    use hyper::service::service_fn;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder as AutoBuilder;
+    use std::convert::Infallible;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let listener = rt
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    std::thread::spawn(move || {
+        rt.block_on(async move {
+            let builder = AutoBuilder::new(TokioExecutor::new()).http2_only();
+            // The connection task polls the hyper connection to
+            // completion; on the shutdown signal it drives a graceful
+            // shutdown (GOAWAY) and waits for it to flush.
+            let mut spawned: Option<tokio::task::JoinHandle<()>> = None;
+            let mut rx_outer = shutdown_rx.clone();
+            loop {
+                tokio::select! {
+                    _ = rx_outer.changed() => break,
+                    accepted = listener.accept() => {
+                        if let Ok((stream, _)) = accepted {
+                            if spawned.is_none() {
+                                let rx = shutdown_rx.clone();
+                                let svc = service_fn(
+                                    |_req: hyper::Request<Incoming>| async move {
+                                        Ok::<_, Infallible>(hyper::Response::new(Full::new(
+                                            HBytes::from_static(b"ok"),
+                                        )))
+                                    },
+                                );
+                                let conn = builder
+                                    .serve_connection(TokioIo::new(stream), svc)
+                                    .into_owned();
+                                spawned = Some(tokio::spawn(async move {
+                                    let mut conn = Box::pin(conn);
+                                    let mut rx = rx;
+                                    tokio::select! {
+                                        _ = conn.as_mut() => {}
+                                        _ = rx.changed() => {
+                                            conn.as_mut().graceful_shutdown();
+                                            let _ = conn.await;
+                                        }
+                                    }
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+            // Let the connection task finish flushing the GOAWAY before
+            // the runtime is dropped.
+            if let Some(handle) = spawned {
+                let _ = handle.await;
+            }
+        });
+    });
+    (addr, shutdown_tx)
+}
+
+/// A peer GOAWAY must make the old connection unusable (fast failure,
+/// not a hang) and must not poison the client for fresh connections.
+fn courierust_h2_client_survives_peer_goaway() {
+    let (addr, shutdown_tx) = hyper_h2_server_graceful();
+    let client = courierust_client(true);
+    let base = format!("http://{addr}/goaway");
+
+    let resp = client
+        .get(&base)
+        .map_err(|e| format!("request before GOAWAY failed: {e}"))
+        .unwrap();
+    assert_eq!(resp.status.as_u16(), 200, "pre-GOAWAY status");
+    assert_eq!(resp.body.collect().unwrap().as_ref(), b"ok");
+
+    // Ask the foreign peer to GOAWAY, then give the driver time to
+    // observe it and mark the connection non-accepting.
+    shutdown_tx.send(true).expect("send shutdown signal");
+    std::thread::sleep(Duration::from_millis(600));
+
+    // The old connection must not be reused; the server is gone, so the
+    // request must fail fast (a hang would be a driver bug).
+    let result = client.get(&base);
+    assert!(
+        result.is_err(),
+        "request after peer GOAWAY must fail fast, got {result:?}"
+    );
+
+    // The client object must recover on a fresh server/authority.
+    let addr2 = hyper_server(true);
+    let resp = client
+        .get(&format!("http://{addr2}/recovered"))
+        .map_err(|e| format!("request after GOAWAY recovery failed: {e}"))
+        .unwrap();
+    assert_eq!(resp.status.as_u16(), 200, "recovery status");
+}
+
 fn main() {
     println!("courierust vs mainstream HTTP stack — interop validation");
     case(
@@ -478,6 +790,21 @@ fn main() {
     case(
         "courierust_h1_slow_reader_to_hyper_h1",
         courierust_h1_slow_reader_to_hyper_h1,
+    );
+    case(
+        "tls_rejects_untrusted_certificate",
+        tls_rejects_untrusted_certificate,
+    );
+    case(
+        "tls_rejects_hostname_mismatch",
+        tls_rejects_hostname_mismatch,
+    );
+    case("tls_alpn_downgrade_to_h1", tls_alpn_downgrade_to_h1);
+    case("tls_h2_alpn_rejected", tls_h2_alpn_rejected);
+    case("h1_connection_close_honored", h1_connection_close_honored);
+    case(
+        "courierust_h2_client_survives_peer_goaway",
+        courierust_h2_client_survives_peer_goaway,
     );
 
     let failures = FAILURES.load(Ordering::SeqCst);

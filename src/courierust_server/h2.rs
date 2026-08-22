@@ -14,10 +14,13 @@ use crate::courierust_http::header::{HeaderMap, HeaderName, HeaderValue};
 use crate::courierust_http::request::Request;
 use crate::courierust_http::response::Response;
 use crate::courierust_http::version::Version;
+use crate::courierust_net::stats::{ActiveH2Streams, Counting, Stats};
 use crate::courierust_net::ConnStream;
 use crate::courierust_server::{Handler, ServerConfig};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::Arc;
 
 /// A response body waiting for flow-control room.
 struct Deferred {
@@ -56,17 +59,17 @@ pub(crate) fn serve(
 ) -> Result<()> {
     read_preface(stream)?;
     configure_read_timeout(stream);
-    let mut conn = Connection::new(stream, stream, server_config(config));
-    let mut req_bodies: HashMap<u32, RequestBuilder> = HashMap::new();
-    let mut deferred: HashMap<u32, Deferred> = HashMap::new();
-    serve_loop(
-        &mut conn,
-        stream,
-        handler,
-        config,
-        &mut req_bodies,
-        &mut deferred,
-    )
+    let stats = config.stats.clone();
+    let stats = stats.as_deref();
+    if let Some(s) = stats {
+        s.h2_connections.fetch_add(1, Ordering::Relaxed);
+        s.h2_connections_active.fetch_add(1, Ordering::Relaxed);
+    }
+    let result = serve_inner(stream, handler, config, None, stats);
+    if let Some(s) = stats {
+        Stats::decrement(&s.h2_connections_active, 1);
+    }
+    result
 }
 
 /// Serve the HTTP/2 side of an RFC 7540 §3.2 `h2c` Upgrade.
@@ -78,11 +81,56 @@ pub(crate) fn serve_upgraded(
 ) -> Result<()> {
     read_preface(stream)?;
     configure_read_timeout(stream);
-    let mut conn = Connection::new(stream, stream, server_config(config));
-    conn.register_upgrade_stream()?;
+    let stats = config.stats.clone();
+    let stats = stats.as_deref();
+    if let Some(s) = stats {
+        s.h2_connections.fetch_add(1, Ordering::Relaxed);
+        s.h2_connections_active.fetch_add(1, Ordering::Relaxed);
+    }
+    let result = serve_inner(stream, handler, config, Some(resp), stats);
+    if let Some(s) = stats {
+        Stats::decrement(&s.h2_connections_active, 1);
+    }
+    result
+}
+
+/// Shared h2 serve body: builds the counting-wrapped connection, sends
+/// the upgrade response when present, then runs the event loop.
+fn serve_inner(
+    stream: &ConnStream,
+    handler: &dyn Handler,
+    config: &ServerConfig,
+    upgrade_resp: Option<Response<Body>>,
+    stats: Option<&Stats>,
+) -> Result<()> {
+    // Transport call counters: real ones when stats are attached, inert
+    // dummies otherwise, so the connection type is uniform.
+    let (reads, writes) = match stats {
+        Some(s) => (s.h2_read_syscalls.clone(), s.h2_write_syscalls.clone()),
+        None => (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
+    };
+    let mut conn = Connection::new(
+        Counting::new(stream, reads.clone(), writes.clone()),
+        Counting::new(stream, reads, writes),
+        server_config(config),
+    );
+    if let Some(resp) = upgrade_resp {
+        conn.register_upgrade_stream()?;
+        let mut req_bodies: HashMap<u32, RequestBuilder> = HashMap::new();
+        let mut deferred: HashMap<u32, Deferred> = HashMap::new();
+        send_response(&mut conn, 1, resp, &mut deferred)?;
+        return serve_loop(
+            &mut conn,
+            stream,
+            handler,
+            config,
+            &mut req_bodies,
+            &mut deferred,
+            stats,
+        );
+    }
     let mut req_bodies: HashMap<u32, RequestBuilder> = HashMap::new();
     let mut deferred: HashMap<u32, Deferred> = HashMap::new();
-    send_response(&mut conn, 1, resp, &mut deferred)?;
     serve_loop(
         &mut conn,
         stream,
@@ -90,17 +138,19 @@ pub(crate) fn serve_upgraded(
         config,
         &mut req_bodies,
         &mut deferred,
+        stats,
     )
 }
 
 /// The shared h2 event loop
 fn serve_loop(
-    conn: &mut Connection<&ConnStream, &ConnStream>,
+    conn: &mut Connection<Counting<&ConnStream>, Counting<&ConnStream>>,
     stream: &ConnStream,
     handler: &dyn Handler,
     config: &ServerConfig,
     req_bodies: &mut HashMap<u32, RequestBuilder>,
     deferred: &mut HashMap<u32, Deferred>,
+    stats: Option<&Stats>,
 ) -> Result<()> {
     let mut peer_goaway = false;
 
@@ -108,6 +158,7 @@ fn serve_loop(
     let mut last_rx = started;
     let mut last_ping: Option<std::time::Instant> = None;
     let mut streaming = false;
+    let mut stream_stats = ActiveH2Streams::new(stats);
 
     loop {
         let want_streaming = !deferred.is_empty();
@@ -138,6 +189,9 @@ fn serve_loop(
                     end_stream,
                     ..
                 } => {
+                    if let Some(s) = stats {
+                        s.h2_streams_total.fetch_add(1, Ordering::Relaxed);
+                    }
                     if end_stream {
                         let resp = handler.handle(build_request(&headers, Body::Empty)?);
                         send_response(conn, stream_id, resp, deferred)?;
@@ -191,6 +245,11 @@ fn serve_loop(
             }
         }
 
+        // Count the connection's actual open stream table. This includes
+        // response streams and avoids conflating request-body buffering with
+        // HTTP/2 multiplexing.
+        stream_stats.set(conn.open_stream_count());
+
         if conn.is_closed() {
             break;
         }
@@ -225,7 +284,7 @@ fn serve_loop(
 ///
 /// Returns `false` when the serve loop should exit.
 fn apply_liveness(
-    conn: &mut Connection<&ConnStream, &ConnStream>,
+    conn: &mut Connection<Counting<&ConnStream>, Counting<&ConnStream>>,
     config: &ServerConfig,
     started: std::time::Instant,
     last_rx: &mut std::time::Instant,
@@ -338,7 +397,7 @@ pub fn build_request(headers: &[HeaderField], body: Body) -> Result<Request<Body
 
 /// Convert a response into HPACK fields and send it.
 fn send_response(
-    conn: &mut Connection<&ConnStream, &ConnStream>,
+    conn: &mut Connection<Counting<&ConnStream>, Counting<&ConnStream>>,
     sid: u32,
     resp: Response<Body>,
     deferred: &mut HashMap<u32, Deferred>,
@@ -416,7 +475,7 @@ pub fn response_fields(resp: &Response<Body>) -> Vec<HeaderField> {
 
 /// Drain deferred (channel) bodies into the connection as room allows.
 fn flush_deferred(
-    conn: &mut Connection<&ConnStream, &ConnStream>,
+    conn: &mut Connection<Counting<&ConnStream>, Counting<&ConnStream>>,
     deferred: &mut HashMap<u32, Deferred>,
 ) -> Result<()> {
     let mut done: Vec<u32> = Vec::new();

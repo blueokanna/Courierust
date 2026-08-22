@@ -62,6 +62,9 @@ fn unix_now() -> i64 {
 pub struct ClientConfig {
     /// Prefer HTTP/2 (h2c prior knowledge) when true; otherwise HTTP/1.1.
     pub http2: bool,
+    /// Use the built-in HTTP/3/QUIC path for HTTPS requests. When enabled,
+    /// HTTP/3 is attempted directly and no TCP fallback is performed.
+    pub http3: bool,
     /// Maximum keep-alive connections cached per host (h1) / maximum h2
     /// connections per host.
     pub max_connections_per_host: usize,
@@ -104,12 +107,17 @@ pub struct ClientConfig {
     /// first request is sent as the upgrade request; if the server
     /// declines, the HTTP/1.1 response is returned directly.
     pub h2c_upgrade: bool,
+    /// Optional instrumentation: when set, the h2 driver threads update
+    /// these counters (connection / stream / syscall evidence for
+    /// benchmarks). `None` (default) disables the accounting entirely.
+    pub stats: Option<Arc<crate::courierust_net::stats::Stats>>,
 }
 
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             http2: false,
+            http3: false,
             max_connections_per_host: 4,
             connect_timeout: Some(Duration::from_secs(10)),
             read_timeout: Some(Duration::from_secs(60)),
@@ -124,6 +132,7 @@ impl Default for ClientConfig {
             h2_ping_timeout: Some(Duration::from_secs(15)),
             h2_idle_timeout: Some(Duration::from_secs(300)),
             h2c_upgrade: false,
+            stats: None,
         }
     }
 }
@@ -134,6 +143,15 @@ struct ClientInner {
     h1_pool: Mutex<HashMap<String, Vec<(SocketAddr, H1Connection)>>>,
     /// Live h2 connections per authority, selected by dispatch reservations.
     h2_pool: Mutex<HashMap<String, Vec<H2Conn>>>,
+    /// Signaled whenever an h2 connection open lands (or fails), so
+    /// callers waiting for the last connection slot wake instead of
+    /// polling.
+    h2_open_cv: std::sync::Condvar,
+    /// h2 connections currently being opened, keyed by authority. The
+    /// counters are protected independently from the pool map but are always
+    /// acquired after `h2_pool`; this keeps one slow authority from
+    /// blocking an unrelated host while the per-host cap remains exact.
+    pending_h2_opens: Mutex<HashMap<String, usize>>,
     /// Global request sequence (instrumentation).
     seq: AtomicUsize,
 }
@@ -179,6 +197,8 @@ impl Client {
                 config,
                 h1_pool: Mutex::new(HashMap::new()),
                 h2_pool: Mutex::new(HashMap::new()),
+                h2_open_cv: std::sync::Condvar::new(),
+                pending_h2_opens: Mutex::new(HashMap::new()),
                 seq: AtomicUsize::new(0),
             }),
         }
@@ -300,6 +320,32 @@ impl Client {
         self.inner.seq.fetch_add(1, Ordering::Relaxed);
         let addr = resolve_addr(&url.host, url.port)?;
         let authority = url.authority();
+        if self.inner.config.http3 {
+            if url.scheme != "https" {
+                return Err(Error::protocol("HTTP/3 requires an https:// URL"));
+            }
+            let tls = self
+                .inner
+                .config
+                .tls
+                .as_ref()
+                .ok_or_else(|| Error::protocol("HTTP/3 requires TLS settings"))?;
+            return crate::courierust_h3::runtime::client_request(
+                addr,
+                &url.host,
+                &authority,
+                req,
+                crate::courierust_h3::runtime::ClientRequestOptions {
+                    roots: tls.roots.clone(),
+                    verify: tls.verify,
+                    now: tls.now,
+                    max_header_list: self.inner.config.max_header_list,
+                    max_body: self.inner.config.max_body,
+                    timeout: self.inner.config.read_timeout,
+                    stats: self.inner.config.stats.clone(),
+                },
+            );
+        }
         if self.inner.config.http2 {
             if self.inner.config.h2c_upgrade && url.scheme == "http" {
                 // RFC 7540 §3.2 Upgrade-based h2c (falls back to HTTP/1.1
@@ -517,7 +563,7 @@ impl Client {
     /// driver is gone, then wait for the reply.
     //
     // The `authority`/`addr`/`tls`/`hostname` bundle is deliberately kept
-    // flat here (and in `get_h2_conn`/`open_h2_conn`) so the retry path
+    // flat here (and in `get_h2_conn`) so the retry path
     // can re-open a fresh connection with exactly the same parameters.
     #[allow(clippy::too_many_arguments)]
     fn send_h2_cmd(
@@ -541,8 +587,9 @@ impl Client {
             }
             Err(std::sync::mpsc::SendError(cmd)) => {
                 // The driver is gone; open a fresh connection and retry.
+                conn.accepting.store(false, Ordering::Release);
                 conn.release();
-                let fresh = self.open_h2_conn(authority, addr, tls, hostname)?;
+                let fresh = self.get_h2_conn(authority, addr, tls, hostname)?;
                 fresh.reserve();
                 let (tx2, rx2) = std::sync::mpsc::channel();
                 let cmd2 = retarget_reply(cmd, tx2);
@@ -566,40 +613,108 @@ impl Client {
         tls: Option<&crate::courierust_tls::TlsConnector>,
         hostname: &str,
     ) -> Result<H2Conn> {
-        let mut pools = self.inner.h2_pool.lock().unwrap();
-        let list = pools.entry(authority.to_string()).or_default();
-        // A driver that has received GOAWAY or lost its transport must not
-        // consume a pool slot. Dropping the pool's sender also lets the
-        // driver finish its cleanup once all request-owned clones are gone.
-        list.retain(|c| c.accepting.load(Ordering::Acquire));
         let max_connections = self.inner.config.max_connections_per_host.max(1);
-        let least_loaded = list
-            .iter()
-            .filter(|c| c.accepting.load(Ordering::Acquire))
-            .min_by_key(|c| c.reservations())
-            .cloned();
+        // Opening a connection (TCP connect + optional TLS handshake +
+        // driver thread spawn) can take milliseconds. It must NOT run
+        // while holding the shared pool lock, or one slow open serializes
+        // every concurrent requester (the 32-worker h2 regression). A
+        // `pending_h2_opens` counter (guarded by the same lock) keeps the
+        // per-authority cap exact while the connect runs unlocked, and a
+        // condition variable lets concurrent callers sleep until the
+        // opener lands instead of spinning or failing on a transiently
+        // empty pool.
+        loop {
+            let mut open = false;
+            let mut should_wait = false;
+            {
+                let mut pools = self.inner.h2_pool.lock().unwrap();
+                let mut pending = self.inner.pending_h2_opens.lock().unwrap();
+                let list = pools.entry(authority.to_string()).or_default();
+                // A driver that has received GOAWAY or lost its transport
+                // must not consume a pool slot. Dropping the pool's
+                // sender also lets the driver finish its cleanup once all
+                // request-owned clones are gone.
+                list.retain(|c| c.accepting.load(Ordering::Acquire));
+                let least_loaded = list
+                    .iter()
+                    .filter(|c| c.accepting.load(Ordering::Acquire))
+                    .min_by_key(|c| c.reservations())
+                    .cloned();
 
-        // Reserve a connection before releasing the pool lock. This makes
-        // concurrent callers visible to the next selector and allows the
-        // configured pool to grow under real contention without opening
-        // extra connections for ordinary sequential reuse.
-        if let Some(conn) = least_loaded {
-            if conn.reservations() == 0 || list.len() >= max_connections {
-                conn.reserve();
-                return Ok(conn);
+                // Reserve a connection before releasing the pool lock.
+                // This makes concurrent callers visible to the next
+                // selector and allows the configured pool to grow under
+                // real contention without opening extra connections for
+                // ordinary sequential reuse.
+                if let Some(conn) = least_loaded {
+                    if conn.reservations() == 0 || list.len() >= max_connections {
+                        conn.reserve();
+                        return Ok(conn);
+                    }
+                }
+
+                let pending_count = pending.get(authority).copied().unwrap_or(0);
+                if list.len() + pending_count < max_connections {
+                    *pending.entry(authority.to_string()).or_default() += 1;
+                    open = true;
+                } else if pending_count > 0 {
+                    // The last slot is being opened by another caller;
+                    // sleep until it lands (bounded, so a lost wake cannot
+                    // wedge the caller).
+                    should_wait = true;
+                }
+            }
+            if !open {
+                if should_wait {
+                    let guard = self.inner.h2_pool.lock().unwrap();
+                    let (guard, _) = self
+                        .inner
+                        .h2_open_cv
+                        .wait_timeout(guard, Duration::from_millis(200))
+                        .expect("h2 pool lock poisoned");
+                    drop(guard);
+                    continue;
+                }
+                // At capacity with every connection busy: fall through to
+                // the least-loaded live connection below.
+                break;
+            }
+
+            // Open outside the pool lock.
+            let opened = (|| -> Result<H2Conn> {
+                let stream = self.open_h2_stream(addr, tls, hostname)?;
+                let conn = h2::start(stream, &self.inner.config)?;
+                let mut pools = self.inner.h2_pool.lock().unwrap();
+                let mut pending = self.inner.pending_h2_opens.lock().unwrap();
+                let list = pools.entry(authority.to_string()).or_default();
+                list.retain(|c| c.accepting.load(Ordering::Acquire));
+                decrement_pending_h2_open(&mut pending, authority);
+                if list.len() < max_connections {
+                    list.push(conn.clone());
+                }
+                self.inner.h2_open_cv.notify_all();
+                Ok(conn)
+            })();
+            match opened {
+                Ok(conn) => {
+                    conn.reserve();
+                    return Ok(conn);
+                }
+                Err(e) => {
+                    let pools = self.inner.h2_pool.lock().unwrap();
+                    let mut pending = self.inner.pending_h2_opens.lock().unwrap();
+                    decrement_pending_h2_open(&mut pending, authority);
+                    self.inner.h2_open_cv.notify_all();
+                    drop(pools);
+                    return Err(e);
+                }
             }
         }
 
-        if list.len() < max_connections {
-            let stream = self.open_h2_stream(addr, tls, hostname)?;
-            let conn = h2::start(stream, &self.inner.config)?;
-            conn.reserve();
-            list.push(conn.clone());
-            return Ok(conn);
-        }
-
-        // `max_connections` is at least one, so this is only reachable when
-        // a connection changed state between selection and reservation.
+        // Rare fallback after a long open race: block on the
+        // least-loaded live connection (its dispatch queue drains).
+        let mut pools = self.inner.h2_pool.lock().unwrap();
+        let list = pools.entry(authority.to_string()).or_default();
         let conn = list
             .iter()
             .filter(|c| c.accepting.load(Ordering::Acquire))
@@ -607,24 +722,6 @@ impl Client {
             .cloned()
             .ok_or_else(|| Error::canceled("no accepting h2 connection"))?;
         conn.reserve();
-        Ok(conn)
-    }
-
-    fn open_h2_conn(
-        &self,
-        authority: &str,
-        addr: SocketAddr,
-        tls: Option<&crate::courierust_tls::TlsConnector>,
-        hostname: &str,
-    ) -> Result<H2Conn> {
-        let stream = self.open_h2_stream(addr, tls, hostname)?;
-        let conn = h2::start(stream, &self.inner.config)?;
-        let mut pools = self.inner.h2_pool.lock().unwrap();
-        let list = pools.entry(authority.to_string()).or_default();
-        list.retain(|c| c.accepting.load(Ordering::Acquire));
-        if list.len() < self.inner.config.max_connections_per_host.max(1) {
-            list.push(conn.clone());
-        }
         Ok(conn)
     }
 
@@ -647,18 +744,43 @@ impl Client {
                 // The peer's ALPN choice must agree with speaking
                 // HTTP/2: a server that negotiated `http/1.1` cannot be
                 // driven with the h2 codec (silent mismatch would hang).
-                if let Some(alpn) = conn.alpn() {
-                    if alpn.as_slice() != b"h2" {
+                match conn.alpn() {
+                    Some(alpn) if alpn.as_slice() == b"h2" => {}
+                    Some(alpn) => {
                         return Err(Error::protocol(format!(
                             "server negotiated {:?}, not h2; set ClientConfig.tls.alpn to offer h2",
                             String::from_utf8_lossy(&alpn)
                         )));
                     }
+                    None if !self.inner.config.tls.is_none() => {
+                        // RFC 9113 §3.3: HTTP/2 over TLS REQUIRES ALPN "h2".
+                        // If the server negotiated no ALPN at all (no
+                        // common protocol), proceeding would be a silent
+                        // protocol mismatch — fail instead of guessing.
+                        return Err(Error::protocol(
+                            "server did not negotiate any ALPN protocol; \
+                             HTTP/2 over TLS requires ALPN h2",
+                        ));
+                    }
+                    None => {}
                 }
                 Ok(conn)
             }
             None => Ok(crate::courierust_net::ConnStream::plain(stream)),
         }
+    }
+}
+
+fn decrement_pending_h2_open(pending: &mut HashMap<String, usize>, authority: &str) {
+    let remove = match pending.get_mut(authority) {
+        Some(count) => {
+            *count = count.saturating_sub(1);
+            *count == 0
+        }
+        None => false,
+    };
+    if remove {
+        pending.remove(authority);
     }
 }
 

@@ -214,13 +214,13 @@ courierust = { version = "0.1", default-features = false }
 
 这个仓库刻意不做的，以及你接手前应该知道的：
 
-- **没有 HTTP/3 / QUIC**。零外部依赖意味着没有可用的 QUIC 实现（QUIC 需要用户态 UDP 栈 + TLS 1.3——TLS 部分已有，传输层没有）。
-- **TLS 暂无 PSK / 0-RTT 恢复 / session ticket / key update，也无双向 mTLS**。每次都做完整 1-RTT 握手；对端发来的 NewSessionTicket 会被忽略；服务端不请求客户端证书。
-- **事件驱动服务器全平台默认开启，只处理 HTTP/1.1**。`ServerConfig::event_driven`（默认 `true`）把空闲明文 HTTP 连接挂在轮询器上（Winsock `select` / POSIX `poll`），少量 worker 即可服务大量 idle keep-alive / SSE / 长轮询连接；TLS 与 HTTP/2 连接仍走阻塞池模型（由 `handshake_timeout`、`h2_idle_timeout` 与 worker 数共同约束）。设为 `false` 恢复旧的每连接一池任务的模型（诊断/对比用）。
+- **HTTP/3 / QUIC 已有零依赖的内置路径，但协议边界必须如实理解**。`courierust_h3` 通过 std UDP reactor 运行 HTTP/3 请求/响应，包含 QUIC v1 包保护、内置 TLS 1.3、ALPN `h3`、有界 CRYPTO/stream 重组、Retry 完整性校验与 token 绑定的地址验证、Version Negotiation、验证前 3x anti-amplification、ACK range、使用新包号的重传、RTT/RTO 采样、有界拥塞窗口、控制/QPACK 流、trailer 与 GOAWAY 校验。它还不是完整的互联网级 QUIC 实现：完整 PTO/时间阈值丢包恢复、动态本地 `MAX_DATA`/`MAX_STREAM_DATA` credit 更新、连接迁移与路径验证、stateless reset、0-RTT/session ticket、自动及双向 key update、QPACK blocked-stream acknowledgement，以及独立实现互操作仍需实现和专门证据。在这些缺口关闭前，不应宣称对外普遍互通。
+- **TLS 暂无 PSK / 0-RTT 恢复 / session ticket / key update，也无双向 mTLS**。每次都做完整 1-RTT 握手；对端发来的 NewSessionTicket 会被忽略；服务端不请求客户端证书。基准里的 TLS 行因此如实报告 `session_resumption=n/a`。
+- **事件驱动服务器全平台默认开启，只处理 HTTP/1.1**。`ServerConfig::event_driven`（默认 `true`）把空闲明文 HTTP 连接挂在轮询器上（Winsock `select` / POSIX `poll`），少量 worker 即可服务大量 idle keep-alive / SSE / 长轮询连接；TLS 与 HTTP/2 连接仍走阻塞池模型（由 `handshake_timeout`、`h2_idle_timeout` 与 worker 数共同约束）。设为 `false` 恢复旧的**每连接一池任务**模型；该路径已不建议用于生产——空闲/慢连接群会耗尽池——仅作对比与调试，默认事件路径用 `max_connections`（连接上限）与 `idle_timeout` 约束资源。
 - **请求体流式上传目前只在 HTTP/2 下可靠**（h2 天然分帧）。HTTP/1.1 的请求体要么一次性给全（`Body::Bytes`），要么你自己拼 chunked。
 - **gRPC 不含 protobuf、`.proto` 代码生成与 `grpc.reflection`**。消息编解码需要你实现 codec trait 或接你自己的 protobuf 生成代码；reflection 需要 protobuf 模式清单，属外部职责。
 - **长时间阻塞的同步 handler 会占住一个 worker**（事件驱动与否都一样）——任何同步服务器的通病；流式场景用 channel 响应体。worker 占用**按连接而非按流**：一条连接上的任意空闲流只占同一个 worker，慢流不阻塞同连接其他流——两者均有集成测试覆盖。
-- **HTTPS 是一等公民**：客户端与服务端内置从零实现的 TLS 1.3；`https://` 需要自备根证书库（无内置 CA）。**ALPN 强制一致**：配置 h2 的客户端连到协商出 `http/1.1` 的服务器（或反之）会得到明确错误而非静默协议错乱。
+- **HTTPS 是一等公民**：客户端与服务端内置从零实现的 TLS 1.3；`https://` 需要自备根证书库（无内置 CA）。**ALPN 强制一致**：配置 h2 的客户端连到协商出 `http/1.1` 的服务器，或对方**完全未协商 ALPN**（RFC 9113 §3.3 要求 TLS 上必须用 ALPN `h2`），都会得到明确错误而非静默协议错乱。
 - 客户端重定向、keep-alive 复用等策略以「正确」为先，未做激进调优。
 
 ## 目录结构
@@ -232,6 +232,8 @@ src/
 ├── courierust_http/        # HTTP/1.1 消息模型（请求/响应/头/URI/状态码）      [no_std]
 ├── courierust_hpack/       # HPACK：表驱动 Huffman + 静态/动态索引表           [no_std]
 ├── courierust_h2/          # HTTP/2 帧、SETTINGS、流状态机、流控、WUCS、PRIORITY_UPDATE [no_std]
+├── courierust_quic/        # QUIC v1 包/帧编解码、varint、连接 ID、crypto 标签  [no_std]
+├── courierust_h3/          # HTTP/3：QPACK 静态/动态表 + H3 帧/流角色         [no_std]
 ├── courierust_fingerprint/ # JA3 / JA4 / Chrome HTTP/2 指纹                    [no_std]
 ├── courierust_crypto/      # 自带 MD5 / SHA-256（指纹用）                      [no_std]
 ├── courierust_bytes/       # 字节缓冲（BytesMut）                              [no_std]
@@ -239,7 +241,7 @@ src/
 ├── courierust_error/       # 统一错误类型
 ├── courierust_tls/         # TLS 1.3（RFC 8446）：握手、记录层、X.509、HTTPS    [std]
 ├── courierust_pool/        # 工作窃取线程池                                    [std]
-├── courierust_net/         # TCP → io trait 适配                               [std]
+├── courierust_net/         # TCP → io trait 适配、轮询器、可选 stats 埋点      [std]
 ├── courierust_body/        # 流式响应体（channel）                             [std]
 ├── courierust_h1/          # HTTP/1.1 线上编解码                                [std]
 ├── courierust_client/      # h1 连接池 + h2 驱动                                [std]
@@ -257,11 +259,9 @@ src/
 - RFC 9218 优先级调度；
 - 并发模型对比（空闲连接群 vs worker 池）与慢发送者群基准。
 
-Workflow 还记录跨机 endpoint、慢连接压力和 `cargo-fuzz` parser 运行结果。生成的
-`Github_Action_Benchmark.md` 会在 main 分支 push 后提交到仓库本身，不只存在于
-Actions 摘要或 artifact 中。Reqwest blocking + h2c + 64 KiB 行会保留原始结果但标记
-为 `invalid`：两种服务端都出现的固定约 41 ms 等待不是性能证据。h2c 结果只适用于
-对应连接策略和负载，不能据此宣称全面领先。
+Workflow 还记录跨机 endpoint（含 TLS 与进程内限速场景）、reactor/连接/流证据（`STATS` 行）、TLS 验证证据（`TLSVERIFY` 行：`cert_verified` / `hostname_verified` / `negotiated_alpn` / `session_resumption`）和 `cargo-fuzz` parser 运行结果。生成的 `Github_Action_Benchmark.md` 会在 main 分支 push 后提交到仓库本身，不只存在于 Actions 摘要或 artifact 中。Reqwest 的 HTTP/2 基线改用 **async** 客户端：blocking 客户端在 h2c 大 body 上固定约 41 ms 的等待是 harness 配置异常，不作为性能证据。h2c 结果只适用于对应连接策略和负载，不能据此宣称全面领先。
+
+**worker 数建议（由 `STATS` 行实测支持）：** HTTP/2 多路复用把所有流都放在一条连接、由一个 driver 线程串行处理。`max_connections_per_host = 1` 时吞吐在 4–8 worker 后随 worker 数**回退**：32 个 worker 争抢共享池锁与单一 driver 命令通道的速度超过 driver 的消化速度。`STATS` 行显示 `h2_connections=1` 且 `workers` 个并发流——这就是串行化点。每条 h2 连接建议 4–8 个客户端 worker，再往上应加连接而不是加 worker。
 
 ```bash
 cargo bench --manifest-path benches/Cargo.toml --bench throughput

@@ -67,7 +67,7 @@ use std::time::Duration;
 let cfg = ServerConfig {
     // Serve HTTP/2 (prior knowledge) on the same port as HTTP/1.1.
     http2: true,
-    // Worker threads; 0 = logical core count.
+    // Worker threads; 0 = bounded auto sizing (1-8 workers).
     threads: 0,
     read_timeout: Some(Duration::from_secs(120)),
     max_header_list: 1 << 20,
@@ -117,6 +117,12 @@ let handler = |_req: Request<Body>| -> Response<Body> {
 Send an error mid-stream with `tx.fail(err)` — the connection resets that stream with `INTERNAL_ERROR`.
 
 ## Notes
+
+- The default is the event-driven connection path. It parks incomplete and
+  slow plain HTTP/1.1 connections without assigning one worker per socket.
+  `max_connections` defaults to 1024; `0` is an explicit unlimited setting.
+  `event_driven: false` is a legacy compatibility mode and must be paired
+  with a finite `max_connections` in exposed deployments.
 
 - HTTP/1.1 responses without a body get an explicit `Content-Length: 0`; chunked encoding is emitted when the length is unknown.
 - The event scheduler is the default on every platform for plain HTTP/1.1: a partial request parks on the poller (zero workers), and connections idle for `ServerConfig::idle_timeout` are reaped. `max_connections` caps the parked population. TLS and HTTP/2 connections run on the blocking pool, bounded by `handshake_timeout` / `h2_idle_timeout`. Setting `event_driven: false` restores the legacy one-pool-job-per-connection model.

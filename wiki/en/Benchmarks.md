@@ -46,7 +46,13 @@ Every configuration is repeated an even number of times. The execution order alt
 
 The `raw_tcp_floor` row is only a transport reference for a four-byte echo. It is not an HTTP comparison row and must not be used to claim a percentage of HTTP performance. The harness intentionally does not publish process-wide allocation counts because server threads, runtimes, logging, and the harness itself make that number non-attributable to one client or server implementation.
 
-The blocking Reqwest + h2c + 64 KiB rows are emitted with `status=invalid`. The fixed approximately 41 ms result appears against both Hyper and Courierust and is treated as a Reqwest/harness wait anomaly, not as performance evidence. The h2c client rows are workload-specific: a single worker does not establish universal leadership, and an 8-worker result must be read together with the connection policy and tail latency.
+The large-body h2c comparison uses async Reqwest with a shared Tokio runtime and
+fully consumes the request and response bodies. The old blocking Reqwest
+measurement showed a fixed approximately 41 ms wait against both peers; that
+harness anomaly is retained only in historical reports and is not performance
+evidence. The h2c client rows are workload-specific: a single worker does not
+establish universal leadership, and an 8-worker result must be read together
+with the connection policy and tail latency.
 
 `network` requires two separately operated hosts. Start the server with `COURIERUST_NETWORK_ROLE=server` and `COURIERUST_NETWORK_BIND=0.0.0.0:8080`, then set the client's `COURIERUST_NETWORK_URL` to that host. Use `COURIERUST_NETWORK_TLS=true` plus DER certificate/key paths for HTTPS. The generated report marks the case `not_configured` when no remote URL is supplied; no cross-machine number is invented.
 

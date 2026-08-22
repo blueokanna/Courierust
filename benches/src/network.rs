@@ -78,7 +78,10 @@ fn server() -> std::io::Result<()> {
     } else {
         None
     };
+    let latency_ms = env_usize("COURIERUST_NETWORK_LATENCY_MS", 0);
+    let throttle_bps = env_usize("COURIERUST_NETWORK_THROTTLE_BPS", 0);
     let body = payload();
+    let body_for_throttle = body.clone();
     let server = Server::bind_with_config(
         &bind,
         ServerConfig {
@@ -90,13 +93,38 @@ fn server() -> std::io::Result<()> {
     )?;
     let address = server.local_addr()?;
     println!(
-        "NETWORK|role=server|status=ready|bind={address}|protocol={}|tls={}|payload_bytes={}",
+        "NETWORK|role=server|status=ready|bind={address}|protocol={}|tls={}|payload_bytes={}|latency_ms={latency_ms}|throttle_bps={throttle_bps}",
         if http2 { "h2" } else { "h1" },
         env_bool("COURIERUST_NETWORK_TLS"),
         body.len(),
     );
     server.serve(move |_request: Request<Body>| {
-        Response::<Body>::with_status(200.into()).with_body(Body::Bytes(body.clone()))
+        if latency_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(latency_ms as u64));
+        }
+        let mut resp = Response::with_status(200.into());
+        if throttle_bps > 0 {
+            // Stream the body at the configured rate through a channel
+            // body so the server applies real per-chunk backpressure.
+            let (tx, rx) = std::sync::mpsc::channel::<courierust::Result<Bytes>>();
+            let body = body_for_throttle.clone();
+            std::thread::spawn(move || {
+                const CHUNK: usize = 16 * 1024;
+                let per_chunk_ms = (CHUNK as u64 * 8 * 1000) / throttle_bps as u64;
+                for slice in body.chunks(CHUNK) {
+                    if tx.send(Ok(Bytes::from(slice.to_vec()))).is_err() {
+                        break;
+                    }
+                    if per_chunk_ms > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(per_chunk_ms));
+                    }
+                }
+            });
+            resp.body = Body::Channel(rx);
+        } else {
+            resp.body = Body::Bytes(body.clone());
+        }
+        resp
     })
 }
 
@@ -131,13 +159,15 @@ fn client() {
     } else {
         None
     };
+    let client_stats = courierust::courierust_net::stats::Stats::new();
     let client = Arc::new(Client::with_config(ClientConfig {
         http2,
         max_connections_per_host: max_connections,
         tls,
+        stats: Some(client_stats.clone()),
         ..Default::default()
     }));
-    let target = Arc::new(url);
+    let target = Arc::new(url.clone());
     let timing = if workers > 1 {
         run_concurrent(requests, workers, MAX_SAMPLES, |_| {
             let client = client.clone();
@@ -155,7 +185,72 @@ fn client() {
         max_connections,
         expected,
         timing,
+        client_stats.snapshot(),
     );
+    if url.starts_with("https://") {
+        network_tls_evidence(&url, http2);
+    }
+}
+
+/// TLS verification evidence for an HTTPS run: the request above already
+/// validated the certificate + hostname (it succeeded), and this opens a
+/// direct handshake to report the negotiated ALPN / cipher suite as
+/// observed on the wire. `session_resumption` is `n/a` because the stack
+/// has no PSK/0-RTT tickets yet.
+fn network_tls_evidence(url: &str, http2: bool) {
+    let root_path = match std::env::var("COURIERUST_NETWORK_ROOT_DER") {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let mut roots = courierust::courierust_tls::RootStore::new();
+    roots.add_der(
+        std::fs::read(&root_path)
+            .unwrap_or_else(|e| panic!("read root certificate {root_path}: {e}")),
+    );
+    let (host, port) = url
+        .trim_start_matches("https://")
+        .split_once(':')
+        .map(|(h, p)| (h.to_string(), p.parse::<u16>().unwrap_or(443)))
+        .unwrap_or_else(|| (url.trim_start_matches("https://").to_string(), 443));
+    let stream = std::net::TcpStream::connect((host.as_str(), port));
+    let stream = match stream {
+        Ok(s) => s,
+        Err(e) => {
+            println!(
+                "NETWORK|role=client|target_scope=remote|tls_evidence=1|cert_verified=false|hostname_verified=false|error=connect:{}",
+                e.to_string().replace('|', "/")
+            );
+            return;
+        }
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    let connector =
+        courierust::courierust_tls::TlsConnector::new(courierust::courierust_tls::ClientConfig {
+            roots,
+            verify: true,
+            alpn: if http2 {
+                vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+            } else {
+                vec![b"http/1.1".to_vec()]
+            },
+            now: now_unix(),
+        });
+    match connector.connect(&host, &stream, &stream) {
+        Ok(tls) => {
+            let negotiated = tls
+                .alpn()
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+                .unwrap_or_else(|| "none".to_string());
+            println!(
+                "NETWORK|role=client|target_scope=remote|tls_evidence=1|cert_verified=true|hostname_verified=true|negotiated_alpn={negotiated}|session_resumption=n/a|cipher_suite=0x{:04x}",
+                tls.cipher_suite()
+            );
+        }
+        Err(e) => println!(
+            "NETWORK|role=client|target_scope=remote|tls_evidence=1|cert_verified=false|hostname_verified=false|error={}",
+            e.to_string().replace('|', "/")
+        ),
+    }
 }
 
 fn network_request(client: &Client, target: &str, expected: usize) {
@@ -179,10 +274,14 @@ fn print_result(
     max_connections: usize,
     bytes: usize,
     mut timing: Timing,
+    stats: courierust::courierust_net::stats::StatsSnapshot,
 ) {
     timing.sort_samples();
+    // An optional scenario tag (e.g. `throttled`, `wan-sim`, `lan`) so
+    // report readers can tell which network-condition case a row is.
+    let tag = std::env::var("COURIERUST_NETWORK_TAG").unwrap_or_default();
     println!(
-        "NETWORK|role=client|status=ok|target_scope=remote|protocol={protocol}|workers={workers}|max_connections={max_connections}|requests={}|bytes={bytes}|elapsed_ms={:.3}|rps={:.1}|response_mbps={:.3}|p50_us={}|p75_us={}|p90_us={}|p95_us={}|p99_us={}|samples={}",
+        "NETWORK|role=client|status=ok|target_scope=remote|protocol={protocol}|workers={workers}|max_connections={max_connections}|requests={}|bytes={bytes}|elapsed_ms={:.3}|rps={:.1}|response_mbps={:.3}|p50_us={}|p75_us={}|p90_us={}|p95_us={}|p99_us={}|samples={}|tag={tag}|{}",
         timing.requests,
         timing.elapsed.as_secs_f64() * 1000.0,
         timing.requests_per_second(),
@@ -193,6 +292,7 @@ fn print_result(
         metric(timing.percentile_us(0.95)),
         metric(timing.percentile_us(0.99)),
         timing.samples.len(),
+        stats.render(),
     );
 }
 
