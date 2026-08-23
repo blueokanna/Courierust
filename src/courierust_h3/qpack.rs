@@ -682,12 +682,15 @@ fn static_entry(index: u64) -> Result<(String, String)> {
 
 /// Decode and apply one encoder-stream instruction. `insert_count` is
 /// the table's current insert count (for resolving dynamic relative
-/// indices). Returns the bytes consumed.
+/// indices). `advertised_capacity` is the decoder's advertised
+/// `SETTINGS_QPACK_MAX_TABLE_CAPACITY`: a Set Capacity instruction above
+/// it is a QPACK_ENCODER_STREAM_ERROR (RFC 9204 §4.3.1).
 pub fn decode_encoder_instruction(
     buf: &[u8],
     pos: &mut usize,
     dyn_table: &mut DynamicTable,
     insert_count: u64,
+    advertised_capacity: Option<u64>,
 ) -> Result<()> {
     let first = *buf.get(*pos).ok_or_else(Error::eof)?;
     if first & 0x80 != 0 {
@@ -733,10 +736,18 @@ pub fn decode_encoder_instruction(
         return Ok(());
     }
     if first & 0xe0 == 0x20 {
-        // Set Dynamic Table Capacity: `001` + 5-bit.
-        let capacity = usize::try_from(decode_integer(buf, 5, pos)?)
-            .map_err(|_| Error::overflow("QPACK table capacity does not fit usize"))?;
-        dyn_table.set_capacity(capacity);
+        // Set Dynamic Table Capacity: `001` + 5-bit. MUST NOT exceed the
+        // decoder's advertised capacity (RFC 9204 §4.3.1).
+        let capacity = decode_integer(buf, 5, pos)?;
+        if advertised_capacity.is_some_and(|advertised| capacity > advertised) {
+            return Err(Error::protocol(
+                "QPACK Set Capacity exceeds the advertised maximum",
+            ));
+        }
+        dyn_table.set_capacity(
+            usize::try_from(capacity)
+                .map_err(|_| Error::overflow("QPACK table capacity does not fit usize"))?,
+        );
         return Ok(());
     }
     // Duplicate: `000` + 5-bit relative index.
@@ -751,6 +762,56 @@ pub fn decode_encoder_instruction(
         .clone();
     dyn_table.insert(&entry.name, &entry.value);
     Ok(())
+}
+
+/// An encoder-stream instruction to emit (RFC 9204 §4.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncoderInstruction<'a> {
+    /// Set the dynamic table capacity (`001` + 5-bit).
+    SetCapacity(u64),
+    /// Insert with name reference (`1` + T + 6-bit + value).
+    InsertWithNameRef {
+        /// Whether the referenced name is in the static table.
+        static_ref: bool,
+        /// Static index, or dynamic relative index (current inserts).
+        index: u64,
+        /// Field value.
+        value: &'a [u8],
+    },
+    /// Insert with literal name (`01` + name + value).
+    InsertWithLiteralName {
+        /// Field name.
+        name: &'a [u8],
+        /// Field value.
+        value: &'a [u8],
+    },
+    /// Duplicate the entry at the given relative index (`000` + 5-bit).
+    Duplicate(u64),
+}
+
+/// Encode an encoder-stream instruction (RFC 9204 §4.3).
+pub fn encode_encoder_instruction(instruction: &EncoderInstruction, out: &mut Vec<u8>) {
+    match instruction {
+        EncoderInstruction::SetCapacity(capacity) => {
+            encode_integer(*capacity, 5, 0x20, out);
+        }
+        EncoderInstruction::InsertWithNameRef {
+            static_ref,
+            index,
+            value,
+        } => {
+            let first = if *static_ref { 0xc0 } else { 0x80 };
+            encode_integer(*index, 6, first, out);
+            encode_string(value, 8, 0x00, out);
+        }
+        EncoderInstruction::InsertWithLiteralName { name, value } => {
+            encode_string(name, 6, 0x40, out);
+            encode_string(value, 8, 0x00, out);
+        }
+        EncoderInstruction::Duplicate(index) => {
+            encode_integer(*index, 5, 0x00, out);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -881,7 +942,8 @@ mod tests {
         let mut pos = 0;
         while pos < enc.len() {
             let insert_count = table.insert_count();
-            decode_encoder_instruction(&enc, &mut pos, &mut table, insert_count).unwrap();
+            decode_encoder_instruction(&enc, &mut pos, &mut table, insert_count, Some(220))
+                .unwrap();
         }
         assert_eq!(table.insert_count(), 2);
         assert_eq!(table.get(0).unwrap().name, ":authority");
@@ -923,7 +985,7 @@ mod tests {
         encode_string(b"custom-value", 8, 0x00, &mut enc);
         let mut table = DynamicTable::new(1000);
         let mut pos = 0;
-        decode_encoder_instruction(&enc, &mut pos, &mut table, 0).unwrap();
+        decode_encoder_instruction(&enc, &mut pos, &mut table, 0, Some(220)).unwrap();
         assert_eq!(pos, enc.len());
         assert_eq!(table.insert_count(), 1);
         assert_eq!(table.get(0).unwrap().name, "custom-key");
@@ -948,7 +1010,7 @@ mod tests {
         // Duplicate (relative index 2) = `02` → abs = 3 - 1 - 2 = 0.
         let mut pos = 0;
         let insert_count = table.insert_count();
-        decode_encoder_instruction(&[0x02], &mut pos, &mut table, insert_count).unwrap();
+        decode_encoder_instruction(&[0x02], &mut pos, &mut table, insert_count, Some(220)).unwrap();
         assert_eq!(table.insert_count(), 4);
         assert_eq!(table.get(3).unwrap().name, ":authority");
 

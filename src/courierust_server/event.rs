@@ -502,8 +502,9 @@ impl EventConn {
                 .next_request(&self.socket, self.reads.as_deref())?
             {
                 Some(req) => {
+                    let request_close = courierust_h1::wants_close(&req.headers);
                     let resp = handler.handle(req);
-                    let (wire, keep_alive) = build_response(resp, config)?;
+                    let (wire, keep_alive) = build_response(resp, config, request_close)?;
                     self.out = wire;
                     self.out_pos = 0;
                     self.keep_alive = keep_alive;
@@ -550,12 +551,19 @@ impl EventConn {
 }
 
 /// Serialize a response (head + body, chunked for channel bodies) into
-/// wire bytes and decide keep-alive.
-fn build_response(resp: Response<Body>, config: &ServerConfig) -> Result<(Vec<u8>, bool)> {
+/// wire bytes and decide keep-alive. `request_close` reflects a request
+/// `Connection: close` token, which forces the connection closed (RFC
+/// 7230 §6.3).
+fn build_response(
+    resp: Response<Body>,
+    config: &ServerConfig,
+    request_close: bool,
+) -> Result<(Vec<u8>, bool)> {
     // `keep_alive_requested` already applies the exact-token `Connection`
     // semantics (a `closex` token does not close); no separate substring
     // check here, or the two paths would disagree.
-    let keep_alive = courierust_h1::keep_alive_requested(resp.version, &resp.headers)
+    let keep_alive = !request_close
+        && courierust_h1::keep_alive_requested(resp.version, &resp.headers)
         && resp.version != Version::HTTP_10;
 
     let mut out_headers = HeaderMap::with_capacity(resp.headers.len() + 3);

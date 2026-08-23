@@ -17,12 +17,19 @@ use alloc::vec::Vec;
 /// pre_shared_key extension (0x0029) — MUST be the last ClientHello
 /// extension (RFC 8446 §4.2.11).
 pub(crate) const EXT_PRE_SHARED_KEY: u16 = 0x0029;
+/// early_data extension (0x002a) — CH / EE (empty) and NST
+/// (max_early_data_size), RFC 8446 §4.2.10 / §4.6.1.
+pub(crate) const EXT_EARLY_DATA: u16 = 0x002a;
 /// psk_key_exchange_modes extension (0x002d).
 pub(crate) const EXT_PSK_KEY_EXCHANGE_MODES: u16 = 0x002d;
 /// NewSessionTicket handshake message type.
 pub(crate) const HS_NEW_SESSION_TICKET: u8 = 4;
 /// Session lifetime the server advertises and enforces.
 pub(crate) const SESSION_LIFETIME_SECS: i64 = 7 * 24 * 3600;
+/// 0-RTT allowance the server advertises per ticket. Kept modest: early
+/// data is not forward secret and may be replayed (RFC 8446 §8), so the
+/// application must only send idempotent requests in it.
+pub(crate) const MAX_EARLY_DATA_SIZE: u32 = 16 * 1024;
 
 /// A resumable session cached by the client.
 #[derive(Debug, Clone)]
@@ -35,6 +42,12 @@ pub(crate) struct ClientSession {
     /// Validity window in seconds (the server's `ticket_lifetime`, capped
     /// at 7 days per RFC 8446 §4.6.1).
     pub(crate) lifetime: i64,
+    /// Maximum 0-RTT data the server permits with this ticket (0 = 0-RTT
+    /// disabled; RFC 8446 §4.6.1 `max_early_data_size`). Consumed by the
+    /// QUIC 0-RTT path (which requires QUIC session resumption first);
+    /// the TCP-TLS connector does not send early data.
+    #[allow(dead_code)]
+    pub(crate) max_early_data_size: u32,
 }
 
 impl ClientSession {
@@ -50,6 +63,8 @@ pub(crate) struct NewSessionTicket {
     pub(crate) nonce: Vec<u8>,
     pub(crate) ticket: Vec<u8>,
     pub(crate) lifetime: u32,
+    /// `max_early_data_size` from the `early_data` extension (0 = absent).
+    pub(crate) max_early_data_size: u32,
 }
 
 /// Parse a `NewSessionTicket` handshake body.
@@ -65,20 +80,47 @@ pub(crate) fn parse_new_session_ticket(body: &[u8]) -> Result<NewSessionTicket, 
         return Err(TlsError::Protocol("empty session ticket".into()));
     }
     let ticket = take(body, &mut p, ticket_len, "ticket")?.to_vec();
-    // extensions (this client sends none and ignores the server's)
+    // Extensions: currently only `early_data` (max_early_data_size) is
+    // defined (RFC 8446 §4.6.1); unrecognized ones are ignored.
+    let mut max_early_data_size = 0u32;
     if p != body.len() {
         let ext_len = take_u16(body, &mut p, "ticket extensions")? as usize;
-        take(body, &mut p, ext_len, "ticket extensions")?;
+        let ext_bytes = take(body, &mut p, ext_len, "ticket extensions")?;
+        let mut e = 0usize;
+        while e + 4 <= ext_bytes.len() {
+            let ext_type = u16::from_be_bytes([ext_bytes[e], ext_bytes[e + 1]]);
+            let len = u16::from_be_bytes([ext_bytes[e + 2], ext_bytes[e + 3]]) as usize;
+            e += 4;
+            if e + len > ext_bytes.len() {
+                return Err(TlsError::Protocol("truncated ticket extension".into()));
+            }
+            if ext_type == EXT_EARLY_DATA && len == 4 && max_early_data_size == 0 {
+                max_early_data_size =
+                    u32::from_be_bytes(ext_bytes[e..e + 4].try_into().expect("4 bytes"));
+            }
+            e += len;
+        }
+        if e != ext_bytes.len() {
+            return Err(TlsError::Protocol("malformed ticket extensions".into()));
+        }
     }
     Ok(NewSessionTicket {
         nonce,
         ticket,
         lifetime,
+        max_early_data_size,
     })
 }
 
-/// Build a `NewSessionTicket` handshake message.
-pub(crate) fn build_new_session_ticket(lifetime: u32, nonce: &[u8], ticket: &[u8]) -> Vec<u8> {
+/// Build a `NewSessionTicket` handshake message with an `early_data`
+/// extension advertising `max_early_data_size` bytes of 0-RTT allowance
+/// (0 disables 0-RTT).
+pub(crate) fn build_new_session_ticket_with_early_data(
+    lifetime: u32,
+    nonce: &[u8],
+    ticket: &[u8],
+    max_early_data_size: u32,
+) -> Vec<u8> {
     let mut body = Vec::with_capacity(16 + nonce.len() + ticket.len());
     body.extend_from_slice(&lifetime.to_be_bytes());
     body.extend_from_slice(&0u32.to_be_bytes()); // ticket_age_add
@@ -86,7 +128,13 @@ pub(crate) fn build_new_session_ticket(lifetime: u32, nonce: &[u8], ticket: &[u8
     body.extend_from_slice(nonce);
     body.extend_from_slice(&(ticket.len() as u16).to_be_bytes());
     body.extend_from_slice(ticket);
-    body.extend_from_slice(&0u16.to_be_bytes()); // no extensions
+    // Extensions: early_data (type 0x002a) with a 4-byte value.
+    let mut ext = Vec::with_capacity(8);
+    ext.extend_from_slice(&EXT_EARLY_DATA.to_be_bytes());
+    ext.extend_from_slice(&4u16.to_be_bytes());
+    ext.extend_from_slice(&max_early_data_size.to_be_bytes());
+    body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+    body.extend_from_slice(&ext);
     let mut msg = Vec::with_capacity(4 + body.len());
     msg.push(HS_NEW_SESSION_TICKET);
     msg.extend_from_slice(&[
@@ -170,7 +218,9 @@ pub(crate) fn decrypt_ticket(
 /// Build a TLS 1.3 ClientHello offering a resumption PSK. The
 /// `pre_shared_key` extension is emitted last; the binder is computed
 /// over the truncated ClientHello (binders removed) with the binder key
-/// derived from the PSK.
+/// derived from the PSK. `early_data` adds the empty `early_data`
+/// extension (RFC 8446 §4.2.10), signalling the client will send 0-RTT
+/// data with the first (0) identity.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_client_hello_with_psk(
     random: &[u8; 32],
@@ -180,6 +230,7 @@ pub(crate) fn build_client_hello_with_psk(
     suite: CipherSuite,
     psk: &[u8],
     ticket: &[u8],
+    early_data: bool,
 ) -> Result<Vec<u8>, TlsError> {
     let mut body = Vec::new();
     body.extend_from_slice(&[0x03, 0x03]); // legacy_version
@@ -244,6 +295,11 @@ pub(crate) fn build_client_hello_with_psk(
     }
     // psk_key_exchange_modes: psk_dhe_ke only (0x01) — forward secrecy.
     exts.push((EXT_PSK_KEY_EXCHANGE_MODES, vec![0x02, 0x01]));
+    // early_data: empty in the ClientHello (RFC 8446 §4.2.10). Placed
+    // before pre_shared_key, which must remain the last extension.
+    if early_data {
+        exts.push((EXT_EARLY_DATA, Vec::new()));
+    }
 
     let mut ext_bytes = Vec::new();
     for (t, c) in exts {
@@ -656,12 +712,21 @@ mod tests {
 
     #[test]
     fn new_session_ticket_roundtrip() {
-        let ticket = build_new_session_ticket(3600, &[1, 2, 3], &[0xdd; 40]);
+        let ticket = build_new_session_ticket_with_early_data(3600, &[1, 2, 3], &[0xdd; 40], 8192);
         // 4-byte handshake header + body.
         let parsed = parse_new_session_ticket(&ticket[4..]).unwrap();
         assert_eq!(parsed.lifetime, 3600);
         assert_eq!(parsed.nonce, vec![1, 2, 3]);
         assert_eq!(parsed.ticket, vec![0xdd; 40]);
+        assert_eq!(parsed.max_early_data_size, 8192);
+        // A ticket without the early_data extension means 0-RTT is off.
+        let plain = build_new_session_ticket_with_early_data(3600, &[1, 2, 3], &[0xdd; 40], 0);
+        assert_eq!(
+            parse_new_session_ticket(&plain[4..])
+                .unwrap()
+                .max_early_data_size,
+            0
+        );
     }
 
     #[test]
@@ -679,6 +744,7 @@ mod tests {
             suite,
             &psk,
             &ticket,
+            true,
         )
         .unwrap();
         // The message is a ClientHello.

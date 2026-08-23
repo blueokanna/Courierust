@@ -53,6 +53,10 @@ pub(crate) fn serve(
                 )?)
             }
         };
+        // RFC 7230 §6.3: a request carrying `Connection: close` forces the
+        // connection closed after this response, regardless of the
+        // response's own keep-alive hints.
+        let request_close = courierust_h1::wants_close(&headers);
         let req = Request {
             method: rl.method,
             uri: rl.target,
@@ -81,7 +85,8 @@ pub(crate) fn serve(
         // semantics (a `closex` token does not close) and already
         // returns false for a close token; no separate substring check
         // here, or this path and the event path would disagree.
-        let keep_alive = courierust_h1::keep_alive_requested(resp.version, &resp.headers)
+        let keep_alive = !request_close
+            && courierust_h1::keep_alive_requested(resp.version, &resp.headers)
             && resp.version != Version::HTTP_10;
 
         // Build wire headers (drop hop-by-hop, add framing).

@@ -1,25 +1,18 @@
-//! A self-contained Protocol Buffers wire-format codec (protobuf
-//! encoding v0 / v1, the canonical "proto3" binary format) plus the
-//! traits and helpers the [`crate::courierust_grpc::message`] and
-//! [`crate::courierust_grpc::service`] macros generate code against.
+//! A self-contained Protocol Buffers wire-format codec (proto3 binary
+//! format) implemented from the public
+//! [protobuf encoding specification](<https://protobuf.dev/programming-guides/encoding/>)
+//! with no third-party crates.
 //!
-//! Everything here is implemented from the public protobuf
-//! specification (https://protobuf.dev/programming-guides/encoding/)
-//! with no third-party crates, so the gRPC layer is a batteries-included
-//! stack: users declare messages and services with the macros, get
-//! type-safe, IDE-friendly Rust types and wire codecs, and plug them
-//! into [`crate::courierust_grpc::GrpcClient`] /
-//! [`crate::courierust_grpc::GrpcServer`] directly.
-//!
-//! Supported scalar types: `int32/int64/uint32/uint64/sint32/sint64/
-//! bool` (varint), `fixed32/fixed64/float/double` (fixed),
-//! `string/bytes` (length-delimited), plus `repeated` fields (packed
-//! for numeric scalars, per proto3) and message-typed fields.
+//! Supported scalars: varint (`int32/int64/uint32/uint64/sint32/sint64/
+//! bool`), fixed (`fixed32/fixed64/float/double`), length-delimited
+//! (`string/bytes`), plus `repeated` (packed for numerics) and
+//! message-typed fields.
 
 use crate::courierust_error::{Error, Result};
 use alloc::vec::Vec;
 
-/// Protobuf wire types (https://protobuf.dev/programming-guides/encoding/#structure).
+/// Protobuf wire types
+/// (<https://protobuf.dev/programming-guides/encoding/#structure>).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireType {
     /// 0 — varint.

@@ -378,6 +378,26 @@ pub(crate) fn binder_key(suite: CipherSuite, psk: &[u8]) -> Vec<u8> {
     derive_secret(h, &early, b"res binder", &empty_hash)
 }
 
+/// Derive the client early traffic secret for 0-RTT (RFC 8446 §7.1):
+/// `early_secret = HKDF-Extract(0, psk)`;
+/// `client_early_traffic_secret = Derive-Secret(early_secret,
+/// "c e traffic", Transcript-Hash(ClientHello))`.
+///
+/// Used to protect 0-RTT application data (QUIC 0-RTT packet space) and
+/// to derive the `early_exporter_master_secret`. Wired by the QUIC 0-RTT
+/// path, which requires QUIC session resumption first.
+#[allow(dead_code)]
+pub(crate) fn client_early_traffic_secret(
+    suite: CipherSuite,
+    psk: &[u8],
+    ch_transcript_hash: &[u8],
+) -> Vec<u8> {
+    let h = suite.hash();
+    let zeros = vec![0u8; h.hash_len()];
+    let early = hkdf_extract(&mut h.new_digest(), &zeros, psk);
+    derive_secret(h, &early, b"c e traffic", ch_transcript_hash)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,6 +451,32 @@ mod tests {
             hex_str(&master),
             "18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919"
         );
+    }
+
+    /// The 0-RTT client early traffic secret (RFC 8446 §7.1): derived from
+    /// the PSK's early secret with the "c e traffic" label over the
+    /// ClientHello transcript. Deterministic for a fixed input, distinct
+    /// from the binder key (different labels must not collide).
+    #[test]
+    fn client_early_traffic_secret_is_deterministic_and_distinct() {
+        let psk = [0x42u8; 32];
+        let ch_hash = [0xabu8; 32];
+        let suite = CipherSuite::TlsAes128GcmSha256;
+        let a = client_early_traffic_secret(suite, &psk, &ch_hash);
+        let b = client_early_traffic_secret(suite, &psk, &ch_hash);
+        assert_eq!(a, b, "early traffic secret must be deterministic");
+        assert_eq!(a.len(), 32);
+        // A different ClientHello changes it.
+        let mut ch2 = ch_hash;
+        ch2[0] ^= 1;
+        assert_ne!(a, client_early_traffic_secret(suite, &psk, &ch2));
+        // A different PSK changes it.
+        let mut psk2 = psk;
+        psk2[0] ^= 1;
+        assert_ne!(a, client_early_traffic_secret(suite, &psk2, &ch_hash));
+        // The binder key (res binder) and early traffic key (c e traffic)
+        // are different outputs of the same early secret.
+        assert_ne!(a, binder_key(suite, &psk));
     }
 
     fn hex_str(v: &[u8]) -> String {

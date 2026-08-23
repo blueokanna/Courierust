@@ -34,6 +34,8 @@ extern crate alloc;
 pub mod frame;
 pub mod qpack;
 #[cfg(feature = "std")]
+mod qpack_conn;
+#[cfg(feature = "std")]
 pub mod runtime;
 
 pub use frame::Frame;

@@ -661,6 +661,8 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
                         issued_at: self.now,
                         // Honor the server's lifetime, capped at 7 days.
                         lifetime: (ticket.lifetime as i64).min(session::SESSION_LIFETIME_SECS),
+                        // 0-RTT allowance the ticket carries (0 = none).
+                        max_early_data_size: ticket.max_early_data_size,
                     };
                     if let Some(store) = &self.session_store {
                         cache_session(&mut store.lock().unwrap(), sess);
@@ -967,6 +969,7 @@ impl TlsConnector {
                 s.suite,
                 &s.psk,
                 &s.ticket,
+                false, // TCP-TLS path: no 0-RTT in this synchronous model
             )?,
             None => handshake::build_client_hello_negotiated(
                 &random,

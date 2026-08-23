@@ -1158,9 +1158,7 @@ impl ServerHandshake {
                             ch.suite,
                             &psk,
                         ),
-                        None => {
-                            super::session::verify_binder(&resume_body, &offer, ch.suite, &psk)
-                        }
+                        None => super::session::verify_binder(&resume_body, &offer, ch.suite, &psk),
                     };
                     if ticket_suite == ch.suite && binder_ok {
                         resumed = true;
@@ -1330,10 +1328,14 @@ impl ServerHandshake {
             fill_entropy(&mut nonce)?;
             let psk = ks.resumption_psk(&transcript.current_hash(), &nonce);
             let ticket = super::session::encrypt_ticket(&key, ch.suite, &psk, self.now);
-            let msg = super::session::build_new_session_ticket(
+            // Advertise 0-RTT for this ticket (RFC 8446 §4.6.1). The
+            // client may send up to this many bytes of early data on a
+            // future connection using the ticket.
+            let msg = super::session::build_new_session_ticket_with_early_data(
                 super::session::SESSION_LIFETIME_SECS as u32,
                 &nonce,
                 &ticket,
+                super::session::MAX_EARLY_DATA_SIZE,
             );
             io.write_encrypted_record(ch.suite, &write, CONTENT_HANDSHAKE, &msg)?;
         }

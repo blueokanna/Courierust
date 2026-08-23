@@ -471,6 +471,15 @@ impl<R: Read, W: Write> Connection<R, W> {
         }
         let mut block = BytesMut::with_capacity(64);
         self.encoder.encode(fields, &mut block);
+        // Respect the peer's SETTINGS_MAX_HEADER_LIST_SIZE (0 = unlimited,
+        // RFC 7540 §6.5.2): an oversized block would otherwise be rejected
+        // by the peer with COMPRESSION_ERROR, so fail the call up front.
+        let peer_limit = self.peer.max_header_list_size as usize;
+        if peer_limit != 0 && block.len() > peer_limit {
+            return Err(Error::overflow(
+                "header block exceeds peer SETTINGS_MAX_HEADER_LIST_SIZE",
+            ));
+        }
         let max = self.peer.max_frame_size as usize;
         let method = fields
             .iter()
@@ -1797,6 +1806,19 @@ impl<R: Read, W: Write> Connection<R, W> {
             s.state = StreamState::Closed;
             s.recv_ended = true;
             s.send_done = true;
+        }
+        // Flush connection-level credit accumulated on close so it is not
+        // stranded when the application never released the stream's data
+        // (a peer closing many streams with un-released bodies would
+        // otherwise shrink the connection receive window indefinitely).
+        let conn_threshold = 32 * 1024i64;
+        if self.conn_pending_release >= conn_threshold {
+            let inc = self.conn_pending_release.min(i64::from(u32::MAX)) as u32;
+            self.conn_pending_release = 0;
+            self.pending_frames.push_back(Frame::WindowUpdate {
+                stream_id: 0,
+                increment: inc,
+            });
         }
         self.scheduler.remove(stream_id);
         self.scheduled.remove(&stream_id);

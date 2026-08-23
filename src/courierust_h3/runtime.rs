@@ -9,7 +9,8 @@
 use crate::courierust_body::Body;
 use crate::courierust_error::{Error, ErrorKind, Result};
 use crate::courierust_h3::frame as h3frame;
-use crate::courierust_h3::qpack::{self, DynamicTable, FieldLine};
+use crate::courierust_h3::qpack::FieldLine;
+use crate::courierust_h3::qpack_conn::QpackConnection;
 use crate::courierust_http::header::{HeaderMap, HeaderName, HeaderValue};
 use crate::courierust_http::method::Method;
 use crate::courierust_http::request::{Request, RequestHead};
@@ -102,6 +103,23 @@ const RETRY_TOKEN_VERSION: u8 = 1;
 const H3_CONTROL_STREAM: u64 = h3frame::STREAM_TYPE_CONTROL;
 const H3_QPACK_ENCODER_STREAM: u64 = h3frame::STREAM_TYPE_QPACK_ENCODER;
 const H3_QPACK_DECODER_STREAM: u64 = h3frame::STREAM_TYPE_QPACK_DECODER;
+
+// QPACK dynamic-table settings we advertise (RFC 9204). 4096 is a sane
+// default capacity; 100 blocked streams bounds how many field sections we
+// will buffer waiting for the peer's encoder stream to catch up.
+const QPACK_MAX_TABLE_CAPACITY: u64 = 4096;
+const QPACK_BLOCKED_STREAMS: u64 = 100;
+// Client-initiated unidirectional stream ids: control 2, encoder 6,
+// decoder 10 (RFC 9114 §6.2). Server-initiated: control 3, encoder 7,
+// decoder 11.
+const CLIENT_QPACK_ENCODER_STREAM: u64 = 6;
+const CLIENT_QPACK_DECODER_STREAM: u64 = 10;
+const SERVER_QPACK_ENCODER_STREAM: u64 = 7;
+const SERVER_QPACK_DECODER_STREAM: u64 = 11;
+
+/// A field section that was blocked on QPACK encoder-stream progress and
+/// can now be decoded: (request/response stream id, decoded fields).
+type UnblockedSection = (u64, Vec<FieldLine>);
 
 /// Server idle receive window: bounds how long the reactor parks on the
 /// poller with no datagram pending. Datagrams and the completed-response
@@ -580,6 +598,7 @@ fn run_client_driver(
         if conn.has_work() {
             last_activity = now;
         } else if now.duration_since(last_activity) >= idle {
+            let _ = conn.send_goaway(&socket);
             let _ = conn.transport.send_connection_close(
                 &socket,
                 0x1,
@@ -641,6 +660,7 @@ fn run_client_driver(
             drain_wake(&wake_reader);
         }
     }
+    let _ = conn.send_goaway(&socket);
     let _ = conn
         .transport
         .send_connection_close(&socket, 0x1, None, "client shutdown");
@@ -794,6 +814,9 @@ fn run_server(
                         connection.handshake_complete,
                         now.duration_since(connection.last_activity),
                     );
+                }
+                if connection.handshake_complete {
+                    let _ = connection.send_goaway(&socket);
                 }
                 let _ = connection.transport.send_connection_close(
                     &socket,
@@ -1130,7 +1153,9 @@ struct ClientConnection {
     streams: BTreeMap<u64, ReceiveStream>,
     control_received: bool,
     peer_goaway: Option<u64>,
-    qpack_decoder: DynamicTable,
+    /// True once GOAWAY has been sent on the control stream (RFC 9114 §7.2.8).
+    goaway_sent: bool,
+    qpack: QpackConnection,
     initial_crypto: CryptoReassembly,
     handshake_crypto: CryptoReassembly,
     initial_tls: Vec<u8>,
@@ -1169,7 +1194,8 @@ impl ClientConnection {
             streams: BTreeMap::new(),
             control_received: false,
             peer_goaway: None,
-            qpack_decoder: DynamicTable::new(0),
+            goaway_sent: false,
+            qpack: QpackConnection::new(QPACK_MAX_TABLE_CAPACITY, QPACK_BLOCKED_STREAMS),
             initial_crypto: CryptoReassembly::default(),
             handshake_crypto: CryptoReassembly::default(),
             initial_tls: Vec::new(),
@@ -1193,7 +1219,12 @@ impl ClientConnection {
         if source == self.transport.peer.unwrap_or(source)
             || self.transport.pending_peer == Some(source)
         {
-            if let Some(version_negotiation) = version_negotiation_versions(datagram)? {
+            // Version Negotiation / Retry packets are unauthenticated.
+            // Per RFC 9000 §5.2 a packet that cannot be processed MUST be
+            // discarded, never fatal: a malformed long header (bad CID
+            // lengths, truncated integrity tag) from the server address is
+            // dropped rather than tearing the connection down.
+            if let Ok(Some(version_negotiation)) = version_negotiation_versions(datagram) {
                 if version_negotiation.dcid == self.transport.local_cid {
                     if version_negotiation.scid != self.transport.original_dcid {
                         return Err(protocol(
@@ -1212,7 +1243,7 @@ impl ClientConnection {
                 }
                 return Ok(());
             }
-            if let Some(retry) = parse_retry_packet(datagram)? {
+            if let Ok(Some(retry)) = parse_retry_packet(datagram) {
                 if retry.dcid != self.transport.local_cid {
                     return Ok(());
                 }
@@ -1407,7 +1438,11 @@ impl ClientConnection {
         }
         if self.handshake_complete {
             self.ensure_control_sent(socket)?;
+            self.flush_qpack(socket)?;
             self.flush_requests(socket)?;
+            // QPACK encoder-stream instructions produced while building
+            // this batch of requests go out before the next batch.
+            self.flush_qpack(socket)?;
             // Resume request bodies deferred by the congestion window;
             // remaining chunks go out once ACKs free credit.
             let resumable: Vec<u64> = self
@@ -1449,8 +1484,14 @@ impl ClientConnection {
             return Ok(());
         }
         let settings = h3frame::Frame::Settings(vec![
-            (h3frame::SETTINGS_QPACK_MAX_TABLE_CAPACITY, 0),
-            (h3frame::SETTINGS_QPACK_BLOCKED_STREAMS, 0),
+            (
+                h3frame::SETTINGS_QPACK_MAX_TABLE_CAPACITY,
+                self.qpack.capacity(),
+            ),
+            (
+                h3frame::SETTINGS_QPACK_BLOCKED_STREAMS,
+                self.qpack.blocked_limit(),
+            ),
             (
                 h3frame::SETTINGS_MAX_FIELD_SECTION_SIZE,
                 self.max_header_list as u64,
@@ -1471,7 +1512,7 @@ impl ClientConnection {
         match self.transport.send_stream(
             socket,
             APPLICATION,
-            6,
+            CLIENT_QPACK_ENCODER_STREAM,
             &stream_type(H3_QPACK_ENCODER_STREAM),
             false,
         ) {
@@ -1482,7 +1523,7 @@ impl ClientConnection {
         match self.transport.send_stream(
             socket,
             APPLICATION,
-            10,
+            CLIENT_QPACK_DECODER_STREAM,
             &stream_type(H3_QPACK_DECODER_STREAM),
             false,
         ) {
@@ -1491,6 +1532,60 @@ impl ClientConnection {
             Err(error) => return Err(error),
         }
         self.control_sent = true;
+        self.flush_qpack(socket)
+    }
+
+    /// Send a GOAWAY frame on the control stream before closing so the
+    /// peer learns which request streams were processed (RFC 9114 §7.2.8).
+    fn send_goaway(&mut self, socket: &UdpSocket) -> Result<()> {
+        if self.goaway_sent || !self.control_sent {
+            return Ok(());
+        }
+        let last = 4u64.saturating_mul(self.next_stream_index.saturating_sub(1));
+        let goaway = h3frame::Frame::GoAway(last).to_bytes();
+        match self
+            .transport
+            .send_stream_append(socket, APPLICATION, 2, &goaway)
+        {
+            Ok(()) => self.goaway_sent = true,
+            Err(error) if error.kind == ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    /// Send any pending QPACK encoder/decoder stream instructions.
+    fn flush_qpack(&mut self, socket: &UdpSocket) -> Result<()> {
+        if self.qpack.has_encoder_out() {
+            let bytes = self.qpack.take_encoder_out();
+            match self.transport.send_stream_append(
+                socket,
+                APPLICATION,
+                CLIENT_QPACK_ENCODER_STREAM,
+                &bytes,
+            ) {
+                Ok(()) => {}
+                Err(error) if error.kind == ErrorKind::WouldBlock => {
+                    self.qpack.restore_encoder_out(bytes);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if self.qpack.has_decoder_out() {
+            let bytes = self.qpack.take_decoder_out();
+            match self.transport.send_stream_append(
+                socket,
+                APPLICATION,
+                CLIENT_QPACK_DECODER_STREAM,
+                &bytes,
+            ) {
+                Ok(()) => {}
+                Err(error) if error.kind == ErrorKind::WouldBlock => {
+                    self.qpack.restore_decoder_out(bytes);
+                }
+                Err(error) => return Err(error),
+            }
+        }
         Ok(())
     }
 
@@ -1531,6 +1626,7 @@ impl ClientConnection {
             let wire = match build_request_wire(
                 request.request,
                 &self.authority,
+                &mut self.qpack,
                 outbound_limit,
                 self.max_body,
             ) {
@@ -1694,16 +1790,19 @@ impl ClientConnection {
         )?;
         stream.frame_buf.extend_from_slice(&ready);
         if stream_id::is_unidirectional(id) {
-            process_unidirectional_stream(
+            let unblocked = process_unidirectional_stream(
                 stream,
                 &mut self.control_received,
                 &mut self.peer_goaway,
                 &mut self.peer_max_header_list,
+                &mut self.qpack,
                 H3Limits {
                     max_header_list: self.max_header_list,
                     max_body: self.max_body,
                 },
-            )?;
+            )?
+            .unwrap_or_default();
+            self.unblock_streams(unblocked)?;
         } else {
             let finished = {
                 let Some(request) = self.active.get_mut(&id) else {
@@ -1721,7 +1820,7 @@ impl ClientConnection {
                     &mut self.control_received,
                     &mut self.peer_goaway,
                     &mut self.peer_max_header_list,
-                    &mut self.qpack_decoder,
+                    &mut self.qpack,
                     H3Limits {
                         max_header_list: self.max_header_list,
                         max_body: self.max_body,
@@ -1745,6 +1844,56 @@ impl ClientConnection {
             }
         }
         self.ensure_buffer_budget()
+    }
+
+    /// Apply field sections that the QPACK encoder stream just unblocked:
+    /// install the headers on the paused response stream and resume
+    /// draining its remaining frames (delivering the response when the
+    /// stream is complete).
+    fn unblock_streams(&mut self, unblocked: Vec<UnblockedSection>) -> Result<()> {
+        for (id, fields) in unblocked {
+            let mut stream = match self.streams.remove(&id) {
+                Some(stream) => stream,
+                None => continue, // response stream already released
+            };
+            if stream.headers.is_some() {
+                if stream.trailers.is_some() {
+                    return Err(protocol("multiple HTTP/3 response trailer blocks"));
+                }
+                stream.trailers = Some(response_trailers_from_fields(fields)?);
+            } else {
+                stream.headers = Some(fields);
+            }
+            stream.blocked = false;
+            let mut finished = false;
+            if let Some(request) = self.active.get_mut(&id) {
+                process_client_stream(
+                    &mut stream,
+                    &mut self.control_received,
+                    &mut self.peer_goaway,
+                    &mut self.peer_max_header_list,
+                    &mut self.qpack,
+                    H3Limits {
+                        max_header_list: self.max_header_list,
+                        max_body: self.max_body,
+                    },
+                    &mut request.response,
+                )?;
+                finished = request.response.is_some();
+            }
+            if finished {
+                let mut request = self
+                    .active
+                    .remove(&id)
+                    .expect("request present while resuming its response");
+                let response = request.response.take().expect("response just completed");
+                let _ = request.reply.send(Ok(response));
+                h3_close_stream(self.stats.as_ref(), &mut self.active_streams, id);
+            } else if !(stream.reassembly.finished() && stream.completed) {
+                self.streams.insert(id, stream);
+            }
+        }
+        Ok(())
     }
 
     fn ensure_buffer_budget(&self) -> Result<()> {
@@ -1823,7 +1972,7 @@ struct ServerConnection {
     /// `MAX_COMPLETED_STREAMS`).
     completed_streams: VecDeque<u64>,
     pending_requests: VecDeque<PendingRequest>,
-    qpack_decoder: DynamicTable,
+    qpack: QpackConnection,
     peer_transport: Option<TransportParameters>,
     initial_crypto: CryptoReassembly,
     handshake_crypto: CryptoReassembly,
@@ -1832,6 +1981,11 @@ struct ServerConnection {
     pending_initial: Vec<u8>,
     pending_handshake: Vec<u8>,
     peer_goaway: Option<u64>,
+    /// Highest client-initiated request stream id accepted; the GOAWAY
+    /// value we advertise so peers know which requests were processed.
+    max_request_stream_id: u64,
+    /// True once GOAWAY has been sent on the control stream (RFC 9114 §7.2.8).
+    goaway_sent: bool,
     stats: Option<Arc<Stats>>,
     active_streams: BTreeSet<u64>,
 }
@@ -1900,7 +2054,7 @@ impl ServerConnection {
             streams: BTreeMap::new(),
             completed_streams: VecDeque::new(),
             pending_requests: VecDeque::new(),
-            qpack_decoder: DynamicTable::new(0),
+            qpack: QpackConnection::new(QPACK_MAX_TABLE_CAPACITY, QPACK_BLOCKED_STREAMS),
             peer_transport: None,
             initial_crypto: CryptoReassembly::default(),
             handshake_crypto: CryptoReassembly::default(),
@@ -1909,6 +2063,8 @@ impl ServerConnection {
             pending_initial: Vec::new(),
             pending_handshake: Vec::new(),
             peer_goaway: None,
+            max_request_stream_id: 0,
+            goaway_sent: false,
             stats: config.stats.clone(),
             active_streams: BTreeSet::new(),
         };
@@ -2079,6 +2235,7 @@ impl ServerConnection {
         if self.handshake_complete && !self.control_sent {
             self.send_control(socket)?;
         }
+        self.flush_qpack(socket)?;
         self.transport.flush_acks(socket)?;
         self.transport
             .check_path_validation_timeout(socket, Instant::now())?;
@@ -2115,8 +2272,14 @@ impl ServerConnection {
             return Ok(());
         }
         let settings = h3frame::Frame::Settings(vec![
-            (h3frame::SETTINGS_QPACK_MAX_TABLE_CAPACITY, 0),
-            (h3frame::SETTINGS_QPACK_BLOCKED_STREAMS, 0),
+            (
+                h3frame::SETTINGS_QPACK_MAX_TABLE_CAPACITY,
+                self.qpack.capacity(),
+            ),
+            (
+                h3frame::SETTINGS_QPACK_BLOCKED_STREAMS,
+                self.qpack.blocked_limit(),
+            ),
             (
                 h3frame::SETTINGS_MAX_FIELD_SECTION_SIZE,
                 self.max_header_list as u64,
@@ -2134,7 +2297,7 @@ impl ServerConnection {
         match self.transport.send_stream(
             socket,
             APPLICATION,
-            7,
+            SERVER_QPACK_ENCODER_STREAM,
             &stream_type(H3_QPACK_ENCODER_STREAM),
             false,
         ) {
@@ -2145,7 +2308,7 @@ impl ServerConnection {
         match self.transport.send_stream(
             socket,
             APPLICATION,
-            11,
+            SERVER_QPACK_DECODER_STREAM,
             &stream_type(H3_QPACK_DECODER_STREAM),
             false,
         ) {
@@ -2154,6 +2317,59 @@ impl ServerConnection {
             Err(error) => return Err(error),
         }
         self.control_sent = true;
+        self.flush_qpack(socket)
+    }
+
+    /// Send a GOAWAY frame on the control stream before closing so the
+    /// peer learns which request streams were processed (RFC 9114 §7.2.8).
+    fn send_goaway(&mut self, socket: &UdpSocket) -> Result<()> {
+        if self.goaway_sent || !self.control_sent {
+            return Ok(());
+        }
+        let goaway = h3frame::Frame::GoAway(self.max_request_stream_id).to_bytes();
+        match self
+            .transport
+            .send_stream_append(socket, APPLICATION, 3, &goaway)
+        {
+            Ok(()) => self.goaway_sent = true,
+            Err(error) if error.kind == ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    /// Send any pending QPACK encoder/decoder stream instructions.
+    fn flush_qpack(&mut self, socket: &UdpSocket) -> Result<()> {
+        if self.qpack.has_encoder_out() {
+            let bytes = self.qpack.take_encoder_out();
+            match self.transport.send_stream_append(
+                socket,
+                APPLICATION,
+                SERVER_QPACK_ENCODER_STREAM,
+                &bytes,
+            ) {
+                Ok(()) => {}
+                Err(error) if error.kind == ErrorKind::WouldBlock => {
+                    self.qpack.restore_encoder_out(bytes);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if self.qpack.has_decoder_out() {
+            let bytes = self.qpack.take_decoder_out();
+            match self.transport.send_stream_append(
+                socket,
+                APPLICATION,
+                SERVER_QPACK_DECODER_STREAM,
+                &bytes,
+            ) {
+                Ok(()) => {}
+                Err(error) if error.kind == ErrorKind::WouldBlock => {
+                    self.qpack.restore_decoder_out(bytes);
+                }
+                Err(error) => return Err(error),
+            }
+        }
         Ok(())
     }
 
@@ -2188,34 +2404,75 @@ impl ServerConnection {
         if !stream_id::is_unidirectional(id) && !self.streams.contains_key(&id) {
             h3_open_stream(self.stats.as_ref(), &mut self.active_streams, id);
         }
-        let stream = self.streams.entry(id).or_insert_with(|| ReceiveStream {
-            id,
-            ..Default::default()
-        });
-        let max = self.max_body.saturating_add(self.max_header_list);
-        let ready = stream.reassembly.insert(offset, data, fin, max)?;
-        stream.frame_buf.extend_from_slice(&ready);
-        process_server_stream(
-            stream,
-            &mut self.local_settings_received,
-            &mut self.peer_goaway,
-            &mut self.peer_max_header_list,
-            &mut self.qpack_decoder,
-            H3Limits {
-                max_header_list: self.max_header_list,
-                max_body: self.max_body,
-            },
-            &mut self.pending_requests,
-        )?;
+        if !stream_id::is_unidirectional(id) {
+            self.max_request_stream_id = self.max_request_stream_id.max(id);
+        }
+        let (unblocked, remove_stream) = {
+            let stream = self.streams.entry(id).or_insert_with(|| ReceiveStream {
+                id,
+                ..Default::default()
+            });
+            let max = self.max_body.saturating_add(self.max_header_list);
+            let ready = stream.reassembly.insert(offset, data, fin, max)?;
+            stream.frame_buf.extend_from_slice(&ready);
+            let unblocked = process_server_stream(
+                stream,
+                &mut self.local_settings_received,
+                &mut self.peer_goaway,
+                &mut self.peer_max_header_list,
+                &mut self.qpack,
+                H3Limits {
+                    max_header_list: self.max_header_list,
+                    max_body: self.max_body,
+                },
+                &mut self.pending_requests,
+            )?;
+            let remove_stream = stream.reassembly.finished() && stream.completed;
+            (unblocked, remove_stream)
+        };
+        self.unblock_streams(unblocked)?;
         // Release the receive-side state once the request is fully
         // consumed so the stream cap counts concurrent streams, not the
         // cumulative request count (which previously tore the connection
         // down after MAX_H3_STREAMS requests).
-        if stream.reassembly.finished() && stream.completed {
+        if remove_stream {
             self.streams.remove(&id);
             self.note_completed_stream(id);
         }
         self.ensure_buffer_budget()
+    }
+
+    /// Apply field sections that the QPACK encoder stream just unblocked:
+    /// install the request headers on the paused stream and resume
+    /// draining its remaining frames (enqueueing the request when the
+    /// stream is complete).
+    fn unblock_streams(&mut self, unblocked: Vec<UnblockedSection>) -> Result<()> {
+        for (id, fields) in unblocked {
+            let mut stream = match self.streams.remove(&id) {
+                Some(stream) => stream,
+                None => continue, // request stream already released
+            };
+            stream.headers = Some(fields);
+            stream.blocked = false;
+            process_server_stream(
+                &mut stream,
+                &mut self.local_settings_received,
+                &mut self.peer_goaway,
+                &mut self.peer_max_header_list,
+                &mut self.qpack,
+                H3Limits {
+                    max_header_list: self.max_header_list,
+                    max_body: self.max_body,
+                },
+                &mut self.pending_requests,
+            )?;
+            if stream.reassembly.finished() && stream.completed {
+                self.note_completed_stream(id);
+            } else {
+                self.streams.insert(id, stream);
+            }
+        }
+        Ok(())
     }
 
     /// Remember a completed request stream so a late retransmission is
@@ -2245,7 +2502,9 @@ impl ServerConnection {
             }
         };
         let outbound_limit = self.max_header_list.min(self.peer_max_header_list);
-        if let Ok(wire) = build_response_wire(response, outbound_limit, self.max_body) {
+        if let Ok(wire) =
+            build_response_wire(response, &mut self.qpack, outbound_limit, self.max_body)
+        {
             let _ = self.transport.queue_stream_wire(stream_id, wire);
         } else {
             self.queue_service_unavailable(stream_id);
@@ -2259,7 +2518,9 @@ impl ServerConnection {
             HeaderValue::from_static("0"),
         );
         let outbound_limit = self.max_header_list.min(self.peer_max_header_list);
-        if let Ok(wire) = build_response_wire(response, outbound_limit, self.max_body) {
+        if let Ok(wire) =
+            build_response_wire(response, &mut self.qpack, outbound_limit, self.max_body)
+        {
             let _ = self.transport.queue_stream_wire(stream_id, wire);
         }
     }
@@ -2320,6 +2581,10 @@ struct ReceiveStream {
     completed: bool,
     stream_type: Option<u64>,
     control_started: bool,
+    /// True while a HEADERS frame waits for the QPACK encoder stream
+    /// (Required Insert Count not yet met). The stream's remaining frames
+    /// stay buffered and are drained once the section is decoded.
+    blocked: bool,
 }
 
 #[derive(Default)]
@@ -2528,15 +2793,19 @@ impl ReceiveStream {
 }
 
 /// Process a unidirectional stream (control / QPACK encoder / QPACK
-/// decoder). Returns `true` when the stream was consumed, `false` when it
-/// is a bidirectional request/response stream that still needs draining.
+/// decoder). Returns `Ok(None)` when the stream is a bidirectional
+/// request/response stream that still needs draining; `Ok(Some(...))`
+/// when the stream was consumed, carrying any field sections that were
+/// blocked and are now decodable (their request/response streams must be
+/// resumed by the caller).
 fn process_unidirectional_stream(
     stream: &mut ReceiveStream,
     control_received: &mut bool,
     peer_goaway: &mut Option<u64>,
     peer_max_header_list: &mut usize,
+    qpack: &mut QpackConnection,
     limits: H3Limits,
-) -> Result<bool> {
+) -> Result<Option<Vec<UnblockedSection>>> {
     if stream.stream_type.is_none() && stream_id::is_unidirectional(stream_id_of(stream)) {
         let (kind, used) = match varint::decode(&stream.frame_buf) {
             Ok(v) => v,
@@ -2546,7 +2815,7 @@ fn process_unidirectional_stream(
                         "HTTP/3 unidirectional stream ended before its type",
                     ));
                 }
-                return Ok(true);
+                return Ok(Some(Vec::new()));
             }
             Err(error) => return Err(error),
         };
@@ -2558,7 +2827,7 @@ fn process_unidirectional_stream(
         // We record the type so the `_` match arm below drains the stream.
     }
     let Some(kind) = stream.stream_type else {
-        return Ok(stream_id::is_unidirectional(stream_id_of(stream)));
+        return Ok(None);
     };
     match kind {
         H3_CONTROL_STREAM => {
@@ -2571,7 +2840,12 @@ fn process_unidirectional_stream(
                     if *control_received {
                         return Err(protocol("duplicate HTTP/3 SETTINGS"));
                     }
-                    validate_settings(&settings, limits.max_header_list, peer_max_header_list)?;
+                    let peer_capacity =
+                        validate_settings(&settings, limits.max_header_list, peer_max_header_list)?;
+                    // Enable the encoder table (emits the Set Capacity
+                    // instruction on the encoder stream) now that the
+                    // peer's limit is known.
+                    qpack.set_peer_capacity(peer_capacity);
                     stream.control_started = true;
                     *control_received = true;
                 } else {
@@ -2595,46 +2869,37 @@ fn process_unidirectional_stream(
             if stream.reassembly.finished() {
                 return Err(protocol("HTTP/3 control stream cannot be closed"));
             }
-            Ok(true)
+            Ok(Some(Vec::new()))
         }
         H3_QPACK_ENCODER_STREAM => {
-            // Both endpoints advertise a zero dynamic-table capacity, so
-            // any instruction bytes are a peer violation (and bounded).
+            // Apply the peer's encoder-stream instructions (Set Capacity,
+            // inserts, duplicates) and retry any field sections that were
+            // waiting on the entries they define.
             if stream.frame_buf.len() > limits.max_header_list {
                 return Err(protocol("QPACK encoder stream exceeds limit"));
             }
-            if !stream.frame_buf.is_empty() {
-                return Err(protocol("QPACK dynamic table instructions are disabled"));
-            }
+            let consumed = qpack.on_encoder_stream(&stream.frame_buf)?;
+            stream.frame_buf.drain(..consumed);
             if stream.reassembly.finished() {
                 return Err(protocol("HTTP/3 QPACK encoder stream cannot be closed"));
             }
-            Ok(true)
+            let unblocked = qpack.retry_blocked(limits.max_header_list)?;
+            Ok(Some(unblocked))
         }
         H3_QPACK_DECODER_STREAM => {
-            // QPACK decoder stream: instructions are parsed and dropped
-            // (the dynamic table is disabled, so nothing is applied).
-            let mut pos = 0;
-            while pos < stream.frame_buf.len() {
-                let before = pos;
-                match qpack::decode_decoder_instruction(&stream.frame_buf, &mut pos) {
-                    Ok(_) => {}
-                    Err(error) if error.kind == ErrorKind::UnexpectedEof => {
-                        pos = before;
-                        break;
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            if pos != 0 {
-                stream.frame_buf.drain(..pos);
-            }
+            // Apply the peer's decoder-stream instructions: Insert Count
+            // Increment raises our encoder-side Known Received Count.
+            let consumed = qpack.on_decoder_stream(&stream.frame_buf)?;
+            stream.frame_buf.drain(..consumed);
             if stream.reassembly.finished() {
                 return Err(protocol("HTTP/3 QPACK decoder stream cannot be closed"));
             }
-            Ok(true)
+            Ok(Some(Vec::new()))
         }
-        _ => process_unknown_unidirectional_stream(stream),
+        _ => {
+            process_unknown_unidirectional_stream(stream)?;
+            Ok(Some(Vec::new()))
+        }
     }
 }
 
@@ -2655,28 +2920,33 @@ fn process_server_stream(
     control_received: &mut bool,
     peer_goaway: &mut Option<u64>,
     peer_max_header_list: &mut usize,
-    qpack_decoder: &mut DynamicTable,
+    qpack: &mut QpackConnection,
     limits: H3Limits,
     requests: &mut VecDeque<PendingRequest>,
-) -> Result<()> {
-    if process_unidirectional_stream(
+) -> Result<Vec<UnblockedSection>> {
+    if let Some(unblocked) = process_unidirectional_stream(
         stream,
         control_received,
         peer_goaway,
         peer_max_header_list,
+        qpack,
         limits,
     )? {
-        return Ok(());
+        return Ok(unblocked);
+    }
+    if stream.blocked {
+        return Ok(Vec::new());
     }
     drain_request_frames(
         stream,
         control_received,
         peer_goaway,
-        qpack_decoder,
+        qpack,
         limits.max_header_list,
         limits.max_body,
         requests,
-    )
+    )?;
+    Ok(Vec::new())
 }
 
 fn process_client_stream(
@@ -2684,27 +2954,32 @@ fn process_client_stream(
     control_received: &mut bool,
     peer_goaway: &mut Option<u64>,
     peer_max_header_list: &mut usize,
-    qpack_decoder: &mut DynamicTable,
+    qpack: &mut QpackConnection,
     limits: H3Limits,
     response: &mut Option<Response<Body>>,
-) -> Result<()> {
-    if process_unidirectional_stream(
+) -> Result<Vec<UnblockedSection>> {
+    if let Some(unblocked) = process_unidirectional_stream(
         stream,
         control_received,
         peer_goaway,
         peer_max_header_list,
+        qpack,
         limits,
     )? {
-        return Ok(());
+        return Ok(unblocked);
+    }
+    if stream.blocked {
+        return Ok(Vec::new());
     }
     drain_response_frames(
         stream,
         control_received,
-        qpack_decoder,
+        qpack,
         limits.max_header_list,
         limits.max_body,
         response,
-    )
+    )?;
+    Ok(Vec::new())
 }
 
 fn stream_id_of(stream: &ReceiveStream) -> u64 {
@@ -2715,23 +2990,29 @@ fn drain_request_frames(
     stream: &mut ReceiveStream,
     control_received: &bool,
     peer_goaway: &Option<u64>,
-    qpack_decoder: &mut DynamicTable,
+    qpack: &mut QpackConnection,
     max_header_list: usize,
     max_body: usize,
     requests: &mut VecDeque<PendingRequest>,
 ) -> Result<()> {
     let mut pos = 0;
+    let mut became_blocked = false;
     while let Some(frame) = h3frame::Frame::decode(&stream.frame_buf, &mut pos)? {
         match frame {
             h3frame::Frame::Headers(block) if stream.headers.is_none() => {
                 if block.len() > max_header_list {
                     return Err(protocol("HTTP/3 request headers exceed configured limit"));
                 }
-                stream.headers = Some(decode_field_section(
-                    &block,
-                    qpack_decoder,
-                    max_header_list,
-                )?);
+                match qpack.decode(stream.id, &block, max_header_list)? {
+                    Some(fields) => stream.headers = Some(fields),
+                    // The section references dynamic entries we have not
+                    // processed yet: consume the frame and pause the
+                    // stream until the encoder stream catches up.
+                    None => {
+                        became_blocked = true;
+                        break;
+                    }
+                }
             }
             h3frame::Frame::Data(data) => {
                 if stream.headers.is_none() {
@@ -2754,10 +3035,24 @@ fn drain_request_frames(
             _ => return Err(protocol("invalid frame on HTTP/3 request stream")),
         }
     }
+    if became_blocked {
+        // The HEADERS frame is now buffered in the QPACK connection; the
+        // remaining frames stay in frame_buf and are drained on unblock.
+        stream.frame_buf.drain(..pos);
+        stream.blocked = true;
+        return Ok(());
+    }
     if pos != 0 {
         stream.frame_buf.drain(..pos);
     }
     if stream.reassembly.finished() && !stream.completed {
+        if stream.blocked {
+            // The request ended while its headers were still blocked;
+            // cancel the section so the encoder does not wait on it.
+            qpack.cancel_stream(stream.id);
+            stream.completed = true;
+            return Ok(());
+        }
         if peer_goaway.is_some_and(|last| stream.id > last) {
             return Err(protocol("HTTP/3 request is beyond peer GOAWAY"));
         }
@@ -2793,26 +3088,34 @@ fn drain_request_frames(
 fn drain_response_frames(
     stream: &mut ReceiveStream,
     _control_received: &bool,
-    qpack_decoder: &mut DynamicTable,
+    qpack: &mut QpackConnection,
     max_header_list: usize,
     max_body: usize,
     response: &mut Option<Response<Body>>,
 ) -> Result<()> {
     let mut pos = 0;
+    let mut became_blocked = false;
     while let Some(frame) = h3frame::Frame::decode(&stream.frame_buf, &mut pos)? {
         match frame {
             h3frame::Frame::Headers(block) => {
                 if block.len() > max_header_list {
                     return Err(protocol("HTTP/3 response headers exceed configured limit"));
                 }
-                let fields = decode_field_section(&block, qpack_decoder, max_header_list)?;
-                if stream.headers.is_none() {
-                    stream.headers = Some(fields);
-                } else {
-                    if stream.trailers.is_some() {
-                        return Err(protocol("multiple HTTP/3 response trailer blocks"));
+                match qpack.decode(stream.id, &block, max_header_list)? {
+                    Some(fields) => {
+                        if stream.headers.is_none() {
+                            stream.headers = Some(fields);
+                        } else {
+                            if stream.trailers.is_some() {
+                                return Err(protocol("multiple HTTP/3 response trailer blocks"));
+                            }
+                            stream.trailers = Some(response_trailers_from_fields(fields)?);
+                        }
                     }
-                    stream.trailers = Some(response_trailers_from_fields(fields)?);
+                    None => {
+                        became_blocked = true;
+                        break;
+                    }
                 }
             }
             h3frame::Frame::Data(data) => {
@@ -2833,10 +3136,20 @@ fn drain_response_frames(
             _ => return Err(protocol("invalid frame on HTTP/3 response stream")),
         }
     }
+    if became_blocked {
+        stream.frame_buf.drain(..pos);
+        stream.blocked = true;
+        return Ok(());
+    }
     if pos != 0 {
         stream.frame_buf.drain(..pos);
     }
     if stream.reassembly.finished() && !stream.completed {
+        if stream.blocked {
+            qpack.cancel_stream(stream.id);
+            stream.completed = true;
+            return Ok(());
+        }
         let fields = stream
             .headers
             .take()
@@ -2851,19 +3164,24 @@ fn drain_response_frames(
     Ok(())
 }
 
+/// Validate the peer's SETTINGS. Returns the peer's advertised QPACK
+/// dynamic-table capacity (0 when absent, RFC 9204 §3.2.2).
 fn validate_settings(
     settings: &[(u64, u64)],
     _max_header_list: usize,
     peer_max_header_list: &mut usize,
-) -> Result<()> {
+) -> Result<u64> {
     let mut seen = BTreeSet::new();
+    let mut peer_qpack_capacity = 0u64;
     for (id, value) in settings {
         if !seen.insert(*id) {
             return Err(protocol("duplicate HTTP/3 SETTINGS identifier"));
         }
         match *id {
-            h3frame::SETTINGS_QPACK_MAX_TABLE_CAPACITY
-            | h3frame::SETTINGS_QPACK_BLOCKED_STREAMS
+            h3frame::SETTINGS_QPACK_MAX_TABLE_CAPACITY => {
+                peer_qpack_capacity = *value;
+            }
+            h3frame::SETTINGS_QPACK_BLOCKED_STREAMS
             | h3frame::SETTINGS_ENABLE_CONNECT_PROTOCOL
             | h3frame::SETTINGS_H3_DATAGRAM
             | h3frame::SETTINGS_WEBTRANSPORT_MAX_SESSIONS => {}
@@ -2876,7 +3194,7 @@ fn validate_settings(
             _ => {}
         }
     }
-    Ok(())
+    Ok(peer_qpack_capacity)
 }
 
 fn validate_content_length(headers: &HeaderMap, actual: usize) -> Result<()> {
@@ -2924,43 +3242,6 @@ fn validate_goaway_id(id: u64, previous: Option<u64>) -> Result<()> {
         return Err(protocol("HTTP/3 GOAWAY stream id increased"));
     }
     Ok(())
-}
-
-fn decode_field_section(
-    block: &[u8],
-    table: &DynamicTable,
-    max_header_list: usize,
-) -> Result<Vec<FieldLine>> {
-    if block.len() > max_header_list {
-        return Err(protocol("QPACK field section exceeds configured limit"));
-    }
-    let mut pos = 0;
-    let (required, base) = qpack::decode_field_section_prefix(
-        block,
-        &mut pos,
-        table.insert_count(),
-        table.capacity() as u64,
-    )?;
-    if required != 0 {
-        return Err(protocol("blocked QPACK field sections are not accepted"));
-    }
-    let mut fields = Vec::new();
-    let mut total = 0usize;
-    while pos < block.len() {
-        let field = qpack::decode_field_line(block, &mut pos, table, base)?;
-        total = total
-            .checked_add(field.name.len())
-            .and_then(|value| value.checked_add(field.value.len()))
-            .ok_or_else(|| protocol("QPACK field-section size overflow"))?;
-        if total > max_header_list {
-            return Err(protocol("QPACK field-section limit exceeded"));
-        }
-        fields.push(field);
-        if fields.len() > 256 {
-            return Err(protocol("HTTP/3 header field count exceeds limit"));
-        }
-    }
-    Ok(fields)
 }
 
 fn request_from_fields(fields: Vec<FieldLine>, body: Vec<u8>) -> Result<Request<Body>> {
@@ -3100,6 +3381,7 @@ fn response_trailers_from_fields(fields: Vec<FieldLine>) -> Result<HeaderMap> {
 fn build_request_wire(
     request: Request<Body>,
     authority: &str,
+    qpack: &mut QpackConnection,
     max_header_list: usize,
     max_body: usize,
 ) -> Result<Vec<u8>> {
@@ -3138,7 +3420,7 @@ fn build_request_wire(
         }
         fields.push((name.as_str().to_string(), value.as_bytes().to_vec()));
     }
-    let header_block = encode_field_section(&fields, max_header_list)?;
+    let header_block = qpack.encode(&fields, max_header_list)?;
     let mut wire = h3frame::Frame::Headers(header_block).to_bytes();
     if !bytes.is_empty() {
         wire.extend_from_slice(&h3frame::Frame::Data(bytes.to_vec()).to_bytes());
@@ -3148,6 +3430,7 @@ fn build_request_wire(
 
 fn build_response_wire(
     response: Response<Body>,
+    qpack: &mut QpackConnection,
     max_header_list: usize,
     max_body: usize,
 ) -> Result<Vec<u8>> {
@@ -3168,7 +3451,7 @@ fn build_response_wire(
         }
         fields.push((name.as_str().to_string(), value.as_bytes().to_vec()));
     }
-    let header_block = encode_field_section(&fields, max_header_list)?;
+    let header_block = qpack.encode(&fields, max_header_list)?;
     let mut wire = h3frame::Frame::Headers(header_block).to_bytes();
     if !body.is_empty() {
         wire.extend_from_slice(&h3frame::Frame::Data(body).to_bytes());
@@ -3198,42 +3481,11 @@ fn build_response_wire(
             tfields.push((n.to_string(), value.as_bytes().to_vec()));
         }
         if !tfields.is_empty() {
-            let trailer_block = encode_field_section(&tfields, max_header_list)?;
+            let trailer_block = qpack.encode(&tfields, max_header_list)?;
             wire.extend_from_slice(&h3frame::Frame::Headers(trailer_block).to_bytes());
         }
     }
     Ok(wire)
-}
-
-fn encode_field_section(fields: &[(String, Vec<u8>)], max_header_list: usize) -> Result<Vec<u8>> {
-    let mut total = 0usize;
-    let mut out = Vec::new();
-    qpack::encode_field_section_prefix(0, 0, 0, &mut out);
-    let table = DynamicTable::new(0);
-    for (name, value) in fields {
-        total = total
-            .checked_add(name.len())
-            .and_then(|total| total.checked_add(value.len()))
-            .ok_or_else(|| protocol("QPACK field-section size overflow"))?;
-        if total > max_header_list
-            || name.is_empty()
-            || !name.bytes().all(|b| {
-                b == b':'
-                    || b.is_ascii_lowercase()
-                    || b.is_ascii_digit()
-                    || b == b'-'
-                    || b == b'.'
-                    || b == b'_'
-            })
-        {
-            return Err(protocol("invalid HTTP/3 header field"));
-        }
-        qpack::encode_field_line(name, value, &table, 0, &mut out);
-    }
-    if out.len() > max_header_list {
-        return Err(protocol("encoded QPACK field section exceeds limit"));
-    }
-    Ok(out)
 }
 
 fn control_stream(settings: Vec<u8>) -> Vec<u8> {
@@ -3980,7 +4232,10 @@ impl QuicTransport {
         }
         let space = &mut self.spaces[level];
         if !space.received.insert(pn) {
+            // A duplicate packet: the peer likely missed our ACK. Re-arm
+            // the batch deadline so it is acknowledged promptly.
             space.ack_pending = true;
+            space.ack_deadline = Some(Instant::now() + ACK_DELAY);
             return Ok(Some((level, pn, Vec::new(), meta.packet_end)));
         }
         if space.received.len() > 8192 {
@@ -4194,6 +4449,25 @@ impl QuicTransport {
         self.send_stream_chunk(socket, level, id, 0, bytes, fin)
     }
 
+    /// Append bytes to a stream at the next unwritten offset (unlike
+    /// [`Self::send_stream`], which always starts at offset 0). Used by
+    /// the QPACK encoder/decoder streams, which are written incrementally
+    /// as instructions are produced; `sent_stream_data` tracks the
+    /// per-stream send position.
+    fn send_stream_append(
+        &mut self,
+        socket: &UdpSocket,
+        level: LevelIndex,
+        id: u64,
+        bytes: &[u8],
+    ) -> Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let offset = self.sent_stream_data.get(&id).copied().unwrap_or(0);
+        self.send_stream_chunk(socket, level, id, offset, bytes, false)
+    }
+
     fn send_stream_chunk(
         &mut self,
         socket: &UdpSocket,
@@ -4311,11 +4585,21 @@ impl QuicTransport {
 
     fn ack(&mut self, level: LevelIndex) {
         self.spaces[level].ack_pending = true;
-        self.spaces[level].ack_deadline = Some(Instant::now());
+        self.spaces[level].ack_deadline = Some(Instant::now() + ACK_DELAY);
     }
 
     fn flush_ack(&mut self, socket: &UdpSocket, level: LevelIndex) -> Result<()> {
         if !self.spaces[level].ack_pending {
+            return Ok(());
+        }
+        // Batch ACKs (RFC 9002 §6.2.2): hold the ACK until the batch
+        // deadline so a burst of packets yields one ACK instead of one per
+        // datagram. `flush_acks` runs every tick, so a deferred ACK is
+        // still sent promptly once the deadline passes.
+        if self.spaces[level]
+            .ack_deadline
+            .is_some_and(|deadline| deadline > Instant::now())
+        {
             return Ok(());
         }
         let Some(largest) = self.spaces[level].largest_received else {
@@ -5316,6 +5600,46 @@ mod tests {
         );
     }
 
+    /// RFC 9000 §5.2: an unauthenticated long-header packet (Version
+    /// Negotiation / Retry candidate) that fails to parse — here an
+    /// illegal DCID length — MUST be discarded during the handshake, not
+    /// treated as a fatal connection error.
+    #[test]
+    fn malformed_version_negotiation_packet_is_dropped() {
+        let local_cid = vec![0x44; 8];
+        let transport =
+            QuicTransport::client(local_cid.clone(), vec![0x55; 8], vec![0x66; 8], None).unwrap();
+        let mut conn = ClientConnection::new(
+            transport,
+            crate::courierust_tls::quic::QuicClient::new(
+                "localhost",
+                vec![b"h3".to_vec()],
+                false,
+                crate::courierust_tls::RootStore::new(),
+                0,
+                TransportParameters::default(),
+                vec![0x66; 8],
+            ),
+            Vec::new(),
+            "localhost".into(),
+            H3Limits {
+                max_header_list: 16 * 1024,
+                max_body: 16 * 1024 * 1024,
+            },
+            None,
+        )
+        .unwrap();
+        // Long header, version 1, DCID length 0xff (> 20, invalid).
+        let mut malformed = vec![0x80, 0x00, 0x00, 0x00, 0x01, 0xff, 0x11, 0x22, 0x33, 0x44];
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let source = socket.local_addr().unwrap();
+        let result = conn.on_datagram(&socket, source, &mut malformed);
+        assert!(
+            matches!(result, Ok(())),
+            "a malformed VN/Retry packet must be dropped, got {result:?}"
+        );
+    }
+
     /// RFC 9000 §13.1: an ACK that acknowledges a packet number never
     /// sent is a protocol error, not a silent no-op. A duplicate ACK of an
     /// already-acknowledged packet is legal and must be accepted.
@@ -5347,11 +5671,86 @@ mod tests {
         assert!(acknowledge(&mut sent, Some(5), 5, &[(0, 0)]).is_ok());
     }
 
+    /// RFC 9114 §7.2.8: a graceful shutdown sends GOAWAY on the control
+    /// stream before CONNECTION_CLOSE, advertising the last request
+    /// stream id the peer's requests will be processed up to. The send
+    /// must (a) be a no-op before the control stream exists, (b) append
+    /// after SETTINGS instead of overwriting offset 0, and (c) be
+    /// idempotent.
+    #[test]
+    fn client_sends_goaway_before_close() {
+        let local_cid = vec![0x77; 8];
+        let transport =
+            QuicTransport::client(local_cid.clone(), vec![0x88; 8], vec![0x99; 8], None).unwrap();
+        let mut conn = ClientConnection::new(
+            transport,
+            crate::courierust_tls::quic::QuicClient::new(
+                "localhost",
+                vec![b"h3".to_vec()],
+                false,
+                crate::courierust_tls::RootStore::new(),
+                0,
+                TransportParameters::default(),
+                vec![0x66; 8],
+            ),
+            Vec::new(),
+            "localhost".into(),
+            H3Limits {
+                max_header_list: 16 * 1024,
+                max_body: 16 * 1024 * 1024,
+            },
+            None,
+        )
+        .unwrap();
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        // No control stream yet: GOAWAY must be deferred, not sent.
+        assert!(!conn.control_sent);
+        conn.send_goaway(&socket).unwrap();
+        assert!(!conn.goaway_sent, "GOAWAY before control stream is a no-op");
+        // Control stream established; streams 0, 4, 8 have been issued.
+        // Install application keys so the control-stream write succeeds.
+        let send_key =
+            crate::courierust_quic::protection::PacketKey::from_secret(0x1301, &[0x42; 32])
+                .unwrap();
+        let recv_key =
+            crate::courierust_quic::protection::PacketKey::from_secret(0x1301, &[0x43; 32])
+                .unwrap();
+        conn.transport.set_application_keys(recv_key, send_key);
+        conn.control_sent = true;
+        conn.transport.peer = Some(socket.local_addr().unwrap());
+        conn.next_stream_index = 3;
+        conn.send_goaway(&socket).unwrap();
+        assert!(conn.goaway_sent);
+        let advanced = conn
+            .transport
+            .sent_stream_data
+            .get(&2)
+            .copied()
+            .unwrap_or(0);
+        assert!(
+            advanced >= 2,
+            "GOAWAY advanced the control stream send offset, got {advanced}"
+        );
+        // A second GOAWAY is idempotent (RFC 9114: at most one).
+        conn.send_goaway(&socket).unwrap();
+        assert_eq!(
+            conn.transport
+                .sent_stream_data
+                .get(&2)
+                .copied()
+                .unwrap_or(0),
+            advanced
+        );
+    }
+
     #[test]
     fn qpack_request_round_trip_is_bounded() {
         let req = Request::<Body>::new(Method::POST, "/upload")
             .header("content-type", "application/octet-stream");
-        let wire = build_request_wire(req, "example.test:443", 16 * 1024, 1024).unwrap();
+        let mut qpack = QpackConnection::new(QPACK_MAX_TABLE_CAPACITY, QPACK_BLOCKED_STREAMS);
+        qpack.set_peer_capacity(QPACK_MAX_TABLE_CAPACITY);
+        let wire =
+            build_request_wire(req, "example.test:443", &mut qpack, 16 * 1024, 1024).unwrap();
         assert!(wire.len() < 1024);
     }
 
@@ -5368,6 +5767,7 @@ mod tests {
         let mut control_received = false;
         let mut peer_goaway = None;
         let mut peer_max_header_list = 0usize;
+        let mut qpack = QpackConnection::new(QPACK_MAX_TABLE_CAPACITY, QPACK_BLOCKED_STREAMS);
         let limits = H3Limits {
             max_header_list: 16 * 1024,
             max_body: 16 * 1024 * 1024,
@@ -5377,11 +5777,12 @@ mod tests {
             &mut control_received,
             &mut peer_goaway,
             &mut peer_max_header_list,
+            &mut qpack,
             limits,
         )
         .unwrap();
         assert!(
-            consumed,
+            consumed.is_some(),
             "unknown uni stream must be consumed, not rejected"
         );
         assert!(
@@ -5406,6 +5807,7 @@ mod tests {
         let mut control_received = false;
         let mut peer_goaway = None;
         let mut peer_max_header_list = 0usize;
+        let mut qpack = QpackConnection::new(QPACK_MAX_TABLE_CAPACITY, QPACK_BLOCKED_STREAMS);
         let limits = H3Limits {
             max_header_list: 16 * 1024,
             max_body: 16 * 1024 * 1024,
@@ -5415,6 +5817,7 @@ mod tests {
             &mut control_received,
             &mut peer_goaway,
             &mut peer_max_header_list,
+            &mut qpack,
             limits,
         )
         .is_ok());
