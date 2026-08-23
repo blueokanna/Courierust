@@ -12,6 +12,7 @@ use std::time::Duration;
 
 pub(crate) mod poller;
 pub mod stats;
+pub(crate) mod udp;
 
 impl Read for &TcpStream {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
@@ -23,10 +24,6 @@ impl Read for &TcpStream {
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                 Err(Error::new(ErrorKind::Timeout))
             }
-            // Windows may transiently surface WSA_IO_PENDING (997) from
-            // the socket timeout machinery under load. A read error never
-            // consumes bytes, so treating it as "no data yet" is safe and
-            // prevents spurious connection kills.
             Err(e) if e.raw_os_error() == Some(997) => Err(Error::new(ErrorKind::WouldBlock)),
             Err(e) => Err(e.into()),
         }

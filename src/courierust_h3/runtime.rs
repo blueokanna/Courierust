@@ -369,7 +369,10 @@ pub(crate) fn spawn_server(
             "HTTP/3 requires ServerConfig TLS ALPN to include h3",
         ));
     }
-    let socket = UdpSocket::bind(addr)?;
+    // macOS (BSD) requires `SO_REUSEADDR` on the UDP socket before it
+    // may share its numeric port with the TCP listener; other platforms
+    // bind directly (see `courierust_net::udp`).
+    let socket = crate::courierust_net::udp::bind_udp(addr)?;
     socket.set_nonblocking(true)?;
     let identity = tls.identity.clone();
     let alpn = tls.alpn.clone();
