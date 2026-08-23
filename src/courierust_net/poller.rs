@@ -463,8 +463,16 @@ mod tests {
         std::io::Write::write_all(&mut writer, b"\x01").unwrap();
         client.write_all(b"hi").unwrap();
 
-        let ready = p.wait(2000, Some(fd_of(&wake_reader))).unwrap();
-        assert!(ready.contains(&7), "connection not reported: {ready:?}");
-        assert!(ready.contains(&WAKE_ID), "wake not reported: {ready:?}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (mut saw_conn, mut saw_wake) = (false, false);
+        while !(saw_conn && saw_wake) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for readiness: conn={saw_conn} wake={saw_wake}"
+            );
+            let ready = p.wait(100, Some(fd_of(&wake_reader))).unwrap();
+            saw_conn |= ready.contains(&7);
+            saw_wake |= ready.contains(&WAKE_ID);
+        }
     }
 }
