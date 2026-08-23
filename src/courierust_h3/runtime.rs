@@ -75,7 +75,16 @@ const PATH_VALIDATION_TIMEOUT: Duration = Duration::from_millis(300);
 /// Floor for the per-connection loss time threshold once an RTT sample
 /// exists. See [`QuicTransport::loss_detection_threshold`] for why a
 /// sub-millisecond floor is wrong on loopback / loaded machines.
-const LOSS_TIMEOUT_FLOOR: Duration = Duration::from_millis(25);
+///
+/// 50 ms absorbs the peer's ACK batching (2 ms), both reactors' poll
+/// latency (5 ms each) and the scheduling jitter of a loaded CI runner.
+/// With the old 25 ms floor a busy peer's ACK could still arrive after
+/// the client had already declared the packet lost, which under
+/// sustained load turned into a retransmit storm (each "loss" collapsed
+/// the congestion window and re-queued a retransmission, adding load and
+/// delaying the next ACK further) until the 8-retransmit cap killed a
+/// perfectly healthy connection.
+const LOSS_TIMEOUT_FLOOR: Duration = Duration::from_millis(50);
 /// RFC 9002 §6.1.1 time-threshold loss detection factor (9/8).
 const TIME_THRESHOLD_NUM: u32 = 9;
 const TIME_THRESHOLD_DEN: u32 = 8;
@@ -642,6 +651,9 @@ fn run_client_driver(
                             stats.h3_udp_recv_syscalls.fetch_add(1, Ordering::Relaxed);
                         }
                         if let Err(error) = conn.on_datagram(&socket, source, &mut datagram[..n]) {
+                            if std::env::var_os("COURIERUST_H3_DEBUG").is_some() {
+                                eprintln!("H3CLIENT on_datagram error: {error}");
+                            }
                             return finish(conn, &socket, error);
                         }
                         if conn.peer_closed {
@@ -4351,10 +4363,11 @@ impl QuicTransport {
     }
 
     /// RFC 9002 §6.1.1 time threshold: `9/8 * max(latest_rtt,
-    /// smoothed_rtt)`, floored to absorb Windows timer granularity and
-    /// scheduler jitter (a loopback RTT of ~0.3 ms would otherwise
-    /// declare a packet lost while its ACK is still in flight, collapse
-    /// the congestion window, and degrade a large transfer to a crawl).
+    /// smoothed_rtt) + max_ack_delay`, floored to absorb Windows timer
+    /// granularity and scheduler jitter (a loopback RTT of ~0.3 ms would
+    /// otherwise declare a packet lost while its ACK is still in flight,
+    /// collapse the congestion window, and degrade a large transfer to a
+    /// crawl).
     fn loss_detection_threshold(&self) -> Duration {
         let rtt = self
             .smoothed_rtt
@@ -4364,7 +4377,11 @@ impl QuicTransport {
             .checked_mul(TIME_THRESHOLD_NUM)
             .map(|v| v / TIME_THRESHOLD_DEN)
             .unwrap_or(rtt);
-        scaled.max(LOSS_TIMEOUT_FLOOR)
+        // RFC 9002 §6.1.2: the peer may delay its ACK by up to its
+        // advertised `max_ack_delay`; our own ACK batching is the same
+        // magnitude, so both directions are absorbed before declaring
+        // loss.
+        (scaled + ACK_DELAY).max(LOSS_TIMEOUT_FLOOR)
     }
 
     /// RFC 9002 §6.2.1: PTO = smoothed_rtt + max(4·rttvar, granularity) +
@@ -4864,6 +4881,17 @@ impl QuicTransport {
                     if pending || aged_out {
                         if !pending {
                             if packet.retransmits >= MAX_RETRANSMITS {
+                                if std::env::var_os("COURIERUST_H3_DEBUG").is_some() {
+                                    eprintln!(
+                                        "H3CLIENT retransmit-limit: level={level} pn={pn} retransmits={} sent_bytes={} cwnd={} largest_sent={:?} largest_acked={:?} sent_at_ms={}",
+                                        packet.retransmits,
+                                        self.sent_data,
+                                        self.congestion_window,
+                                        space.largest_sent,
+                                        space.largest_acked,
+                                        now.duration_since(packet.sent_at).as_millis(),
+                                    );
+                                }
                                 return Err(protocol(
                                     "QUIC packet loss exceeded retransmission limit",
                                 ));
