@@ -1,0 +1,4 @@
+subjectAltName=DNS:evil.com
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature
+extendedKeyUsage=serverAuth

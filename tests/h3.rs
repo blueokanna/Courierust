@@ -192,8 +192,6 @@ fn h3_concurrent_multiplex() {
     for i in 0..16 {
         let client = client.clone();
         let url = format!("{base}/mux/{i}");
-        // Explicit stack: the QUIC/TLS request path is deep, and Windows
-        // threads default to a 1 MiB stack (2 MiB elsewhere).
         handles.push(
             std::thread::Builder::new()
                 .stack_size(8 * 1024 * 1024)
@@ -215,7 +213,6 @@ fn h3_concurrent_multiplex() {
 #[test]
 fn h3_rejects_untrusted_certificate() {
     let base = spawn_h3_server(echo_handler);
-    // Empty trust store + verify=true: nothing is trusted.
     let client = Client::with_config(ClientConfig {
         http3: true,
         read_timeout: Some(Duration::from_secs(5)),

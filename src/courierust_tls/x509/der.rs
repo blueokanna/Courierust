@@ -78,7 +78,6 @@ pub(crate) fn oid_to_string(oid: &[u8]) -> String {
     if oid.is_empty() {
         return out;
     }
-    // First byte: 40 * first + second.
     let first = core::cmp::min(oid[0] / 40, 2);
     let second = oid[0] - first * 40;
     out.push_str(&format!("{first}.{second}"));
@@ -99,7 +98,6 @@ fn parse_time(der: &[u8], pos: &mut usize) -> Option<i64> {
     let e = read_element(der, pos)?;
     match e.tag {
         0x17 => {
-            // UTCTime: YYMMDDHHMMSSZ (also handles YYMMDDHHMMZ).
             let s = core::str::from_utf8(e.content).ok()?;
             let (year, rest) = if s.len() == 13 && s.ends_with('Z') {
                 (parse2(&s[0..2])?, &s[2..12])
@@ -121,7 +119,6 @@ fn parse_time(der: &[u8], pos: &mut usize) -> Option<i64> {
             to_unix(yy, month, day, hour, min, sec)
         }
         0x18 => {
-            // GeneralizedTime: YYYYMMDDHHMMSSZ (or with fractional).
             let s = core::str::from_utf8(e.content).ok()?;
             if s.len() < 15 || !s.ends_with('Z') {
                 return None;
@@ -155,7 +152,6 @@ fn to_unix(year: i64, month: i64, day: i64, hour: i64, min: i64, sec: i64) -> Op
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60 {
         return None;
     }
-    // Howard Hinnant's days_from_civil.
     let y = if month <= 2 { year - 1 } else { year };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
@@ -177,11 +173,20 @@ pub(crate) const OID_RSA_SHA512: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0
 pub(crate) const OID_EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
 pub(crate) const OID_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
 pub(crate) const OID_ECDSA_SHA384: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03];
+pub(crate) const OID_ECDSA_SHA512: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04];
+/// Named curve prime256v1 / secp256r1 (1.2.840.10045.3.1.7).
+pub(crate) const OID_P256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+/// Named curve secp384r1 (1.3.132.0.34).
+pub(crate) const OID_P384: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x22];
+/// Named curve secp521r1 (1.3.132.0.35).
+pub(crate) const OID_P521: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x23];
 pub(crate) const OID_ED25519: &[u8] = &[0x2b, 0x65, 0x70];
 pub(crate) const OID_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
 pub(crate) const OID_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
 pub(crate) const OID_SUBJECT_ALT_NAME: &[u8] = &[0x55, 0x1d, 0x11];
 pub(crate) const OID_EXTENDED_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x25];
+/// Name constraints (2.5.29.30).
+pub(crate) const OID_NAME_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x1e];
 #[allow(dead_code)] // used by the TLS handshake certificate validation
 pub(crate) const OID_KEY_USAGE_SERVER_AUTH: &[u8] =
     &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
@@ -200,6 +205,8 @@ fn sig_alg_from_oid(oid: &[u8]) -> SigAlg {
         SigAlg::EcdsaSha256
     } else if oid == OID_ECDSA_SHA384 {
         SigAlg::EcdsaSha384
+    } else if oid == OID_ECDSA_SHA512 {
+        SigAlg::EcdsaSha512
     } else if oid == OID_ED25519 {
         SigAlg::Ed25519
     } else {
@@ -230,20 +237,49 @@ fn parse_name(der: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
 }
 
 /// Parse a SubjectPublicKeyInfo.
+///
+/// For `id-ecPublicKey` keys the algorithm parameters (the named curve
+/// OID) are captured so certificate signature verification can enforce
+/// the strict curve↔hash mapping used by rustls/webpki.
 fn parse_spki(der: &[u8], pos: &mut usize) -> Option<Spki> {
-    let seq = expect_sequence(der, pos)?;
+    // SPKI: SEQUENCE { AlgorithmIdentifier, subjectPublicKey BIT STRING }
+    let spki_seq = expect_sequence(der, pos)?;
     let mut p = 0usize;
-    let (oid, _) = parse_algorithm_identifier(seq, &mut p)?;
-    let key_e = read_element(seq, &mut p)?;
+    // AlgorithmIdentifier: SEQUENCE { OID, parameters OPTIONAL }
+    let alg = expect_sequence(spki_seq, &mut p)?;
+    let mut ap = 0usize;
+    let oid_e = read_element(alg, &mut ap)?;
+    if oid_e.tag != 0x06 {
+        return None;
+    }
+    let oid = oid_e.content.to_vec();
+    let mut ec_curve = None;
+    if oid == OID_EC_PUBLIC_KEY {
+        // The parameters must be the named curve OID.
+        if let Some(params) = read_element(alg, &mut ap) {
+            if params.tag == 0x06 {
+                ec_curve = match params.content {
+                    OID_P256 => Some(crate::courierust_tls::crypto::ecdsa::Curve::P256),
+                    OID_P384 => Some(crate::courierust_tls::crypto::ecdsa::Curve::P384),
+                    OID_P521 => Some(crate::courierust_tls::crypto::ecdsa::Curve::P521),
+                    _ => None,
+                };
+            }
+        }
+    } else if read_element(alg, &mut ap).is_some() {
+        // RSA / Ed25519: skip the optional NULL (or absent) parameters.
+    }
+    // subjectPublicKey: BIT STRING, after the AlgorithmIdentifier in the
+    // SPKI sequence.
+    let key_e = read_element(spki_seq, &mut p)?;
     if key_e.tag != 0x03 {
         return None;
     }
-    // BIT STRING: skip the unused-bits byte.
     if key_e.content.is_empty() {
         return None;
     }
     let key = key_e.content[1..].to_vec();
-    Some(Spki { oid, key })
+    Some(Spki { oid, key, ec_curve })
 }
 
 /// Fully parse a DER X.509 certificate.
@@ -257,9 +293,15 @@ pub(crate) fn parse_certificate(der: &[u8]) -> crate::courierust_tls::TlsResult<
         ));
     }
     let mut p = 0usize;
+    let tbs_start = p;
     let tbs_der = expect_sequence(outer.content, &mut p)
         .ok_or_else(|| TlsError::Protocol("missing tbsCertificate".into()))?
         .to_vec();
+    // RFC 5280 §4.1.1.2: the certificate signature is computed over the
+    // full DER encoding of the tbsCertificate, including the SEQUENCE tag
+    // and length header — not just its content. Keep the whole element for
+    // signature verification while parsing the fields from the content.
+    let tbs_full = outer.content[tbs_start..p].to_vec();
     let (sig_alg, _) = parse_algorithm_identifier(outer.content, &mut p)
         .ok_or_else(|| TlsError::Protocol("missing signature algorithm".into()))?;
     let sig_e = read_element(outer.content, &mut p)
@@ -268,14 +310,10 @@ pub(crate) fn parse_certificate(der: &[u8]) -> crate::courierust_tls::TlsResult<
         return Err(TlsError::Protocol("bad signature value".into()));
     }
     let signature = sig_e.content[1..].to_vec();
-
-    // Parse TBSCertificate.
     let mut t = 0usize;
     let first = read_element(&tbs_der, &mut t)
         .ok_or_else(|| TlsError::Protocol("bad tbsCertificate".into()))?;
-    // Optional [0] EXPLICIT version.
     if first.tag == 0xA0 {
-        // version INTEGER (should be 2 for v3); content is an INTEGER TLV.
         let mut vp = 0usize;
         let v = read_element(first.content, &mut vp)
             .ok_or_else(|| TlsError::Protocol("bad version".into()))?;
@@ -283,8 +321,7 @@ pub(crate) fn parse_certificate(der: &[u8]) -> crate::courierust_tls::TlsResult<
             return Err(TlsError::Protocol("bad version".into()));
         }
     }
-    // If the first element wasn't [0], it must be the serial number.
-    let serial_e = if first.tag == 0xA0 {
+    let serial_e: Element<'_> = if first.tag == 0xA0 {
         read_element(&tbs_der, &mut t).ok_or_else(|| TlsError::Protocol("missing serial".into()))?
     } else {
         first
@@ -293,12 +330,10 @@ pub(crate) fn parse_certificate(der: &[u8]) -> crate::courierust_tls::TlsResult<
         return Err(TlsError::Protocol("missing serial".into()));
     }
     let serial = serial_e.content.to_vec();
-    // signature AlgorithmIdentifier.
     let _ = parse_algorithm_identifier(&tbs_der, &mut t)
         .ok_or_else(|| TlsError::Protocol("missing tbs signature alg".into()))?;
     let issuer_der =
         parse_name(&tbs_der, &mut t).ok_or_else(|| TlsError::Protocol("missing issuer".into()))?;
-    // Validity.
     let validity = read_element(&tbs_der, &mut t)
         .ok_or_else(|| TlsError::Protocol("missing validity".into()))?
         .content
@@ -317,8 +352,12 @@ pub(crate) fn parse_certificate(der: &[u8]) -> crate::courierust_tls::TlsResult<
     let mut dns_names: Vec<String> = Vec::new();
     let mut ip_names: Vec<Vec<u8>> = Vec::new();
     let mut is_ca: Option<bool> = None;
+    let mut path_len: Option<u8> = None;
     let mut key_usage = KeyUsage::default();
     let mut eku: Vec<Vec<u8>> = Vec::new();
+    let mut name_constraints = None;
+    let mut has_other_sans = false;
+    let mut unknown_critical = false;
     if let Some(e) = read_element(&tbs_der, &mut t) {
         if e.tag == 0xA3 {
             let mut p2 = 0usize;
@@ -338,13 +377,14 @@ pub(crate) fn parse_certificate(der: &[u8]) -> crate::courierust_tls::TlsResult<
                     return Err(TlsError::Protocol("bad extension oid".into()));
                 }
                 let oid = oid_e.content;
-                // After the OID comes an optional critical BOOLEAN,
-                // then the OCTET STRING value.
+                let mut critical = false;
                 let value_e = loop {
                     let e = read_element(ext.content, &mut r)
                         .ok_or_else(|| TlsError::Protocol("extension value missing".into()))?;
                     if e.tag == 0x01 {
-                        continue; // critical flag: skip
+                        // critical BOOLEAN (DEFAULT FALSE).
+                        critical = !e.content.is_empty() && e.content[0] != 0;
+                        continue;
                     }
                     if e.tag == 0x04 {
                         break e;
@@ -355,12 +395,17 @@ pub(crate) fn parse_certificate(der: &[u8]) -> crate::courierust_tls::TlsResult<
                 };
                 apply_extension(
                     oid,
+                    critical,
                     value_e.content,
                     &mut dns_names,
                     &mut ip_names,
                     &mut is_ca,
+                    &mut path_len,
                     &mut key_usage,
                     &mut eku,
+                    &mut name_constraints,
+                    &mut has_other_sans,
+                    &mut unknown_critical,
                 );
             }
         }
@@ -368,7 +413,7 @@ pub(crate) fn parse_certificate(der: &[u8]) -> crate::courierust_tls::TlsResult<
 
     Ok(Certificate {
         der: der.to_vec(),
-        tbs: tbs_der,
+        tbs: tbs_full,
         sig_alg: sig_alg_from_oid(&sig_alg),
         signature,
         spki,
@@ -380,29 +425,48 @@ pub(crate) fn parse_certificate(der: &[u8]) -> crate::courierust_tls::TlsResult<
         dns_names,
         ip_names,
         is_ca,
+        path_len,
         key_usage,
         eku,
+        name_constraints,
+        has_other_sans,
+        unknown_critical,
     })
 }
 
 /// Apply one parsed extension.
+#[allow(clippy::too_many_arguments)]
 fn apply_extension(
     oid: &[u8],
+    critical: bool,
     value: &[u8],
     dns_names: &mut Vec<String>,
     ip_names: &mut Vec<Vec<u8>>,
     is_ca: &mut Option<bool>,
+    path_len: &mut Option<u8>,
     key_usage: &mut KeyUsage,
     eku: &mut Vec<Vec<u8>>,
+    name_constraints: &mut Option<super::NameConstraints>,
+    has_other_sans: &mut bool,
+    unknown_critical: &mut bool,
 ) {
     if oid == OID_BASIC_CONSTRAINTS {
-        // SEQUENCE { cA BOOLEAN DEFAULT FALSE, ... }
+        // SEQUENCE { cA BOOLEAN DEFAULT FALSE, pathLenConstraint INTEGER OPTIONAL }
         let mut p = 0usize;
         if let Some(seq) = expect_sequence(value, &mut p) {
             let mut q = 0usize;
             if let Some(e) = read_element(seq, &mut q) {
                 if e.tag == 0x01 {
                     *is_ca = Some(!e.content.is_empty() && e.content[0] != 0);
+                }
+            }
+            if let Some(e) = read_element(seq, &mut q) {
+                if e.tag == 0x02 && !e.content.is_empty() {
+                    let mut v: u64 = 0;
+                    for &b in e.content {
+                        v = v.saturating_mul(256).saturating_add(b as u64);
+                    }
+                    *path_len = Some(v.min(u8::MAX as u64) as u8);
                 }
             }
         }
@@ -416,7 +480,10 @@ fn apply_extension(
         }
     } else if oid == OID_SUBJECT_ALT_NAME {
         // GeneralNames: SEQUENCE OF GeneralName; dNSName = [2] IA5String,
-        // iPAddress = [7] OCTET STRING (4 or 16 bytes).
+        // iPAddress = [7] OCTET STRING (4 or 16 bytes). Any other form
+        // (rfc822 = [1], directoryName = [4], URI = [6], …) is tracked so
+        // name-constraint checking can fail closed for forms this verifier
+        // does not model.
         let mut p = 0usize;
         if let Some(seq) = expect_sequence(value, &mut p) {
             let mut q = 0usize;
@@ -429,6 +496,9 @@ fn apply_extension(
                         },
                         0x87 if e.content.len() == 4 || e.content.len() == 16 => {
                             ip_names.push(e.content.to_vec());
+                        }
+                        0x81 | 0x83 | 0x84 | 0x85 | 0x86 | 0x88 => {
+                            *has_other_sans = true;
                         }
                         _ => {}
                     }
@@ -448,12 +518,86 @@ fn apply_extension(
                 }
             }
         }
+    } else if oid == OID_NAME_CONSTRAINTS {
+        // NameConstraints ::= SEQUENCE {
+        //     permittedSubtrees [0] GeneralSubtrees OPTIONAL,
+        //     excludedSubtrees [1] GeneralSubtrees OPTIONAL }
+        // The [0]/[1] tags are IMPLICIT for GeneralSubtrees, so their
+        // content is directly a sequence of GeneralSubtree elements:
+        //   GeneralSubtree ::= SEQUENCE { base GeneralName,
+        //                                minimum [0] BaseDistance DEFAULT 0,
+        //                                maximum [1] BaseDistance OPTIONAL }
+        let mut nc = super::NameConstraints::default();
+        let mut p = 0usize;
+        if let Some(seq) = expect_sequence(value, &mut p) {
+            let mut q = 0usize;
+            while let Some(e) = read_element(seq, &mut q) {
+                let permitted = match e.tag {
+                    0xa0 => true,
+                    0xa1 => false,
+                    _ => continue,
+                };
+                // `e.content` is the SEQUENCE OF GeneralSubtree (the
+                // GeneralSubtrees SEQUENCE tag is implicit in [0]/[1]).
+                let mut s = 0usize;
+                while s < e.content.len() {
+                    if let Some(st) = read_element(e.content, &mut s) {
+                        if st.tag != 0x30 {
+                            continue;
+                        }
+                        // The first element of GeneralSubtree is the
+                        // base GeneralName (minimum/maximum [0]/[1]
+                        // follow; they are intentionally ignored — RFC
+                        // 5280 treats minimum=0/maximum absent as the
+                        // common case and TLS verifiers do not use the
+                        // deprecated distance fields).
+                        let mut b = 0usize;
+                        if let Some(base) = read_element(st.content, &mut b) {
+                            match base.tag {
+                                0x82 => {
+                                    let name = core::str::from_utf8(base.content)
+                                        .unwrap_or("")
+                                        .to_ascii_lowercase();
+                                    if permitted {
+                                        nc.permitted_dns.push(name);
+                                    } else {
+                                        nc.excluded_dns.push(name);
+                                    }
+                                }
+                                0x87 => {
+                                    let oct = base.content.to_vec();
+                                    if oct.len() == 8 || oct.len() == 32 {
+                                        if permitted {
+                                            nc.permitted_ip.push(oct);
+                                        } else {
+                                            nc.excluded_ip.push(oct);
+                                        }
+                                    }
+                                }
+                                _ => nc.has_other_forms = true,
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // A malformed NameConstraints extension (no SEQUENCE) fails closed.
+        if !nc.is_empty() || p == 0 {
+            *name_constraints = Some(nc);
+        }
+    } else if critical {
+        // RFC 5280 §4.2: an unrecognized extension marked critical
+        // forces rejection of the certificate.
+        *unknown_critical = true;
     }
 }
 
 /// Extract the RSA public key (modulus, exponent) from an
 /// RSAPublicKey DER (SEQUENCE { modulus INTEGER, publicExponent INTEGER }).
-#[allow(dead_code)] // used by the TLS handshake certificate validation
+/// The INTEGERs are normalized by stripping the leading zero sign byte
+/// so the modulus length equals its real byte length (a 2048-bit
+/// modulus is 256 bytes, not 257): the RSA verification code treats
+/// `n.len()` as the key size.
 pub(crate) fn parse_rsa_public_key(der: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     let mut p = 0usize;
     let seq = expect_sequence(der, &mut p)?;
@@ -466,5 +610,14 @@ pub(crate) fn parse_rsa_public_key(der: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     if e.tag != 0x02 {
         return None;
     }
-    Some((n.content.to_vec(), e.content.to_vec()))
+    Some((strip_int(n.content).to_vec(), strip_int(e.content).to_vec()))
+}
+
+/// Remove a leading 0x00 sign byte from a positive INTEGER.
+fn strip_int(v: &[u8]) -> &[u8] {
+    if v.len() > 1 && v[0] == 0 {
+        &v[1..]
+    } else {
+        v
+    }
 }

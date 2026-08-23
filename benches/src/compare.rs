@@ -17,8 +17,16 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 
-const H3_CERT_DER: &[u8] = include_bytes!("../../tests/certs/server_cert.der");
-const H3_KEY_DER: &[u8] = include_bytes!("../../tests/certs/server_key.der");
+// HTTP/3 (QUIC v1 + TLS 1.3): Courierust H3 client vs quinn + h3 crate
+// against the SAME Courierust H3 server. Both reuse one pooled QUIC
+// connection, so rows are warm per-request cost.
+//
+// The server presents a proper end-entity certificate (CA:FALSE, serverAuth)
+// signed by a dedicated test CA; quinn/rustls reject a self-signed CA:TRUE
+// cert used as an end entity (CaUsedAsEndEntity).
+const H3_SERVER_CERT_DER: &[u8] = include_bytes!("../certs/h3_server.der");
+const H3_SERVER_KEY_DER: &[u8] = include_bytes!("../certs/h3_server_key.der");
+const H3_CA_DER: &[u8] = include_bytes!("../certs/h3_ca.der");
 
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
@@ -665,8 +673,8 @@ fn compare_servers(
 /// A Courierust HTTP/3 (QUIC v1 + TLS 1.3, ALPN `h3`) server.
 fn h3_server(payload: Payload) -> SocketAddr {
     let identity = courierust::courierust_tls::Identity {
-        cert_chain: vec![H3_CERT_DER.to_vec()],
-        private_key: H3_KEY_DER.to_vec(),
+        cert_chain: vec![H3_SERVER_CERT_DER.to_vec()],
+        private_key: H3_SERVER_KEY_DER.to_vec(),
         is_rsa: false,
     };
     serve_courierust(
@@ -685,7 +693,7 @@ fn h3_server(payload: Payload) -> SocketAddr {
 
 fn run_courierust_h3_client(address: SocketAddr, payload: Payload, requests: usize) -> Timing {
     let mut roots = courierust::courierust_tls::RootStore::new();
-    roots.add_der(H3_CERT_DER.to_vec());
+    roots.add_der(H3_CA_DER.to_vec());
     let client = Client::with_config(ClientConfig {
         http3: true,
         max_connections_per_host: 1,
@@ -727,9 +735,9 @@ fn run_quinn_h3_client(
     let mut roots = rustls::RootCertStore::empty();
     roots
         .add(rustls::pki_types::CertificateDer::from(
-            H3_CERT_DER.to_vec(),
+            H3_CA_DER.to_vec(),
         ))
-        .expect("test cert parses");
+        .expect("test CA parses");
     let mut crypto = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
@@ -814,11 +822,6 @@ fn compare_h3_clients(
         );
     }
     let courierust_timing = courierust_timing.expect("repetitions positive");
-
-    // Probe the independent handshake once. A failure is reported as
-    // `not_available` and skipped — repeating a known-failing handshake
-    // would only burn CI time on 5 s idle timeouts. A failure after a
-    // successful probe is a real regression and fails the bench.
     let mut quinn_timing = match run_quinn_h3_client(address, payload, requests, handle) {
         Ok(timing) => Some(timing),
         Err(reason) => {
@@ -875,11 +878,6 @@ fn main() {
     let parallel_requests = env_usize("BENCH_PARALLEL_REQUESTS", requests);
     let parallel_workers = env_usize("BENCH_COMPARE_WORKERS", 8);
     let repetitions = comparison_repetitions();
-    // One shared tokio runtime drives the async reqwest client used for
-    // the HTTP/2 rows. Note: the h2c large-body rows still show a large
-    // fixed wait in the async client (h2 flow-control window pacing); it
-    // is not a blocking-client artifact, so those rows are not suitable
-    // for ratio claims (see `compare_h2_large_body`).
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -923,7 +921,6 @@ fn main() {
         }
     }
 
-    // HTTP/3: Courierust H3 client vs quinn + h3 crate (warm reuse).
     for payload in [ONE_KIB, SIXTY_FOUR_KIB] {
         compare_h3_clients(payload, requests, repetitions, &handle);
     }

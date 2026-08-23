@@ -1,0 +1,31 @@
+// The canonical "hello world" gRPC example, used by the generated-code
+// pipeline (build.rs compiles this into Rust at build time).
+//
+// Try it:
+//   let client = courierust::courierust_grpc::GrpcClient::new("http://127.0.0.1:50051")?;
+//   let stub = courierust::courierust_grpc::generated::helloworld::Greeter::new(client);
+//   let reply = stub.say_hello(HelloRequest { name: "world".into(), ..Default::default() })?;
+
+syntax = "proto3";
+
+package helloworld;
+
+// The request message containing the user's name.
+message HelloRequest {
+  string name = 1;
+  repeated string tags = 2;
+}
+
+// The response message containing the greetings.
+message HelloReply {
+  string message = 1;
+  int32 count = 2;
+}
+
+// The greeting service definition.
+service Greeter {
+  // Sends a greeting.
+  rpc SayHello (HelloRequest) returns (HelloReply);
+  // Server-streaming greeting.
+  rpc Watch (HelloRequest) returns (stream HelloReply);
+}

@@ -7,6 +7,24 @@
 			"command": "for /L %i in (1,1,5) do (cargo test --test integration > tmp_stab_task_run.txt 2>&1 & findstr /C:\"test result: ok. 26 passed\" tmp_stab_task_run.txt >nul && echo run=%i PASS >> tmp_stab_task.txt || echo run=%i FAILED >> tmp_stab_task.txt)",
 			"problemMatcher": [],
 			"group": "test"
+		},
+		{
+			"label": "verify-grease-fix",
+			"type": "shell",
+			"command": "cargo bench --manifest-path benches/Cargo.toml --bench tmp_repro > tmp_verify_task.txt 2>&1",
+			"group": "test"
+		},
+		{
+			"label": "verify-grease-fix2",
+			"type": "shell",
+			"command": "cargo bench --manifest-path benches/Cargo.toml --bench tmp_repro > tmp_verify_task2.txt 2>&1; Get-Content tmp_verify_task2.txt -Raw | Select-String -Pattern \"QUINN-H3 repro outcome|COURIERUST-CLIENT phase|QUINN phase\" | ForEach-Object { $_.Line }",
+			"group": "test"
+		},
+		{
+			"label": "task-marker-test",
+			"type": "shell",
+			"command": "Set-Content -Path task_test_marker.txt -Value \"hello-from-task\"; Write-Output marker-written",
+			"group": "test"
 		}
 	]
 }

@@ -232,6 +232,7 @@ fn network_tls_evidence(url: &str, http2: bool) {
                 vec![b"http/1.1".to_vec()]
             },
             now: now_unix(),
+            ..Default::default()
         });
     match connector.connect(&host, &stream, &stream) {
         Ok(tls) => {

@@ -114,6 +114,16 @@ struct Pending {
     trailers: Arc<std::sync::Mutex<Option<HeaderMap>>>,
     /// Bytes of response body received so far (enforces `max_body`).
     body_len: usize,
+    /// Per-request deadline (from `ClientConfig::read_timeout`): when the
+    /// response head has not arrived by then, the stream is reset with
+    /// `CANCEL` and the caller receives a timeout error. Guards against a
+    /// peer that acknowledges streams but never completes responses.
+    deadline: Option<std::time::Instant>,
+}
+
+/// Map a configured read timeout to an absolute per-request deadline.
+fn deadline_from(timeout: Option<Duration>) -> Option<std::time::Instant> {
+    timeout.map(|t| std::time::Instant::now() + t)
 }
 
 /// An in-flight streaming request body being fed to the connection.
@@ -270,6 +280,7 @@ fn driver(
                     body_rx: Some(body_rx),
                     trailers,
                     body_len: 0,
+                    deadline: deadline_from(cfg.read_timeout),
                 },
             );
             if let Some(s) = stats {
@@ -293,6 +304,7 @@ fn driver(
             &mut stream_bodies,
             &mut goaway,
             &mut deferred,
+            cfg.read_timeout,
             stats,
         ) {
             cleanup(&mut conn, &mut pending, &mut stream_bodies);
@@ -308,6 +320,7 @@ fn driver(
                 &mut goaway,
                 &mut deferred,
                 cmd,
+                cfg.read_timeout,
                 stats,
             ) {
                 cleanup(&mut conn, &mut pending, &mut stream_bodies);
@@ -340,12 +353,14 @@ fn driver(
                 cfg.max_body,
             );
             drain_stream_bodies(&mut conn, &mut stream_bodies);
+            check_timeouts(&mut conn, &mut pending, stats);
             if !retry_deferred(
                 &mut conn,
                 &mut pending,
                 &mut stream_bodies,
                 &mut goaway,
                 &mut deferred,
+                cfg.read_timeout,
                 stats,
             ) {
                 cleanup(&mut conn, &mut pending, &mut stream_bodies);
@@ -378,6 +393,7 @@ fn driver(
                         &mut goaway,
                         &mut deferred,
                         cmd,
+                        cfg.read_timeout,
                         stats,
                     ) {
                         break;
@@ -401,12 +417,14 @@ fn driver(
                         cfg.max_body,
                     );
                     drain_stream_bodies(&mut conn, &mut stream_bodies);
+                    check_timeouts(&mut conn, &mut pending, stats);
                     if !retry_deferred(
                         &mut conn,
                         &mut pending,
                         &mut stream_bodies,
                         &mut goaway,
                         &mut deferred,
+                        cfg.read_timeout,
                         stats,
                     ) {
                         break;
@@ -518,6 +536,9 @@ fn apply_liveness(
     true
 }
 
+/// Handle one command from the caller's channel. Returns `false` when
+/// the driver must shut down.
+#[allow(clippy::too_many_arguments)]
 fn handle_cmd(
     conn: &mut DriverConn<'_>,
     pending: &mut HashMap<u32, Pending>,
@@ -525,6 +546,7 @@ fn handle_cmd(
     goaway: &mut bool,
     deferred: &mut VecDeque<H2Cmd>,
     cmd: H2Cmd,
+    timeout: Option<Duration>,
     stats: Option<&Stats>,
 ) -> bool {
     match cmd {
@@ -586,6 +608,7 @@ fn handle_cmd(
                             body_rx: Some(body_rx),
                             trailers,
                             body_len: 0,
+                            deadline: deadline_from(timeout),
                         },
                     );
                 }
@@ -648,6 +671,7 @@ fn handle_cmd(
                             body_rx: Some(body_rx),
                             trailers,
                             body_len: 0,
+                            deadline: deadline_from(timeout),
                         },
                     );
                 }
@@ -656,6 +680,38 @@ fn handle_cmd(
                 }
             }
             true
+        }
+    }
+}
+
+/// Fail every pending stream whose per-request deadline has passed:
+/// reset the stream with `CANCEL` and surface a timeout to the caller.
+/// The connection itself survives — only the stalled request is dropped.
+fn check_timeouts(
+    conn: &mut DriverConn<'_>,
+    pending: &mut HashMap<u32, Pending>,
+    stats: Option<&Stats>,
+) {
+    use std::sync::atomic::Ordering;
+    let now = std::time::Instant::now();
+    let timed_out: Vec<u32> = pending
+        .iter()
+        .filter(|(_, p)| p.deadline.is_some_and(|d| now >= d))
+        .map(|(sid, _)| *sid)
+        .collect();
+    if timed_out.is_empty() {
+        return;
+    }
+    if let Some(s) = stats {
+        s.h2_streams_timed_out
+            .fetch_add(timed_out.len(), Ordering::Relaxed);
+    }
+    for sid in timed_out {
+        conn.send_rst(sid, ErrorCode::Cancel);
+        if let Some(p) = pending.remove(&sid) {
+            let err = Error::timeout("h2 response did not complete in time");
+            let _ = p.body_tx.map(|tx| tx.send(Err(err.clone())));
+            let _ = p.reply.map(|r| r.send(Err(err)));
         }
     }
 }
@@ -669,6 +725,7 @@ fn retry_deferred(
     stream_bodies: &mut HashMap<u32, StreamBody>,
     goaway: &mut bool,
     deferred: &mut VecDeque<H2Cmd>,
+    timeout: Option<Duration>,
     stats: Option<&Stats>,
 ) -> bool {
     while let Some(cmd) = deferred.pop_front() {
@@ -676,7 +733,16 @@ fn retry_deferred(
             deferred.push_front(cmd);
             return true;
         }
-        if !handle_cmd(conn, pending, stream_bodies, goaway, deferred, cmd, stats) {
+        if !handle_cmd(
+            conn,
+            pending,
+            stream_bodies,
+            goaway,
+            deferred,
+            cmd,
+            timeout,
+            stats,
+        ) {
             return false;
         }
     }
@@ -908,6 +974,12 @@ fn h2_config(cfg: &ClientConfig) -> H2Config {
         auto_release_credit: true,
         ..Default::default()
     };
+    // RFC 9113 §6.5.2: a client MUST NOT advertise `SETTINGS_ENABLE_PUSH=1`.
+    // This implementation does not consume server-push streams, so it
+    // declares 0; a peer that pushes anyway then rightly triggers a
+    // PROTOCOL_ERROR connection error instead of silently corrupting the
+    // stream space.
+    c.local_settings.enable_push = 0;
     if c.local_settings.initial_window_size < 256 * 1024 {
         c.local_settings.initial_window_size = 256 * 1024;
     }

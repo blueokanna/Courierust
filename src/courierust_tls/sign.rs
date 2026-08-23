@@ -1,10 +1,13 @@
-//! Server-side CertificateVerify signing.
+//! Server-side CertificateVerify / ServerKeyExchange signing.
 //!
-//! Parses a PKCS#8 / PKCS#1 private key (RSA, Ed25519 or ECDSA P-256)
-//! and produces the TLS 1.3 CertificateVerify signature for the chosen
-//! scheme. RSA uses PKCS#1 v1.5 or PSS; Ed25519 uses RFC 8032; ECDSA
-//! uses a deterministic RFC 6979 nonce.
+//! Parses a PKCS#8 / PKCS#1 private key (RSA, Ed25519 or ECDSA on the
+//! NIST P-256 / P-384 / P-521 curves) and produces the TLS 1.3
+//! CertificateVerify signature (RFC 8446 §4.4.3) or the TLS 1.2
+//! ServerKeyExchange signature (RFC 5246 §7.4.3). RSA uses PKCS#1 v1.5
+//! or PSS; Ed25519 uses RFC 8032; ECDSA uses a deterministic RFC 6979
+//! nonce with constant-time scalar arithmetic.
 
+use super::crypto::ecdsa::Curve;
 use super::crypto::hash::{Digest, Sha256, Sha384};
 use super::crypto::{ecdsa, ed25519, rsa};
 use super::key_schedule::{CipherSuite, SuiteHash};
@@ -20,16 +23,111 @@ const OID_ED25519: &[u8] = &[0x2b, 0x65, 0x70];
 const OID_EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
 /// DER OID: prime256v1 / secp256r1 (1.2.840.10045.3.1.7).
 const OID_P256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+/// DER OID: secp384r1 (1.3.132.0.34).
+const OID_P384: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x22];
+/// DER OID: secp521r1 (1.3.132.0.35).
+const OID_P521: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x23];
 
 /// A parsed private key.
 enum ParsedKey {
     Rsa { n: Vec<u8>, d: Vec<u8> },
     Ed25519([u8; 32]),
-    EcP256 { d: [u8; 32] },
+    Ec { curve: Curve, d: Vec<u8> },
+}
+
+/// The certificate key type of an [`Identity`], used to pick the
+/// TLS 1.2 ECDHE signature family (RFC 5246 §7.4.3 / RFC 8422 §5.5)
+/// and the TLS 1.3 signature scheme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdentityKeyType {
+    /// RSA (ECDHE_RSA suites; PKCS#1 v1.5 SKE signatures).
+    Rsa,
+    /// ECDSA on one of the NIST curves (ECDHE_ECDSA suites).
+    Ecdsa(Curve),
+    /// Ed25519 — usable for TLS 1.3 CertificateVerify; not usable for
+    /// TLS 1.2 key exchange (no mainstream TLS 1.2 stack offers it).
+    Ed25519,
+}
+
+/// Determine the key type of an [`Identity`].
+pub(crate) fn identity_key_type(identity: &Identity) -> TlsResult<IdentityKeyType> {
+    match parse_private_key(&identity.private_key)? {
+        ParsedKey::Rsa { .. } => Ok(IdentityKeyType::Rsa),
+        ParsedKey::Ec { curve, .. } => Ok(IdentityKeyType::Ecdsa(curve)),
+        ParsedKey::Ed25519(_) => Ok(IdentityKeyType::Ed25519),
+    }
+}
+
+/// The cipher-suite hash a server should prefer given its identity key.
+///
+/// TLS 1.3 fixes the ECDSA CertificateVerify scheme from the suite hash
+/// (SHA-256 → P-256, SHA-384 → P-384), so a server with an EC identity
+/// must only negotiate suites whose hash matches its curve. P-521 would
+/// need a SHA-512 suite, which the TLS 1.3 profile does not offer, so
+/// there is no compatible suite (mirrors rustls).
+pub(crate) fn tls13_suite_hash_pref(identity: &Identity) -> Option<SuiteHash> {
+    match identity_key_type(identity).ok()? {
+        IdentityKeyType::Rsa | IdentityKeyType::Ed25519 => None,
+        IdentityKeyType::Ecdsa(Curve::P256) => Some(SuiteHash::Sha256),
+        IdentityKeyType::Ecdsa(Curve::P384) => Some(SuiteHash::Sha384),
+        IdentityKeyType::Ecdsa(Curve::P521) => None,
+    }
+}
+
+/// Sign the TLS 1.2 `ServerKeyExchange` body with the identity key and
+/// the digest algorithm matching the key (RFC 5246 §4.7): RSA uses
+/// PKCS#1 v1.5 over SHA-256/SHA-384, ECDSA a DER `ECDSA-Sig-Value` with
+/// SHA-256 (P-256) / SHA-384 (P-384) / SHA-512 (P-521).
+/// Returns `(hash_alg, sig_alg, signature)`.
+pub(crate) fn sign_tls12_server_key_exchange(
+    identity: &Identity,
+    message: &[u8],
+) -> TlsResult<Option<(u8, u8, Vec<u8>)>> {
+    let key = parse_private_key(&identity.private_key)?;
+    match key {
+        ParsedKey::Rsa { n, d } => {
+            let mut h = Sha256::new();
+            let digest = {
+                h.update(message);
+                h.finalize()
+            };
+            rsa::sign_pkcs1v15(&n, &d, rsa::DIGEST_INFO_SHA256, &digest)
+                .map(|sig| (4, 1, sig))
+                .map(Some)
+                .ok_or_else(|| TlsError::Certificate("RSA signing failed".into()))
+        }
+        ParsedKey::Ec { curve, d } => {
+            let (hash_alg, digest) = match curve {
+                Curve::P256 => {
+                    let mut h = Sha256::new();
+                    h.update(message);
+                    (4, h.finalize())
+                }
+                Curve::P384 => {
+                    let mut h = Sha384::new();
+                    h.update(message);
+                    (5, h.finalize())
+                }
+                Curve::P521 => {
+                    let mut h = ed25519::Sha512::new();
+                    h.update(message);
+                    (6, h.finalize())
+                }
+            };
+            match ecdsa::sign(curve, &d, &digest) {
+                Some((r, s)) => {
+                    let der = encode_ecdsa_sig(&r, &s);
+                    Ok(Some((hash_alg, 3, der)))
+                }
+                None => Err(TlsError::Certificate("ECDSA signing failed".into())),
+            }
+        }
+        ParsedKey::Ed25519(_) => Ok(None),
+    }
 }
 
 /// Sign the TLS 1.3 CertificateVerify message for a server identity.
-/// Returns (signature_scheme, signature).
+/// Returns `(signature_scheme, signature)`.
 pub(crate) fn sign_server_cert_verify(
     identity: &Identity,
     message: &[u8],
@@ -66,29 +164,42 @@ pub(crate) fn sign_server_cert_verify(
             let sig = ed25519::sign(&seed, message);
             Ok(Some((0x0807, sig.to_vec())))
         }
-        ParsedKey::EcP256 { d } => {
-            let mut h: super::crypto::hash::BoxDigest = match suite.hash() {
-                SuiteHash::Sha256 => Box::<Sha256>::default(),
-                SuiteHash::Sha384 => Box::<Sha384>::default(),
+        ParsedKey::Ec { curve, d } => {
+            // TLS 1.3 fixes the ECDSA scheme from the suite hash: a P-256
+            // key requires a SHA-256 suite (0x0403) and a P-384 key a
+            // SHA-384 suite (0x0503). P-521 would need SHA-512, for which
+            // no TLS 1.3 suite exists, so it cannot produce a TLS 1.3
+            // CertificateVerify (identical to rustls).
+            let (scheme, digest) = match (curve, suite.hash()) {
+                (Curve::P256, SuiteHash::Sha256) => {
+                    let mut h = Sha256::new();
+                    h.update(message);
+                    (0x0403, h.finalize())
+                }
+                (Curve::P384, SuiteHash::Sha384) => {
+                    let mut h = Sha384::new();
+                    h.update(message);
+                    (0x0503, h.finalize())
+                }
+                (Curve::P521, _) => {
+                    return Err(TlsError::Certificate(
+                        "P-521 identity cannot sign a TLS 1.3 CertificateVerify \
+                         (no SHA-512 cipher suite)"
+                            .into(),
+                    ))
+                }
+                _ => {
+                    return Err(TlsError::Certificate(
+                        "ECDSA identity curve incompatible with the negotiated \
+                         cipher suite"
+                            .into(),
+                    ))
+                }
             };
-            let digest = {
-                h.update(message);
-                let out = h.finalize();
-                let mut d32 = [0u8; 32];
-                d32.copy_from_slice(&out);
-                d32
-            };
-            match ecdsa::sign(&d, &digest) {
+            match ecdsa::sign(curve, &d, &digest) {
                 Some((r, s)) => {
                     let der = encode_ecdsa_sig(&r, &s);
-                    Ok(Some((
-                        if suite.hash() == SuiteHash::Sha256 {
-                            0x0403
-                        } else {
-                            0x0503
-                        },
-                        der,
-                    )))
+                    Ok(Some((scheme, der)))
                 }
                 None => Err(TlsError::Certificate("ECDSA signing failed".into())),
             }
@@ -97,6 +208,10 @@ pub(crate) fn sign_server_cert_verify(
 }
 
 /// DER-encode an ECDSA signature: SEQUENCE { INTEGER r, INTEGER s }.
+///
+/// Handles body lengths ≥ 128 bytes (P-384/P-521 signatures) with the
+/// DER long-form length (0x81 <len>) — a bare high-bit byte would be
+/// misread as a multi-byte length.
 fn encode_ecdsa_sig(r: &[u8], s: &[u8]) -> Vec<u8> {
     fn enc_int(v: &[u8]) -> Vec<u8> {
         let mut body = v.to_vec();
@@ -115,9 +230,16 @@ fn encode_ecdsa_sig(r: &[u8], s: &[u8]) -> Vec<u8> {
     }
     let r_der = enc_int(r);
     let s_der = enc_int(s);
-    let mut out = Vec::with_capacity(2 + r_der.len() + s_der.len());
+    let body_len = r_der.len() + s_der.len();
+    let mut out = Vec::with_capacity(4 + body_len);
     out.push(0x30);
-    out.push((r_der.len() + s_der.len()) as u8);
+    // DER length: short form below 128, long form otherwise.
+    if body_len < 128 {
+        out.push(body_len as u8);
+    } else {
+        out.push(0x81);
+        out.push(body_len as u8);
+    }
     out.extend_from_slice(&r_der);
     out.extend_from_slice(&s_der);
     out
@@ -185,11 +307,17 @@ fn parse_pkcs8(der: &[u8]) -> Option<ParsedKey> {
         return Some(ParsedKey::Ed25519(seed));
     }
     if oid.content == OID_EC_PUBLIC_KEY {
-        // params must be P-256.
+        // The params must be a recognized named curve.
         let params = read_element(alg.content, &mut a)?;
-        if params.tag != 0x06 || params.content != OID_P256 {
+        if params.tag != 0x06 {
             return None;
         }
+        let curve = match params.content {
+            OID_P256 => Curve::P256,
+            OID_P384 => Curve::P384,
+            OID_P521 => Curve::P521,
+            _ => return None,
+        };
         // ECPrivateKey: SEQUENCE { INTEGER version, OCTET STRING d, [1] pub? }
         let mut e = 0usize;
         let ec_seq = expect_sequence(key.content, &mut e)?;
@@ -199,12 +327,18 @@ fn parse_pkcs8(der: &[u8]) -> Option<ParsedKey> {
             return None;
         }
         let d_oct = read_element(ec_seq, &mut ep)?;
-        if d_oct.tag != 0x04 || d_oct.content.len() != 32 {
+        if d_oct.tag != 0x04 {
             return None;
         }
-        let mut d = [0u8; 32];
-        d.copy_from_slice(d_oct.content);
-        return Some(ParsedKey::EcP256 { d });
+        let coord_len = curve.coord_len();
+        // OpenSSL writes the scalar in a fixed-size OCTET STRING; accept
+        // exactly coord_len bytes, or a shorter minimal encoding.
+        if d_oct.content.is_empty() || d_oct.content.len() > coord_len {
+            return None;
+        }
+        let mut d = vec![0u8; coord_len];
+        d[coord_len - d_oct.content.len()..].copy_from_slice(d_oct.content);
+        return Some(ParsedKey::Ec { curve, d });
     }
     None
 }
@@ -297,30 +431,30 @@ mod tests {
     /// known public key.
     #[test]
     fn ecdsa_p256_sign_verify_roundtrip() {
-        let d: [u8; 32] = hex("C9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721")
-            .try_into()
-            .unwrap();
-        let digest: [u8; 32] =
-            hex("af2bdbe1aa9b6ec1e2ade1d694f41fc71a831d0268e9891562113d8a62add1bf")
-                .try_into()
-                .unwrap();
-        let (r, s) = ecdsa::sign(&d, &digest).expect("sign");
-        let qx: [u8; 32] = hex("60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6")
-            .try_into()
-            .unwrap();
-        let qy: [u8; 32] = hex("7903FE1008B8BC99A41AE9E95628BC64F2F1B20C2D7E9F5177A3C294D4462299")
-            .try_into()
-            .unwrap();
+        let d: Vec<u8> = hex("C9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721");
+        let digest: Vec<u8> =
+            hex("af2bdbe1aa9b6ec1e2ade1d694f41fc71a831d0268e9891562113d8a62add1bf");
+        let (r, s) = ecdsa::sign(Curve::P256, &d, &digest).expect("sign");
+        let qx = hex("60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6");
+        let qy = hex("7903FE1008B8BC99A41AE9E95628BC64F2F1B20C2D7E9F5177A3C294D4462299");
         // Encode as DER ECDSA-Sig-Value and verify.
         let der = encode_ecdsa_sig(&r, &s);
         assert!(super::super::crypto::ecdsa::verify_der(
-            &qx, &qy, &digest, &der
+            Curve::P256,
+            &qx,
+            &qy,
+            &digest,
+            &der
         ));
         // Tamper with the digest → must fail.
         let mut bad = digest;
         bad[0] ^= 1;
         assert!(!super::super::crypto::ecdsa::verify_der(
-            &qx, &qy, &bad, &der
+            Curve::P256,
+            &qx,
+            &qy,
+            &bad,
+            &der
         ));
     }
 

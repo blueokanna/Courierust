@@ -214,19 +214,50 @@ pub(crate) struct KeySchedule {
 
 impl KeySchedule {
     /// Compute the handshake-stage secrets from the ECDHE shared secret
-    /// and the ClientHello..ServerHello transcript.
+    /// and the ClientHello..ServerHello transcript (no PSK).
     pub(crate) fn handshake(suite: CipherSuite, ecdhe: &[u8; 32], transcript_hash: &[u8]) -> Self {
         let h = suite.hash();
         // early_secret = HKDF-Extract(0, 0)  (no PSK)
         let zeros = vec![0u8; h.hash_len()];
         let early = hkdf_extract(&mut h.new_digest(), &zeros, &zeros);
-        // derived = Derive-Secret(early, "derived", Hash(""))
         let empty_hash = {
             let mut d = h.new_digest();
             d.finalize()
         };
         let derived = derive_secret(h, &early, b"derived", &empty_hash);
         // handshake_secret = HKDF-Extract(derived, ecdhe)
+        let handshake_secret = hkdf_extract(&mut h.new_digest(), &derived, ecdhe);
+        let c_hs = derive_secret(h, &handshake_secret, b"c hs traffic", transcript_hash);
+        let s_hs = derive_secret(h, &handshake_secret, b"s hs traffic", transcript_hash);
+        Self {
+            suite,
+            handshake_secret,
+            master_secret: Vec::new(),
+            c_hs,
+            s_hs,
+            c_ap: Vec::new(),
+            s_ap: Vec::new(),
+        }
+    }
+
+    /// Compute the handshake-stage secrets from a PSK (session
+    /// resumption, RFC 8446 §4.2.11). `psk_dhe_ke` still mixes the ECDHE
+    /// shared secret for forward secrecy.
+    pub(crate) fn handshake_with_psk(
+        suite: CipherSuite,
+        ecdhe: &[u8; 32],
+        psk: &[u8],
+        transcript_hash: &[u8],
+    ) -> Self {
+        let h = suite.hash();
+        // early_secret = HKDF-Extract(0, psk)
+        let zeros = vec![0u8; h.hash_len()];
+        let early = hkdf_extract(&mut h.new_digest(), &zeros, psk);
+        let empty_hash = {
+            let mut d = h.new_digest();
+            d.finalize()
+        };
+        let derived = derive_secret(h, &early, b"derived", &empty_hash);
         let handshake_secret = hkdf_extract(&mut h.new_digest(), &derived, ecdhe);
         let c_hs = derive_secret(h, &handshake_secret, b"c hs traffic", transcript_hash);
         let s_hs = derive_secret(h, &handshake_secret, b"s hs traffic", transcript_hash);
@@ -307,6 +338,44 @@ impl KeySchedule {
     pub(crate) fn suite(&self) -> CipherSuite {
         self.suite
     }
+
+    /// Derive the resumption master secret (RFC 8446 §7.1), used to
+    /// derive per-ticket resumption PSKs.
+    pub(crate) fn resumption_master(&self, transcript_hash: &[u8]) -> Vec<u8> {
+        let h = self.suite.hash();
+        derive_secret(h, &self.master_secret, b"res master", transcript_hash)
+    }
+
+    /// Derive the resumption PSK for a NewSessionTicket (RFC 8446 §7.1 /
+    /// §4.6.1): `resumption_master_secret = Derive-Secret(master_secret,
+    /// "res master", CH..client Finished)` then `PSK =
+    /// HKDF-Expand-Label(resumption_master_secret, "resumption",
+    /// ticket_nonce, Hash.length)`.
+    pub(crate) fn resumption_psk(&self, transcript_hash: &[u8], ticket_nonce: &[u8]) -> Vec<u8> {
+        let res_master = self.resumption_master(transcript_hash);
+        let h = self.suite.hash();
+        expand_label(
+            h.new_digest().as_mut(),
+            &res_master,
+            b"resumption",
+            ticket_nonce,
+            h.hash_len(),
+        )
+    }
+}
+
+/// Derive the `binder_key` from a PSK (RFC 8446 §7.1):
+/// `early_secret = HKDF-Extract(0, psk)`;
+/// `binder_key = Derive-Secret(early_secret, "res binder", Hash(""))`.
+pub(crate) fn binder_key(suite: CipherSuite, psk: &[u8]) -> Vec<u8> {
+    let h = suite.hash();
+    let zeros = vec![0u8; h.hash_len()];
+    let early = hkdf_extract(&mut h.new_digest(), &zeros, psk);
+    let empty_hash = {
+        let mut d = h.new_digest();
+        d.finalize()
+    };
+    derive_secret(h, &early, b"res binder", &empty_hash)
 }
 
 #[cfg(test)]

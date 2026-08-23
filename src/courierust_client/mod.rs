@@ -396,6 +396,7 @@ impl Client {
                         verify: t.verify,
                         alpn: t.alpn.clone(),
                         now: t.now,
+                        ..Default::default()
                     },
                 ))),
                 None => Err(Error::protocol(

@@ -43,6 +43,9 @@ pub struct Stats {
     pub h2_connections_active: Arc<AtomicUsize>,
     /// HTTP/2 streams ever opened.
     pub h2_streams_total: Arc<AtomicUsize>,
+    /// HTTP/2 streams reset by the client because the per-request
+    /// response deadline (`ClientConfig::read_timeout`) elapsed.
+    pub h2_streams_timed_out: Arc<AtomicUsize>,
     /// HTTP/2 streams currently in flight (peak tracked separately).
     pub h2_streams_active: Arc<AtomicUsize>,
     /// Highest number of concurrent HTTP/2 streams observed.
@@ -98,6 +101,7 @@ impl Stats {
             h2_connections: self.h2_connections.load(Ordering::Relaxed),
             h2_connections_active: self.h2_connections_active.load(Ordering::Relaxed),
             h2_streams_total: self.h2_streams_total.load(Ordering::Relaxed),
+            h2_streams_timed_out: self.h2_streams_timed_out.load(Ordering::Relaxed),
             h2_streams_active: self.h2_streams_active.load(Ordering::Relaxed),
             h2_streams_active_peak: self.h2_streams_active_peak.load(Ordering::Relaxed),
             h2_streams_per_connection_peak: self
@@ -209,6 +213,9 @@ pub struct StatsSnapshot {
     pub h2_connections_active: usize,
     /// HTTP/2 streams ever opened.
     pub h2_streams_total: usize,
+    /// HTTP/2 streams reset by the client for exceeding the per-request
+    /// response deadline.
+    pub h2_streams_timed_out: usize,
     /// HTTP/2 streams currently in flight.
     pub h2_streams_active: usize,
     /// Highest number of concurrent HTTP/2 streams observed.
@@ -244,7 +251,7 @@ impl StatsSnapshot {
     /// Machine-readable `|`-separated field block for benchmark output.
     pub fn render(&self) -> String {
         format!(
-            "connections_accepted={}|connections_active={}|event_poll_syscalls={}|event_wakeups={}|event_queue_depth_peak={}|h1_connections={}|h1_read_syscalls={}|h1_write_syscalls={}|h2_connections={}|h2_connections_active={}|h2_streams_total={}|h2_streams_active={}|h2_streams_active_peak={}|h2_streams_per_connection_peak={}|h2_read_syscalls={}|h2_write_syscalls={}|h3_connections={}|h3_connections_active={}|h3_streams_total={}|h3_streams_active={}|h3_streams_active_peak={}|h3_streams_per_connection_peak={}|h3_queue_depth_peak={}|h3_udp_recv_syscalls={}|h3_udp_send_syscalls={}",
+            "connections_accepted={}|connections_active={}|event_poll_syscalls={}|event_wakeups={}|event_queue_depth_peak={}|h1_connections={}|h1_read_syscalls={}|h1_write_syscalls={}|h2_connections={}|h2_connections_active={}|h2_streams_total={}|h2_streams_timed_out={}|h2_streams_active={}|h2_streams_active_peak={}|h2_streams_per_connection_peak={}|h2_read_syscalls={}|h2_write_syscalls={}|h3_connections={}|h3_connections_active={}|h3_streams_total={}|h3_streams_active={}|h3_streams_active_peak={}|h3_streams_per_connection_peak={}|h3_queue_depth_peak={}|h3_udp_recv_syscalls={}|h3_udp_send_syscalls={}",
             self.connections_accepted,
             self.connections_active,
             self.event_poll_syscalls,
@@ -256,6 +263,7 @@ impl StatsSnapshot {
             self.h2_connections,
             self.h2_connections_active,
             self.h2_streams_total,
+            self.h2_streams_timed_out,
             self.h2_streams_active,
             self.h2_streams_active_peak,
             self.h2_streams_per_connection_peak,

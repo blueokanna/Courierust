@@ -6,12 +6,22 @@
 //! with unary, server-streaming, client-streaming and bidi calls on both
 //! the client and the server side.
 //!
-//! Protobuf itself is deliberately out of scope: implement
-//! [`crate::courierust_grpc::codec::EncodeMessage`] / [`crate::courierust_grpc::codec::DecodeMessage`]
-//! for your message types (or use the raw-bytes API) and plug in your own
-//! protobuf codec. There is no `.proto` compiler integration and no
-//! `grpc.reflection` server (both require a protobuf implementation,
-//! which is external by design).
+//! The crate ships a batteries-included, zero-dependency protobuf +
+//! gRPC code-generation chain:
+//!
+//! * [`proto`] — a from-scratch protobuf wire-format codec (varints,
+//!   fixed widths, length-delimited, packed repeated fields, ZigZag,
+//!   bounded nesting) with no third-party crates.
+//! * [`generated`] — build-time codegen: `build.rs` compiles every
+//!   `proto/*.proto` file into type-safe, IDE-friendly Rust structs and
+//!   wire codecs (implementing [`codec::EncodeMessage`] /
+//!   [`codec::DecodeMessage`]) plus typed gRPC client stubs. The
+//!   canonical `proto/helloworld.proto` is shipped and exposed as
+//!   `generated::helloworld`. Add your own `.proto` files and they are
+//!   generated automatically.
+//!
+//! Existing users can of course implement the codec traits themselves or
+//! wrap an external codec (e.g. prost) — the traits are the seam.
 //!
 //! Capabilities:
 //!
@@ -45,7 +55,9 @@
 
 pub mod codec;
 pub mod compress;
+pub mod generated;
 pub mod health;
+pub mod proto;
 pub mod status;
 
 use crate::courierust_body::Body;

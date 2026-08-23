@@ -578,6 +578,7 @@ fn tls_rejects_hostname_mismatch() {
             verify: true,
             alpn: vec![b"http/1.1".to_vec()],
             now: unix_now(),
+            ..Default::default()
         });
     let err = connector
         .connect("not-localhost.invalid", &stream, &stream)

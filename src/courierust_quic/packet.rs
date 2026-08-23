@@ -107,6 +107,9 @@ pub fn encode_short(dcid: &[u8], pn: u64, pn_len: usize, key_phase: bool) -> Res
         ));
     }
     let mut out = Vec::with_capacity(1 + dcid.len() + pn_len);
+    // Short header (RFC 9000 §17.3.1): 0x40 fixed bit, key phase at
+    // bit 2 (0x04), packet-number length in the low two bits. Bits 4-3
+    // (0x18) are reserved and stay 0.
     out.push(0x40 | (u8::from(key_phase) << 2) | pn_len_field);
     out.extend_from_slice(dcid);
     out.extend_from_slice(&encode_pn(pn, pn_len)?);

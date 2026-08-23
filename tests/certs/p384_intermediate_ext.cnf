@@ -1,0 +1,2 @@
+basicConstraints=critical,CA:TRUE
+keyUsage=critical,keyCertSign,cRLSign

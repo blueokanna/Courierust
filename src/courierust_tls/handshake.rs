@@ -34,19 +34,32 @@ pub(crate) const HS_CERTIFICATE: u8 = 11;
 pub(crate) const HS_CERTIFICATE_REQUEST: u8 = 13;
 pub(crate) const HS_CERTIFICATE_VERIFY: u8 = 15;
 pub(crate) const HS_FINISHED: u8 = 20;
+/// Synthetic `message_hash` handshake type used after a HelloRetryRequest
+/// (RFC 8446 §4.4.1).
+pub(crate) const HS_MESSAGE_HASH: u8 = 254;
+
+/// HelloRetryRequest random: SHA-256("HelloRetryRequest") (RFC 8446 §4.1.3).
+pub(crate) const HRR_RANDOM: [u8; 32] = [
+    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+    0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
+];
 
 /// Extension types.
 const EXT_SERVER_NAME: u16 = 0x0000;
 const EXT_SUPPORTED_GROUPS: u16 = 0x000a;
+const EXT_EC_POINT_FORMATS: u16 = 0x000b;
 const EXT_SIGNATURE_ALGORITHMS: u16 = 0x000d;
 const EXT_ALPN: u16 = 0x0010;
 const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
+/// cookie extension (RFC 8446 §4.2.2) — sent in the HelloRetryRequest and
+/// echoed verbatim by the client in the retried ClientHello.
+pub(crate) const EXT_COOKIE: u16 = 0x002c;
 const EXT_KEY_SHARE: u16 = 0x0033;
 /// QUIC transport parameters (RFC 9001 section 5.2).
 pub(crate) const EXT_QUIC_TRANSPORT_PARAMETERS: u16 = 0x0039;
 
 /// Named group for X25519.
-const GROUP_X25519: u16 = 0x001d;
+pub(crate) const GROUP_X25519: u16 = 0x001d;
 
 /// Signature schemes offered (RFC 8446 §4.2.3): RSA-PSS-PSS, RSA-PSS-RSAE,
 /// ECDSA P-256, Ed25519, and RSA PKCS#1.
@@ -198,6 +211,11 @@ pub(crate) struct HandshakeResult {
     pub(crate) alpn: Option<Vec<u8>>,
     pub(crate) server_name: Option<String>,
     pub(crate) peer_cert: Option<Vec<u8>>,
+    /// True when the handshake was resumed from a PSK.
+    pub(crate) resumed: bool,
+    /// Server side: the resumption master secret, used to issue a
+    /// NewSessionTicket after the handshake.
+    pub(crate) resumption_master: Option<Vec<u8>>,
 }
 
 /// The application traffic keys (write = client, read = server and
@@ -212,19 +230,11 @@ pub(crate) struct AppKeys {
 // ClientHello construction
 // ---------------------------------------------------------------------
 
-/// Build a full ClientHello message (header + body) with the given
-/// random, session id, key share and ALPN list.
-pub(crate) fn build_client_hello(
-    random: &[u8; 32],
-    key_share: &[u8; 32],
-    alpn: &[Vec<u8>],
-    server_name: Option<&str>,
-) -> Vec<u8> {
-    build_client_hello_with_transport_params(random, key_share, alpn, server_name, None)
-}
-
 /// Build a ClientHello with an optional QUIC transport-parameters
-/// extension. The ordinary TLS path passes `None`.
+/// extension. The ordinary TLS path passes `None`. This is the TLS 1.3
+/// client hello used by the QUIC path (RFC 9001 requires TLS 1.3); the
+/// TCP connector uses [`build_client_hello_negotiated`] instead so it
+/// can also speak TLS 1.2.
 pub(crate) fn build_client_hello_with_transport_params(
     random: &[u8; 32],
     key_share: &[u8; 32],
@@ -232,16 +242,63 @@ pub(crate) fn build_client_hello_with_transport_params(
     server_name: Option<&str>,
     transport_params: Option<&[u8]>,
 ) -> Vec<u8> {
+    build_client_hello_negotiated(
+        random,
+        Some(key_share),
+        alpn,
+        server_name,
+        transport_params,
+        true,
+        false,
+    )
+}
+
+/// Build a ClientHello covering a configurable version window.
+///
+/// * `key_share` — `Some` includes an X25519 share; `None` emits an
+///   empty `client_shares` vector (RFC 8446 §4.2.8 allows requesting
+///   group selection, which makes the server answer with a
+///   HelloRetryRequest).
+/// * `offer13` — include `supported_versions` (0x0304) and the TLS 1.3
+///   suites.
+/// * `offer12` — also include the TLS 1.2 AEAD ECDHE suites and the
+///   `ec_point_formats` extension, so a TLS 1.2-only server can
+///   negotiate TLS 1.2.
+///
+/// `supported_groups` always lists X25519 and secp256r1 (the latter is
+/// what a TLS 1.2 ECDHE server needs); `signature_algorithms` carries
+/// both the TLS 1.3 and the TLS 1.2 scheme sets.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_client_hello_negotiated(
+    random: &[u8; 32],
+    key_share: Option<&[u8; 32]>,
+    alpn: &[Vec<u8>],
+    server_name: Option<&str>,
+    transport_params: Option<&[u8]>,
+    offer13: bool,
+    offer12: bool,
+) -> Vec<u8> {
     let mut body = Vec::new();
     // legacy_version = 0x0303
     body.extend_from_slice(&[0x03, 0x03]);
     body.extend_from_slice(random);
     // legacy_session_id (empty for a non-resuming client)
     body.push(0);
-    // cipher_suites (big-endian u16 length)
-    body.extend_from_slice(&(CLIENT_SUITES.len() as u16 * 2).to_be_bytes());
-    for s in CLIENT_SUITES {
-        body.extend_from_slice(&s.wire().to_be_bytes());
+    // cipher_suites (big-endian u16 length): TLS 1.3 suites when
+    // offering TLS 1.3, then TLS 1.2 AEAD ECDHE suites when offering
+    // TLS 1.2. RFC 8446 §4.1.2: a client that supports TLS 1.3 MUST put
+    // the 1.3 suites in `cipher_suites` (they are identified by the
+    // 0x03 prefix) — TLS 1.2 servers simply ignore them.
+    let mut suite_wires: Vec<u16> = Vec::new();
+    if offer13 {
+        suite_wires.extend(CLIENT_SUITES.iter().map(|s| s.wire()));
+    }
+    if offer12 {
+        suite_wires.extend(super::tls12::CLIENT_SUITES_12.iter().map(|s| s.wire()));
+    }
+    body.extend_from_slice(&(suite_wires.len() as u16 * 2).to_be_bytes());
+    for s in &suite_wires {
+        body.extend_from_slice(&s.to_be_bytes());
     }
     // legacy_compression_methods
     body.extend_from_slice(&[1, 0]);
@@ -262,31 +319,47 @@ pub(crate) fn build_client_hello_with_transport_params(
         exts.push((EXT_SERVER_NAME, server_name_ext));
     }
 
-    // supported_groups
+    // supported_groups: X25519 + secp256r1.
     let mut groups = Vec::new();
-    groups.extend_from_slice(&[0x00, 0x02, 0x00, 0x1d]); // list len 2, X25519
+    groups.extend_from_slice(&[0x00, 0x04]); // list len 4
+    groups.extend_from_slice(&(0x001d_u16).to_be_bytes()); // X25519
+    groups.extend_from_slice(&super::tls12::GROUP_SECP256R1.to_be_bytes()); // secp256r1
     exts.push((EXT_SUPPORTED_GROUPS, groups));
 
-    // signature_algorithms
+    // signature_algorithms: TLS 1.3 schemes + TLS 1.2 schemes.
     let mut sigs = Vec::new();
-    sigs.extend_from_slice(&(SIGNATURE_SCHEMES.len() as u16 * 2).to_be_bytes());
-    for s in SIGNATURE_SCHEMES {
+    let mut sig_schemes: Vec<u16> = SIGNATURE_SCHEMES.to_vec();
+    sig_schemes.extend_from_slice(super::tls12::TLS12_SIGNATURE_ALGORITHMS);
+    sigs.extend_from_slice(&(sig_schemes.len() as u16 * 2).to_be_bytes());
+    for s in &sig_schemes {
         sigs.extend_from_slice(&s.to_be_bytes());
     }
     exts.push((EXT_SIGNATURE_ALGORITHMS, sigs));
 
-    // supported_versions: 0x0304
-    let mut versions = Vec::new();
-    versions.extend_from_slice(&[0x02, 0x03, 0x04]);
-    exts.push((EXT_SUPPORTED_VERSIONS, versions));
+    // ec_point_formats (required by TLS 1.2 ECDHE): uncompressed only.
+    if offer12 {
+        exts.push((EXT_EC_POINT_FORMATS, vec![1, 0]));
+    }
 
-    // key_share: one X25519 entry
-    let mut ks = Vec::new();
-    ks.extend_from_slice(&[0x00, 0x24]); // 2 bytes list len = 36
-    ks.extend_from_slice(&GROUP_X25519.to_be_bytes());
-    ks.extend_from_slice(&[0x00, 0x20]); // 32-byte key
-    ks.extend_from_slice(key_share);
-    exts.push((EXT_KEY_SHARE, ks));
+    // supported_versions + key_share only when offering TLS 1.3.
+    if offer13 {
+        let mut versions = Vec::new();
+        versions.extend_from_slice(&[0x02, 0x03, 0x04]);
+        exts.push((EXT_SUPPORTED_VERSIONS, versions));
+
+        let mut ks = Vec::new();
+        match key_share {
+            Some(share) => {
+                ks.extend_from_slice(&[0x00, 0x24]); // 2 bytes list len = 36
+                ks.extend_from_slice(&GROUP_X25519.to_be_bytes());
+                ks.extend_from_slice(&[0x00, 0x20]); // 32-byte key
+                ks.extend_from_slice(share);
+            }
+            // Empty client_shares: ask the server to pick a group.
+            None => ks.extend_from_slice(&[0x00, 0x00]),
+        }
+        exts.push((EXT_KEY_SHARE, ks));
+    }
 
     // ALPN (RFC 7301)
     if !alpn.is_empty() {
@@ -317,6 +390,89 @@ pub(crate) fn build_client_hello_with_transport_params(
     encode_hs(HS_CLIENT_HELLO, &body)
 }
 
+/// Whether a ServerHello negotiates TLS 1.3: true when the
+/// `supported_versions` extension is present with value 0x0304. A TLS
+/// 1.2 ServerHello carries no such extension. Used by the connector to
+/// dispatch between the TLS 1.3 and TLS 1.2 paths.
+pub(crate) fn server_hello_negotiates_tls13(body: &[u8]) -> bool {
+    let mut c = Cur::new(body);
+    // legacy_version (must be 0x0303), random (32), session id.
+    if c.u16().is_none() || c.take(32).is_none() {
+        return false;
+    }
+    let sid_len = match c.u8() {
+        Some(n) => n as usize,
+        None => return false,
+    };
+    if c.take(sid_len).is_none() {
+        return false;
+    }
+    // cipher_suite (2), compression (1), then extensions.
+    if c.take(3).is_none() {
+        return false;
+    }
+    let Some(exts) = parse_extensions(c.rest()) else {
+        return false;
+    };
+    for e in exts {
+        if e.ext_type == EXT_SUPPORTED_VERSIONS {
+            let mut v = Cur::new(e.content);
+            if let Some(ver) = v.u16() {
+                return ver == 0x0304;
+            }
+        }
+    }
+    false
+}
+
+/// Whether a ClientHello offers TLS 1.3 (`supported_versions` contains
+/// 0x0304). Used by the acceptor to decide between the TLS 1.3 and
+/// TLS 1.2 paths before running either state machine.
+pub(crate) fn client_hello_offers_tls13(body: &[u8]) -> TlsResult<bool> {
+    let mut c = Cur::new(body);
+    if c.u16().is_none() || c.take(32).is_none() {
+        return Err(TlsError::Protocol("bad CH".into()));
+    }
+    let sid_len = c.u8().ok_or_else(|| TlsError::Protocol("bad CH".into()))? as usize;
+    if sid_len > 32 {
+        return Err(TlsError::Protocol("bad CH sid".into()));
+    }
+    c.take(sid_len)
+        .ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
+    let suites_len = c.u16().ok_or_else(|| TlsError::Protocol("bad CH".into()))? as usize;
+    if suites_len < 2 || !suites_len.is_multiple_of(2) {
+        return Err(TlsError::Protocol("bad CH suites".into()));
+    }
+    c.take(suites_len)
+        .ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
+    let comp_len = c.u8().ok_or_else(|| TlsError::Protocol("bad CH".into()))? as usize;
+    c.take(comp_len)
+        .ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
+    let exts =
+        parse_extensions(c.rest()).ok_or_else(|| TlsError::Protocol("bad CH exts".into()))?;
+    for e in exts {
+        if e.ext_type == EXT_SUPPORTED_VERSIONS {
+            let mut v = Cur::new(e.content);
+            let list_len = v
+                .u8()
+                .ok_or_else(|| TlsError::Protocol("bad versions".into()))?
+                as usize;
+            let list = v
+                .take(list_len)
+                .ok_or_else(|| TlsError::Protocol("bad versions".into()))?;
+            let mut lc = Cur::new(list);
+            while !lc.done() {
+                if let Some(ver) = lc.u16() {
+                    if ver == 0x0304 {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
 // ---------------------------------------------------------------------
 // ServerHello parsing
 // ---------------------------------------------------------------------
@@ -328,8 +484,8 @@ pub(crate) struct ServerHelloInfo {
     pub(crate) key_share: [u8; 32],
     /// The echoed legacy_session_id (must equal the one we sent).
     pub(crate) session_id: Vec<u8>,
-    /// QUIC transport parameters, when present.
-    pub(crate) transport_params: Option<Vec<u8>>,
+    /// True when the server accepted our resumption PSK.
+    pub(crate) resumed: bool,
 }
 
 pub(crate) fn parse_server_hello(body: &[u8]) -> TlsResult<ServerHelloInfo> {
@@ -362,7 +518,7 @@ pub(crate) fn parse_server_hello(body: &[u8]) -> TlsResult<ServerHelloInfo> {
         parse_extensions(c.rest()).ok_or_else(|| TlsError::Protocol("bad SH exts".into()))?;
     let mut key_share = None;
     let mut saw_supported_versions = false;
-    let mut transport_params = None;
+    let mut resumed = false;
     for e in exts {
         match e.ext_type {
             EXT_SUPPORTED_VERSIONS => {
@@ -374,6 +530,20 @@ pub(crate) fn parse_server_hello(body: &[u8]) -> TlsResult<ServerHelloInfo> {
                     return Err(TlsError::Protocol("server does not speak TLS 1.3".into()));
                 }
                 saw_supported_versions = true;
+            }
+            super::session::EXT_PRE_SHARED_KEY => {
+                // selected_identity must be 0 (we offer one identity).
+                let mut v = Cur::new(e.content);
+                let selected = v
+                    .u16()
+                    .ok_or_else(|| TlsError::Protocol("bad SH psk".into()))?;
+                if selected != 0 {
+                    return Err(TlsError::Protocol("server selected unknown PSK".into()));
+                }
+                if !v.done() {
+                    return Err(TlsError::Protocol("bad SH psk".into()));
+                }
+                resumed = true;
             }
             EXT_KEY_SHARE => {
                 let mut v = Cur::new(e.content);
@@ -394,14 +564,6 @@ pub(crate) fn parse_server_hello(body: &[u8]) -> TlsResult<ServerHelloInfo> {
                 );
                 key_share = Some(k);
             }
-            EXT_QUIC_TRANSPORT_PARAMETERS => {
-                if transport_params.is_some() {
-                    return Err(TlsError::Protocol(
-                        "duplicate QUIC transport parameters".into(),
-                    ));
-                }
-                transport_params = Some(e.content.to_vec());
-            }
             _ => {}
         }
     }
@@ -413,7 +575,7 @@ pub(crate) fn parse_server_hello(body: &[u8]) -> TlsResult<ServerHelloInfo> {
         suite,
         key_share: key_share.unwrap(),
         session_id,
-        transport_params,
+        resumed,
     })
 }
 
@@ -421,9 +583,17 @@ pub(crate) fn parse_server_hello(body: &[u8]) -> TlsResult<ServerHelloInfo> {
 // EncryptedExtensions parsing
 // ---------------------------------------------------------------------
 
-pub(crate) fn parse_encrypted_extensions(body: &[u8]) -> TlsResult<Option<Vec<u8>>> {
+/// The parsed content of an EncryptedExtensions message: the negotiated
+/// ALPN protocol (if any) and the QUIC transport parameters (if present).
+/// Per RFC 9001 §8.2 the server's `quic_transport_parameters` extension is
+/// carried in EncryptedExtensions, never in the ServerHello.
+#[allow(clippy::type_complexity)]
+pub(crate) fn parse_encrypted_extensions(
+    body: &[u8],
+) -> TlsResult<(Option<Vec<u8>>, Option<Vec<u8>>)> {
     let exts = parse_extensions(body).ok_or_else(|| TlsError::Protocol("bad EE".into()))?;
     let mut alpn = None;
+    let mut transport_params = None;
     for e in exts {
         if e.ext_type == EXT_ALPN {
             let mut c = Cur::new(e.content);
@@ -444,9 +614,11 @@ pub(crate) fn parse_encrypted_extensions(body: &[u8]) -> TlsResult<Option<Vec<u8
                 return Err(TlsError::Protocol("bad alpn".into()));
             }
             alpn = Some(proto.to_vec());
+        } else if e.ext_type == EXT_QUIC_TRANSPORT_PARAMETERS {
+            transport_params = Some(e.content.to_vec());
         }
     }
-    Ok(alpn)
+    Ok((alpn, transport_params))
 }
 
 // ---------------------------------------------------------------------
@@ -532,7 +704,7 @@ pub(crate) fn verify_cert_verify(
     client: bool,
     suite: CipherSuite,
 ) -> TlsResult<()> {
-    use super::crypto::rsa::{verify_rsa_pkcs1v15, verify_rsa_pss, RsaPublicKey};
+    use super::crypto::rsa::{verify_rsa_pkcs1v15, RsaPublicKey};
     use super::crypto::{ecdsa, ed25519};
     use super::x509::der::{
         parse_rsa_public_key, OID_EC_PUBLIC_KEY, OID_ED25519, OID_RSA_ENCRYPTION,
@@ -552,18 +724,25 @@ pub(crate) fn verify_cert_verify(
         let (n, e) = parse_rsa_public_key(&spki.key)
             .ok_or_else(|| TlsError::Certificate("bad RSA SPKI".into()))?;
         let key = RsaPublicKey { n, e };
+        // PSS verifies the *raw* certificate-verify content (RFC 8446
+        // §4.4.3 / RFC 8017 §9.1: mHash = Hash(M)); PKCS#1 v1.5 signs
+        // the digest of that content. Passing the pre-hashed digest to
+        // the PSS path would double-hash and reject every valid
+        // signature.
         let ok = match cv.scheme {
+            0x0804 if suite.hash() == super::key_schedule::SuiteHash::Sha256 => {
+                let mut h = super::crypto::hash::Sha256::default();
+                key.verify_pss(&mut h, &msg, 32, &cv.signature)
+            }
+            0x0805 if suite.hash() == super::key_schedule::SuiteHash::Sha384 => {
+                let mut h = super::crypto::hash::Sha384::default();
+                key.verify_pss(&mut h, &msg, 48, &cv.signature)
+            }
             0x0401 if suite.hash() == super::key_schedule::SuiteHash::Sha256 => {
                 verify_rsa_pkcs1v15(&key, false, &hash, &cv.signature)
             }
             0x0501 if suite.hash() == super::key_schedule::SuiteHash::Sha384 => {
                 verify_rsa_pkcs1v15(&key, true, &hash, &cv.signature)
-            }
-            0x0804 if suite.hash() == super::key_schedule::SuiteHash::Sha256 => {
-                verify_rsa_pss(&key, false, &hash, &cv.signature)
-            }
-            0x0805 if suite.hash() == super::key_schedule::SuiteHash::Sha384 => {
-                verify_rsa_pss(&key, true, &hash, &cv.signature)
             }
             _ => false,
         };
@@ -575,18 +754,25 @@ pub(crate) fn verify_cert_verify(
             ))
         }
     } else if spki.oid == OID_EC_PUBLIC_KEY {
-        let expected_scheme = match suite.hash() {
-            super::key_schedule::SuiteHash::Sha256 => 0x0403,
-            super::key_schedule::SuiteHash::Sha384 => 0x0503,
+        // TLS 1.3 fixes the ECDSA CertificateVerify scheme from the
+        // negotiated cipher-suite hash: SHA-256 → 0x0403 with a P-256
+        // key, SHA-384 → 0x0503 with a P-384 key. P-521 would require
+        // a SHA-512 suite, which this profile does not offer, so it can
+        // never appear here (identical to rustls).
+        let (curve, expected_scheme) = match suite.hash() {
+            super::key_schedule::SuiteHash::Sha256 => (ecdsa::Curve::P256, 0x0403),
+            super::key_schedule::SuiteHash::Sha384 => (ecdsa::Curve::P384, 0x0503),
         };
-        if cv.scheme != expected_scheme || spki.key.len() != 65 || spki.key[0] != 0x04 {
+        if cv.scheme != expected_scheme || spki.ec_curve != Some(curve) {
             return Err(TlsError::Certificate("unsupported EC signature".into()));
         }
-        let mut qx = [0u8; 32];
-        let mut qy = [0u8; 32];
-        qx.copy_from_slice(&spki.key[1..33]);
-        qy.copy_from_slice(&spki.key[33..65]);
-        if ecdsa::verify_der(&qx, &qy, &hash, &cv.signature) {
+        let clen = curve.coord_len();
+        if spki.key.len() != 1 + 2 * clen || spki.key[0] != 0x04 {
+            return Err(TlsError::Certificate("bad EC SPKI".into()));
+        }
+        let qx = &spki.key[1..1 + clen];
+        let qy = &spki.key[1 + clen..1 + 2 * clen];
+        if ecdsa::verify_der(curve, qx, qy, &hash, &cv.signature) {
             Ok(())
         } else {
             Err(TlsError::Certificate(
@@ -652,41 +838,38 @@ pub(crate) fn fill_entropy(buf: &mut [u8]) -> TlsResult<()> {
 }
 
 pub(crate) struct ClientHandshake {
-    pub(crate) alpn: Vec<Vec<u8>>,
     pub(crate) server_name: Option<String>,
     pub(crate) verify: bool,
+    /// A resumption PSK to offer (RFC 8446 §4.2.11), with its suite.
+    pub(crate) psk: Option<(Vec<u8>, CipherSuite)>,
 }
 
 impl ClientHandshake {
-    /// Run the full client handshake over `io` and return the negotiated
-    /// application keys.
-    pub(crate) fn run<R: crate::courierust_io::Read, W: crate::courierust_io::Write>(
+    /// Continue a client handshake whose ClientHello has already been
+    /// sent and whose ServerHello has already been read (used by the
+    /// version-negotiating connector, which must see the ServerHello to
+    /// decide between the TLS 1.3 and TLS 1.2 paths).
+    #[allow(clippy::too_many_arguments)]
+    /// * `hrr` — when the handshake went through a HelloRetryRequest,
+    ///   the `(ClientHello1, HelloRetryRequest, ClientHello2)` messages;
+    ///   the transcript then starts with `message_hash(Hash(CH1)) ||
+    ///   HRR || CH2` (RFC 8446 §4.4.1) instead of a single ClientHello.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_from_server_hello<
+        R: crate::courierust_io::Read,
+        W: crate::courierust_io::Write,
+    >(
         &self,
         io: &mut super::TlsIo<R, W>,
         roots: &super::x509::RootStore,
         now: i64,
+        ch: &[u8],
+        _random: &[u8; 32],
+        priv_key: &[u8; 32],
+        sh_body: &[u8],
+        hrr: Option<(&[u8], &[u8], &[u8])>,
     ) -> TlsResult<HandshakeResult> {
-        // 1. ClientHello. Entropy is mandatory: continuing with a failed
-        //    OS entropy source would yield an all-zero X25519 private
-        //    key (predictable ECDHE → compromised session keys), so the
-        //    handshake fails closed instead.
-        let mut random = [0u8; 32];
-        fill_entropy(&mut random)?;
-        let mut priv_key = [0u8; 32];
-        fill_entropy(&mut priv_key)?;
-        let pub_key = x25519::x25519(&priv_key, &x25519::BASE_POINT);
-        let ch = build_client_hello(&random, &pub_key, &self.alpn, self.server_name.as_deref());
-        io.write_plaintext_record(CONTENT_HANDSHAKE, &ch)?;
-
-        // 2. ServerHello. The transcript is created *after* the suite is
-        //    known: RFC 8446 §4.4.1 uses the negotiated suite's hash for
-        //    every message, including the ClientHello. Creating it with
-        //    SHA-256 up front is wrong when the server picks
-        //    TLS_AES_256_GCM_SHA384 (OpenSSL's default preference), which
-        //    would make both sides derive different handshake keys and
-        //    fail with bad_record_mac.
-        let (_, sh_body) = io.read_plaintext_handshake()?;
-        let sh = parse_server_hello(&sh_body)?;
+        let sh = parse_server_hello(sh_body)?;
         // RFC 8446 §4.1.3: the echoed session id must match the one we
         // sent (we send an empty one).
         if !sh.session_id.is_empty() {
@@ -694,14 +877,36 @@ impl ClientHandshake {
         }
 
         let mut transcript = Transcript::new(sh.suite.hash());
-        transcript.update(&ch);
-        let sh_msg = encode_hs(HS_SERVER_HELLO, &sh_body);
+        match hrr {
+            Some((ch1, hrr_msg, ch2)) => {
+                transcript.update(&message_hash_message(ch1, sh.suite));
+                transcript.update(hrr_msg);
+                transcript.update(ch2);
+            }
+            None => transcript.update(ch),
+        }
+        let sh_msg = encode_hs(HS_SERVER_HELLO, sh_body);
         transcript.update(&sh_msg);
 
         // 3. ECDHE + key schedule
-        let shared = x25519::x25519(&priv_key, &sh.key_share);
+        let shared = x25519::x25519(priv_key, &sh.key_share);
         let th = transcript.current_hash();
-        let mut ks = KeySchedule::handshake(sh.suite, &shared, &th);
+        let mut ks = if sh.resumed {
+            // The server accepted our resumption PSK (RFC 8446 §4.2.11);
+            // the negotiated suite must be the PSK's suite.
+            let (psk, psk_suite) = self
+                .psk
+                .clone()
+                .ok_or_else(|| TlsError::Protocol("server resumed without a PSK offer".into()))?;
+            if psk_suite != sh.suite {
+                return Err(TlsError::Protocol(
+                    "resumption cipher suite does not match the PSK".into(),
+                ));
+            }
+            KeySchedule::handshake_with_psk(sh.suite, &shared, &psk, &th)
+        } else {
+            KeySchedule::handshake(sh.suite, &shared, &th)
+        };
         let _ = sh.random;
 
         // 4. Encrypted flight (EncryptedExtensions, Certificate,
@@ -726,7 +931,8 @@ impl ClientHandshake {
         for (t, body) in &messages {
             match *t {
                 HS_ENCRYPTED_EXTENSIONS => {
-                    negotiated_alpn = parse_encrypted_extensions(body)?;
+                    let (alpn, _transport_params) = parse_encrypted_extensions(body)?;
+                    negotiated_alpn = alpn;
                     saw_ee = true;
                 }
                 HS_CERTIFICATE => {
@@ -810,6 +1016,11 @@ impl ClientHandshake {
         io.write_encrypted_record(sh.suite, &c_hs_keys, CONTENT_HANDSHAKE, &fin_msg)?;
         transcript.update(&fin_msg);
 
+        // The resumption master secret (transcript = CH..client Finished)
+        // lets the client derive the PSK of any NewSessionTicket it reads
+        // after the handshake (RFC 8446 §7.1).
+        let resumption_master = Some(ks.resumption_master(&transcript.current_hash()));
+
         // 6. Application keys.
         let write = ks.client_application_keys();
         let read = ks.server_application_keys();
@@ -819,6 +1030,8 @@ impl ClientHandshake {
             alpn: negotiated_alpn,
             server_name: self.server_name.clone(),
             peer_cert: Some(peer_cert_der),
+            resumed: sh.resumed,
+            resumption_master,
         })
     }
 }
@@ -853,37 +1066,136 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 pub(crate) struct ServerHandshake {
     pub(crate) identity: super::Identity,
     pub(crate) alpn: Vec<Vec<u8>>,
+    /// Key used to encrypt/decrypt session tickets. `None` disables
+    /// session resumption (the QUIC path passes None).
+    pub(crate) ticket_key: Option<[u8; 32]>,
+    /// Current Unix time (used to validate ticket age).
+    pub(crate) now: i64,
 }
 
 impl ServerHandshake {
-    /// Run the full server handshake over `io`.
-    pub(crate) fn run<R: crate::courierust_io::Read, W: crate::courierust_io::Write>(
+    /// Continue a server handshake whose ClientHello has already been
+    /// read (used by the version-negotiating acceptor).
+    pub(crate) fn run_from_client_hello<
+        R: crate::courierust_io::Read,
+        W: crate::courierust_io::Write,
+    >(
         &self,
         io: &mut super::TlsIo<R, W>,
+        ch_body: &[u8],
     ) -> TlsResult<HandshakeResult> {
-        // 1. Read ClientHello.
-        let (_, ch_body) = io.read_plaintext_handshake()?;
-        let ch = parse_client_hello(&ch_body)?;
+        let suite_hash_pref = super::sign::tls13_suite_hash_pref(&self.identity);
 
+        // 1. Read ClientHello. If the client supports X25519 but did not
+        //    offer a share, send a HelloRetryRequest (RFC 8446 §4.1.4)
+        //    and read the retried ClientHello. The transcript replaces
+        //    ClientHello1 with message_hash(Hash(ClientHello1)) and then
+        //    appends HelloRetryRequest and ClientHello2 (§4.4.1); a PSK
+        //    binder in ClientHello2 is computed over CH1 || HRR ||
+        //    Truncate(CH2) (§4.2.11.2).
+        let mut ch = parse_client_hello(ch_body, suite_hash_pref)?;
         let mut transcript = Transcript::new(ch.suite.hash());
-        transcript.update(&encode_hs(HS_CLIENT_HELLO, &ch_body));
+        // The ClientHello body that carries the resumption offer, plus
+        // the (ClientHello1, HelloRetryRequest) pair when a retry
+        // happened (the CH2 binder is over CH1 || HRR || Truncate(CH2)).
+        let mut resume_body: Vec<u8> = ch_body.to_vec();
+        let mut hrr_prefix: Option<(Vec<u8>, Vec<u8>)> = None;
+        if ch.key_share.is_none() {
+            if !ch.x25519_in_groups {
+                return Err(TlsError::Protocol(
+                    "no mutually supported key exchange group".into(),
+                ));
+            }
+            let hrr = build_hello_retry_request(ch.suite, &ch.session_id);
+            io.write_plaintext_record(CONTENT_HANDSHAKE, &hrr)?;
+            let (ct2, ch2) = io.read_plaintext_record()?;
+            if ct2 != CONTENT_HANDSHAKE || ch2.len() < 4 || ch2[0] != HS_CLIENT_HELLO {
+                return Err(TlsError::Protocol("expected a retried ClientHello".into()));
+            }
+            let ch2_body = ch2[4..].to_vec();
+            let ch2_info = parse_client_hello(&ch2_body, suite_hash_pref)?;
+            let ch2_share = ch2_info.key_share.ok_or_else(|| {
+                TlsError::Protocol("retried ClientHello lacks an X25519 share".into())
+            })?;
+            if ch2_info.suite != ch.suite {
+                return Err(TlsError::Protocol(
+                    "retried ClientHello changed the cipher suite".into(),
+                ));
+            }
+            let ch1_msg = encode_hs(HS_CLIENT_HELLO, ch_body);
+            transcript.update(&message_hash_message(&ch1_msg, ch.suite));
+            transcript.update(&hrr);
+            transcript.update(&encode_hs(HS_CLIENT_HELLO, &ch2_body));
+            ch.key_share = Some(ch2_share);
+            ch.session_id = ch2_info.session_id;
+            ch.server_name = ch2_info.server_name;
+            ch.alpn = ch2_info.alpn;
+            ch.transport_params = ch2_info.transport_params;
+            resume_body = ch2_body;
+            hrr_prefix = Some((ch1_msg, hrr));
+        } else {
+            transcript.update(&encode_hs(HS_CLIENT_HELLO, ch_body));
+        }
+
+        // 1b. Resumption: a well-formed pre_shared_key offer whose ticket
+        // decrypts, matches the negotiated suite, and carries a valid
+        // binder resumes the session (RFC 8446 §4.2.11). Any failure
+        // falls back to a full handshake (the client proceeds without the
+        // PSK), except a malformed offer, which is a protocol error.
+        let mut resumed = false;
+        let mut resume_psk: Option<Vec<u8>> = None;
+        if let Some(offer) = super::session::parse_pre_shared_key(&resume_body)? {
+            if let Some(key) = self.ticket_key {
+                if let Ok((ticket_suite, psk)) =
+                    super::session::decrypt_ticket(&key, &offer.ticket, self.now)
+                {
+                    let binder_ok = match &hrr_prefix {
+                        Some((ch1, hrr)) => super::session::verify_binder_hrr(
+                            ch1,
+                            hrr,
+                            &resume_body,
+                            &offer,
+                            ch.suite,
+                            &psk,
+                        ),
+                        None => {
+                            super::session::verify_binder(&resume_body, &offer, ch.suite, &psk)
+                        }
+                    };
+                    if ticket_suite == ch.suite && binder_ok {
+                        resumed = true;
+                        resume_psk = Some(psk);
+                    }
+                }
+            }
+        }
 
         // 2. ECDHE + ServerHello. Same fail-closed entropy requirement as
         //    the client: an all-zero server private key would make the
         //    session keys predictable to a passive attacker.
+        let ch_share = ch.key_share.expect("X25519 share resolved above");
         let mut s_priv = [0u8; 32];
         fill_entropy(&mut s_priv)?;
         let s_pub = x25519::x25519(&s_priv, &x25519::BASE_POINT);
-        let shared = x25519::x25519(&s_priv, &ch.key_share);
+        let shared = x25519::x25519(&s_priv, &ch_share);
         let mut random = [0u8; 32];
         fill_entropy(&mut random)?;
-        let sh = build_server_hello(&random, &s_pub, ch.suite, &ch.session_id);
+        let sh = if resumed {
+            super::session::build_server_hello_psk(&random, &s_pub, ch.suite, &ch.session_id)
+        } else {
+            build_server_hello(&random, &s_pub, ch.suite, &ch.session_id)
+        };
         io.write_plaintext_record(CONTENT_HANDSHAKE, &sh)?;
         let sh_body = sh[4..].to_vec();
         transcript.update(&encode_hs(HS_SERVER_HELLO, &sh_body));
 
         let th = transcript.current_hash();
-        let mut ks = KeySchedule::handshake(ch.suite, &shared, &th);
+        let mut ks = if resumed {
+            let psk = resume_psk.expect("resume psk set above");
+            KeySchedule::handshake_with_psk(ch.suite, &shared, &psk, &th)
+        } else {
+            KeySchedule::handshake(ch.suite, &shared, &th)
+        };
 
         // 3. EncryptedExtensions, Certificate, CertificateVerify, Finished.
         let mut ee_body = Vec::new();
@@ -1003,12 +1315,37 @@ impl ServerHandshake {
 
         let write = ks.server_application_keys();
         let read = ks.client_application_keys();
+
+        // The application keys start a fresh record sequence space
+        // (RFC 8446 §5.2: sequence numbers reset at each key change).
+        io.reset_sequences();
+
+        // 5. Issue a NewSessionTicket (session resumption, RFC 8446
+        //    §4.6.1). Sent after the handshake, protected by the server
+        //    application keys. The PSK is derived from the resumption
+        //    master secret with a fresh nonce and encrypted inside the
+        //    ticket with the server-held ticket key.
+        if let Some(key) = self.ticket_key {
+            let mut nonce = [0u8; 8];
+            fill_entropy(&mut nonce)?;
+            let psk = ks.resumption_psk(&transcript.current_hash(), &nonce);
+            let ticket = super::session::encrypt_ticket(&key, ch.suite, &psk, self.now);
+            let msg = super::session::build_new_session_ticket(
+                super::session::SESSION_LIFETIME_SECS as u32,
+                &nonce,
+                &ticket,
+            );
+            io.write_encrypted_record(ch.suite, &write, CONTENT_HANDSHAKE, &msg)?;
+        }
+
         Ok(HandshakeResult {
             suite: ch.suite,
             keys: AppKeys { write, read },
             alpn: negotiated_alpn,
             server_name: ch.server_name,
             peer_cert: None,
+            resumed,
+            resumption_master: None,
         })
     }
 }
@@ -1016,7 +1353,11 @@ impl ServerHandshake {
 /// Parsed ClientHello essentials.
 pub(crate) struct ClientHelloInfo {
     pub(crate) suite: CipherSuite,
-    pub(crate) key_share: [u8; 32],
+    /// The client's X25519 key share, when one was offered.
+    pub(crate) key_share: Option<[u8; 32]>,
+    /// Whether X25519 appears in the client's `supported_groups` (used to
+    /// decide between a HelloRetryRequest and a hard failure).
+    pub(crate) x25519_in_groups: bool,
     pub(crate) server_name: Option<String>,
     /// ALPN protocols offered by the client.
     pub(crate) alpn: Vec<Vec<u8>>,
@@ -1028,7 +1369,13 @@ pub(crate) struct ClientHelloInfo {
     pub(crate) transport_params: Option<Vec<u8>>,
 }
 
-pub(crate) fn parse_client_hello(body: &[u8]) -> TlsResult<ClientHelloInfo> {
+/// Parse a ClientHello. `suite_hash_pref` (from the server identity key)
+/// restricts the chosen cipher suite to one whose hash matches the EC
+/// identity curve, so the CertificateVerify scheme is always valid.
+pub(crate) fn parse_client_hello(
+    body: &[u8],
+    suite_hash_pref: Option<super::key_schedule::SuiteHash>,
+) -> TlsResult<ClientHelloInfo> {
     let mut c = Cur::new(body);
     // legacy_version
     c.u16().ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
@@ -1062,6 +1409,7 @@ pub(crate) fn parse_client_hello(body: &[u8]) -> TlsResult<ClientHelloInfo> {
     let exts =
         parse_extensions(c.rest()).ok_or_else(|| TlsError::Protocol("bad CH exts".into()))?;
     let mut key_share = None;
+    let mut x25519_in_groups = false;
     let mut server_name = None;
     let mut client_alpn: Vec<Vec<u8>> = Vec::new();
     let mut saw_versions = false;
@@ -1076,6 +1424,22 @@ pub(crate) fn parse_client_hello(body: &[u8]) -> TlsResult<ClientHelloInfo> {
                     .ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
                 if list.contains(&0x03) && list.contains(&0x04) {
                     saw_versions = true;
+                }
+            }
+            EXT_SUPPORTED_GROUPS => {
+                let mut v = Cur::new(e.content);
+                let list_len = v.u16().ok_or_else(|| TlsError::Protocol("bad CH".into()))? as usize;
+                let list = v
+                    .take(list_len)
+                    .ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
+                let mut lc = Cur::new(list);
+                while !lc.done() {
+                    let group = lc
+                        .u16()
+                        .ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
+                    if group == GROUP_X25519 {
+                        x25519_in_groups = true;
+                    }
                 }
             }
             EXT_KEY_SHARE => {
@@ -1150,23 +1514,151 @@ pub(crate) fn parse_client_hello(body: &[u8]) -> TlsResult<ClientHelloInfo> {
             _ => {}
         }
     }
-    if !saw_versions || key_share.is_none() {
-        return Err(TlsError::Protocol("CH missing required extensions".into()));
+    if !saw_versions {
+        return Err(TlsError::Protocol("CH missing supported_versions".into()));
     }
-    // Choose the first offered suite we support.
+    // Choose the first offered suite we support whose hash matches the
+    // identity key (for EC identities the TLS 1.3 ECDSA scheme is fixed
+    // by the suite hash).
     let suite = CLIENT_SUITES
         .iter()
         .copied()
+        .filter(|s| suite_hash_pref.is_none_or(|h| s.hash() == h))
         .find(|s| offered.contains(&s.wire()))
         .ok_or_else(|| TlsError::Protocol("no shared cipher suite".into()))?;
     Ok(ClientHelloInfo {
         suite,
-        key_share: key_share.unwrap(),
+        key_share,
+        x25519_in_groups,
         session_id,
         server_name,
         alpn: client_alpn,
         transport_params,
     })
+}
+
+/// Whether a ServerHello is actually a HelloRetryRequest (RFC 8446
+/// §4.1.3: the random value equals SHA-256("HelloRetryRequest")).
+pub(crate) fn is_hello_retry_request(body: &[u8]) -> bool {
+    let mut c = Cur::new(body);
+    if c.u16().is_none() {
+        return false;
+    }
+    match c.take(32) {
+        Some(r) => r == HRR_RANDOM,
+        None => false,
+    }
+}
+
+/// A parsed HelloRetryRequest (RFC 8446 §4.1.4).
+pub(crate) struct HrrInfo {
+    /// The group the server wants a share for (key_share extension).
+    pub(crate) selected_group: u16,
+}
+
+/// Parse a HelloRetryRequest body. The client MUST verify that
+/// `supported_versions` is 0x0304 and that `key_share` carries the
+/// selected group; the caller then decides whether it can comply.
+pub(crate) fn parse_hello_retry_request(body: &[u8]) -> Result<HrrInfo, TlsError> {
+    let mut c = Cur::new(body);
+    c.u16()
+        .ok_or_else(|| TlsError::Protocol("bad HRR".into()))?; // legacy_version
+    let random = c
+        .take(32)
+        .ok_or_else(|| TlsError::Protocol("bad HRR".into()))?;
+    if random != HRR_RANDOM {
+        return Err(TlsError::Protocol("not a HelloRetryRequest".into()));
+    }
+    let sid_len = c.u8().ok_or_else(|| TlsError::Protocol("bad HRR".into()))? as usize;
+    c.take(sid_len)
+        .ok_or_else(|| TlsError::Protocol("bad HRR".into()))?; // session id echo
+    c.u16()
+        .ok_or_else(|| TlsError::Protocol("bad HRR".into()))?; // cipher_suite
+    let comp = c.u8().ok_or_else(|| TlsError::Protocol("bad HRR".into()))?;
+    if comp != 0 {
+        return Err(TlsError::Protocol("bad HRR compression".into()));
+    }
+    let exts =
+        parse_extensions(c.rest()).ok_or_else(|| TlsError::Protocol("bad HRR exts".into()))?;
+    let mut selected_group = None;
+    let mut saw_versions = false;
+    for e in exts {
+        match e.ext_type {
+            EXT_SUPPORTED_VERSIONS => {
+                let mut v = Cur::new(e.content);
+                let ver = v
+                    .u16()
+                    .ok_or_else(|| TlsError::Protocol("bad HRR ver".into()))?;
+                if ver != 0x0304 {
+                    return Err(TlsError::Protocol(
+                        "HRR selected a version below TLS 1.3".into(),
+                    ));
+                }
+                saw_versions = true;
+            }
+            EXT_KEY_SHARE => {
+                let mut v = Cur::new(e.content);
+                selected_group = Some(
+                    v.u16()
+                        .ok_or_else(|| TlsError::Protocol("bad HRR key_share".into()))?,
+                );
+            }
+            EXT_COOKIE => {
+                // Validate the stateless cookie's framing; this client has
+                // no re-issue path, so the content is not retained.
+                let mut v = Cur::new(e.content);
+                let len = v
+                    .u16()
+                    .ok_or_else(|| TlsError::Protocol("bad HRR cookie".into()))?
+                    as usize;
+                v.take(len)
+                    .ok_or_else(|| TlsError::Protocol("bad HRR cookie".into()))?;
+            }
+            _ => {}
+        }
+    }
+    if !saw_versions || selected_group.is_none() {
+        return Err(TlsError::Protocol("HRR missing required extensions".into()));
+    }
+    Ok(HrrInfo {
+        selected_group: selected_group.unwrap(),
+    })
+}
+
+/// Build a HelloRetryRequest (full message) requesting an X25519 share,
+/// echoing the client's session id (RFC 8446 §4.1.4).
+pub(crate) fn build_hello_retry_request(suite: CipherSuite, session_id: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0x03, 0x03]); // legacy_version
+    body.extend_from_slice(&HRR_RANDOM);
+    body.push(session_id.len() as u8);
+    body.extend_from_slice(session_id);
+    body.extend_from_slice(&suite.wire().to_be_bytes());
+    body.push(0); // legacy_compression_method
+                  // Extensions: supported_versions (selected) + key_share (selected_group).
+    let mut exts = Vec::new();
+    let mut sv = Vec::new();
+    sv.extend_from_slice(&0x0304u16.to_be_bytes());
+    exts.extend_from_slice(&EXT_SUPPORTED_VERSIONS.to_be_bytes());
+    exts.extend_from_slice(&(sv.len() as u16).to_be_bytes());
+    exts.extend_from_slice(&sv);
+    let mut ks = Vec::new();
+    ks.extend_from_slice(&GROUP_X25519.to_be_bytes());
+    exts.extend_from_slice(&EXT_KEY_SHARE.to_be_bytes());
+    exts.extend_from_slice(&(ks.len() as u16).to_be_bytes());
+    exts.extend_from_slice(&ks);
+    body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+    body.extend_from_slice(&exts);
+    encode_hs(HS_SERVER_HELLO, &body)
+}
+
+/// RFC 8446 §4.4.1: replace ClientHello1 in the transcript with the
+/// synthetic `message_hash` handshake message carrying Hash(ClientHello1).
+fn message_hash_message(ch1: &[u8], suite: CipherSuite) -> Vec<u8> {
+    let mut d = suite.hash().new_digest();
+    d.update(ch1);
+    let h = d.finalize();
+    encode_hs(HS_MESSAGE_HASH, &h)
 }
 
 /// Build a ServerHello (full message) for the given suite and key share.

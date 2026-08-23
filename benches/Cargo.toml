@@ -59,6 +59,16 @@ harness = false
 path = "src/network.rs"
 
 [[bench]]
+name = "quinn_dbg"
+harness = false
+path = "src/quinn_dbg.rs"
+
+[[bench]]
+name = "tmp_repro"
+harness = false
+path = "src/tmp_repro.rs"
+
+[[bench]]
 name = "h3"
 harness = false
 path = "src/h3.rs"

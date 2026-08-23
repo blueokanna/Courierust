@@ -62,3 +62,114 @@ pub(crate) fn root_store() -> crate::courierust_tls::RootStore {
     roots.add_der(SERVER_CERT_DER.to_vec());
     roots
 }
+
+// ---------------------------------------------------------------------
+// TLS 1.2 test identity (RSA 2048, self-signed for `localhost`)
+// ---------------------------------------------------------------------
+//
+// TLS 1.2 requires a certificate key that can sign a ServerKeyExchange;
+// the Ed25519 identity above is TLS 1.3-only. This RSA 2048 certificate
+// (generated with OpenSSL 3.x, valid 2026-08-23..2036-08-20, subject
+// CN=localhost, SAN DNS:localhost + IP:127.0.0.1, CA:TRUE, serverAuth)
+// covers the TLS 1.2 ECDHE_RSA suites. The DER is embedded via
+// `include_bytes!` from this directory (kept as files so the constants
+// cannot drift from what openssl actually emitted).
+
+/// DER-encoded RSA 2048 self-signed certificate for `localhost`.
+pub(crate) const RSA_SERVER_CERT_DER: &[u8] = include_bytes!("testdata/rsa_server_cert.der");
+
+/// PKCS#8 DER-encoded RSA 2048 private key matching [`RSA_SERVER_CERT_DER`].
+pub(crate) const RSA_SERVER_KEY_DER: &[u8] = include_bytes!("testdata/rsa_server_key.der");
+
+/// The RSA server identity used by the TLS 1.2 tests.
+pub(crate) fn rsa_server_identity() -> crate::courierust_tls::Identity {
+    crate::courierust_tls::Identity {
+        cert_chain: vec![RSA_SERVER_CERT_DER.to_vec()],
+        private_key: RSA_SERVER_KEY_DER.to_vec(),
+        is_rsa: true,
+    }
+}
+
+/// A root store that trusts the RSA test certificate.
+pub(crate) fn rsa_root_store() -> crate::courierust_tls::RootStore {
+    let mut roots = crate::courierust_tls::RootStore::new();
+    roots.add_der(RSA_SERVER_CERT_DER.to_vec());
+    roots
+}
+
+// ---------------------------------------------------------------------
+// P-384 ECDSA chain (root → intermediate → leaf) for `localhost`
+// ---------------------------------------------------------------------
+//
+// Generated with OpenSSL 3.x (`scripts/gen_p384_certs.ps1`), valid
+// 2026-08-23..2036-08-20:
+//   * p384_ca_cert         — self-signed P-384 root (CA:TRUE, keyCertSign)
+//   * p384_intermediate_cert — P-384 intermediate, signed by the root
+//     with ecdsa-with-SHA384 (CA:TRUE, keyCertSign)
+//   * p384_leaf_cert       — P-384 leaf for CN=localhost, SAN
+//     DNS:localhost + IP:127.0.0.1, signed by the P-384 intermediate
+//     with ecdsa-with-SHA384 (CA:FALSE, serverAuth)
+//
+// This is the exact case the chain verifier must accept: an ECDSA
+// intermediate whose SPKI is a 97-byte P-384 uncompressed point, with
+// both intermediate and leaf signed using ecdsa-with-SHA384.
+
+/// DER-encoded P-384 root CA certificate.
+pub(crate) const P384_CA_CERT_DER: &[u8] = include_bytes!("testdata/p384_ca_cert.der");
+/// DER-encoded P-384 intermediate CA certificate.
+pub(crate) const P384_INTERMEDIATE_CERT_DER: &[u8] =
+    include_bytes!("testdata/p384_intermediate_cert.der");
+/// DER-encoded P-384 leaf certificate (CN=localhost).
+pub(crate) const P384_LEAF_CERT_DER: &[u8] = include_bytes!("testdata/p384_leaf_cert.der");
+/// PKCS#8 DER-encoded P-384 private key matching [`P384_LEAF_CERT_DER`].
+pub(crate) const P384_LEAF_KEY_DER: &[u8] = include_bytes!("testdata/p384_leaf_key.der");
+
+/// The P-384 server identity: leaf + intermediate, signed by the P-384
+/// root. Used to prove that an ECDSA P-384 intermediate CA validates.
+pub(crate) fn p384_server_identity() -> crate::courierust_tls::Identity {
+    crate::courierust_tls::Identity {
+        cert_chain: vec![
+            P384_LEAF_CERT_DER.to_vec(),
+            P384_INTERMEDIATE_CERT_DER.to_vec(),
+        ],
+        private_key: P384_LEAF_KEY_DER.to_vec(),
+        is_rsa: false,
+    }
+}
+
+/// A root store that trusts the P-384 root CA.
+pub(crate) fn p384_root_store() -> crate::courierust_tls::RootStore {
+    let mut roots = crate::courierust_tls::RootStore::new();
+    roots.add_der(P384_CA_CERT_DER.to_vec());
+    roots
+}
+
+// ---------------------------------------------------------------------
+// Name-constraint test chain (root → constrained intermediate → leaf)
+// ---------------------------------------------------------------------
+//
+// Generated with OpenSSL 3.x (`scripts/gen_nc_certs.ps1`):
+//   * nc_ca_cert         — self-signed P-256 root
+//   * nc_intermediate_cert — P-256 intermediate carrying
+//     `nameConstraints = critical, permitted;DNS:localhost`
+//   * nc_leaf_ok_cert    — leaf for CN=localhost, SAN DNS:localhost +
+//     IP:127.0.0.1 (inside the permitted subtree)
+//   * nc_leaf_bad_cert   — leaf for CN=evil.com, SAN DNS:evil.com
+//     (outside the permitted subtree — must be rejected)
+
+/// DER-encoded name-constraint root CA.
+pub(crate) const NC_CA_CERT_DER: &[u8] = include_bytes!("testdata/nc_ca_cert.der");
+/// DER-encoded name-constraint intermediate CA.
+pub(crate) const NC_INTERMEDIATE_CERT_DER: &[u8] =
+    include_bytes!("testdata/nc_intermediate_cert.der");
+/// DER-encoded leaf inside the permitted subtree (localhost).
+pub(crate) const NC_LEAF_OK_CERT_DER: &[u8] = include_bytes!("testdata/nc_leaf_ok_cert.der");
+/// DER-encoded leaf outside the permitted subtree (evil.com).
+pub(crate) const NC_LEAF_BAD_CERT_DER: &[u8] = include_bytes!("testdata/nc_leaf_bad_cert.der");
+
+/// A root store that trusts the name-constraint root CA.
+pub(crate) fn nc_root_store() -> crate::courierust_tls::RootStore {
+    let mut roots = crate::courierust_tls::RootStore::new();
+    roots.add_der(NC_CA_CERT_DER.to_vec());
+    roots
+}

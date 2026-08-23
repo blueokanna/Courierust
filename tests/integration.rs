@@ -959,7 +959,6 @@ fn https_server_survives_malformed_tls_input() {
             let _ = s.flush();
         }
     }
-    // Give the server a moment to process (and fail) the garbage.
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     let client = Client::with_config(https_client_config(true));
@@ -1030,10 +1029,8 @@ fn tls_hostname_mismatch_rejected() {
             verify: true,
             alpn: vec![b"http/1.1".to_vec()],
             now: common::NOW,
+            ..Default::default()
         });
-    // Control: the covered hostname validates. The socket is scoped so it
-    // is dropped right after the handshake — the server's pool worker
-    // (threads: 1) must not stay parked on this connection.
     {
         let s = std::net::TcpStream::connect(&addr).unwrap();
         s.set_read_timeout(Some(std::time::Duration::from_secs(5)))
@@ -1303,6 +1300,7 @@ fn tls_client_handshake_interrupted() {
             verify: true,
             alpn: vec![b"http/1.1".to_vec()],
             now: common::NOW,
+            ..Default::default()
         });
     let t0 = Instant::now();
     let err = connector

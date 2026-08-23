@@ -7,6 +7,7 @@
 //! (0x03).
 
 use crate::courierust_error::{Error, Result};
+use alloc::string::ToString;
 use alloc::vec::Vec;
 
 const MAX_SETTINGS_ENTRIES: usize = 256;
@@ -31,8 +32,10 @@ pub const SETTINGS_QPACK_BLOCKED_STREAMS: u64 = 0x7;
 pub const SETTINGS_ENABLE_CONNECT_PROTOCOL: u64 = 0x8;
 /// SETTINGS_H3_DATAGRAM (RFC 9297).
 pub const SETTINGS_H3_DATAGRAM: u64 = 0x33;
+/// SETTINGS_ENABLE_WEBTRANSPORT (RFC 9220).
+pub const SETTINGS_ENABLE_WEBTRANSPORT: u64 = 0x2b603742;
 /// SETTINGS_WEBTRANSPORT_MAX_SESSIONS (RFC 9220).
-pub const SETTINGS_WEBTRANSPORT_MAX_SESSIONS: u64 = 0x34;
+pub const SETTINGS_WEBTRANSPORT_MAX_SESSIONS: u64 = 0x2b603743;
 /// The legacy `SETTINGS_MAX_PUSH_ID` alias is not a real identifier;
 /// push is bounded by MAX_PUSH_ID frames, not a SETTINGS entry.
 /// An HTTP/3 frame (RFC 9114 §7.2).
@@ -92,9 +95,12 @@ impl Frame {
                 crate::courierust_h3::qpack::encode_integer(*id, 8, 0, &mut payload);
             }
             Frame::Settings(settings) => {
+                // RFC 9114 §7.2.4: SETTINGS identifiers and values are
+                // QUIC variable-length integers (NOT QPACK prefix
+                // integers, which only coincide for small values).
                 for (id, value) in settings {
-                    crate::courierust_h3::qpack::encode_integer(*id, 8, 0, &mut payload);
-                    crate::courierust_h3::qpack::encode_integer(*value, 8, 0, &mut payload);
+                    payload.extend_from_slice(&crate::courierust_quic::varint::encode(*id));
+                    payload.extend_from_slice(&crate::courierust_quic::varint::encode(*value));
                 }
             }
             Frame::PushPromise { push_id, headers } => {
@@ -178,8 +184,17 @@ impl Frame {
                     if settings.len() >= MAX_SETTINGS_ENTRIES {
                         return Err(Error::overflow("HTTP/3 SETTINGS entry count exceeds limit"));
                     }
-                    let id = crate::courierust_h3::qpack::decode_integer(payload, 8, &mut q)?;
-                    let value = crate::courierust_h3::qpack::decode_integer(payload, 8, &mut q)?;
+                    // RFC 9114 §7.2.4: SETTINGS entries are QUIC varints.
+                    let (id, used) = crate::courierust_quic::varint::decode(&payload[q..])
+                        .map_err(|e| Error::protocol(e.to_string()))?;
+                    q = q
+                        .checked_add(used)
+                        .ok_or_else(|| Error::overflow("HTTP/3 SETTINGS id offset overflow"))?;
+                    let (value, used) = crate::courierust_quic::varint::decode(&payload[q..])
+                        .map_err(|e| Error::protocol(e.to_string()))?;
+                    q = q
+                        .checked_add(used)
+                        .ok_or_else(|| Error::overflow("HTTP/3 SETTINGS value offset overflow"))?;
                     settings.push((id, value));
                 }
                 Frame::Settings(settings)

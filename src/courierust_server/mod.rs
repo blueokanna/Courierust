@@ -401,6 +401,7 @@ pub(crate) fn serve_accepted(
                 crate::courierust_tls::TlsAcceptor::new(crate::courierust_tls::ServerConfig {
                     identity: t.identity.clone(),
                     alpn: t.alpn.clone(),
+                    ..Default::default()
                 });
             let arc = Arc::new(stream);
             let peer = arc

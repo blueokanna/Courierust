@@ -11,8 +11,9 @@ use super::crypto::x25519;
 use super::handshake::{
     cert_verify_message, encode_hs, finished_verify_data, parse_cert_verify,
     parse_certificate_list, parse_client_hello, parse_encrypted_extensions, parse_hs,
-    parse_server_hello, verify_cert_verify, ClientHelloInfo, ServerHelloInfo, HS_CERTIFICATE,
-    HS_CERTIFICATE_VERIFY, HS_CLIENT_HELLO, HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, HS_SERVER_HELLO,
+    parse_server_hello, verify_cert_verify, ClientHelloInfo, ServerHelloInfo,
+    EXT_QUIC_TRANSPORT_PARAMETERS, HS_CERTIFICATE, HS_CERTIFICATE_VERIFY, HS_CLIENT_HELLO,
+    HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, HS_SERVER_HELLO,
 };
 use super::key_schedule::{CipherSuite, KeySchedule, Transcript};
 use super::{server_sign, Identity, RootStore, TlsError, TlsResult};
@@ -26,33 +27,68 @@ const MAX_CERT_CHAIN: usize = 8 * 1024 * 1024;
 
 /// QUIC transport parameters used by the runtime.  Unknown parameters are
 /// ignored as required by RFC 9000; known parameters are unique and bounded.
+///
+/// Parameter IDs follow RFC 9000 §18.2 exactly. Earlier drafts (and an
+/// earlier revision of this code) used the draft-29 IDs for 0x02..0x08,
+/// which made Courierust internally consistent but wire-incompatible with
+/// RFC 9001 peers such as quinn.
 #[derive(Debug, Clone)]
 pub(crate) struct TransportParameters {
+    /// 0x00 — server only: the client's first Initial DCID.
+    pub(crate) original_destination_connection_id: Option<Vec<u8>>,
+    /// 0x01 — max idle timeout in milliseconds.
     pub(crate) max_idle_timeout: u64,
+    /// 0x02 — server only: 16-byte stateless reset token.
+    pub(crate) stateless_reset_token: Option<[u8; 16]>,
+    /// 0x03 — maximum UDP payload this endpoint will accept.
     pub(crate) max_udp_payload_size: u64,
+    /// 0x04 — connection-level initial flow control credit.
     pub(crate) initial_max_data: u64,
+    /// 0x05 — initial flow control for locally initiated bidi streams.
     pub(crate) initial_max_stream_data_bidi_local: u64,
+    /// 0x06 — initial flow control for peer-initiated bidi streams.
     pub(crate) initial_max_stream_data_bidi_remote: u64,
+    /// 0x07 — initial flow control for unidirectional streams.
     pub(crate) initial_max_stream_data_uni: u64,
+    /// 0x08 — initial bidirectional stream limit.
     pub(crate) initial_max_streams_bidi: u64,
+    /// 0x09 — initial unidirectional stream limit.
     pub(crate) initial_max_streams_uni: u64,
+    /// 0x0e — active connection ID limit (must be at least 2).
     pub(crate) active_connection_id_limit: u64,
+    /// 0x0f — the endpoint's own SCID from its first Initial.
     pub(crate) initial_source_connection_id: Vec<u8>,
+    /// 0x10 — server only: the SCID the server placed in a Retry packet.
+    pub(crate) retry_source_connection_id: Option<Vec<u8>>,
+    /// 0x0b — the endpoint will not actively migrate connections
+    /// (RFC 9000 §18.2). It still accepts and validates passive paths.
+    pub(crate) disable_active_migration: bool,
 }
 
 impl Default for TransportParameters {
     fn default() -> Self {
         Self {
+            original_destination_connection_id: None,
             max_idle_timeout: 30_000,
+            stateless_reset_token: None,
             max_udp_payload_size: 1350,
             initial_max_data: 16 * 1024 * 1024,
             initial_max_stream_data_bidi_local: 16 * 1024 * 1024,
             initial_max_stream_data_bidi_remote: 16 * 1024 * 1024,
             initial_max_stream_data_uni: 1024 * 1024,
             initial_max_streams_bidi: 1024,
-            initial_max_streams_uni: 3,
+            // HTTP/3 needs the three mandatory unidirectional streams
+            // (control, QPACK encoder, QPACK decoder) plus headroom for
+            // RFC 9114 §6.2.3 reserved (grease) streams, which compliant
+            // peers such as quinn may open at any time. A limit of 3 was
+            // a race in practice: when a peer's reserved stream arrived in
+            // the same datagram as the three mandatory ones, the server
+            // rejected it before the next tick could replenish MAX_STREAMS.
+            initial_max_streams_uni: 16,
             active_connection_id_limit: 2,
             initial_source_connection_id: Vec::new(),
+            retry_source_connection_id: None,
+            disable_active_migration: false,
         }
     }
 }
@@ -65,16 +101,28 @@ impl TransportParameters {
             ));
         }
         let mut out = Vec::with_capacity(128);
+        if let Some(odcid) = &self.original_destination_connection_id {
+            put_bytes_param(&mut out, 0x00, odcid)?;
+        }
         put_var_param(&mut out, 0x01, self.max_idle_timeout)?;
-        put_var_param(&mut out, 0x02, self.max_udp_payload_size)?;
-        put_var_param(&mut out, 0x03, self.initial_max_data)?;
-        put_var_param(&mut out, 0x04, self.initial_max_stream_data_bidi_local)?;
-        put_var_param(&mut out, 0x05, self.initial_max_stream_data_bidi_remote)?;
-        put_var_param(&mut out, 0x06, self.initial_max_stream_data_uni)?;
-        put_var_param(&mut out, 0x07, self.initial_max_streams_bidi)?;
-        put_var_param(&mut out, 0x08, self.initial_max_streams_uni)?;
+        if let Some(token) = &self.stateless_reset_token {
+            put_bytes_param(&mut out, 0x02, token)?;
+        }
+        put_var_param(&mut out, 0x03, self.max_udp_payload_size)?;
+        put_var_param(&mut out, 0x04, self.initial_max_data)?;
+        put_var_param(&mut out, 0x05, self.initial_max_stream_data_bidi_local)?;
+        put_var_param(&mut out, 0x06, self.initial_max_stream_data_bidi_remote)?;
+        put_var_param(&mut out, 0x07, self.initial_max_stream_data_uni)?;
+        put_var_param(&mut out, 0x08, self.initial_max_streams_bidi)?;
+        put_var_param(&mut out, 0x09, self.initial_max_streams_uni)?;
         put_var_param(&mut out, 0x0e, self.active_connection_id_limit.max(2))?;
         put_bytes_param(&mut out, 0x0f, source_cid)?;
+        if self.disable_active_migration {
+            put_var_param(&mut out, 0x0b, 1)?;
+        }
+        if let Some(retry_scid) = &self.retry_source_connection_id {
+            put_bytes_param(&mut out, 0x10, retry_scid)?;
+        }
         Ok(out)
     }
 
@@ -86,7 +134,7 @@ impl TransportParameters {
         }
         let mut p = 0usize;
         let mut out = Self::default();
-        let mut seen = [false; 10];
+        let mut seen = [false; 12];
         while p < buf.len() {
             let (id, id_len) = varint::decode(&buf[p..])
                 .map_err(|_| TlsError::Protocol("malformed QUIC transport parameter id".into()))?;
@@ -113,19 +161,19 @@ impl TransportParameters {
             let value = &buf[p..end];
             p = end;
             let slot = match id {
-                0x01 => Some(0),
-                0x02 => Some(1),
-                0x03 => Some(2),
-                0x04 => Some(3),
-                0x05 => Some(4),
-                0x06 => Some(5),
-                0x07 => Some(6),
-                0x08 => Some(7),
-                0x0e => Some(8),
-                0x0f => Some(9),
-                // Retry/source CID parameters are handled by the transport
-                // layer when present; they are still length-checked here.
-                0x00 | 0x09..=0x0d | 0x10..=0x1f => None,
+                0x00 => Some(0),
+                0x01 => Some(1),
+                0x02 => Some(2),
+                0x03 => Some(3),
+                0x04 => Some(4),
+                0x05 => Some(5),
+                0x06 => Some(6),
+                0x07 => Some(7),
+                0x08 => Some(8),
+                0x09 => Some(9),
+                0x0b => Some(11),
+                0x0e => Some(10),
+                0x0f | 0x10 => None,
                 _ => None,
             };
             if let Some(slot) = slot {
@@ -137,32 +185,55 @@ impl TransportParameters {
                 seen[slot] = true;
             }
             match id {
+                0x00 => {
+                    if value.is_empty() || value.len() > 20 {
+                        return Err(TlsError::Protocol(
+                            "invalid original_destination_connection_id".into(),
+                        ));
+                    }
+                    out.original_destination_connection_id = Some(value.to_vec());
+                }
                 0x01 => out.max_idle_timeout = read_var_value(value, "max_idle_timeout")?,
                 0x02 => {
+                    let token: [u8; 16] = value.try_into().map_err(|_| {
+                        TlsError::Protocol("stateless_reset_token must be 16 bytes".into())
+                    })?;
+                    out.stateless_reset_token = Some(token);
+                }
+                0x03 => {
                     out.max_udp_payload_size = read_var_value(value, "max_udp_payload_size")?;
                     if out.max_udp_payload_size < 1200 || out.max_udp_payload_size > 65_527 {
                         return Err(TlsError::Protocol("invalid max_udp_payload_size".into()));
                     }
                 }
-                0x03 => out.initial_max_data = read_var_value(value, "initial_max_data")?,
-                0x04 => {
+                0x04 => out.initial_max_data = read_var_value(value, "initial_max_data")?,
+                0x05 => {
                     out.initial_max_stream_data_bidi_local =
                         read_var_value(value, "initial_max_stream_data_bidi_local")?;
                 }
-                0x05 => {
+                0x06 => {
                     out.initial_max_stream_data_bidi_remote =
                         read_var_value(value, "initial_max_stream_data_bidi_remote")?;
                 }
-                0x06 => {
+                0x07 => {
                     out.initial_max_stream_data_uni =
                         read_var_value(value, "initial_max_stream_data_uni")?;
                 }
-                0x07 => {
+                0x08 => {
                     out.initial_max_streams_bidi =
                         read_var_value(value, "initial_max_streams_bidi")?;
                 }
-                0x08 => {
+                0x09 => {
                     out.initial_max_streams_uni = read_var_value(value, "initial_max_streams_uni")?;
+                }
+                0x0b => {
+                    let v = read_var_value(value, "disable_active_migration")?;
+                    if v > 1 {
+                        return Err(TlsError::Protocol(
+                            "invalid disable_active_migration".into(),
+                        ));
+                    }
+                    out.disable_active_migration = v == 1;
                 }
                 0x0e => {
                     out.active_connection_id_limit =
@@ -180,6 +251,14 @@ impl TransportParameters {
                         ));
                     }
                     out.initial_source_connection_id = value.to_vec();
+                }
+                0x10 => {
+                    if value.is_empty() || value.len() > 20 {
+                        return Err(TlsError::Protocol(
+                            "invalid retry_source_connection_id".into(),
+                        ));
+                    }
+                    out.retry_source_connection_id = Some(value.to_vec());
                 }
                 _ => {}
             }
@@ -264,6 +343,13 @@ pub(crate) struct QuicClient {
     now: i64,
     client_transport: TransportParameters,
     expected_server_cid: Vec<u8>,
+    /// The DCID the client chose for its very first Initial packet. The
+    /// server echoes it as `original_destination_connection_id`; validated
+    /// when processing EncryptedExtensions.
+    original_dcid: Vec<u8>,
+    /// The Retry SCID, when a QUIC Retry was received (the server must
+    /// echo it as `retry_source_connection_id`).
+    retry_source_cid: Option<Vec<u8>>,
     private_key: [u8; 32],
     client_hello: Vec<u8>,
     initial_in: Vec<u8>,
@@ -297,7 +383,9 @@ impl QuicClient {
             roots,
             now,
             client_transport,
+            original_dcid: expected_server_cid.clone(),
             expected_server_cid,
+            retry_source_cid: None,
             private_key: [0; 32],
             client_hello: Vec::new(),
             initial_in: Vec::new(),
@@ -334,20 +422,20 @@ impl QuicClient {
     pub(crate) fn on_initial(&mut self, bytes: &[u8]) -> TlsResult<()> {
         append_bounded(&mut self.initial_in, bytes, MAX_CRYPTO_BUFFER)?;
         let message = parse_single_message(&self.initial_in, HS_SERVER_HELLO)?;
+        // A HelloRetryRequest would require re-issuing the Initial packet
+        // with a fresh SCID (RFC 9000 §17.2.5). This client always sends
+        // an X25519 share and the configured server always accepts it, so
+        // an HRR here means a misbehaving peer: fail closed rather than
+        // mis-parse the HRR as a ServerHello.
+        if super::handshake::is_hello_retry_request(&message[4..]) {
+            return Err(TlsError::Protocol(
+                "QUIC peer sent HelloRetryRequest for an offered group".into(),
+            ));
+        }
         let sh: ServerHelloInfo = parse_server_hello(&message[4..])?;
         if !sh.session_id.is_empty() {
             return Err(TlsError::Protocol(
                 "QUIC ServerHello session id mismatch".into(),
-            ));
-        }
-        let params = sh.transport_params.as_deref().ok_or_else(|| {
-            TlsError::Protocol("QUIC ServerHello lacks transport parameters".into())
-        })?;
-        let peer_transport = TransportParameters::parse(params)?;
-        self.peer_transport = Some(peer_transport.clone());
-        if peer_transport.initial_source_connection_id != self.expected_server_cid {
-            return Err(TlsError::Protocol(
-                "server initial_source_connection_id does not match connection id".into(),
             ));
         }
         let mut transcript = Transcript::new(sh.suite.hash());
@@ -361,7 +449,9 @@ impl QuicClient {
         Ok(())
     }
 
-    /// Transport limits advertised by the server in ServerHello.
+    /// Transport limits advertised by the server. Per RFC 9001 §8.2 these
+    /// arrive in EncryptedExtensions (never the ServerHello), so this is
+    /// only available after the handshake flight has been processed.
     pub(crate) fn peer_transport(&self) -> Option<&TransportParameters> {
         self.peer_transport.as_ref()
     }
@@ -386,6 +476,12 @@ impl QuicClient {
         self.expected_server_cid = cid;
     }
 
+    /// Record the Retry SCID after the QUIC transport applied a Retry, so
+    /// the server's `retry_source_connection_id` can be validated.
+    pub(crate) fn set_retry_source_cid(&mut self, cid: Vec<u8>) {
+        self.retry_source_cid = Some(cid);
+    }
+
     pub(crate) fn on_handshake(&mut self, bytes: &[u8]) -> TlsResult<Option<QuicTlsFlight>> {
         if self.key_schedule.is_none() {
             return Err(TlsError::Protocol(
@@ -405,12 +501,45 @@ impl QuicClient {
                     if self.saw_ee {
                         return Err(TlsError::Protocol("duplicate EncryptedExtensions".into()));
                     }
-                    self.negotiated_alpn = parse_encrypted_extensions(body)?;
+                    let (alpn, transport_params) = parse_encrypted_extensions(body)?;
+                    self.negotiated_alpn = alpn;
                     if self.negotiated_alpn.as_deref() != Some(b"h3") {
                         return Err(TlsError::Unsupported(
                             "QUIC requires ALPN h3; server did not negotiate it".into(),
                         ));
                     }
+                    // RFC 9001 §8.2: the server's transport parameters are
+                    // carried in EncryptedExtensions.
+                    let params = transport_params.ok_or_else(|| {
+                        TlsError::Protocol(
+                            "QUIC EncryptedExtensions lacks transport parameters".into(),
+                        )
+                    })?;
+                    let peer_transport = TransportParameters::parse(&params)?;
+                    if peer_transport.initial_source_connection_id != self.expected_server_cid {
+                        return Err(TlsError::Protocol(
+                            "server initial_source_connection_id does not match connection id"
+                                .into(),
+                        ));
+                    }
+                    // RFC 9000 §7.3: the server must echo the client's first
+                    // Initial DCID and (if a Retry was involved) the Retry
+                    // SCID.
+                    if peer_transport.original_destination_connection_id.as_deref()
+                        != Some(self.original_dcid.as_slice())
+                    {
+                        return Err(TlsError::Protocol(
+                            "server original_destination_connection_id mismatch".into(),
+                        ));
+                    }
+                    if peer_transport.retry_source_connection_id.as_deref()
+                        != self.retry_source_cid.as_deref()
+                    {
+                        return Err(TlsError::Protocol(
+                            "server retry_source_connection_id mismatch".into(),
+                        ));
+                    }
+                    self.peer_transport = Some(peer_transport);
                     self.saw_ee = true;
                     self.transcript_mut()?.update(&message);
                 }
@@ -574,7 +703,10 @@ impl QuicServer {
 
     pub(crate) fn on_client_hello(&mut self, bytes: &[u8]) -> TlsResult<QuicTlsFlight> {
         let message = parse_single_message(bytes, HS_CLIENT_HELLO)?;
-        let ch: ClientHelloInfo = parse_client_hello(&message[4..])?;
+        let ch: ClientHelloInfo = parse_client_hello(
+            &message[4..],
+            super::sign::tls13_suite_hash_pref(&self.identity),
+        )?;
         let client_params = ch.transport_params.as_deref().ok_or_else(|| {
             TlsError::Protocol("QUIC ClientHello lacks transport parameters".into())
         })?;
@@ -592,27 +724,29 @@ impl QuicServer {
                 "QUIC server identity is incomplete".into(),
             ));
         }
+        let ch_share = ch.key_share.ok_or_else(|| {
+            TlsError::Protocol("QUIC ClientHello lacks an X25519 key share".into())
+        })?;
         let mut s_priv = [0u8; 32];
         super::handshake::fill_entropy(&mut s_priv)?;
         let s_pub = x25519::x25519(&s_priv, &x25519::BASE_POINT);
-        let shared = x25519::x25519(&s_priv, &ch.key_share);
+        let shared = x25519::x25519(&s_priv, &ch_share);
         let mut random = [0u8; 32];
         super::handshake::fill_entropy(&mut random)?;
         let params = self.server_transport.encode(&self.server_source_cid)?;
-        let sh = super::handshake::build_server_hello_with_transport_params(
-            &random,
-            &s_pub,
-            ch.suite,
-            &ch.session_id,
-            Some(&params),
-        );
+        // RFC 9001 §8.2: the server's transport parameters belong in the
+        // EncryptedExtensions message (protected by Handshake keys), never
+        // in the cleartext ServerHello. quinn/rustls enforce this and reject
+        // a ServerHello carrying the extension with
+        // UnexpectedCleartextExtension.
+        let sh = super::handshake::build_server_hello(&random, &s_pub, ch.suite, &ch.session_id);
         let mut transcript = Transcript::new(ch.suite.hash());
         transcript.update(&message);
         transcript.update(&sh);
         let th = transcript.current_hash();
         let mut ks = KeySchedule::handshake(ch.suite, &shared, &th);
 
-        let ee = encrypted_extensions_h3();
+        let ee = encrypted_extensions_h3(Some(&params));
         let cert = certificate_message(&self.identity.cert_chain)?;
         transcript.update(&ee);
         transcript.update(&cert);
@@ -699,17 +833,27 @@ impl QuicServer {
     }
 }
 
-fn encrypted_extensions_h3() -> Vec<u8> {
+fn encrypted_extensions_h3(transport_params: Option<&[u8]>) -> Vec<u8> {
     let mut alpn = Vec::with_capacity(5);
     alpn.extend_from_slice(&[0x00, 0x03, 0x02]);
     alpn.push(b'h');
     alpn.push(b'3');
-    let extension_len = 2usize + 2 + alpn.len();
-    let mut body = Vec::with_capacity(2 + extension_len);
-    body.extend_from_slice(&(extension_len as u16).to_be_bytes());
-    body.extend_from_slice(&0x0010u16.to_be_bytes());
-    body.extend_from_slice(&(alpn.len() as u16).to_be_bytes());
-    body.extend_from_slice(&alpn);
+    let mut exts: Vec<(u16, Vec<u8>)> = Vec::new();
+    exts.push((0x0010u16, alpn));
+    if let Some(params) = transport_params {
+        // RFC 9001 §8.2: the server advertises its transport parameters in
+        // the EncryptedExtensions message.
+        exts.push((EXT_QUIC_TRANSPORT_PARAMETERS, params.to_vec()));
+    }
+    let mut body = Vec::new();
+    let mut ext_bytes = Vec::new();
+    for (t, c) in exts {
+        ext_bytes.extend_from_slice(&t.to_be_bytes());
+        ext_bytes.extend_from_slice(&(c.len() as u16).to_be_bytes());
+        ext_bytes.extend_from_slice(&c);
+    }
+    body.extend_from_slice(&(ext_bytes.len() as u16).to_be_bytes());
+    body.extend_from_slice(&ext_bytes);
     encode_hs(HS_ENCRYPTED_EXTENSIONS, &body)
 }
 

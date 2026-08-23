@@ -626,8 +626,12 @@ impl Digest for Sha512 {
         let block_count = if self.buf_len < 112 { 1 } else { 2 };
         for i in 0..block_count {
             let mut b = [0u8; 128];
-            b[..self.buf_len].copy_from_slice(&self.buf[..self.buf_len]);
             if i == 0 {
+                // Only the first padding block carries the message tail and
+                // the 0x80 marker; the length block must be zeros (RFC
+                // 6234 §7.4). Re-copying `self.buf` here corrupts digests
+                // whose final block holds 112..=127 message bytes.
+                b[..self.buf_len].copy_from_slice(&self.buf[..self.buf_len]);
                 b[self.buf_len] = 0x80;
             }
             if i == block_count - 1 {
@@ -753,6 +757,48 @@ mod tests {
              2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
                 .replace(' ', "")
         );
+    }
+
+    /// Regression test: the two- and three-block SHA-512 padding paths
+    /// (message lengths whose final 128-byte block holds 112..=127 bytes)
+    /// must hash identically to an independent reference. The previous
+    /// implementation re-copied the buffered message into the length
+    /// block, corrupting every digest in this range — silently rejecting
+    /// valid Ed25519 / P-521 signatures over such messages.
+    #[test]
+    fn sha512_multiblock_boundaries() {
+        let mut source = [0u8; 512];
+        for (i, b) in source.iter_mut().enumerate() {
+            *b = (i % 256) as u8;
+        }
+        // (length, sha512 digest) from Python hashlib.
+        let vectors: &[(usize, &str)] = &[
+            (111, "a1a111449b198d9b1f538bad7f3fc1022b3a5b1a5e90a0bc860de8512746cbc31599e6c834de3a3235327af0b51ff57bf7acf1974a73014d9c3953812edc7c8d"),
+            (112, "c5fbd731d19d2ae1180f001be72c2c1aaba1d7b094b3748880e24593b8e117a750e11c1bd867cc2f96dace8c8b74abd2d5c4f236be444e77d30d1916174070b9"),
+            (113, "61b2e77db697dfe5571fff3ed06bd60c41e1e7b7c08a80de01cb16526d9a9a52d690dfbe792278a60f6e2b4c57a97c729773f26e258d2393890c985d645f6715"),
+            (126, "2681bf910ddfa680b7204037294d00d0fcaee84a3747f6e302a16704b3b08efbda0e57dbb8e61e92348c8d5fc5a59eab74c77949a74c7740c30412a9fc65bf34"),
+            (127, "eab89674feaa34e27aebeeff3c0a4d70070bb872d5e9f186cf1dbbdee517b6e35724d629ff025a5b07185e911ada7e3c8acf830aa0e4f71777bd2d44f504f7f0"),
+            (128, "1dffd5e3adb71d45d2245939665521ae001a317a03720a45732ba1900ca3b8351fc5c9b4ca513eba6f80bc7b1d1fdad4abd13491cb824d61b08d8c0e1561b3f7"),
+            (129, "1d9da57fbbdab09afb3506ab2d223d06109d65c1c8ad197f50138f714bc4c3f2fe5787922639c680acad1c651f955990425954ce2cba0c5cc83f2667d878eb0f"),
+            (240, "6c48466c9f6c07e4ab762c696b7eeb35cfe236fca73683e5fab873ac3489b4d2eb3d7afcce7e8165dbbf37aded3b5b0c889c0b7e0f1790a8330d8677429d91a5"),
+            (241, "4f663484efca758d670147758a5d4d9e5933fe22c0a1dc01f954738ff8310a6515b3ec42094449075ed678c55ee001a4fb91b1081dfae6ab83860b7b4cc7b4ab"),
+            (254, "e2da07644daa73b66c1b6fbcdae7ff28e3b9024f0bc5408fe02c18e3744cf9bd6dd54ea7bfa1f6f3a81c8560fb938fdff9a38a29853a3a819b58d10213a290ec"),
+            (255, "15025c9d135861ff5a549df0bfd6c398fd126613496d4e97627651e68b7b1f80407f187d7978464f0f78bfeea787600faaebbe991eddb60671cd0ce874f0a744"),
+            (256, "1e7b80bc8edc552c8feeb2780e111477e5bc70465fac1a77b29b35980c3f0ce4a036a6c9462036824bd56801e62af7e9feba5c22ed8a5af877bf7de117dcac6d"),
+            (377, "28c20d33eb44a2976e5f12b79ce215b8ed25f64d0b7553d29dc53e49dcb94454a7d9d2cadaaa7c07d033b6aefd38ad1408ef72e9ef36a83b9e710384317eabd7"),
+            (511, "a496013faccd4c2cc09c214736811521533c2feb200ccbc241728f3af2831b14c1b44b7ff6eabefb62cbed6528a609e9248e9eef9949474c5888d1f8ca6262de"),
+            (512, "edb9bed721aa6a5f6fbc6619d3a3c2be3d043043f05a9aebc7b1197a2aa9c49a57d5ddd4674c1785785088d9f1ff42c797a02adc9b817a139a50970da6c99524"),
+        ];
+        for &(len, expected) in vectors {
+            let mut h = Sha512::new();
+            h.update(&source[..len]);
+            let digest = h.finalize();
+            let hex_digest: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(
+                hex_digest, expected,
+                "SHA-512 mismatch at message length {len}"
+            );
+        }
     }
 
     #[test]

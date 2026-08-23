@@ -46,7 +46,13 @@ const MAX_CRYPTO_CHUNK: usize = 1000;
 const MAX_CRYPTO_BUFFER: usize = 16 * 1024 * 1024;
 const MAX_STREAM_CHUNKS: usize = 4096;
 const MAX_H3_STREAMS: usize = 1024;
-const MAX_H3_UNI_STREAMS: usize = 3;
+// 16 covers the three mandatory HTTP/3 unidirectional streams (control,
+// QPACK encoder, QPACK decoder) plus RFC 9114 §6.2.3 reserved (grease)
+// streams that independent peers such as quinn may open; this also
+// matches `initial_max_streams_uni` so a reserved stream arriving in the
+// same datagram as the mandatory ones is never rejected before the next
+// tick replenishes MAX_STREAMS.
+const MAX_H3_UNI_STREAMS: usize = 16;
 /// Bounded history of completed request-stream ids. A stream's receive
 /// state is released as soon as its message is fully consumed (so the
 /// concurrent stream cap counts *live* streams, not the cumulative
@@ -61,12 +67,35 @@ const MAX_H3_CONNECTION_BUFFER: usize = 64 * 1024 * 1024;
 /// connection sweep — `on_tick`/response flushing runs between drains.
 const MAX_DATAGRAMS_PER_POLL: usize = 256;
 const ACK_DELAY: Duration = Duration::from_millis(2);
-const LOSS_DELAY: Duration = Duration::from_millis(250);
-/// Floor for the per-connection loss timeout once an RTT sample exists.
-/// See [`QuicTransport::loss_timeout`] for why a sub-millisecond floor
-/// is wrong on loopback / loaded machines.
+/// RFC 9000 §9.3.3: PATH_CHALLENGE probe timeout — after this long without
+/// a matching PATH_RESPONSE the probe is retried once, then the pending
+/// path is abandoned (the validated path remains authoritative).
+const PATH_VALIDATION_TIMEOUT: Duration = Duration::from_millis(300);
+/// Floor for the per-connection loss time threshold once an RTT sample
+/// exists. See [`QuicTransport::loss_detection_threshold`] for why a
+/// sub-millisecond floor is wrong on loopback / loaded machines.
 const LOSS_TIMEOUT_FLOOR: Duration = Duration::from_millis(25);
+/// RFC 9002 §6.1.1 time-threshold loss detection factor (9/8).
+const TIME_THRESHOLD_NUM: u32 = 9;
+const TIME_THRESHOLD_DEN: u32 = 8;
+/// RFC 9002 §6.1.1 packet-threshold loss detection: a packet is declared
+/// lost when `largest_acked` is at least this many packet numbers ahead
+/// of it (the RFC's default `kPacketThreshold = 3`).
+const PACKET_THRESHOLD: u64 = 3;
 const MAX_RETRANSMITS: u8 = 8;
+/// Automatic key update cadence: packets sent on one application key
+/// phase before deriving the next (RFC 9001 §6 — long-lived
+/// connections must not reuse a single AEAD key generation forever).
+/// Overridable with `COURIERUST_KEY_UPDATE_PACKETS` (tests force a tiny
+/// value to exercise the update deterministically).
+const KEY_UPDATE_PACKETS: u64 = 4096;
+
+fn key_update_threshold() -> u64 {
+    std::env::var("COURIERUST_KEY_UPDATE_PACKETS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(KEY_UPDATE_PACKETS)
+}
 const RETRY_TOKEN_TTL: u64 = 30;
 const RETRY_CLOCK_SKEW: u64 = 5;
 const RETRY_TOKEN_VERSION: u8 = 1;
@@ -143,6 +172,7 @@ struct RetryProtector {
 
 struct RetryToken {
     retry_dcid: Vec<u8>,
+    original_dcid: Vec<u8>,
 }
 
 impl RetryProtector {
@@ -206,7 +236,7 @@ impl RetryProtector {
             return None;
         }
         let original_end = pos.checked_add(original_len)?;
-        body.get(pos..original_end)?;
+        let original_dcid = body.get(pos..original_end)?.to_vec();
         pos = original_end;
         let retry_len = *body.get(pos)? as usize;
         pos += 1;
@@ -224,7 +254,10 @@ impl RetryProtector {
         {
             return None;
         }
-        Some(RetryToken { retry_dcid })
+        Some(RetryToken {
+            retry_dcid,
+            original_dcid,
+        })
     }
 }
 
@@ -342,7 +375,11 @@ fn build_client_connection(
         SocketAddr::V6(_) => "[::]:0".parse::<SocketAddr>().expect("valid IPv6 wildcard"),
     })
     .map_err(|e| io_error(e.to_string()))?;
-    socket.connect(addr).map_err(|e| io_error(e.to_string()))?;
+    // Left unconnected: `recv_from` reports the real source address so a
+    // migrated / NAT-rebound peer path can be validated (RFC 9000 §9).
+    socket
+        .set_nonblocking(true)
+        .map_err(|e| io_error(e.to_string()))?;
     let local_cid = random_cid()?;
     let server_cid = random_cid()?;
     let local_tp = transport_parameters_for_limits(options.max_header_list, options.max_body);
@@ -362,6 +399,7 @@ fn build_client_connection(
         server_cid.clone(),
         options.stats.clone(),
     )?;
+    transport.peer = Some(addr);
     transport.set_local_transport(&local_tp);
     let conn = ClientConnection::new(
         transport,
@@ -575,8 +613,8 @@ fn run_client_driver(
             // Bounded drain: mirror the server so a flood cannot starve
             // `on_tick` / deadline handling between datagram batches.
             for _ in 0..MAX_DATAGRAMS_PER_POLL {
-                match socket.recv(&mut datagram) {
-                    Ok(n) => {
+                match socket.recv_from(&mut datagram) {
+                    Ok((n, source)) => {
                         if n == 0 || n > MAX_DATAGRAM {
                             return finish(conn, &socket, protocol("invalid QUIC datagram length"));
                         }
@@ -584,7 +622,7 @@ fn run_client_driver(
                         if let Some(stats) = options.stats.as_deref() {
                             stats.h3_udp_recv_syscalls.fetch_add(1, Ordering::Relaxed);
                         }
-                        if let Err(error) = conn.on_datagram(&socket, &mut datagram[..n]) {
+                        if let Err(error) = conn.on_datagram(&socket, source, &mut datagram[..n]) {
                             return finish(conn, &socket, error);
                         }
                     }
@@ -631,6 +669,48 @@ struct ServerState {
     identity: crate::courierust_tls::Identity,
     alpn: Vec<Vec<u8>>,
     config: ServerConfig,
+    /// Process-lifetime secret used to derive stateless reset tokens
+    /// (RFC 9000 §10.3.2). Deterministic per CID, so a reset can be sent
+    /// for a connection whose state is gone.
+    reset_key: [u8; 32],
+}
+
+/// Derive the stateless reset token for a connection ID (RFC 9000
+/// §10.3.2): HMAC-SHA256(server_reset_key, cid)[0..16]. The server keeps
+/// one secret key for the process lifetime, so the token for a dead
+/// connection's CID can be recomputed on demand — that is what makes the
+/// reset *stateless*.
+fn stateless_reset_token(reset_key: &[u8; 32], cid: &[u8]) -> [u8; 16] {
+    use crate::courierust_tls::crypto::hash::Sha256;
+    use crate::courierust_tls::crypto::hmac::hmac;
+    let mut digest = Sha256::new();
+    let mac = hmac(&mut digest, reset_key, cid);
+    let mut token = [0u8; 16];
+    token.copy_from_slice(&mac[..16]);
+    token
+}
+
+/// Build a stateless reset datagram (RFC 9000 §10.3): a short-header
+/// packet addressed to `dcid` with a random payload whose final 16 bytes
+/// are the connection's stateless reset token. The datagram is padded so
+/// the receiver can read the token without risking the packet being
+/// confused with a valid short packet.
+fn build_stateless_reset(dcid: &[u8], token: &[u8; 16]) -> Result<Vec<u8>> {
+    if dcid.is_empty() || dcid.len() > 20 {
+        return Err(protocol("invalid connection ID for stateless reset"));
+    }
+    let mut out = Vec::with_capacity(1 + dcid.len() + 21 + 16);
+    // Short header with the destination connection ID length in the low
+    // 6 bits (RFC 9000 §17.3).
+    out.push(0x40 | ((dcid.len() as u8).saturating_sub(1) & 0x3f));
+    out.extend_from_slice(dcid);
+    let mut random = [0u8; 21];
+    if !crate::courierust_tls::crypto::rng::fill_random(&mut random) {
+        return Err(protocol("OS randomness unavailable for stateless reset"));
+    }
+    out.extend_from_slice(&random);
+    out.extend_from_slice(token);
+    Ok(out)
 }
 
 fn run_server(
@@ -659,7 +739,13 @@ fn run_server(
         identity,
         alpn,
         config,
+        reset_key: [0u8; 32],
     };
+    if !crate::courierust_tls::crypto::rng::fill_random(&mut state.reset_key) {
+        return Err(protocol(
+            "OS randomness unavailable for stateless reset key",
+        ));
+    }
     let mut datagram = [0u8; MAX_DATAGRAM];
     let (wake_reader, wake_writer) = wakeup_pair().map_err(|e| io_error(e.to_string()))?;
     let wake_writer = Arc::new(wake_writer);
@@ -801,6 +887,7 @@ fn handle_server_datagram(
         identity,
         alpn,
         config,
+        reset_key,
     } = state;
     let n = datagram.len();
     if let Some(stats) = config.stats.as_deref() {
@@ -818,9 +905,13 @@ fn handle_server_datagram(
             return;
         };
         if connection.transport.peer != Some(peer) {
-            return;
+            // A packet from a new source address may be a NAT rebinding or
+            // a client migration. It is passed through; the connection
+            // authenticates it and only then starts path validation.
+            // Unauthenticated packets from the new address change nothing
+            // (RFC 9000 §9.3).
         }
-        let failure = connection.on_datagram(socket, datagram).err();
+        let failure = connection.on_datagram(socket, peer, datagram).err();
         if let Some(error) = failure {
             if std::env::var_os("COURIERUST_H3_DEBUG").is_some() {
                 eprintln!("H3SERVER conn-killed: {error}");
@@ -853,6 +944,24 @@ fn handle_server_datagram(
             }
         }
     }
+    // RFC 9000 §10.3: a short-header packet for an unknown connection ID
+    // (the connection is gone) triggers a stateless reset. The token is
+    // derived deterministically from the destination CID, so no state is
+    // needed.
+    if !datagram.is_empty() && datagram[0] & 0x80 == 0 && datagram[0] & 0x40 != 0 {
+        if let Some(dcid) = packet_destination_cid(datagram) {
+            let token = stateless_reset_token(reset_key, dcid);
+            if let Ok(reset) = build_stateless_reset(dcid, &token) {
+                if reset.len() <= MAX_DATAGRAM {
+                    if let Some(stats) = config.stats.as_deref() {
+                        stats.h3_udp_send_syscalls.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let _ = socket.send_to(&reset, peer);
+                    return;
+                }
+            }
+        }
+    }
     if config.max_connections != 0 && connections.len() >= config.max_connections {
         return;
     }
@@ -863,6 +972,7 @@ fn handle_server_datagram(
         return;
     };
     let token = retry_protector.validate(peer, &meta.token);
+    let original_dcid = token.as_ref().map(|value| value.original_dcid.as_slice());
     if token
         .as_ref()
         .is_none_or(|value| value.retry_dcid != meta.dcid)
@@ -887,10 +997,19 @@ fn handle_server_datagram(
         }
         return;
     }
-    if let Ok((mut connection, mut initial)) =
-        ServerConnection::accept(peer, datagram, identity.clone(), alpn.to_vec(), config)
-    {
-        if connection.on_datagram(socket, &mut initial[..]).is_ok() {
+    if let Ok((mut connection, mut initial)) = ServerConnection::accept(
+        peer,
+        datagram,
+        original_dcid,
+        identity.clone(),
+        alpn.to_vec(),
+        config,
+        &state.reset_key,
+    ) {
+        if connection
+            .on_datagram(socket, peer, &mut initial[..])
+            .is_ok()
+        {
             let connection_id = connection.transport.local_cid.clone();
             let initial_id = connection.transport.initial_dcid.clone();
             if routes.contains_key(&connection_id) || routes.contains_key(&initial_id) {
@@ -1060,61 +1179,113 @@ impl ClientConnection {
         })
     }
 
-    fn on_datagram(&mut self, socket: &UdpSocket, datagram: &mut [u8]) -> Result<()> {
+    fn on_datagram(
+        &mut self,
+        socket: &UdpSocket,
+        source: SocketAddr,
+        datagram: &mut [u8],
+    ) -> Result<()> {
         self.last_activity = Instant::now();
-        if let Some(version_negotiation) = version_negotiation_versions(datagram)? {
-            if version_negotiation.dcid == self.transport.local_cid {
-                if version_negotiation.scid != self.transport.original_dcid {
-                    return Err(protocol(
-                        "QUIC Version Negotiation has an unexpected source connection ID",
-                    ));
+        // Handshake-stage messages (version negotiation / Retry) are only
+        // processed from the validated peer; a packet from a new source is
+        // authenticated in the packet loop below and only then may start
+        // path validation (RFC 9000 §9.3).
+        if source == self.transport.peer.unwrap_or(source)
+            || self.transport.pending_peer == Some(source)
+        {
+            if let Some(version_negotiation) = version_negotiation_versions(datagram)? {
+                if version_negotiation.dcid == self.transport.local_cid {
+                    if version_negotiation.scid != self.transport.original_dcid {
+                        return Err(protocol(
+                            "QUIC Version Negotiation has an unexpected source connection ID",
+                        ));
+                    }
+                    if version_negotiation
+                        .versions
+                        .contains(&crate::courierust_quic::VERSION_1)
+                    {
+                        return Err(protocol(
+                            "QUIC server sent Version Negotiation for a supported version",
+                        ));
+                    }
+                    return Err(protocol("QUIC server does not support QUIC version 1"));
                 }
-                if version_negotiation
-                    .versions
-                    .contains(&crate::courierust_quic::VERSION_1)
+                return Ok(());
+            }
+            if let Some(retry) = parse_retry_packet(datagram)? {
+                if retry.dcid != self.transport.local_cid {
+                    return Ok(());
+                }
+                let retry_wire = &datagram[..datagram.len().saturating_sub(16)];
+                if !protection::verify_retry_integrity(
+                    &self.transport.original_dcid,
+                    retry_wire,
+                    &retry.tag,
+                )
+                .map_err(|error| protocol(error.to_string()))?
                 {
-                    return Err(protocol(
-                        "QUIC server sent Version Negotiation for a supported version",
-                    ));
+                    return Ok(());
                 }
-                return Err(protocol("QUIC server does not support QUIC version 1"));
-            }
-            return Ok(());
-        }
-        if let Some(retry) = parse_retry_packet(datagram)? {
-            if retry.dcid != self.transport.local_cid {
+                if self.tls_server_hello || self.handshake_complete {
+                    return Err(protocol("QUIC Retry arrived after handshake progress"));
+                }
+                if !self.transport.apply_retry(retry.scid, retry.token)? {
+                    return Err(protocol("multiple QUIC Retry packets are not permitted"));
+                }
+                // RFC 9000 §7.3: record the Retry SCID so the server's
+                // `retry_source_connection_id` transport parameter can be
+                // validated during the TLS handshake.
+                let retry_scid = self.transport.initial_dcid.clone();
+                self.tls.set_retry_source_cid(retry_scid);
+                self.tls_initial_sent = false;
                 return Ok(());
             }
-            let retry_wire = &datagram[..datagram.len().saturating_sub(16)];
-            if !protection::verify_retry_integrity(
-                &self.transport.original_dcid,
-                retry_wire,
-                &retry.tag,
-            )
-            .map_err(|error| protocol(error.to_string()))?
-            {
-                return Ok(());
-            }
-            if self.tls_server_hello || self.handshake_complete {
-                return Err(protocol("QUIC Retry arrived after handshake progress"));
-            }
-            if !self.transport.apply_retry(retry.scid, retry.token)? {
-                return Err(protocol("multiple QUIC Retry packets are not permitted"));
-            }
-            self.tls_initial_sent = false;
-            return Ok(());
         }
         let mut consumed = 0usize;
         while consumed < datagram.len() {
-            let Some((level, _pn, frames, packet_len)) =
-                self.transport.open(&mut datagram[consumed..])?
-            else {
-                break;
+            let opened = self.transport.open(&mut datagram[consumed..]);
+            let (level, _pn, frames, packet_len) = match opened {
+                Ok(Some(value)) => value,
+                _ => {
+                    // RFC 9000 §10.3.3: a packet that fails to authenticate
+                    // (or is malformed) MUST NOT close the connection — it
+                    // is dropped. The single authenticated exception is a
+                    // stateless reset: an undecryptable short-header packet
+                    // whose final 16 bytes match the peer's advertised
+                    // token means the peer lost connection state and is
+                    // telling us to go away.
+                    if self.transport.is_stateless_reset(&datagram[consumed..]) {
+                        return Err(protocol("peer sent a stateless reset"));
+                    }
+                    break;
+                }
             };
             if packet_len == 0 || packet_len > datagram.len() - consumed {
                 return Err(protocol("QUIC packet decoder made no progress"));
             }
             consumed += packet_len;
+            // Path validation (RFC 9000 §9.3): answer the peer's
+            // PATH_CHALLENGE on the path it arrived on, and commit a
+            // migration when a PATH_RESPONSE echoes our probe token.
+            for frame in &frames {
+                match frame {
+                    QFrame::PathChallenge(token) => {
+                        self.transport.handle_path_challenge(socket, *token, source);
+                    }
+                    QFrame::PathResponse(token) => {
+                        self.transport.handle_path_response(token, source);
+                    }
+                    _ => {}
+                }
+            }
+            // An authenticated packet from a brand-new source address is a
+            // migration attempt or a NAT rebinding: validate the path
+            // before switching traffic to it.
+            if source != self.transport.peer.unwrap_or(source)
+                && self.transport.pending_peer != Some(source)
+            {
+                self.transport.initiate_path_validation(socket, source)?;
+            }
             let mut ack = false;
             for frame in frames {
                 match frame {
@@ -1164,6 +1335,13 @@ impl ClientConnection {
                                     packet_keys_from_flight(flight.application_read)?,
                                     packet_keys_from_flight(flight.application_write)?,
                                 );
+                                // The server's transport parameters arrive in
+                                // EncryptedExtensions (RFC 9001 §8.2), so they
+                                // only become available once the handshake
+                                // flight has been processed.
+                                if let Some(parameters) = self.tls.peer_transport() {
+                                    self.transport.set_peer_transport(parameters);
+                                }
                                 self.handshake_complete = true;
                                 self.flush_requests(socket)?;
                             }
@@ -1204,12 +1382,22 @@ impl ClientConnection {
 
     fn on_tick(&mut self, socket: &UdpSocket) -> Result<()> {
         self.transport.flush_acks(socket)?;
+        self.transport
+            .check_path_validation_timeout(socket, Instant::now())?;
         // Raise the advertised connection-level receive window as the
         // application consumes data, so a long-lived connection is not
         // capped at `initial_max_data` (which otherwise tears the
         // connection down mid-transfer).
         self.transport.replenish_connection_window(socket)?;
+        // Same for per-stream windows: a long-lived stream must not be
+        // capped at its initial `MAX_STREAM_DATA` either.
+        self.transport.replenish_stream_windows(socket)?;
+        // And the stream-count limits (RFC 9000 §4.6): a long-lived
+        // connection must not stop at the initial MAX_STREAMS.
+        self.transport.replenish_stream_limits(socket)?;
         self.transport.retransmit(socket)?;
+        // Automatic bidirectional key update (RFC 9001 §6).
+        self.transport.maybe_key_update();
         if !self.tls_initial_sent {
             self.transport
                 .send_crypto(socket, INITIAL, &self.client_hello)?;
@@ -1322,6 +1510,17 @@ impl ClientConnection {
             if self.active.len() >= MAX_H3_STREAMS {
                 self.waiting.push_front(request);
                 break;
+            }
+            // RFC 9000 §4.6: respect the peer's advertised cumulative
+            // stream-count limit (raised by MAX_STREAMS frames). If the
+            // limit is exhausted, fail the request cleanly instead of
+            // blocking forever.
+            let peer_limit = self.transport.peer_stream_count_limit();
+            if self.next_stream_index >= peer_limit {
+                let _ = request
+                    .reply
+                    .send(Err(protocol("HTTP/3 peer stream-count limit exceeded")));
+                continue;
             }
             let stream_id = 4 * self.next_stream_index;
             self.next_stream_index = self
@@ -1641,9 +1840,11 @@ impl ServerConnection {
     fn accept(
         peer: SocketAddr,
         initial: &[u8],
+        original_dcid: Option<&[u8]>,
         identity: crate::courierust_tls::Identity,
         alpn: Vec<Vec<u8>>,
         config: &ServerConfig,
+        reset_key: &[u8; 32],
     ) -> Result<(Self, Vec<u8>)> {
         let meta = PacketMeta::parse(initial, 8)?;
         if meta.long_type != Some(LongType::Initial) || meta.dcid.is_empty() || meta.scid.is_empty()
@@ -1653,11 +1854,33 @@ impl ServerConnection {
         let local_cid = random_cid()?;
         let initial_dcid = meta.dcid.clone();
         let client_cid = meta.scid.clone();
-        let local_tp = transport_parameters_for_limits(config.max_header_list, config.max_body);
+        let mut local_tp = transport_parameters_for_limits(config.max_header_list, config.max_body);
+        // Advertise a deterministic stateless reset token for this CID
+        // (RFC 9000 §10.3) so the peer can recognize a reset after the
+        // connection state is gone.
+        let reset_token = stateless_reset_token(reset_key, &local_cid);
+        local_tp.stateless_reset_token = Some(reset_token);
+        // RFC 9000 §7.3 / §18.2: the server must echo the client's first
+        // Initial DCID (original_destination_connection_id, 0x00) and, when
+        // it sent a Retry, the Retry SCID (retry_source_connection_id,
+        // 0x10). quinn validates both and rejects the handshake otherwise.
+        match original_dcid {
+            // A Retry was involved: the client's current DCID is the Retry
+            // SCID, and the original DCID is recovered from the token.
+            Some(odcid) => {
+                local_tp.original_destination_connection_id = Some(odcid.to_vec());
+                local_tp.retry_source_connection_id = Some(meta.dcid.clone());
+            }
+            // No Retry: the client's current DCID is its original one.
+            None => {
+                local_tp.original_destination_connection_id = Some(meta.dcid.clone());
+            }
+        }
         let tls = QuicServer::new(identity, alpn, local_tp.clone(), local_cid.clone());
         let mut transport =
             QuicTransport::server(local_cid, client_cid, initial_dcid, config.stats.clone())?;
         transport.set_local_transport(&local_tp);
+        transport.stateless_reset_token = Some(reset_token);
         transport.peer = Some(peer);
         let connection = Self {
             transport,
@@ -1692,19 +1915,56 @@ impl ServerConnection {
         Ok((connection, initial.to_vec()))
     }
 
-    fn on_datagram(&mut self, socket: &UdpSocket, datagram: &mut [u8]) -> Result<()> {
+    fn on_datagram(
+        &mut self,
+        socket: &UdpSocket,
+        source: SocketAddr,
+        datagram: &mut [u8],
+    ) -> Result<()> {
         self.last_activity = Instant::now();
         let mut consumed = 0usize;
         while consumed < datagram.len() {
-            let Some((level, _pn, frames, packet_len)) =
-                self.transport.open(&mut datagram[consumed..])?
-            else {
+            let opened = self.transport.open(&mut datagram[consumed..]);
+            let Some((level, _pn, frames, packet_len)) = (match opened {
+                Ok(value) => value,
+                Err(error) => {
+                    // RFC 9000 §10.3: a peer stateless reset is detected
+                    // by the token in the final 16 bytes of a packet that
+                    // fails to decrypt.
+                    if self.transport.is_stateless_reset(&datagram[consumed..]) {
+                        return Err(protocol("peer sent a stateless reset"));
+                    }
+                    return Err(error);
+                }
+            }) else {
                 break;
             };
             if packet_len == 0 || packet_len > datagram.len() - consumed {
                 return Err(protocol("QUIC packet decoder made no progress"));
             }
             consumed += packet_len;
+            // Path validation (RFC 9000 §9.3): answer the peer's
+            // PATH_CHALLENGE on the path it arrived on, and commit a
+            // migration when a PATH_RESPONSE echoes our probe token.
+            for frame in &frames {
+                match frame {
+                    QFrame::PathChallenge(token) => {
+                        self.transport.handle_path_challenge(socket, *token, source);
+                    }
+                    QFrame::PathResponse(token) => {
+                        self.transport.handle_path_response(token, source);
+                    }
+                    _ => {}
+                }
+            }
+            // An authenticated packet from a brand-new source address is a
+            // migration attempt or a NAT rebinding: validate the path
+            // before switching traffic to it.
+            if source != self.transport.peer.unwrap_or(source)
+                && self.transport.pending_peer != Some(source)
+            {
+                self.transport.initiate_path_validation(socket, source)?;
+            }
             let mut ack = false;
             for frame in frames {
                 match frame {
@@ -1815,20 +2075,21 @@ impl ServerConnection {
     }
 
     fn on_tick(&mut self, socket: &UdpSocket) -> Result<()> {
-        // Deliver the TLS flight and control streams incrementally; both
-        // are deferred (never fatal) when the congestion window is full,
-        // so a large certificate or a busy path cannot tear the
-        // connection down.
         self.flush_pending_crypto(socket)?;
         if self.handshake_complete && !self.control_sent {
             self.send_control(socket)?;
         }
         self.transport.flush_acks(socket)?;
-        // Raise the advertised connection-level receive window as request
-        // bodies are consumed, so a long-lived connection is not capped
-        // at `initial_max_data`.
+        self.transport
+            .check_path_validation_timeout(socket, Instant::now())?;
         self.transport.replenish_connection_window(socket)?;
-        self.transport.retransmit(socket)
+        self.transport.replenish_stream_windows(socket)?;
+        // Stream-count limits too (RFC 9000 §4.6): a long-lived connection
+        // must not stop at the initial MAX_STREAMS.
+        self.transport.replenish_stream_limits(socket)?;
+        self.transport.retransmit(socket)?;
+        self.transport.maybe_key_update();
+        Ok(())
     }
 
     /// Deliver the TLS flight incrementally. `send_crypto` resumes from
@@ -1839,8 +2100,6 @@ impl ServerConnection {
             self.transport
                 .send_crypto(socket, INITIAL, &self.pending_initial)?;
             if self.transport.crypto_send_offsets[INITIAL] < self.pending_initial.len() as u64 {
-                // The client cannot decrypt Handshake data before it has
-                // the full Initial flight; hold Handshake until then.
                 return Ok(());
             }
         }
@@ -1864,9 +2123,6 @@ impl ServerConnection {
             ),
         ])
         .to_bytes();
-        // Control streams are tiny; the only way they can fail is a full
-        // congestion window. They are idempotent (the peer's reassembly
-        // deduplicates a retry), so defer and retry on a later tick.
         match self
             .transport
             .send_stream(socket, APPLICATION, 3, &control_stream(settings), false)
@@ -1910,7 +2166,10 @@ impl ServerConnection {
                 ));
             }
             if stream_id::stream_index(id) >= MAX_H3_UNI_STREAMS as u64 {
-                return Err(protocol("HTTP/3 unidirectional stream limit exceeded"));
+                return Err(protocol(format!(
+                    "HTTP/3 unidirectional stream limit exceeded (id={id}, index={})",
+                    stream_id::stream_index(id)
+                )));
             }
         } else if !stream_id::is_client_initiated(id) {
             return Err(protocol("request stream has invalid initiator"));
@@ -2293,12 +2552,10 @@ fn process_unidirectional_stream(
         };
         stream.frame_buf.drain(..used);
         stream.stream_type = Some(kind);
-        if kind != H3_CONTROL_STREAM
-            && kind != H3_QPACK_ENCODER_STREAM
-            && kind != H3_QPACK_DECODER_STREAM
-        {
-            return Err(protocol("unsupported HTTP/3 unidirectional stream type"));
-        }
+        // RFC 9114 §6.2.3: unknown stream types — including the reserved
+        // 0x1f * N + 0x21 grease types, which compliant peers (e.g. the
+        // h3 crate) MAY open at any time — MUST be ignored, not rejected.
+        // We record the type so the `_` match arm below drains the stream.
     }
     let Some(kind) = stream.stream_type else {
         return Ok(stream_id::is_unidirectional(stream_id_of(stream)));
@@ -2354,7 +2611,7 @@ fn process_unidirectional_stream(
             }
             Ok(true)
         }
-        _ => {
+        H3_QPACK_DECODER_STREAM => {
             // QPACK decoder stream: instructions are parsed and dropped
             // (the dynamic table is disabled, so nothing is applied).
             let mut pos = 0;
@@ -2377,7 +2634,20 @@ fn process_unidirectional_stream(
             }
             Ok(true)
         }
+        _ => process_unknown_unidirectional_stream(stream),
     }
+}
+
+/// Ignore an unknown HTTP/3 unidirectional stream type.
+///
+/// RFC 9114 §6.2.3: unknown stream types — including the reserved
+/// `0x1f * N + 0x21` grease types that compliant peers (e.g. the `h3`
+/// crate) MAY open at any time — MUST be ignored, not rejected. Drain and
+/// discard any buffered bytes; the stream may legally stay open and send
+/// more padding later, so each arrival simply clears the buffer again.
+fn process_unknown_unidirectional_stream(stream: &mut ReceiveStream) -> Result<bool> {
+    stream.frame_buf.clear();
+    Ok(true)
 }
 
 fn process_server_stream(
@@ -2903,6 +3173,35 @@ fn build_response_wire(
     if !body.is_empty() {
         wire.extend_from_slice(&h3frame::Frame::Data(body).to_bytes());
     }
+    // HTTP/3 trailers (RFC 9114 §4.1): a HEADERS frame after the DATA
+    // frames; the stream is END_STREAM after this frame. Symmetric with
+    // the client's `drain_response_frames`, which decodes a second
+    // HEADERS block as trailers. Pseudo-headers and the connection
+    // hop-by-hop fields are forbidden in trailers (RFC 9114 §4.3).
+    if let Some(trailers) = response.trailers {
+        let mut tfields = Vec::new();
+        for (name, value) in trailers.iter() {
+            let n = name.as_str();
+            if n.starts_with(':')
+                || matches!(
+                    n,
+                    "connection"
+                        | "keep-alive"
+                        | "proxy-connection"
+                        | "transfer-encoding"
+                        | "upgrade"
+                        | "content-length"
+                )
+            {
+                return Err(protocol("invalid HTTP/3 response trailer field"));
+            }
+            tfields.push((n.to_string(), value.as_bytes().to_vec()));
+        }
+        if !tfields.is_empty() {
+            let trailer_block = encode_field_section(&tfields, max_header_list)?;
+            wire.extend_from_slice(&h3frame::Frame::Headers(trailer_block).to_bytes());
+        }
+    }
     Ok(wire)
 }
 
@@ -3148,6 +3447,13 @@ fn packet_destination_cid(buf: &[u8]) -> Option<&[u8]> {
 struct PacketSpace {
     next_send: u64,
     largest_received: Option<u64>,
+    /// Highest acknowledged packet number in this space (for the RFC 9002
+    /// §6.1.1 packet-threshold loss detector).
+    largest_acked: Option<u64>,
+    /// Highest packet number ever sent in this space (RFC 9000 §13.1:
+    /// an ACK is only an error when it exceeds this, never for a
+    /// duplicate ACK of an already-acknowledged packet).
+    largest_sent: Option<u64>,
     received: BTreeSet<u64>,
     sent: BTreeMap<u64, SentPacket>,
     ack_pending: bool,
@@ -3161,16 +3467,32 @@ struct SentPacket {
     retransmits: u8,
     ack_eliciting: bool,
     size: usize,
-    /// A retransmit blocked by the congestion window. Retried on the
-    /// next tick once ACKs free credit, not after a full loss timeout,
-    /// and not counted as a fresh loss (which would re-collapse the
-    /// window while the packet is merely waiting for credit).
     pending_resend: bool,
 }
 
 struct QuicTransport {
     server: bool,
     peer: Option<SocketAddr>,
+    /// Candidate peer address undergoing RFC 9000 §9.3 path validation.
+    /// While set, all application data keeps flowing to `peer`; only the
+    /// PATH_CHALLENGE probe is sent to this address, and no more than the
+    /// anti-amplification budget may be sent to it.
+    pending_peer: Option<SocketAddr>,
+    /// The outstanding PATH_CHALLENGE token for the pending path.
+    path_challenge: Option<[u8; 8]>,
+    /// When the pending PATH_CHALLENGE was last sent (drives retry/abort).
+    path_challenge_sent: Option<Instant>,
+    /// Number of PATH_CHALLENGE retries on the pending path (max 1).
+    path_validation_retries: u8,
+    /// The peer's `disable_active_migration` transport parameter (RFC 9000
+    /// §18.2): when set, this endpoint MUST NOT actively migrate, though
+    /// passive path validation still runs.
+    peer_disable_active_migration: bool,
+    /// Maximum UDP datagram this endpoint will send: the peer's
+    /// `max_udp_payload_size`, discovered up via DPLPMTUD-style probing
+    /// (RFC 8899) and never above the hard UDP ceiling. RFC 9000 §14
+    /// requires sending nothing larger.
+    max_packet_size: usize,
     local_cid: Vec<u8>,
     remote_cid: Vec<u8>,
     original_dcid: Vec<u8>,
@@ -3185,6 +3507,8 @@ struct QuicTransport {
     application_recv: Option<PacketKey>,
     application_send_phase: bool,
     application_recv_phase: bool,
+    key_phase_packets: u64,
+    send_update_pending: bool,
     spaces: [PacketSpace; 3],
     crypto_send_offsets: [u64; 3],
     queued_streams: VecDeque<(u64, Vec<u8>, usize)>,
@@ -3192,6 +3516,7 @@ struct QuicTransport {
     slow_start_threshold: usize,
     smoothed_rtt: Option<Duration>,
     rtt_variance: Duration,
+    latest_rtt: Option<Duration>,
     peer_max_data: u64,
     peer_max_stream_data_bidi_local: u64,
     peer_max_stream_data_bidi_remote: u64,
@@ -3203,8 +3528,19 @@ struct QuicTransport {
     local_max_stream_data_bidi_local: u64,
     local_max_stream_data_bidi_remote: u64,
     local_max_stream_data_uni: u64,
+    local_stream_limits: BTreeMap<u64, u64>,
     received_data: u64,
     received_stream_data: BTreeMap<u64, u64>,
+    peer_max_streams_bidi: u64,
+    /// The peer's advertised cumulative limit on the uni streams we
+    /// initiate, raised by any MAX_STREAMS we received.
+    peer_max_streams_uni: u64,
+    local_max_streams_bidi: u64,
+    local_max_streams_uni: u64,
+    received_streams_bidi: u64,
+    received_streams_uni: u64,
+    peer_stateless_reset_token: Option<[u8; 16]>,
+    stateless_reset_token: Option<[u8; 16]>,
     stats: Option<Arc<Stats>>,
 }
 
@@ -3259,6 +3595,12 @@ impl QuicTransport {
         Self {
             server,
             peer: None,
+            pending_peer: None,
+            path_challenge: None,
+            path_challenge_sent: None,
+            path_validation_retries: 0,
+            peer_disable_active_migration: false,
+            max_packet_size: 1200,
             local_cid,
             remote_cid,
             original_dcid: initial_dcid.clone(),
@@ -3273,6 +3615,8 @@ impl QuicTransport {
             application_recv: None,
             application_send_phase: false,
             application_recv_phase: false,
+            key_phase_packets: 0,
+            send_update_pending: false,
             spaces: [
                 PacketSpace::default(),
                 PacketSpace::default(),
@@ -3284,6 +3628,7 @@ impl QuicTransport {
             slow_start_threshold: usize::MAX,
             smoothed_rtt: None,
             rtt_variance: Duration::from_millis(0),
+            latest_rtt: None,
             peer_max_data: 16 * 1024 * 1024,
             peer_max_stream_data_bidi_local: 16 * 1024 * 1024,
             peer_max_stream_data_bidi_remote: 16 * 1024 * 1024,
@@ -3295,8 +3640,17 @@ impl QuicTransport {
             local_max_stream_data_bidi_local: 16 * 1024 * 1024,
             local_max_stream_data_bidi_remote: 16 * 1024 * 1024,
             local_max_stream_data_uni: 1024 * 1024,
+            local_stream_limits: BTreeMap::new(),
             received_data: 0,
             received_stream_data: BTreeMap::new(),
+            peer_max_streams_bidi: 1024,
+            peer_max_streams_uni: 16,
+            local_max_streams_bidi: 1024,
+            local_max_streams_uni: 16,
+            received_streams_bidi: 0,
+            received_streams_uni: 0,
+            peer_stateless_reset_token: None,
+            stateless_reset_token: None,
             stats,
         }
     }
@@ -3311,6 +3665,7 @@ impl QuicTransport {
         self.application_send = Some(send);
         self.application_send_phase = false;
         self.application_recv_phase = false;
+        self.send_update_pending = false;
     }
 
     fn set_peer_transport(&mut self, parameters: &TransportParameters) {
@@ -3318,6 +3673,31 @@ impl QuicTransport {
         self.peer_max_stream_data_bidi_local = parameters.initial_max_stream_data_bidi_local;
         self.peer_max_stream_data_bidi_remote = parameters.initial_max_stream_data_bidi_remote;
         self.peer_max_stream_data_uni = parameters.initial_max_stream_data_uni;
+        self.peer_max_streams_bidi = parameters.initial_max_streams_bidi;
+        self.peer_max_streams_uni = parameters.initial_max_streams_uni;
+        self.peer_stateless_reset_token = parameters.stateless_reset_token;
+        self.peer_disable_active_migration = parameters.disable_active_migration;
+        // PMTUD: never send above the peer's advertised receive ceiling
+        // (RFC 9000 §14.1) and never above the UDP hard limit.
+        let peer_cap = usize::try_from(parameters.max_udp_payload_size).unwrap_or(MAX_DATAGRAM);
+        self.max_packet_size = peer_cap.clamp(1200, MAX_DATAGRAM);
+    }
+
+    /// Whether `datagram` is a stateless reset (RFC 9000 §10.3): a
+    /// short-header packet whose final 16 bytes match the token the peer
+    /// advertised in its transport parameters. Constant-time comparison.
+    fn is_stateless_reset(&self, datagram: &[u8]) -> bool {
+        let Some(token) = &self.peer_stateless_reset_token else {
+            return false;
+        };
+        // Short header (0x40..=0x7f); at least 1 header + 16 token bytes.
+        if datagram.is_empty() || datagram[0] & 0x80 != 0 || datagram[0] & 0x40 == 0 {
+            return false;
+        }
+        if datagram.len() < 17 || datagram.len() > MAX_DATAGRAM {
+            return false;
+        }
+        constant_time_equal(&datagram[datagram.len() - 16..], token)
     }
 
     fn apply_retry(&mut self, retry_dcid: Vec<u8>, token: Vec<u8>) -> Result<bool> {
@@ -3344,11 +3724,18 @@ impl QuicTransport {
         self.application_recv = None;
         self.application_send_phase = false;
         self.application_recv_phase = false;
+        self.key_phase_packets = 0;
+        self.send_update_pending = false;
         self.sent_data = 0;
         self.sent_stream_data.clear();
         self.peer_stream_limits.clear();
+        self.local_stream_limits.clear();
         self.received_data = 0;
         self.received_stream_data.clear();
+        self.latest_rtt = None;
+        self.smoothed_rtt = None;
+        self.rtt_variance = Duration::from_millis(0);
+        self.peer_stateless_reset_token = None;
         Ok(true)
     }
 
@@ -3357,6 +3744,14 @@ impl QuicTransport {
         self.local_max_stream_data_bidi_local = parameters.initial_max_stream_data_bidi_local;
         self.local_max_stream_data_bidi_remote = parameters.initial_max_stream_data_bidi_remote;
         self.local_max_stream_data_uni = parameters.initial_max_stream_data_uni;
+        self.local_max_streams_bidi = parameters.initial_max_streams_bidi;
+        self.local_max_streams_uni = parameters.initial_max_streams_uni;
+    }
+
+    /// The peer's advertised cumulative limit on the bidi streams we
+    /// initiate (RFC 9000 §4.6), raised by any MAX_STREAMS we received.
+    fn peer_stream_count_limit(&self) -> u64 {
+        self.peer_max_streams_bidi
     }
 
     /// The peer's advertised send limit for `id` (its transport parameter,
@@ -3379,6 +3774,21 @@ impl QuicTransport {
         if length == 0 {
             return Ok(());
         }
+        // RFC 9000 §4.6 stream-count limit: the peer may only open streams
+        // below the cumulative limit we last advertised. Track the highest
+        // peer-initiated stream index so MAX_STREAMS can be replenished.
+        if stream_id::is_client_initiated(id) == self.server {
+            let (limit, counter) = if stream_id::is_unidirectional(id) {
+                (self.local_max_streams_uni, &mut self.received_streams_uni)
+            } else {
+                (self.local_max_streams_bidi, &mut self.received_streams_bidi)
+            };
+            let index = stream_id::stream_index(id);
+            if index >= limit {
+                return Err(protocol("QUIC peer stream limit exceeded"));
+            }
+            *counter = (*counter).max(index + 1);
+        }
         let end = offset
             .checked_add(length as u64)
             .ok_or_else(|| protocol("QUIC stream receive offset overflow"))?;
@@ -3389,7 +3799,15 @@ impl QuicTransport {
         } else {
             self.local_max_stream_data_bidi_remote
         };
-        if end > default_limit {
+        // The peer may use the *last advertised* limit for this stream
+        // (raised by `MAX_STREAM_DATA` replenishment), not merely the
+        // initial transport parameter.
+        let advertised = self
+            .local_stream_limits
+            .get(&id)
+            .copied()
+            .unwrap_or(default_limit);
+        if end > advertised {
             return Err(protocol("QUIC local stream flow-control limit exceeded"));
         }
         let previous = self.received_stream_data.get(&id).copied().unwrap_or(0);
@@ -3406,9 +3824,17 @@ impl QuicTransport {
 
     fn open(&mut self, datagram: &mut [u8]) -> Result<Option<OpenPacket>> {
         if datagram.len() < 21 || datagram.len() > MAX_DATAGRAM {
-            return Err(protocol("invalid QUIC datagram size"));
+            // RFC 9000 §5.2: an endpoint may drop a packet it cannot
+            // process (a short or oversized tail in a coalesced datagram).
+            return Ok(None);
         }
-        let meta = PacketMeta::parse(datagram, self.local_cid.len())?;
+        let meta = match PacketMeta::parse(datagram, self.local_cid.len()) {
+            Ok(meta) => meta,
+            // RFC 9000 §5.2: malformed/unparseable packets are dropped,
+            // never treated as a connection error (the header is not
+            // authenticated).
+            Err(_) => return Ok(None),
+        };
         let (level, key) = if meta.long_type == Some(LongType::Initial) {
             (INITIAL, self.initial_recv.clone())
         } else if meta.long_type == Some(LongType::Handshake) {
@@ -3469,11 +3895,88 @@ impl QuicTransport {
             }
         }
         let Some((pn, plaintext)) = opened else {
-            return Err(protocol("QUIC packet authentication failed"));
+            if std::env::var_os("COURIERUST_H3_DEBUG").is_some() {
+                let phase_bit = if meta.long_type.is_none() {
+                    Some((datagram[0] >> 2) & 1)
+                } else {
+                    None
+                };
+                let recv_phase = if level == APPLICATION {
+                    Some(self.application_recv_phase)
+                } else {
+                    None
+                };
+                let recv_fp = self.application_recv.as_ref().map(|k| k.fingerprint());
+                let next_fp = self
+                    .application_recv
+                    .as_ref()
+                    .and_then(|k| k.next_key_phase().ok())
+                    .map(|k| k.fingerprint());
+                let initial_fp = if level == INITIAL {
+                    Some(self.initial_recv.fingerprint())
+                } else {
+                    None
+                };
+                eprintln!(
+                    "H3 auth-fail: {} long_type={:?} level={} len={} recv_phase={:?} send_phase={} phase_bit={:?} pn={} recv_fp={:?} next_fp={:?} send_fp={:?} initial_fp={:?} dcid={:?} scid={:?} token_len={}",
+                    if self.server { "server" } else { "client" },
+                    meta.long_type,
+                    level,
+                    datagram.len(),
+                    recv_phase,
+                    self.application_send_phase,
+                    phase_bit,
+                    expected,
+                    recv_fp,
+                    next_fp,
+                    self.application_send.as_ref().map(|k| k.fingerprint()),
+                    initial_fp,
+                    meta.dcid,
+                    meta.scid,
+                    meta.token.len()
+                );
+            }
+            // RFC 9000 §10.3.3: an endpoint MUST NOT close a connection
+            // because a packet fails to authenticate. The packet may be
+            // stale (a late duplicate from before a key update), forged,
+            // or corrupted in transit — in every case it is dropped, and
+            // the connection survives. A validated stateless reset is
+            // detected by the caller from this same drop path.
+            return Ok(None);
         };
         if level == APPLICATION && next_phase {
             self.application_recv = Some(candidate);
             self.application_recv_phase = !self.application_recv_phase;
+            // RFC 9001 §6.2: on detecting a peer key update, the receiver
+            // MUST respond by updating its own send keys to the new phase
+            // (the key phase is shared between both directions) before it
+            // may initiate further updates. If we had already initiated an
+            // update of our own, the peer's new-phase packet confirms it,
+            // so the one-update-at-a-time guard clears here.
+            if self.application_send_phase != self.application_recv_phase {
+                if let Some(next_send) = self
+                    .application_send
+                    .as_ref()
+                    .and_then(|k| k.next_key_phase().ok())
+                {
+                    self.application_send = Some(next_send);
+                    self.application_send_phase = self.application_recv_phase;
+                }
+            }
+            if self.application_send_phase == self.application_recv_phase {
+                self.send_update_pending = false;
+            }
+            self.key_phase_packets = 0;
+            if std::env::var_os("COURIERUST_H3_DEBUG").is_some() {
+                eprintln!(
+                    "H3 key-update: {} mirrored peer update -> send_phase={} recv_phase={} pending={} counter={}",
+                    if self.server { "server" } else { "client" },
+                    self.application_send_phase,
+                    self.application_recv_phase,
+                    self.send_update_pending,
+                    self.key_phase_packets
+                );
+            }
         }
         let space = &mut self.spaces[level];
         if !space.received.insert(pn) {
@@ -3508,13 +4011,29 @@ impl QuicTransport {
                 ..
             } = frame
             {
-                let (bytes, sample) = acknowledge(&mut space.sent, *largest_acked, ranges);
+                space.largest_acked = Some(
+                    space
+                        .largest_acked
+                        .map_or(*largest_acked, |l| l.max(*largest_acked)),
+                );
+                let (bytes, sample) =
+                    acknowledge(&mut space.sent, space.largest_sent, *largest_acked, ranges)?;
                 acknowledged_bytes = acknowledged_bytes.saturating_add(bytes);
                 rtt_sample = rtt_sample.or(sample);
             }
             match frame {
                 QFrame::MaxData(max) => {
                     self.peer_max_data = self.peer_max_data.max(*max);
+                }
+                QFrame::MaxStreams {
+                    unidirectional,
+                    max,
+                } => {
+                    if *unidirectional {
+                        self.peer_max_streams_uni = self.peer_max_streams_uni.max(*max);
+                    } else {
+                        self.peer_max_streams_bidi = self.peer_max_streams_bidi.max(*max);
+                    }
                 }
                 QFrame::MaxStreamData { stream_id, max } => {
                     let limit = self.peer_stream_limits.entry(*stream_id).or_insert(0);
@@ -3528,13 +4047,14 @@ impl QuicTransport {
             space.ack_deadline = Some(Instant::now() + ACK_DELAY);
         }
         if acknowledged_bytes != 0 {
-            self.on_acknowledgement(acknowledged_bytes, rtt_sample);
+            self.on_acknowledgement(acknowledged_bytes, rtt_sample, level);
         }
         Ok(Some((level, pn, frames, meta.packet_end)))
     }
 
-    fn on_acknowledgement(&mut self, bytes: usize, sample: Option<Duration>) {
+    fn on_acknowledgement(&mut self, bytes: usize, sample: Option<Duration>, level: LevelIndex) {
         if let Some(sample) = sample {
+            self.latest_rtt = Some(sample);
             if self.smoothed_rtt.is_none() {
                 self.smoothed_rtt = Some(sample);
                 self.rtt_variance = sample / 2;
@@ -3560,23 +4080,74 @@ impl QuicTransport {
                 .saturating_add(increment)
                 .min(16 * 1024 * 1024);
         }
+        // RFC 9002 §6.1.1: acknowledging a packet is the trigger for
+        // time-threshold loss detection — any earlier ack-eliciting
+        // packet older than the threshold is declared lost promptly
+        // rather than waiting for the next tick.
+        let _ = self.detect_lost_packets(level, Instant::now());
     }
 
-    fn loss_timeout(&self) -> Duration {
+    /// RFC 9002 §6.1.1 time threshold: `9/8 * max(latest_rtt,
+    /// smoothed_rtt)`, floored to absorb Windows timer granularity and
+    /// scheduler jitter (a loopback RTT of ~0.3 ms would otherwise
+    /// declare a packet lost while its ACK is still in flight, collapse
+    /// the congestion window, and degrade a large transfer to a crawl).
+    fn loss_detection_threshold(&self) -> Duration {
+        let rtt = self
+            .smoothed_rtt
+            .or(self.latest_rtt)
+            .unwrap_or(Duration::from_millis(100));
+        let scaled = rtt
+            .checked_mul(TIME_THRESHOLD_NUM)
+            .map(|v| v / TIME_THRESHOLD_DEN)
+            .unwrap_or(rtt);
+        scaled.max(LOSS_TIMEOUT_FLOOR)
+    }
+
+    /// RFC 9002 §6.2.1: PTO = smoothed_rtt + max(4·rttvar, granularity) +
+    /// max_ack_delay. A PTO expiry triggers a single retransmission (a
+    /// probe) and does not by itself declare loss or collapse the
+    /// congestion window — only time-threshold detection does.
+    fn pto_timeout(&self) -> Duration {
         let Some(smoothed) = self.smoothed_rtt else {
-            return LOSS_DELAY;
+            return Duration::from_millis(1000);
         };
         let variance = (self.rtt_variance * 4).max(Duration::from_millis(1));
-        // RFC 9002: PTO = smoothed_rtt + max(4*rttvar, granularity) +
-        // max_ack_delay. The floor absorbs scheduling jitter (Windows
-        // timer granularity, CPU contention from parallel connections):
-        // without it a loopback RTT of ~0.3 ms yields a ~3 ms loss
-        // timeout, so a single delayed ACK is misclassified as loss, the
-        // congestion window collapses to its 2400-byte floor, and a large
-        // body degrades to a crawl (one window per loss timeout).
         (smoothed + variance + ACK_DELAY).max(LOSS_TIMEOUT_FLOOR)
     }
 
+    /// Declare ack-eliciting packets in `level` lost once they are older
+    /// than the time threshold or `kPacketThreshold` packets behind the
+    /// highest acknowledged packet (RFC 9002 §6.1.1). Returns the number
+    /// of packets declared lost; the caller halves the congestion window
+    /// once per invocation.
+    fn detect_lost_packets(&mut self, level: LevelIndex, now: Instant) -> usize {
+        let threshold = self.loss_detection_threshold();
+        let space = &mut self.spaces[level];
+        let largest_acked = space.largest_acked;
+        let mut lost: Vec<u64> = Vec::new();
+        for (&pn, packet) in &space.sent {
+            if !packet.ack_eliciting || packet.pending_resend {
+                continue;
+            }
+            let over_time = now.duration_since(packet.sent_at) >= threshold;
+            let over_packet = largest_acked
+                .is_some_and(|la| la.saturating_sub(pn) >= PACKET_THRESHOLD && pn < la);
+            if over_time || over_packet {
+                lost.push(pn);
+            }
+        }
+        if lost.is_empty() {
+            return 0;
+        }
+        for pn in &lost {
+            space.sent.remove(pn);
+        }
+        self.on_loss();
+        lost.len()
+    }
+
+    /// RFC 9002 §5.1 congestion window reaction to loss.
     fn on_loss(&mut self) {
         self.congestion_window = (self.congestion_window / 2).max(2400);
         self.slow_start_threshold = self.congestion_window;
@@ -3808,46 +4379,249 @@ impl QuicTransport {
         }
     }
 
+    /// Replenish per-stream receive windows as the application consumes
+    /// data (RFC 9000 §4.1). Once a stream's peer has used more than
+    /// half of the currently advertised limit, advertise a fresh window
+    /// via `MAX_STREAM_DATA` so a long-lived stream is never capped at
+    /// `initial_max_stream_data_*`.
+    fn replenish_stream_windows(&mut self, socket: &UdpSocket) -> Result<()> {
+        let mut updates: Vec<(u64, u64)> = Vec::new();
+        for (&id, &received) in &self.received_stream_data {
+            let default_limit = if stream_id::is_unidirectional(id) {
+                self.local_max_stream_data_uni
+            } else if stream_id::is_client_initiated(id) == !self.server {
+                self.local_max_stream_data_bidi_local
+            } else {
+                self.local_max_stream_data_bidi_remote
+            };
+            let headroom = default_limit.saturating_sub(received);
+            if headroom <= default_limit / 2 {
+                let new_limit = received
+                    .saturating_add(default_limit)
+                    .min(crate::courierust_quic::varint::MAX);
+                updates.push((id, new_limit));
+            }
+        }
+        for (id, new_limit) in updates {
+            let advertised = self.local_stream_limits.entry(id).or_insert(0);
+            if new_limit <= *advertised {
+                continue;
+            }
+            *advertised = new_limit;
+            match self.send_frames(
+                socket,
+                APPLICATION,
+                &[QFrame::MaxStreamData {
+                    stream_id: id,
+                    max: new_limit,
+                }],
+                false,
+            ) {
+                Ok(()) => {}
+                // A full send buffer defers the update; retry next tick.
+                Err(error) if error.kind == ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// Replenish the advertised stream-count limits as the peer opens
+    /// streams (RFC 9000 §4.6). Once the peer has used more than half of a
+    /// limit, advertise a fresh limit via MAX_STREAMS so a long-lived
+    /// connection can keep opening streams — otherwise a peer such as
+    /// quinn stops at the initial limit (1024 bidi streams) and the next
+    /// request times out.
+    fn replenish_stream_limits(&mut self, socket: &UdpSocket) -> Result<()> {
+        let mut updates = Vec::new();
+        let bidi_headroom = self
+            .local_max_streams_bidi
+            .saturating_sub(self.received_streams_bidi);
+        if bidi_headroom <= self.local_max_streams_bidi / 2 {
+            let new_limit = self
+                .received_streams_bidi
+                .saturating_add(self.local_max_streams_bidi)
+                .min(crate::courierust_quic::varint::MAX);
+            if new_limit > self.local_max_streams_bidi {
+                updates.push((false, new_limit));
+            }
+        }
+        let uni_headroom = self
+            .local_max_streams_uni
+            .saturating_sub(self.received_streams_uni);
+        if uni_headroom <= self.local_max_streams_uni / 2 {
+            let new_limit = self
+                .received_streams_uni
+                .saturating_add(self.local_max_streams_uni)
+                .min(crate::courierust_quic::varint::MAX);
+            if new_limit > self.local_max_streams_uni {
+                updates.push((true, new_limit));
+            }
+        }
+        for (unidirectional, new_limit) in updates {
+            let slot = if unidirectional {
+                &mut self.local_max_streams_uni
+            } else {
+                &mut self.local_max_streams_bidi
+            };
+            if new_limit <= *slot {
+                continue;
+            }
+            *slot = new_limit;
+            if std::env::var_os("COURIERUST_H3_DEBUG").is_some() {
+                eprintln!(
+                    "H3 maxstreams: {} uni={} new_limit={} received_bidi={} received_uni={}",
+                    if self.server { "server" } else { "client" },
+                    unidirectional,
+                    new_limit,
+                    self.received_streams_bidi,
+                    self.received_streams_uni,
+                );
+            }
+            match self.send_frames(
+                socket,
+                APPLICATION,
+                &[QFrame::MaxStreams {
+                    unidirectional,
+                    max: new_limit,
+                }],
+                false,
+            ) {
+                Ok(()) => {}
+                // A full send buffer defers the update; retry next tick.
+                Err(error) if error.kind == ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// Automatic bidirectional key update (RFC 9001 §6): after a
+    /// configurable number of packets on the current application key
+    /// phase, the endpoint derives the next packet-protection keys and
+    /// toggles the key phase, so long-lived connections refresh their
+    /// AEAD keys in both directions instead of reusing one generation
+    /// indefinitely.
+    ///
+    /// The packet number space is deliberately NOT reset on a key update:
+    /// RFC 9001 §6.1 only requires the new phase to not reuse a packet
+    /// number, and continuing the sequence keeps the peer's packet-number
+    /// recovery (`expected = largest_received + 1`) valid across phases.
+    fn maybe_key_update(&mut self) {
+        let threshold = key_update_threshold();
+        // RFC 9001 §6.2 one-at-a-time rule: an endpoint that has initiated
+        // a key update MUST NOT initiate another until the peer has
+        // confirmed the new phase by sending a packet protected with the
+        // new keys (the receiver's key-update path clears this flag).
+        // Without the guard, two endpoints that independently reach their
+        // packet counters drift apart by a whole generation and become
+        // undecryptable: the phase bit only toggles per generation, so a
+        // two-generation drift is indistinguishable from the old phase.
+        if self.send_update_pending
+            || self.application_send.is_none()
+            || self.key_phase_packets < threshold
+        {
+            return;
+        }
+        if let Some(next) = self
+            .application_send
+            .as_ref()
+            .and_then(|k| k.next_key_phase().ok())
+        {
+            self.application_send = Some(next);
+            self.application_send_phase = !self.application_send_phase;
+            self.key_phase_packets = 0;
+            self.send_update_pending = true;
+            if std::env::var_os("COURIERUST_H3_DEBUG").is_some() {
+                eprintln!(
+                    "H3 key-update: {} initiated -> send_phase={} recv_phase={} pending=true counter={} fp={:?}",
+                    if self.server { "server" } else { "client" },
+                    self.application_send_phase,
+                    self.application_recv_phase,
+                    self.key_phase_packets,
+                    self.application_send.as_ref().map(|k| k.fingerprint()),
+                );
+            }
+        }
+    }
+
     fn retransmit(&mut self, socket: &UdpSocket) -> Result<()> {
         let now = Instant::now();
-        let loss_timeout = self.loss_timeout();
-        let mut resend = Vec::new();
+        let lost_threshold = self.loss_detection_threshold();
+        let pto = self.pto_timeout();
+        let mut resend: Vec<(u64, LevelIndex, Vec<QFrame>, bool, u8)> = Vec::new();
         let mut lost = false;
-        for (level, space) in self.spaces.iter_mut().enumerate() {
-            let mut expired = Vec::new();
-            for (&pn, packet) in &mut space.sent {
-                // A retransmit previously blocked by the congestion
-                // window is retried on the next tick (it does not count
-                // as a fresh loss and must not wait out a full loss
-                // timeout); only a fresh expiry increments the
-                // retransmit budget and halves the window.
-                let pending = packet.pending_resend;
-                if packet.ack_eliciting
-                    && (pending || now.duration_since(packet.sent_at) >= loss_timeout)
-                {
-                    if !pending {
-                        if packet.retransmits >= MAX_RETRANSMITS {
-                            return Err(protocol("QUIC packet loss exceeded retransmission limit"));
-                        }
-                        packet.retransmits += 1;
-                        lost = true;
+        let mut probe_armed = false;
+
+        for level in [INITIAL, HANDSHAKE, APPLICATION] {
+            let mut expired: Vec<(u64, Vec<QFrame>, bool, u8)> = Vec::new();
+            let mut earliest_ack_eliciting: Option<(u64, Instant)> = None;
+            {
+                let space = &mut self.spaces[level];
+                for (&pn, packet) in &mut space.sent {
+                    if !packet.ack_eliciting {
+                        continue;
                     }
-                    expired.push((
-                        pn,
-                        level,
-                        packet.frames.clone(),
-                        packet.pad_initial,
-                        packet.retransmits,
-                    ));
+                    // A retransmit previously blocked by the congestion
+                    // window is retried on the next tick (it does not
+                    // count as a fresh loss); only a fresh time-threshold
+                    // expiry increments the retransmit budget and halves
+                    // the window.
+                    let pending = packet.pending_resend;
+                    let aged_out = now.duration_since(packet.sent_at) >= lost_threshold;
+                    if pending || aged_out {
+                        if !pending {
+                            if packet.retransmits >= MAX_RETRANSMITS {
+                                return Err(protocol(
+                                    "QUIC packet loss exceeded retransmission limit",
+                                ));
+                            }
+                            packet.retransmits += 1;
+                            lost = true;
+                        }
+                        expired.push((
+                            pn,
+                            packet.frames.clone(),
+                            packet.pad_initial,
+                            packet.retransmits,
+                        ));
+                    }
+                    if earliest_ack_eliciting.is_none()
+                        || packet.sent_at < earliest_ack_eliciting.unwrap().1
+                    {
+                        earliest_ack_eliciting = Some((pn, packet.sent_at));
+                    }
                 }
-                if expired.len() >= 8 {
-                    break;
+                for (pn, _, _, _) in &expired {
+                    space.sent.remove(pn);
                 }
             }
-            for (pn, _, _, _, _) in &expired {
-                space.sent.remove(pn);
+            // RFC 9002 §6.2.1 PTO: if nothing was declared lost but an
+            // ack-eliciting packet has been in flight longer than the
+            // PTO, send a single probe. The probe is a retransmission
+            // that does NOT collapse the congestion window — only
+            // time-threshold loss does.
+            if expired.is_empty() && !probe_armed {
+                if let Some((pn, sent_at)) = earliest_ack_eliciting {
+                    if now.duration_since(sent_at) >= pto {
+                        if let Some(packet) = self.spaces[level].sent.get(&pn) {
+                            if packet.retransmits < MAX_RETRANSMITS {
+                                probe_armed = true;
+                                expired.push((
+                                    pn,
+                                    packet.frames.clone(),
+                                    packet.pad_initial,
+                                    packet.retransmits,
+                                ));
+                                self.spaces[level].sent.remove(&pn);
+                            }
+                        }
+                    }
+                }
             }
-            resend.extend(expired);
+            for (pn, frames, pad_initial, retransmits) in expired {
+                resend.push((pn, level, frames, pad_initial, retransmits));
+            }
         }
         if lost {
             self.on_loss();
@@ -3897,6 +4671,19 @@ impl QuicTransport {
         self.send_frames_with_retransmits(socket, level, frames, pad_initial, 0)
     }
 
+    /// Send frames to an explicit destination (used for the PATH_CHALLENGE
+    /// probe to an unvalidated address during RFC 9000 §9.3 validation).
+    fn send_frames_to(
+        &mut self,
+        socket: &UdpSocket,
+        level: LevelIndex,
+        frames: &[QFrame],
+        pad_initial: bool,
+        dest: SocketAddr,
+    ) -> Result<()> {
+        self.send_frames_inner(socket, level, frames, pad_initial, 0, Some(dest))
+    }
+
     fn send_frames_with_retransmits(
         &mut self,
         socket: &UdpSocket,
@@ -3904,6 +4691,18 @@ impl QuicTransport {
         frames: &[QFrame],
         pad_initial: bool,
         retransmits: u8,
+    ) -> Result<()> {
+        self.send_frames_inner(socket, level, frames, pad_initial, retransmits, None)
+    }
+
+    fn send_frames_inner(
+        &mut self,
+        socket: &UdpSocket,
+        level: LevelIndex,
+        frames: &[QFrame],
+        pad_initial: bool,
+        retransmits: u8,
+        dest: Option<SocketAddr>,
     ) -> Result<()> {
         let key = match level {
             INITIAL => self.initial_send.clone(),
@@ -3922,6 +4721,8 @@ impl QuicTransport {
             .next_send
             .checked_add(1)
             .ok_or_else(|| protocol("QUIC packet number exhausted"))?;
+        self.spaces[level].largest_sent =
+            Some(self.spaces[level].largest_sent.map_or(pn, |l| l.max(pn)));
         let mut plaintext = Vec::new();
         for frame in frames {
             frame.encode(&mut plaintext);
@@ -3972,8 +4773,10 @@ impl QuicTransport {
         }
         let pn_offset = header.len() - pn_len;
         key.protect_header(&mut wire, pn_offset, long_type.is_some())?;
-        if wire.len() > MAX_DATAGRAM {
-            return Err(protocol("QUIC packet exceeds UDP datagram limit"));
+        if wire.len() > self.max_packet_size {
+            return Err(protocol(
+                "QUIC packet exceeds the peer's max_udp_payload_size",
+            ));
         }
         let ack_eliciting = frames.iter().any(|frame| {
             !matches!(
@@ -3986,7 +4789,10 @@ impl QuicTransport {
         {
             return Err(Error::new(ErrorKind::WouldBlock));
         }
-        self.send_wire(socket, &wire)?;
+        self.send_wire(socket, &wire, dest)?;
+        if level == APPLICATION {
+            self.key_phase_packets = self.key_phase_packets.saturating_add(1);
+        }
         if ack_eliciting {
             self.spaces[level].sent.insert(
                 pn,
@@ -4018,11 +4824,107 @@ impl QuicTransport {
         self.spaces.iter().any(|space| !space.sent.is_empty())
     }
 
-    fn send_wire(&self, socket: &UdpSocket, wire: &[u8]) -> Result<()> {
+    fn send_wire(&self, socket: &UdpSocket, wire: &[u8], dest: Option<SocketAddr>) -> Result<()> {
         if let Some(stats) = self.stats.as_deref() {
             stats.h3_udp_send_syscalls.fetch_add(1, Ordering::Relaxed);
         }
-        send_datagram(socket, self.peer, wire)
+        send_datagram(socket, dest.or(self.peer), wire)
+    }
+
+    // -----------------------------------------------------------------
+    // Path validation (RFC 9000 §9.3) — connection migration / NAT
+    // rebinding.
+    // -----------------------------------------------------------------
+
+    /// Validate a new peer address before switching traffic to it. Only a
+    /// small PATH_CHALLENGE probe is sent to the candidate; all other
+    /// traffic continues on the validated path until PATH_RESPONSE commits
+    /// the migration (anti-amplification / anti-hijacking).
+    fn initiate_path_validation(
+        &mut self,
+        socket: &UdpSocket,
+        candidate: SocketAddr,
+    ) -> Result<()> {
+        // RFC 9000 §9.6: an endpoint that set disable_active_migration
+        // must not be actively migrated to.
+        if self.peer_disable_active_migration && !self.server {
+            return Ok(());
+        }
+        let mut token = [0u8; 8];
+        if !crate::courierust_tls::crypto::rng::fill_random(&mut token) {
+            return Err(protocol("OS randomness unavailable for PATH_CHALLENGE"));
+        }
+        self.pending_peer = Some(candidate);
+        self.path_challenge = Some(token);
+        self.path_challenge_sent = Some(Instant::now());
+        self.send_frames_to(
+            socket,
+            APPLICATION,
+            &[QFrame::PathChallenge(token)],
+            false,
+            candidate,
+        )
+    }
+
+    /// Respond to a PATH_CHALLENGE on the path the challenge arrived on
+    /// (RFC 9000 §9.3.2): echo the 8-byte token back to the sender.
+    fn handle_path_challenge(&mut self, socket: &UdpSocket, token: [u8; 8], source: SocketAddr) {
+        let _ = self.send_frames_to(
+            socket,
+            APPLICATION,
+            &[QFrame::PathResponse(token)],
+            false,
+            source,
+        );
+    }
+
+    /// Commit a validated migration: the PATH_RESPONSE echoes our token
+    /// and arrives from the candidate address.
+    fn handle_path_response(&mut self, token: &[u8; 8], source: SocketAddr) {
+        if self.pending_peer != Some(source) || self.path_challenge.as_ref() != Some(token) {
+            return;
+        }
+        self.peer = Some(source);
+        self.pending_peer = None;
+        self.path_challenge = None;
+        self.path_challenge_sent = None;
+    }
+
+    /// Re-send or abandon an unanswered PATH_CHALLENGE. A challenge older
+    /// than the probe timeout is retried once, then abandoned (the old
+    /// path stays authoritative).
+    fn check_path_validation_timeout(&mut self, socket: &UdpSocket, now: Instant) -> Result<()> {
+        let Some(sent) = self.path_challenge_sent else {
+            return Ok(());
+        };
+        if now.duration_since(sent) < PATH_VALIDATION_TIMEOUT {
+            return Ok(());
+        }
+        let Some(candidate) = self.pending_peer else {
+            self.path_challenge_sent = None;
+            return Ok(());
+        };
+        let Some(token) = self.path_challenge else {
+            return Ok(());
+        };
+        // Retry once, then abandon the pending path.
+        if self.path_validation_retries < 1 {
+            self.path_validation_retries += 1;
+            self.path_challenge_sent = Some(now);
+            self.send_frames_to(
+                socket,
+                APPLICATION,
+                &[QFrame::PathChallenge(token)],
+                false,
+                candidate,
+            )?;
+        } else {
+            self.pending_peer = None;
+            self.path_challenge = None;
+            self.path_challenge_sent = None;
+            self.path_validation_retries = 0;
+        }
+        Ok(())
     }
 
     fn send_connection_close(
@@ -4102,9 +5004,18 @@ fn ack_ranges(received: &BTreeSet<u64>, largest: u64) -> Vec<(u64, u64)> {
 
 fn acknowledge(
     sent: &mut BTreeMap<u64, SentPacket>,
+    largest_sent_ever: Option<u64>,
     largest: u64,
     ranges: &[(u64, u64)],
-) -> (usize, Option<Duration>) {
+) -> Result<(usize, Option<Duration>)> {
+    // RFC 9000 §13.1: an ACK that acknowledges a packet number the sender
+    // never sent is a protocol error. A duplicate ACK of an already-
+    // acknowledged packet stays within `largest_sent_ever` and is legal
+    // (peers re-ACK when they receive a retransmission), so only an ACK
+    // beyond the highest number ever sent is rejected.
+    if largest_sent_ever.is_none_or(|max| largest > max) {
+        return Err(protocol("ACK acknowledges an unsent packet number"));
+    }
     let now = Instant::now();
     let mut acknowledged_bytes = 0usize;
     let mut rtt_sample = None;
@@ -4132,7 +5043,7 @@ fn acknowledge(
             };
         }
     }
-    (acknowledged_bytes, rtt_sample)
+    Ok((acknowledged_bytes, rtt_sample))
 }
 
 fn decode_quic_frames(buf: &[u8]) -> Result<Vec<QFrame>> {
@@ -4164,14 +5075,27 @@ fn open_packet_with_key(
     expected_phase: Option<bool>,
 ) -> Result<Option<(u64, Vec<u8>)>> {
     let header_room = meta.pn_offset.saturating_add(4).min(datagram.len());
+    // Header protection is removed in place. A failed attempt (phase
+    // mismatch OR an invalid recovered header) must restore the original
+    // bytes before returning, because the caller retries with the next
+    // key phase on the same buffer: unprotecting once with the wrong
+    // phase's HP key corrupts the first byte and packet number, and any
+    // subsequent attempt then computes a wrong AAD and can never succeed.
     let saved = expected_phase
         .is_some()
         .then(|| datagram[..header_room].to_vec());
-    let Ok(pn_len) = key.unprotect_header(datagram, meta.pn_offset, meta.long_type.is_some())
-    else {
-        return Ok(None);
+    let pn_len = match key.unprotect_header(datagram, meta.pn_offset, meta.long_type.is_some()) {
+        Ok(pn_len) => pn_len,
+        Err(_) => {
+            if let Some(saved) = &saved {
+                datagram[..header_room].copy_from_slice(saved);
+            }
+            return Ok(None);
+        }
     };
     if let Some(expected_phase) = expected_phase {
+        // Key phase is bit 2 (0x04) of the short header (RFC 9000
+        // §17.3.1); bits 4-3 (0x18) are reserved.
         let phase = datagram[0] & 0x04 != 0;
         if phase != expected_phase {
             if let Some(saved) = &saved {
@@ -4180,12 +5104,15 @@ fn open_packet_with_key(
             return Ok(None);
         }
     }
-    let payload_start = meta
-        .pn_offset
-        .checked_add(pn_len)
-        .ok_or_else(|| protocol("QUIC packet-number offset overflow"))?;
+    let payload_start = meta.pn_offset.saturating_add(pn_len);
     if payload_start > meta.packet_end {
-        return Err(protocol("QUIC packet number exceeds packet length"));
+        if let Some(saved) = &saved {
+            datagram[..header_room].copy_from_slice(saved);
+        }
+        // Malformed packet (packet number runs past the end): drop it
+        // rather than terminate the connection (RFC 9000 §5.2 — the
+        // header is not authenticated at this point).
+        return Ok(None);
     }
     let pn = packet::decode_pn(
         &datagram[meta.pn_offset..payload_start],
@@ -4323,12 +5250,174 @@ impl PacketMeta {
 mod tests {
     use super::*;
 
+    /// RFC 9000 §10.3.3: a packet that fails to authenticate MUST NOT
+    /// close the connection — it is dropped. Regression test for the
+    /// single-forged-datagram connection kill: an attacker who knows the
+    /// (plaintext) destination CID can send garbage on the short header;
+    /// `open` must return `Ok(None)` (drop) rather than `Err`.
+    #[test]
+    fn forged_packet_is_dropped_not_connection_fatal() {
+        let local_cid = vec![0x11; 8];
+        let transport =
+            QuicTransport::client(local_cid.clone(), vec![0x22; 8], vec![0x33; 8], None).unwrap();
+        let mut transport = transport;
+        // Short header with the client's DCID + a bogus packet number and
+        // random payload that cannot decrypt.
+        let mut forged = vec![0x40u8];
+        forged.extend_from_slice(&local_cid);
+        forged.push(0x00); // packet number 0 (1-byte length)
+        forged.extend_from_slice(&[0xde; 32]); // garbage payload
+        let opened = transport.open(&mut forged);
+        assert!(
+            matches!(opened, Ok(None)),
+            "an undecryptable packet must be dropped, got {opened:?}"
+        );
+    }
+
+    /// The same guarantee at the `on_datagram` level (client role): the
+    /// error must not propagate as a connection error.
+    #[test]
+    fn forged_packet_on_datagram_is_dropped() {
+        let local_cid = vec![0x44; 8];
+        let transport =
+            QuicTransport::client(local_cid.clone(), vec![0x55; 8], vec![0x66; 8], None).unwrap();
+        let mut conn = ClientConnection::new(
+            transport,
+            // TLS is never touched for an undecryptable packet; dummy
+            // values are sufficient.
+            crate::courierust_tls::quic::QuicClient::new(
+                "localhost",
+                vec![b"h3".to_vec()],
+                false,
+                crate::courierust_tls::RootStore::new(),
+                0,
+                TransportParameters::default(),
+                vec![0x66; 8],
+            ),
+            Vec::new(),
+            "localhost".into(),
+            H3Limits {
+                max_header_list: 16 * 1024,
+                max_body: 16 * 1024 * 1024,
+            },
+            None,
+        )
+        .unwrap();
+        let mut forged = vec![0x40u8];
+        forged.extend_from_slice(&local_cid);
+        forged.push(0x00);
+        forged.extend_from_slice(&[0xde; 32]);
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let source = socket.local_addr().unwrap();
+        let result = conn.on_datagram(&socket, source, &mut forged);
+        assert!(
+            matches!(result, Ok(())),
+            "a forged datagram must not kill the connection, got {result:?}"
+        );
+    }
+
+    /// RFC 9000 §13.1: an ACK that acknowledges a packet number never
+    /// sent is a protocol error, not a silent no-op. A duplicate ACK of an
+    /// already-acknowledged packet is legal and must be accepted.
+    #[test]
+    fn ack_of_unsent_packet_is_protocol_error() {
+        use std::collections::BTreeMap;
+        let mut sent: BTreeMap<u64, SentPacket> = BTreeMap::new();
+        sent.insert(
+            5,
+            SentPacket {
+                frames: Vec::new(),
+                pad_initial: false,
+                sent_at: Instant::now(),
+                retransmits: 0,
+                ack_eliciting: true,
+                size: 64,
+                pending_resend: false,
+            },
+        );
+        // largest_acked = 99, but the highest packet ever sent is 5.
+        let err = acknowledge(&mut sent, Some(5), 99, &[(0, 0)])
+            .expect_err("unsent ACK must be an error");
+        assert!(matches!(err.kind, ErrorKind::Protocol), "got {err:?}");
+        // A legitimate ACK (within the sent range) still succeeds.
+        assert!(acknowledge(&mut sent, Some(5), 5, &[(0, 0)]).is_ok());
+        // A duplicate ACK of an already-acknowledged packet (removed from
+        // `sent`) must NOT be treated as a protocol error.
+        sent.remove(&5);
+        assert!(acknowledge(&mut sent, Some(5), 5, &[(0, 0)]).is_ok());
+    }
+
     #[test]
     fn qpack_request_round_trip_is_bounded() {
         let req = Request::<Body>::new(Method::POST, "/upload")
             .header("content-type", "application/octet-stream");
         let wire = build_request_wire(req, "example.test:443", 16 * 1024, 1024).unwrap();
         assert!(wire.len() < 1024);
+    }
+
+    /// RFC 9114 §6.2.3: reserved (grease) stream types — and any unknown
+    /// unidirectional stream type — MUST be ignored, never rejected. The
+    /// `h3` crate opens a grease stream (type 0x21) on every connection.
+    #[test]
+    fn unknown_unidirectional_stream_type_is_ignored() {
+        let mut stream = ReceiveStream {
+            id: 14,                                  // 4th client-initiated unidirectional stream (grease)
+            frame_buf: vec![0x21, 0x01, 0x02, 0x03], // grease type + padding
+            ..Default::default()
+        };
+        let mut control_received = false;
+        let mut peer_goaway = None;
+        let mut peer_max_header_list = 0usize;
+        let limits = H3Limits {
+            max_header_list: 16 * 1024,
+            max_body: 16 * 1024 * 1024,
+        };
+        let consumed = process_unidirectional_stream(
+            &mut stream,
+            &mut control_received,
+            &mut peer_goaway,
+            &mut peer_max_header_list,
+            limits,
+        )
+        .unwrap();
+        assert!(
+            consumed,
+            "unknown uni stream must be consumed, not rejected"
+        );
+        assert!(
+            stream.frame_buf.is_empty(),
+            "ignored stream data must be drained"
+        );
+        assert!(!control_received, "grease stream must not act as control");
+        assert_eq!(stream.stream_type, Some(0x21));
+    }
+
+    /// RFC 9114 §6.2.3 requires ignoring unknown stream types even when
+    /// the stream ends without further data.
+    #[test]
+    fn unknown_unidirectional_stream_type_tolerates_eof() {
+        let mut stream = ReceiveStream {
+            id: 14,
+            frame_buf: vec![0x21],
+            completed: true,
+            ..Default::default()
+        };
+        stream.reassembly.final_size = Some(1);
+        let mut control_received = false;
+        let mut peer_goaway = None;
+        let mut peer_max_header_list = 0usize;
+        let limits = H3Limits {
+            max_header_list: 16 * 1024,
+            max_body: 16 * 1024 * 1024,
+        };
+        assert!(process_unidirectional_stream(
+            &mut stream,
+            &mut control_received,
+            &mut peer_goaway,
+            &mut peer_max_header_list,
+            limits,
+        )
+        .is_ok());
     }
 
     #[test]
@@ -4466,6 +5555,138 @@ mod tests {
         }
     }
 
+    /// Drive a raw `ClientConnection` until the queued request's reply
+    /// arrives. `send_socket` is where outbound datagrams go; `sockets`
+    /// are polled for inbound datagrams (the old path is kept drained so
+    /// packets sent before a migration commits are not misread as loss).
+    fn drive_raw_client(
+        send_socket: &std::net::UdpSocket,
+        sockets: &[&std::net::UdpSocket],
+        conn: &mut ClientConnection,
+        reply: &std::sync::mpsc::Receiver<Result<Response<Body>>>,
+    ) -> Result<Response<Body>> {
+        let mut datagram = [0u8; MAX_DATAGRAM];
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let _ = conn.on_tick(send_socket);
+            if let Ok(res) = reply.try_recv() {
+                return res;
+            }
+            if Instant::now() > deadline {
+                return Err(protocol("test driver deadline exceeded"));
+            }
+            let mut received = false;
+            for socket in sockets {
+                loop {
+                    match socket.recv_from(&mut datagram) {
+                        Ok((n, source)) => {
+                            if n > 0 {
+                                received = true;
+                                conn.on_datagram(socket, source, &mut datagram[..n])?;
+                            }
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock
+                                    | std::io::ErrorKind::TimedOut
+                                    | std::io::ErrorKind::ConnectionReset
+                            ) =>
+                        {
+                            break;
+                        }
+                        Err(error) => return Err(io_error(error.to_string())),
+                    }
+                }
+            }
+            if !received {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+
+    /// RFC 9000 §9: a NAT rebinding changes the client's source address
+    /// while the connection state (CIDs, TLS, stream state) stays put. The
+    /// server must validate the new path and keep serving the connection
+    /// instead of dropping the packets from the new address.
+    #[test]
+    fn loopback_http3_survives_client_nat_rebinding() {
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = tcp.local_addr().unwrap();
+        drop(tcp);
+        let identity = crate::courierust_tls::testdata::server_identity();
+        let tls = TlsSettings {
+            identity,
+            alpn: vec![b"h3".to_vec()],
+        };
+        let handler: Arc<dyn Handler> = Arc::new(|request: Request<Body>| {
+            let path = request.uri.as_str().to_string();
+            Response::<Body>::with_status(StatusCode::OK).with_body(Body::from(path))
+        });
+        let config = ServerConfig {
+            http3: true,
+            tls: Some(tls.clone()),
+            max_body: 1024 * 1024,
+            ..ServerConfig::default()
+        };
+        let _server = spawn_server(addr, &tls, handler, config).unwrap();
+
+        let options = ClientRequestOptions {
+            roots: crate::courierust_tls::testdata::root_store(),
+            verify: true,
+            now: crate::courierust_tls::testdata::NOW,
+            max_header_list: 16 * 1024,
+            max_body: 1024 * 1024,
+            timeout: Some(Duration::from_secs(8)),
+            stats: None,
+        };
+        let (socket1, mut conn) = build_client_connection(
+            addr,
+            "localhost",
+            &format!("localhost:{}", addr.port()),
+            &options,
+        )
+        .unwrap();
+        socket1.set_nonblocking(true).unwrap();
+
+        // First request from the original source address.
+        let (tx, rx) = std::sync::mpsc::channel();
+        conn.queue_request(
+            Request::<Body>::new(Method::GET, "/one"),
+            tx,
+            Instant::now() + Duration::from_secs(8),
+        );
+        let response = drive_raw_client(&socket1, &[&socket1], &mut conn, &rx).unwrap();
+        assert_eq!(response.body.as_bytes(), Some(&b"/one"[..]));
+
+        // NAT rebinding: the same connection now sends from a new source
+        // port. The server validates the path; the request must still
+        // complete.
+        let socket2 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket2.set_nonblocking(true).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        conn.queue_request(
+            Request::<Body>::new(Method::GET, "/two"),
+            tx,
+            Instant::now() + Duration::from_secs(8),
+        );
+        let response = drive_raw_client(&socket2, &[&socket1, &socket2], &mut conn, &rx).unwrap();
+        assert_eq!(response.body.as_bytes(), Some(&b"/two"[..]));
+
+        // The migration must have committed: a request driven only on the
+        // new socket is served directly (no old-path fallback). If the
+        // server had kept `peer` on the old address, this response would
+        // be lost and the test would time out.
+        let (tx, rx) = std::sync::mpsc::channel();
+        conn.queue_request(
+            Request::<Body>::new(Method::GET, "/three"),
+            tx,
+            Instant::now() + Duration::from_secs(8),
+        );
+        let response = drive_raw_client(&socket2, &[&socket2], &mut conn, &rx).unwrap();
+        assert_eq!(response.body.as_bytes(), Some(&b"/three"[..]));
+    }
+
     #[test]
     fn loopback_http3_large_response_drains_congestion_queue() {
         let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -4589,6 +5810,53 @@ mod tests {
             "H3 pooled round trip: n={runs} total={:?} avg={}us median={median}us p99={p99}us",
             total,
             total.as_micros() / runs as u128
+        );
+    }
+
+    /// RFC 9114 §4.1: response trailers are a HEADERS frame after DATA.
+    /// Regression test for the server silently dropping `response.trailers`
+    /// (the client already decoded them; the server never sent them).
+    #[test]
+    fn loopback_http3_response_trailers_round_trip() {
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = tcp.local_addr().unwrap();
+        drop(tcp);
+        let identity = crate::courierust_tls::testdata::server_identity();
+        let tls = TlsSettings {
+            identity,
+            alpn: vec![b"h3".to_vec()],
+        };
+        let handler: Arc<dyn Handler> = Arc::new(|_request: Request<Body>| {
+            let mut trailers = HeaderMap::new();
+            trailers.append(
+                HeaderName::from_static("checksum"),
+                HeaderValue::from_static("sha256:abc123"),
+            );
+            let mut response =
+                Response::<Body>::with_status(StatusCode::OK).with_body(Body::from("trailered"));
+            response.trailers = Some(trailers);
+            response
+        });
+        let config = ServerConfig {
+            http3: true,
+            tls: Some(tls.clone()),
+            max_body: 1024 * 1024,
+            ..ServerConfig::default()
+        };
+        let _server = spawn_server(addr, &tls, handler, config).unwrap();
+
+        let client = h3_client(1024 * 1024, Duration::from_secs(5));
+        let response = client
+            .get(&format!("https://localhost:{}/trailers", addr.port()))
+            .unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body.as_bytes(), Some(&b"trailered"[..]));
+        let trailers = response
+            .trailers
+            .expect("response trailers must be delivered");
+        assert_eq!(
+            trailers.get("checksum").map(|v| v.as_bytes()),
+            Some(&b"sha256:abc123"[..])
         );
     }
 }

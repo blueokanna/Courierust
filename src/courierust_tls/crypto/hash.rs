@@ -462,8 +462,14 @@ impl Digest for Sha384 {
         let block_count = if self.buf_len < 112 { 1 } else { 2 };
         for i in 0..block_count {
             let mut b = [0u8; 128];
-            b[..self.buf_len].copy_from_slice(&self.buf[..self.buf_len]);
             if i == 0 {
+                // First padding block: the buffered message tail followed
+                // by the 0x80 marker. The remaining (length) block(s) must
+                // start from an all-zero buffer — re-copying the message
+                // here would corrupt every digest whose message length
+                // leaves 112..=127 bytes in the final block (RFC 6234
+                // §7.4: pad1 = zeros after the 0x80).
+                b[..self.buf_len].copy_from_slice(&self.buf[..self.buf_len]);
                 b[self.buf_len] = 0x80;
             }
             if i == block_count - 1 {
@@ -573,5 +579,45 @@ mod tests {
             "9d0e1809716474cb086e834e310a4a1ced149e9c00f248527972cec5704c2a5b\
              07b8b3dc38ecc4ebae97ddd87f3d8985"
         );
+    }
+
+    /// Regression test: the two- and three-block SHA-384 padding paths
+    /// (message lengths whose final 128-byte block holds 112..=127 bytes)
+    /// must hash identically to an independent reference. The previous
+    /// implementation re-copied the buffered message into the length
+    /// block, corrupting every digest in this range — which silently
+    /// rejected valid P-384/P-521 certificate chains.
+    #[test]
+    fn sha384_multiblock_boundaries() {
+        // Deterministic 512-byte source: bytes 0..=255 repeated twice.
+        let mut source = [0u8; 512];
+        for (i, b) in source.iter_mut().enumerate() {
+            *b = (i % 256) as u8;
+        }
+        // (length, sha384 digest) from Python hashlib.
+        let vectors: &[(usize, &str)] = &[
+            (111, "f5f9fe110d809d34029de262a01b208356caec6e054c7f926b2591f6c9780579d4b59f5578c6f531a84f158a33660cef"),
+            (112, "33ba080ec0ccb378e4e95fed3b26c23aa1a280476e007519ee47f60cd9c5c8a65d627259a9aa2fd33ca06d3c14ee5548"),
+            (113, "f14fc73c4192759b70993dc35fbee193a60a98dbd1f8b2421afa253dec63015a0d6b75fb50f9f9a5f7fb8e7241540699"),
+            (126, "764eb963850537e57d0969c9914355c5aa67aa9722644569b7f50e20da8461cc9c6ca5958abe10f5469e4dc1ed27619f"),
+            (127, "d5fcfe2fcf6b3ef375ede37c8123d9b78065fecc1d55197e2f7721e6e9a93d0ba4d7fd15f9b96dea2744df24141ba2ef"),
+            (128, "ca2385773319124534111a36d0581fc3f00815e907034b90cff9c3a861e126a741d5dfcff65a417b6d7296863ac0ec17"),
+            (129, "ef49ae5b9ad51433d00323528d81ea8d2e4d2b507dbd9f1cb84f952b66249a788b1c89fcdb77a0db9f1feb901d47fc73"),
+            (240, "d64769ad58f5a338669b935f3431e5bef31667d0a2437bff78f1e5275075f434fff675f9833ea04ac4e5c2e2c2c99b8c"),
+            (241, "3264cad70d24b53cec95269b980dab85a30d24cf8bdbd68f0ff8a45c6208f05723a4b3270cd095fb8b2d9a4167fb3d3b"),
+            (254, "f663682ef7fa3f300dff0b4d9c0d2d126f2bbc164f3b88c8a2207c3799464ed2086cdd324c1e88daa6ef2d53cf7c190b"),
+            (255, "98d7ac796c4cfb5d98a1c323656a4be8afaaad168e5ee72b6b7a3fa3260461a043e27243120d41584b58f1ae4463121a"),
+            (256, "ffdaebff65ed05cf400f0221c4ccfb4b2104fb6a51f87e40be6c4309386bfdec2892e9179b34632331a59592737db5c5"),
+            (377, "ed273a51752d416e6662e10c579ff54d7e5e3541b59391814283b6c29f6bf3756503bc366f54be03b7b13693392504d5"),
+            (511, "7263a7745daacbecd55d2c7ac6a8f4a809bc55f96e0ca54b0e8cd391e8b2992d848d49444e52ae6ee43dc135fad249c6"),
+            (512, "4582fc82430e526886a1853411e60645fef7e8ea0c8546b7c9ba0c8416d9a98fb52ebd0c605fbb70749c4e3e5da3dbac"),
+        ];
+        for &(len, expected) in vectors {
+            assert_eq!(
+                hex(&Sha384::oneshot(&source[..len])),
+                expected,
+                "SHA-384 mismatch at message length {len}"
+            );
+        }
     }
 }
