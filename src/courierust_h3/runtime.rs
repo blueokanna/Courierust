@@ -644,6 +644,10 @@ fn run_client_driver(
                         if let Err(error) = conn.on_datagram(&socket, source, &mut datagram[..n]) {
                             return finish(conn, &socket, error);
                         }
+                        if conn.peer_closed {
+                            conn.fail_all(Error::canceled("HTTP/3 connection closed by peer"));
+                            return Ok(());
+                        }
                     }
                     Err(error)
                         if error.kind() == std::io::ErrorKind::WouldBlock
@@ -805,6 +809,13 @@ fn run_server(
         let now = Instant::now();
         let mut dead = Vec::new();
         for (connection_id, connection) in state.connections.iter_mut() {
+            if connection.peer_closed {
+                if std::env::var_os("COURIERUST_H3_DEBUG").is_some() {
+                    eprintln!("H3SERVER conn-closed: peer sent CONNECTION_CLOSE");
+                }
+                dead.push(connection_id.clone());
+                continue;
+            }
             if (!connection.handshake_complete && now >= connection.handshake_deadline)
                 || now.duration_since(connection.last_activity) >= connection.idle_timeout
             {
@@ -943,6 +954,18 @@ fn handle_server_datagram(
                 connection
                     .transport
                     .send_connection_close(socket, 0x1, None, &error.to_string());
+            connections.remove(&connection_id);
+            routes.retain(|_, target| target != &connection_id);
+            if let Some(stats) = config.stats.as_deref() {
+                Stats::decrement(&stats.connections_active, 1);
+                Stats::decrement(&stats.h3_connections_active, 1);
+            }
+        } else if connection.peer_closed {
+            // RFC 9000 §10.2: the client closed the connection — normal
+            // termination, removed without the conn-killed error path.
+            if std::env::var_os("COURIERUST_H3_DEBUG").is_some() {
+                eprintln!("H3SERVER conn-closed: peer sent CONNECTION_CLOSE");
+            }
             connections.remove(&connection_id);
             routes.retain(|_, target| target != &connection_id);
             if let Some(stats) = config.stats.as_deref() {
@@ -1155,6 +1178,9 @@ struct ClientConnection {
     peer_goaway: Option<u64>,
     /// True once GOAWAY has been sent on the control stream (RFC 9114 §7.2.8).
     goaway_sent: bool,
+    /// True once the peer sent CONNECTION_CLOSE (RFC 9000 §10.2): the
+    /// close is then normal termination, not a protocol error.
+    peer_closed: bool,
     qpack: QpackConnection,
     initial_crypto: CryptoReassembly,
     handshake_crypto: CryptoReassembly,
@@ -1195,6 +1221,7 @@ impl ClientConnection {
             control_received: false,
             peer_goaway: None,
             goaway_sent: false,
+            peer_closed: false,
             qpack: QpackConnection::new(QPACK_MAX_TABLE_CAPACITY, QPACK_BLOCKED_STREAMS),
             initial_crypto: CryptoReassembly::default(),
             handshake_crypto: CryptoReassembly::default(),
@@ -1395,7 +1422,12 @@ impl ClientConnection {
                         ack = true;
                     }
                     QFrame::ConnectionClose { .. } => {
-                        return Err(protocol("peer closed HTTP/3"));
+                        // RFC 9000 §10.2: a peer CONNECTION_CLOSE is normal
+                        // termination, not a protocol error. The driver fails
+                        // outstanding requests without answering with its own
+                        // CONNECTION_CLOSE.
+                        self.peer_closed = true;
+                        return Ok(());
                     }
                     _ => {}
                 }
@@ -1986,6 +2018,9 @@ struct ServerConnection {
     max_request_stream_id: u64,
     /// True once GOAWAY has been sent on the control stream (RFC 9114 §7.2.8).
     goaway_sent: bool,
+    /// True once the peer sent CONNECTION_CLOSE (RFC 9000 §10.2): the
+    /// close is then normal termination, not a protocol error.
+    peer_closed: bool,
     stats: Option<Arc<Stats>>,
     active_streams: BTreeSet<u64>,
 }
@@ -2009,23 +2044,13 @@ impl ServerConnection {
         let initial_dcid = meta.dcid.clone();
         let client_cid = meta.scid.clone();
         let mut local_tp = transport_parameters_for_limits(config.max_header_list, config.max_body);
-        // Advertise a deterministic stateless reset token for this CID
-        // (RFC 9000 §10.3) so the peer can recognize a reset after the
-        // connection state is gone.
         let reset_token = stateless_reset_token(reset_key, &local_cid);
         local_tp.stateless_reset_token = Some(reset_token);
-        // RFC 9000 §7.3 / §18.2: the server must echo the client's first
-        // Initial DCID (original_destination_connection_id, 0x00) and, when
-        // it sent a Retry, the Retry SCID (retry_source_connection_id,
-        // 0x10). quinn validates both and rejects the handshake otherwise.
         match original_dcid {
-            // A Retry was involved: the client's current DCID is the Retry
-            // SCID, and the original DCID is recovered from the token.
             Some(odcid) => {
                 local_tp.original_destination_connection_id = Some(odcid.to_vec());
                 local_tp.retry_source_connection_id = Some(meta.dcid.clone());
             }
-            // No Retry: the client's current DCID is its original one.
             None => {
                 local_tp.original_destination_connection_id = Some(meta.dcid.clone());
             }
@@ -2065,6 +2090,7 @@ impl ServerConnection {
             peer_goaway: None,
             max_request_stream_id: 0,
             goaway_sent: false,
+            peer_closed: false,
             stats: config.stats.clone(),
             active_streams: BTreeSet::new(),
         };
@@ -2099,9 +2125,6 @@ impl ServerConnection {
                 return Err(protocol("QUIC packet decoder made no progress"));
             }
             consumed += packet_len;
-            // Path validation (RFC 9000 §9.3): answer the peer's
-            // PATH_CHALLENGE on the path it arrived on, and commit a
-            // migration when a PATH_RESPONSE echoes our probe token.
             for frame in &frames {
                 match frame {
                     QFrame::PathChallenge(token) => {
@@ -2113,9 +2136,6 @@ impl ServerConnection {
                     _ => {}
                 }
             }
-            // An authenticated packet from a brand-new source address is a
-            // migration attempt or a NAT rebinding: validate the path
-            // before switching traffic to it.
             if source != self.transport.peer.unwrap_or(source)
                 && self.transport.pending_peer != Some(source)
             {
@@ -2217,7 +2237,8 @@ impl ServerConnection {
                         ack = true;
                     }
                     QFrame::ConnectionClose { .. } => {
-                        return Err(protocol("peer closed HTTP/3"));
+                        self.peer_closed = true;
+                        return Ok(());
                     }
                     _ => {}
                 }
@@ -2431,10 +2452,6 @@ impl ServerConnection {
             (unblocked, remove_stream)
         };
         self.unblock_streams(unblocked)?;
-        // Release the receive-side state once the request is fully
-        // consumed so the stream cap counts concurrent streams, not the
-        // cumulative request count (which previously tore the connection
-        // down after MAX_H3_STREAMS requests).
         if remove_stream {
             self.streams.remove(&id);
             self.note_completed_stream(id);
@@ -3456,11 +3473,6 @@ fn build_response_wire(
     if !body.is_empty() {
         wire.extend_from_slice(&h3frame::Frame::Data(body).to_bytes());
     }
-    // HTTP/3 trailers (RFC 9114 §4.1): a HEADERS frame after the DATA
-    // frames; the stream is END_STREAM after this frame. Symmetric with
-    // the client's `drain_response_frames`, which decodes a second
-    // HEADERS block as trailers. Pseudo-headers and the connection
-    // hop-by-hop fields are forbidden in trailers (RFC 9114 §4.3).
     if let Some(trailers) = response.trailers {
         let mut tfields = Vec::new();
         for (name, value) in trailers.iter() {
@@ -4335,10 +4347,6 @@ impl QuicTransport {
                 .saturating_add(increment)
                 .min(16 * 1024 * 1024);
         }
-        // RFC 9002 §6.1.1: acknowledging a packet is the trigger for
-        // time-threshold loss detection — any earlier ack-eliciting
-        // packet older than the threshold is declared lost promptly
-        // rather than waiting for the next tick.
         let _ = self.detect_lost_packets(level, Instant::now());
     }
 

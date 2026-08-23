@@ -315,11 +315,14 @@ fn bench_https(requests: usize, payload: Payload, server_threads: usize) {
 /// Emit the TLS verification evidence behind an HTTPS row: certificate
 /// and hostname validation both passed (otherwise the handshake would
 /// have failed), and the negotiated ALPN + cipher suite are reported as
-/// observed on the wire. `session_resumption` is `n/a` because the stack
-/// does not implement PSK/0-RTT/session tickets yet — reported, never
+/// observed on the wire. `session_resumption` is `n/a` because this
+/// single-handshake check does not measure resumption (the stack does
+/// implement TLS 1.3 session tickets) — reported as not measured, never
 /// assumed.
 fn tls_verify_evidence(address: std::net::SocketAddr, roots: crate_tls::RootStore) {
-    use courierust::courierust_tls::{ClientConfig as TlsClientConfig, TlsConnector};
+    use courierust::courierust_tls::{
+        ClientConfig as TlsClientConfig, TlsConnector, TlsVersion,
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -342,6 +345,8 @@ fn tls_verify_evidence(address: std::net::SocketAddr, roots: crate_tls::RootStor
         verify: true,
         alpn: vec![b"h2".to_vec()],
         now,
+        min_version: TlsVersion::Tls12,
+        max_version: TlsVersion::Tls13,
     });
     match connector.connect("127.0.0.1", &stream, &stream) {
         Ok(tls) => {
