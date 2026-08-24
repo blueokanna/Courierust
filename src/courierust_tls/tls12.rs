@@ -62,10 +62,13 @@ const EXT_SUPPORTED_GROUPS: u16 = 0x000a;
 const EXT_SIGNATURE_ALGORITHMS: u16 = 0x000d;
 const EXT_ALPN: u16 = 0x0010;
 const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
+/// Secure renegotiation indicator (RFC 5746 §3.2): empty for a fresh
+/// handshake; TLS 1.2 peers require it.
+const EXT_RENEGOTIATION_INFO: u16 = 0xff01;
 
 /// TLS 1.2 signature algorithms offered in `signature_algorithms`
 /// (RFC 5246 §7.4.1.4.1 / RFC 8422): sha256+rsa, sha384+rsa,
-/// sha256+ecdsa, sha384+ecdsa.
+/// sha256+ecdsa, sha384+ecdsa, ed25519.
 pub(crate) const TLS12_SIGNATURE_ALGORITHMS: &[u16] = &[
     0x0401, // rsa_pkcs1_sha256
     0x0501, // rsa_pkcs1_sha384
@@ -73,6 +76,7 @@ pub(crate) const TLS12_SIGNATURE_ALGORITHMS: &[u16] = &[
     0x0403, // ecdsa_secp256r1_sha256
     0x0503, // ecdsa_secp384r1_sha384
     0x0603, // ecdsa_secp521r1_sha512
+    0x0807, // ed25519 (RFC 8422 §4.3; the server SKE uses sig_alg 7)
 ];
 
 /// The maximum size of a TLS 1.2 record payload (2^14).
@@ -367,7 +371,10 @@ pub(crate) fn seal_record(
     aad.extend_from_slice(&seq.to_be_bytes());
     aad.push(content_type);
     aad.extend_from_slice(&VERSION_12);
-    aad.extend_from_slice(&(record_len as u16).to_be_bytes());
+    // RFC 5246 §6.2.3.3: additional_data = seq || type || version ||
+    // TLSCompressed.length, where TLSCompressed.length is the *plaintext*
+    // length — the explicit nonce and AEAD tag are NOT included.
+    aad.extend_from_slice(&(plaintext.len() as u16).to_be_bytes());
 
     let key = &keys.key[..suite.key_len()];
     let encrypted = suite
@@ -414,7 +421,11 @@ pub(crate) fn open_record(
     aad.extend_from_slice(&seq.to_be_bytes());
     aad.push(content_type);
     aad.extend_from_slice(&header[1..3]);
-    aad.extend_from_slice(&header[3..5]);
+    // Same AAD rule as seal: length is the plaintext length, i.e. the
+    // wire record length minus the 8-byte explicit nonce and 16-byte tag.
+    let wire_len = ((header[3] as usize) << 8) | header[4] as usize;
+    let plaintext_len = wire_len.saturating_sub(8 + 16);
+    aad.extend_from_slice(&(plaintext_len as u16).to_be_bytes());
 
     let key = &keys.key[..suite.key_len()];
     let plaintext = suite
@@ -484,6 +495,9 @@ pub(crate) struct ClientHello12 {
     /// Whether the client offered TLS 1.3 (supported_versions with
     /// 0x0304); drives the server's downgrade sentinel.
     pub(crate) offered_tls13: bool,
+    /// Whether the client offered the RFC 5746 `renegotiation_info`
+    /// extension. The server MUST echo it only if offered (§3.2).
+    pub(crate) offered_renegotiation: bool,
 }
 
 /// Parse a TLS 1.2-or-1.3 ClientHello. `signature_algorithms` is
@@ -529,6 +543,7 @@ pub(crate) fn parse_client_hello12(body: &[u8]) -> TlsResult<ClientHello12> {
     let mut server_name = None;
     let mut alpn = Vec::new();
     let mut offered_tls13 = false;
+    let mut offered_renegotiation = false;
     if !c.done() {
         let ext_total =
             c.u16()
@@ -645,6 +660,11 @@ pub(crate) fn parse_client_hello12(body: &[u8]) -> TlsResult<ClientHello12> {
                         }
                     }
                 }
+                EXT_RENEGOTIATION_INFO => {
+                    // RFC 5746 §3.2: a fresh handshake carries an empty
+                    // `renegotiated_connection`; just note the offer.
+                    offered_renegotiation = true;
+                }
                 _ => {}
             }
         }
@@ -658,6 +678,7 @@ pub(crate) fn parse_client_hello12(body: &[u8]) -> TlsResult<ClientHello12> {
         server_name,
         alpn,
         offered_tls13,
+        offered_renegotiation,
     })
 }
 
@@ -666,12 +687,16 @@ pub(crate) fn parse_client_hello12(body: &[u8]) -> TlsResult<ClientHello12> {
 /// overwritten with the RFC 8446 §4.1.3 sentinel (server negotiating
 /// TLS 1.2 with a TLS 1.3-capable client). `alpn` carries the negotiated
 /// protocol in an ALPN extension (RFC 7301), when one was selected.
+/// `renegotiation` echoes the RFC 5746 secure-renegotiation indicator
+/// (empty for a fresh handshake) — the server MUST include it only when
+/// the client offered it (§3.2).
 pub(crate) fn build_server_hello12(
     mut random: [u8; 32],
     session_id: &[u8],
     suite: Tls12Suite,
     downgrade_sentinel: bool,
     alpn: Option<&[u8]>,
+    renegotiation: bool,
 ) -> Vec<u8> {
     if downgrade_sentinel {
         random[24..].copy_from_slice(&DOWNGRADE_SENTINEL_12);
@@ -683,6 +708,16 @@ pub(crate) fn build_server_hello12(
     body.extend_from_slice(session_id);
     body.extend_from_slice(&suite.wire().to_be_bytes());
     body.push(0); // compression null
+    let mut ext_bytes = Vec::new();
+    // RFC 5746 §3.2: secure renegotiation indicator. TLS 1.2 clients
+    // (OpenSSL s_client) refuse to proceed without it when they offered
+    // it ("unsafe legacy renegotiation disabled"); a fresh handshake's
+    // `renegotiated_connection` is an empty vector, so the extension_data
+    // is a single 0x00 length byte (`ff 01 00 01 00`).
+    if renegotiation {
+        ext_bytes.extend_from_slice(&EXT_RENEGOTIATION_INFO.to_be_bytes());
+        ext_bytes.extend_from_slice(&[0x00, 0x01, 0x00]);
+    }
     if let Some(proto) = alpn {
         let mut proto_list = Vec::new();
         proto_list.push(proto.len() as u8);
@@ -690,13 +725,12 @@ pub(crate) fn build_server_hello12(
         let mut alpn_body = Vec::new();
         alpn_body.extend_from_slice(&(proto_list.len() as u16).to_be_bytes());
         alpn_body.extend_from_slice(&proto_list);
-        let mut ext_bytes = Vec::new();
         ext_bytes.extend_from_slice(&EXT_ALPN.to_be_bytes());
         ext_bytes.extend_from_slice(&(alpn_body.len() as u16).to_be_bytes());
         ext_bytes.extend_from_slice(&alpn_body);
-        body.extend_from_slice(&(ext_bytes.len() as u16).to_be_bytes());
-        body.extend_from_slice(&ext_bytes);
     }
+    body.extend_from_slice(&(ext_bytes.len() as u16).to_be_bytes());
+    body.extend_from_slice(&ext_bytes);
     encode_hs(2, &body) // server_hello
 }
 
@@ -1077,6 +1111,27 @@ fn verify_server_key_exchange(
                 "ServerKeyExchange ECDSA signature invalid".into(),
             ))
         }
+    } else if ske.sig_alg == 7 && spki.oid == super::x509::der::OID_ED25519 {
+        // RFC 8422: sig_alg 7 = Ed25519 (the two-byte scheme is 0x0807,
+        // parsed here as hash_alg=0x08, sig_alg=0x07). The signature is
+        // over the raw SKE params (RFC 8032; no separate digest).
+        if spki.key.len() != 32 {
+            return Err(TlsError::Certificate("bad Ed25519 SPKI".into()));
+        }
+        if ske.signature.len() != 64 {
+            return Err(TlsError::Certificate("bad Ed25519 signature length".into()));
+        }
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(&spki.key);
+        let mut sig = [0u8; 64];
+        sig.copy_from_slice(&ske.signature);
+        if super::crypto::ed25519::verify(&pk, &to_sign, &sig) {
+            Ok(())
+        } else {
+            Err(TlsError::Certificate(
+                "ServerKeyExchange Ed25519 signature invalid".into(),
+            ))
+        }
     } else {
         Err(TlsError::Certificate(
             "ServerKeyExchange signature algorithm mismatch".into(),
@@ -1112,9 +1167,10 @@ pub(crate) fn client_handshake<R: crate::courierust_io::Read, W: crate::courieru
         return Err(TlsError::Protocol("expected ServerHello".into()));
     }
     let sh = parse_server_hello12(&sh_body)?;
-    if !sh.session_id.is_empty() {
-        return Err(TlsError::Protocol("ServerHello session id mismatch".into()));
-    }
+    // RFC 5246 §7.4.1.2: when the client offered an empty session id
+    // (no resumption), the server MAY issue a fresh session id for its
+    // own cache. Accept whatever it sends; we never resume via TLS 1.2
+    // session ids, so the value is carried but unused.
     if offered_tls13 && !sh.random[24..].starts_with(&DOWNGRADE_SENTINEL_12) {
         return Err(TlsError::Protocol(
             "TLS 1.2 ServerHello missing downgrade sentinel".into(),
@@ -1182,8 +1238,8 @@ pub(crate) fn client_handshake<R: crate::courierust_io::Read, W: crate::courieru
     let verify_data = finished_verify_data(suite.hash(), &master, b"client finished", &fin_hash);
     let fin_msg = encode_hs(20, &verify_data);
 
-    io.write_plaintext_record(22, &cke)?;
-    io.write_plaintext_record(CONTENT_CHANGE_CIPHER_SPEC, &[1])?;
+    io.write_plaintext_record_v(VERSION_12, 22, &cke)?;
+    io.write_plaintext_record_v(VERSION_12, CONTENT_CHANGE_CIPHER_SPEC, &[1])?;
     io.write_tls12_record(suite, &client_keys, 22, &fin_msg)?;
 
     let (ct, payload) = io.read_plaintext_record()?;
@@ -1230,10 +1286,11 @@ pub(crate) fn client_handshake<R: crate::courierust_io::Read, W: crate::courieru
     })
 }
 
-/// Parsed TLS 1.2 ServerHello essentials.
+/// Parsed TLS 1.2 ServerHello essentials. The session id is consumed but
+/// not retained — we never resume via TLS 1.2 session ids, and RFC 5246
+/// allows the server to issue a fresh one even when the client sent none.
 struct ServerHello12 {
     random: [u8; 32],
-    session_id: Vec<u8>,
     suite_wire: u16,
     alpn: Option<Vec<u8>>,
 }
@@ -1253,10 +1310,9 @@ fn parse_server_hello12(body: &[u8]) -> TlsResult<ServerHello12> {
     if sid_len > 32 {
         return Err(TlsError::Protocol("bad SH session id".into()));
     }
-    let session_id = c
+    let _ = c
         .take(sid_len)
-        .ok_or_else(|| TlsError::Protocol("bad SH".into()))?
-        .to_vec();
+        .ok_or_else(|| TlsError::Protocol("bad SH".into()))?;
     let suite_wire = c.u16().ok_or_else(|| TlsError::Protocol("bad SH".into()))?;
     let comp = c.u8().ok_or_else(|| TlsError::Protocol("bad SH".into()))?;
     if comp != 0 {
@@ -1313,7 +1369,6 @@ fn parse_server_hello12(body: &[u8]) -> TlsResult<ServerHello12> {
     }
     Ok(ServerHello12 {
         random,
-        session_id,
         suite_wire,
         alpn,
     })
@@ -1395,7 +1450,10 @@ pub(crate) fn server_handshake<R: crate::courierust_io::Read, W: crate::courieru
                 (EcdheSig::Ecdsa, super::sign::IdentityKeyType::Ecdsa(Curve::P384)) => {
                     s.hash() == SuiteHash::Sha384
                 }
-                _ => false, // P-521 / Ed25519 have no TLS 1.2 ECDHE suite here
+                // RFC 8422 §4.3: an Ed25519 identity signs the SKE of an
+                // ECDHE-ECDSA suite (scheme 0x0807).
+                (EcdheSig::Ecdsa, super::sign::IdentityKeyType::Ed25519) => true,
+                _ => false,
             };
             family_ok && ch.offered_suites.contains(&s.wire())
         })
@@ -1412,7 +1470,9 @@ pub(crate) fn server_handshake<R: crate::courierust_io::Read, W: crate::courieru
         (EcdheSig::Rsa, _) => 0x0401,
         (EcdheSig::Ecdsa, super::sign::IdentityKeyType::Ecdsa(Curve::P256)) => 0x0403,
         (EcdheSig::Ecdsa, super::sign::IdentityKeyType::Ecdsa(Curve::P384)) => 0x0503,
-        _ => 0x0403, // unreachable: P-521/Ed25519 never select an ECDHE suite
+        // RFC 8422: Ed25519 signs the SKE with scheme 0x0807.
+        (EcdheSig::Ecdsa, super::sign::IdentityKeyType::Ed25519) => 0x0807,
+        _ => 0x0403, // unreachable: P-521 never selects an ECDHE suite
     };
     if !ch.signature_algorithms.contains(&required_sigalg) {
         return Err(TlsError::Protocol(
@@ -1440,6 +1500,7 @@ pub(crate) fn server_handshake<R: crate::courierust_io::Read, W: crate::courieru
         suite,
         ch.offered_tls13,
         negotiated_alpn.as_deref(),
+        ch.offered_renegotiation,
     );
 
     let mut transcript = Tls12Transcript::new(suite.hash());
@@ -1471,7 +1532,7 @@ pub(crate) fn server_handshake<R: crate::courierust_io::Read, W: crate::courieru
     flight.extend_from_slice(&cert_msg);
     flight.extend_from_slice(&ske);
     flight.extend_from_slice(&shd);
-    io.write_plaintext_record(22, &flight)?;
+    io.write_plaintext_record_v(VERSION_12, 22, &flight)?;
 
     let (_, cke_body) = io.read_plaintext_handshake()?;
     let cke = parse_client_key_exchange(&cke_body)?;
@@ -1513,7 +1574,7 @@ pub(crate) fn server_handshake<R: crate::courierust_io::Read, W: crate::courieru
     let verify_data =
         finished_verify_data(suite.hash(), &master, b"server finished", &server_fin_hash);
     let fin_msg = encode_hs(20, &verify_data);
-    io.write_plaintext_record(CONTENT_CHANGE_CIPHER_SPEC, &[1])?;
+    io.write_plaintext_record_v(VERSION_12, CONTENT_CHANGE_CIPHER_SPEC, &[1])?;
     io.write_tls12_record(suite, &server_keys, 22, &fin_msg)?;
 
     Ok(Tls12HandshakeResult {
@@ -1682,7 +1743,14 @@ mod tests {
     #[test]
     fn downgrade_sentinel_present_when_offering_13() {
         let random = [0u8; 32];
-        let sh = build_server_hello12(random, &[], Tls12Suite::EcdheRsaAes128GcmSha256, true, None);
+        let sh = build_server_hello12(
+            random,
+            &[],
+            Tls12Suite::EcdheRsaAes128GcmSha256,
+            true,
+            None,
+            true,
+        );
         let body = &sh[4..];
         let mut c = Cur::new(body);
         c.take(2).unwrap();
@@ -1695,11 +1763,111 @@ mod tests {
             Tls12Suite::EcdheRsaAes128GcmSha256,
             false,
             None,
+            true,
         );
         let body2 = &sh2[4..];
         let mut c2 = Cur::new(body2);
         c2.take(2).unwrap();
         let r2: &[u8] = c2.take(32).unwrap();
         assert!(!r2[24..].starts_with(&DOWNGRADE_SENTINEL_12));
+    }
+
+    #[test]
+    fn renegotiation_info_echoed_only_when_offered() {
+        // A ServerHello built with renegotiation=true must carry the
+        // RFC 5746 extension: `ff 01 00 01 00` (type, length 1, a single
+        // 0x00 length byte for the empty renegotiated_connection).
+        let random = [0u8; 32];
+        let sh = build_server_hello12(
+            random,
+            &[],
+            Tls12Suite::EcdheRsaAes128GcmSha256,
+            false,
+            None,
+            true,
+        );
+        let body = &sh[4..];
+        let mut c = Cur::new(body);
+        c.take(2).unwrap(); // version
+        c.take(32).unwrap(); // random
+        let sid_len = c.u8().unwrap() as usize;
+        c.take(sid_len).unwrap();
+        c.take(2).unwrap(); // suite
+        c.take(1).unwrap(); // compression
+        let ext_total = c.u16().unwrap() as usize;
+        let ext_bytes = c.take(ext_total).unwrap();
+        let mut e = Cur::new(ext_bytes);
+        let mut found = false;
+        while !e.done() {
+            let t = e.u16().unwrap();
+            let len = e.u16().unwrap() as usize;
+            let content = e.take(len).unwrap();
+            if t == EXT_RENEGOTIATION_INFO {
+                found = true;
+                assert_eq!(
+                    content,
+                    &[0x00],
+                    "fresh-handshake body must be a single 0x00 length byte"
+                );
+            }
+        }
+        assert!(found, "renegotiation_info must be echoed when offered");
+
+        // ...and omitted when the client did not offer it (RFC 5746 §3.2).
+        let sh2 = build_server_hello12(
+            random,
+            &[],
+            Tls12Suite::EcdheRsaAes128GcmSha256,
+            false,
+            None,
+            false,
+        );
+        let body2 = &sh2[4..];
+        let mut c2 = Cur::new(body2);
+        c2.take(2).unwrap();
+        c2.take(32).unwrap();
+        let sid_len2 = c2.u8().unwrap() as usize;
+        c2.take(sid_len2).unwrap();
+        c2.take(2).unwrap();
+        c2.take(1).unwrap();
+        let ext_total2 = c2.u16().unwrap() as usize;
+        let ext_bytes2 = c2.take(ext_total2).unwrap();
+        let mut e2 = Cur::new(ext_bytes2);
+        while !e2.done() {
+            let t = e2.u16().unwrap();
+            let len = e2.u16().unwrap() as usize;
+            let _ = e2.take(len).unwrap();
+            assert_ne!(t, EXT_RENEGOTIATION_INFO, "must not echo when not offered");
+        }
+    }
+
+    #[test]
+    fn parse_client_hello_detects_renegotiation_offer() {
+        // Build a minimal ClientHello offering renegotiation_info and
+        // confirm parse_client_hello12 records it.
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]); // legacy_version
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(0); // session id
+        body.extend_from_slice(&[0x00, 0x02, 0xc0, 0x2f]); // one suite
+        body.extend_from_slice(&[1, 0]); // compression
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&EXT_RENEGOTIATION_INFO.to_be_bytes());
+        ext.extend_from_slice(&[0x00, 0x01, 0x00]); // len 1, empty vector
+        body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        body.extend_from_slice(&ext);
+        let ch = parse_client_hello12(&body).expect("parse");
+        assert!(ch.offered_renegotiation);
+
+        // Without the extension the flag must stay false.
+        let mut body2 = Vec::new();
+        body2.extend_from_slice(&[0x03, 0x03]);
+        body2.extend_from_slice(&[0u8; 32]);
+        body2.push(0);
+        body2.extend_from_slice(&[0x00, 0x02, 0xc0, 0x2f]);
+        body2.extend_from_slice(&[1, 0]);
+        body2.extend_from_slice(&[0x00, 0x00]); // no extensions
+        let ch2 = parse_client_hello12(&body2).expect("parse");
+        assert!(!ch2.offered_renegotiation);
     }
 }

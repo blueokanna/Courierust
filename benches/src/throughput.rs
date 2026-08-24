@@ -283,6 +283,7 @@ fn bench_https(requests: usize, payload: Payload, server_threads: usize) {
             verify: true,
             alpn: vec![b"h2".to_vec()],
             now,
+            ..Default::default()
         }),
         ..Default::default()
     });

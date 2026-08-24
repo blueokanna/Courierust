@@ -24,7 +24,7 @@ use std::time::Duration;
 /// Client-side TLS settings for `https://` URLs.
 ///
 /// When `None`, `https://` URLs are rejected with a clear error. Set
-/// [`ClientConfig::tls`] to enable TLS 1.3 on the client.
+/// [`ClientConfig::tls`] to enable TLS on the client.
 #[derive(Debug, Clone)]
 pub struct TlsSettings {
     /// Trust anchors for server certificate validation.
@@ -35,6 +35,10 @@ pub struct TlsSettings {
     pub alpn: Vec<Vec<u8>>,
     /// The current time (Unix seconds) used for validity checks.
     pub now: i64,
+    /// Lowest TLS version the client will offer/negotiate.
+    pub min_version: crate::courierust_tls::TlsVersion,
+    /// Highest TLS version the client will offer/negotiate.
+    pub max_version: crate::courierust_tls::TlsVersion,
 }
 
 impl Default for TlsSettings {
@@ -46,6 +50,8 @@ impl Default for TlsSettings {
             // (false): speak HTTP/1.1 over TLS unless told otherwise.
             alpn: vec![b"http/1.1".to_vec()],
             now: unix_now(),
+            min_version: crate::courierust_tls::TlsVersion::Tls12,
+            max_version: crate::courierust_tls::TlsVersion::Tls13,
         }
     }
 }
@@ -218,6 +224,7 @@ impl Client {
                 verify: true,
                 alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
                 now: unix_now(),
+                ..Default::default()
             }),
             ..Default::default()
         })
@@ -315,10 +322,6 @@ impl Client {
                     _ => orig_method,
                 };
                 let mut new_req = Request::new(method, next.path_and_query.clone());
-                // Never forward credentials to a different origin: a
-                // malicious server could otherwise redirect a request and
-                // harvest `Authorization` / `Cookie` (RFC 9110 §15.4
-                // credential-leakage guidance).
                 let mut headers = orig_headers;
                 if next.authority() != url.authority() {
                     for name in ["authorization", "proxy-authorization", "cookie"] {
@@ -339,12 +342,6 @@ impl Client {
         req: Request<Body>,
         priority: Priority,
     ) -> Result<Response<Body>> {
-        // The URL supplies scheme/host/port; the request path is used
-        // as-is when the caller set one (gRPC method paths, redirects,
-        // explicit `execute` calls). The convenience methods `get`/`post`
-        // construct requests with the default target `/`, so when the
-        // path is still the default we take it from the URL — otherwise
-        // `client.get("http://host/api/v1")` would silently request `/`.
         let req = if req.uri.as_str() == "/" && url.path_and_query.as_str() != "/" {
             let mut req = req;
             req.uri = url.path_and_query.clone();
@@ -367,8 +364,6 @@ impl Client {
         }
         if self.inner.config.http2 {
             if self.inner.config.h2c_upgrade && url.scheme == "http" {
-                // RFC 7540 §3.2 Upgrade-based h2c (falls back to HTTP/1.1
-                // when the server declines).
                 return self.execute_h2c_upgrade(url, &authority, addr, req);
             }
             let raw = self.execute_h2(url, &authority, addr, tls, req, priority)?;
@@ -396,7 +391,8 @@ impl Client {
                         verify: t.verify,
                         alpn: t.alpn.clone(),
                         now: t.now,
-                        ..Default::default()
+                        min_version: t.min_version,
+                        max_version: t.max_version,
                     },
                 ))),
                 None => Err(Error::protocol(
@@ -682,7 +678,6 @@ impl Client {
         addr: SocketAddr,
         req: Request<Body>,
     ) -> Result<Response<Body>> {
-        // 1. Reuse a pooled, already-upgraded connection when available.
         let pooled = {
             let mut pools = self.inner.h2_pool.lock().unwrap();
             pools.get_mut(authority).and_then(|list| {
@@ -716,7 +711,6 @@ impl Client {
                 });
         }
 
-        // 2. No usable connection: perform the Upgrade handshake.
         let stream = crate::courierust_net::connect(&addr, self.inner.config.connect_timeout)?;
         crate::courierust_net::configure(&stream, self.inner.config.read_timeout)?;
         let settings_b64 = h2::upgrade_settings_b64(&self.inner.config);
@@ -798,7 +792,6 @@ impl Client {
                 result
             }
             Err(std::sync::mpsc::SendError(cmd)) => {
-                // The driver is gone; open a fresh connection and retry.
                 conn.accepting.store(false, Ordering::Release);
                 conn.release();
                 let fresh = self.get_h2_conn(authority, addr, tls, hostname)?;
@@ -842,10 +835,6 @@ impl Client {
                 let mut pools = self.inner.h2_pool.lock().unwrap();
                 let mut pending = self.inner.pending_h2_opens.lock().unwrap();
                 let list = pools.entry(authority.to_string()).or_default();
-                // A driver that has received GOAWAY or lost its transport
-                // must not consume a pool slot. Dropping the pool's
-                // sender also lets the driver finish its cleanup once all
-                // request-owned clones are gone.
                 list.retain(|c| c.accepting.load(Ordering::Acquire));
                 let least_loaded = list
                     .iter()
@@ -853,11 +842,6 @@ impl Client {
                     .min_by_key(|c| c.reservations())
                     .cloned();
 
-                // Reserve a connection before releasing the pool lock.
-                // This makes concurrent callers visible to the next
-                // selector and allows the configured pool to grow under
-                // real contention without opening extra connections for
-                // ordinary sequential reuse.
                 if let Some(conn) = least_loaded {
                     if conn.reservations() == 0 || list.len() >= max_connections {
                         conn.reserve();
@@ -870,9 +854,6 @@ impl Client {
                     *pending.entry(authority.to_string()).or_default() += 1;
                     open = true;
                 } else if pending_count > 0 {
-                    // The last slot is being opened by another caller;
-                    // sleep until it lands (bounded, so a lost wake cannot
-                    // wedge the caller).
                     should_wait = true;
                 }
             }
@@ -887,8 +868,6 @@ impl Client {
                     drop(guard);
                     continue;
                 }
-                // At capacity with every connection busy: fall through to
-                // the least-loaded live connection below.
                 break;
             }
 
@@ -922,9 +901,6 @@ impl Client {
                 }
             }
         }
-
-        // Rare fallback after a long open race: block on the
-        // least-loaded live connection (its dispatch queue drains).
         let mut pools = self.inner.h2_pool.lock().unwrap();
         let list = pools.entry(authority.to_string()).or_default();
         let conn = list
@@ -947,15 +923,10 @@ impl Client {
         let stream = crate::courierust_net::connect(&addr, self.inner.config.connect_timeout)?;
         match tls {
             Some(c) => {
-                // Short timeout during the handshake so a stalled peer
-                // releases the caller (the driver applies its own short
-                // read timeout right after).
                 let _ =
                     crate::courierust_net::configure(&stream, self.inner.config.handshake_timeout);
                 let conn = crate::courierust_net::ConnStream::tls_client(stream, c, hostname)?;
-                // The peer's ALPN choice must agree with speaking
-                // HTTP/2: a server that negotiated `http/1.1` cannot be
-                // driven with the h2 codec (silent mismatch would hang).
+
                 match conn.alpn() {
                     Some(alpn) if alpn.as_slice() == b"h2" => {}
                     Some(alpn) => {
@@ -965,10 +936,6 @@ impl Client {
                         )));
                     }
                     None if !self.inner.config.tls.is_none() => {
-                        // RFC 9113 §3.3: HTTP/2 over TLS REQUIRES ALPN "h2".
-                        // If the server negotiated no ALPN at all (no
-                        // common protocol), proceeding would be a silent
-                        // protocol mismatch — fail instead of guessing.
                         return Err(Error::protocol(
                             "server did not negotiate any ALPN protocol; \
                              HTTP/2 over TLS requires ALPN h2",
@@ -1084,7 +1051,6 @@ fn resolve_addr(host: &str, port: u16) -> Result<SocketAddr> {
     let mut addrs = (host, port)
         .to_socket_addrs()
         .map_err(|e| Error::io(format!("resolve {host}: {e}")))?;
-    // Prefer IPv4 to dodge IPv6 happy-eyeballs complexity.
     let mut first_v4 = None;
     for a in addrs.by_ref() {
         if a.is_ipv4() {
@@ -1107,7 +1073,6 @@ fn resolve_redirect(base: &Url, location: &str) -> Result<Url> {
     if location.starts_with("http://") || location.starts_with("https://") {
         return Url::parse(location);
     }
-    // Relative or protocol-relative redirect (preserve the base scheme).
     let scheme = base.scheme.as_str();
     let mut s = format!("{scheme}://{}{}", base.authority(), location);
     if location.starts_with("//") {

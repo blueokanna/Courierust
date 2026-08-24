@@ -1748,11 +1748,11 @@ mod tests {
         let _ = server.join();
     }
 
-    /// An Ed25519-only identity cannot sign a TLS 1.2 ServerKeyExchange;
-    /// the server must report "no shared TLS 1.2 cipher suite" rather
-    /// than downgrading the record layer.
+    /// An Ed25519 identity negotiates TLS 1.2 via an ECDHE_ECDSA suite:
+    /// the server signs the ServerKeyExchange with Ed25519 (RFC 8422
+    /// §4.3, scheme 0x0807) and the client verifies it.
     #[test]
-    fn tls12_rejects_ed25519_identity() {
+    fn tls12_ed25519_identity_roundtrip() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -1760,27 +1760,44 @@ mod tests {
             let (stream, _) = listener.accept().unwrap();
             let acceptor = TlsAcceptor::new(ServerConfig {
                 identity: testdata::server_identity(), // Ed25519
-                alpn: Vec::new(),
+                alpn: vec![b"h2".to_vec()],
                 min_version: TlsVersion::Tls12,
                 max_version: TlsVersion::Tls12,
                 session_ticket_key: None,
             });
-            let result = acceptor.accept(&stream, &stream);
-            assert!(result.is_err(), "Ed25519 identity negotiated TLS 1.2");
+            let mut tls = acceptor.accept(&stream, &stream).unwrap();
+            assert_eq!(tls.version(), TlsVersion::Tls12);
+            let data = tls.read_record().unwrap();
+            assert_eq!(data, b"ping");
+            tls.write_all(b"pong").unwrap();
+            tls.close_notify().unwrap();
         });
 
         let stream = TcpStream::connect(addr).unwrap();
         let connector = TlsConnector::new(ClientConfig {
             roots: testdata::root_store(),
             verify: true,
-            alpn: Vec::new(),
+            alpn: vec![b"h2".to_vec()],
             now: testdata::NOW,
             min_version: TlsVersion::Tls12,
             max_version: TlsVersion::Tls12,
         });
-        let _ = connector.connect("localhost", &stream, &stream);
-        drop(stream);
-        let _ = server.join();
+        let mut tls = connector.connect("localhost", &stream, &stream).unwrap();
+        assert_eq!(tls.version(), TlsVersion::Tls12);
+        assert!(tls.peer_certificate().is_some());
+        // The suite must be an ECDHE_ECDSA AEAD suite (Ed25519 signs the
+        // SKE of the ECDSA family, RFC 8422 §4.3).
+        let suite = tls.cipher_suite();
+        assert!(
+            matches!(suite, 0xc02b | 0xc02c | 0xcca9),
+            "unexpected TLS 1.2 suite {suite:#06x}"
+        );
+        tls.write_all(b"ping").unwrap();
+        let data = tls.read_record().unwrap();
+        assert_eq!(data, b"pong");
+        tls.close_notify().unwrap();
+
+        server.join().unwrap();
     }
 
     /// Full session-resumption round trip (RFC 8446 §4.6.1): the first

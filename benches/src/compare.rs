@@ -731,6 +731,7 @@ fn run_courierust_h3_client(address: SocketAddr, payload: Payload, requests: usi
             verify: true,
             alpn: vec![b"h3".to_vec()],
             now: unix_now(),
+            ..Default::default()
         }),
         ..Default::default()
     });
@@ -794,8 +795,6 @@ fn run_quinn_h3_client(
             .map_err(|e| format!("h3 connect: {e:?}"))?;
         Ok::<_, String>((endpoint, h3_conn, send_request))
     })?;
-    // wait_idle drives the connection until it closes; Handle::spawn
-    // works off a runtime context, tokio::spawn would panic here.
     handle.spawn(async move {
         let _ = h3_conn.wait_idle().await;
     });

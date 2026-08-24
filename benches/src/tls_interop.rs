@@ -1,21 +1,34 @@
-//! Courierust side of the TLS interop matrix (driven by `scripts/tls_interop.sh`).
-//!
-//! Connects to `COURIERUST_TLS_URL`, validates the cert against
-//! `COURIERUST_TLS_ROOT`, reports the HTTP outcome. Body length is not
-//! asserted — external servers' responses are not ours to pin. The TLS
-//! version is forced by the peer (s_server / nginx) and proven by a
-//! successful request. The mirror direction (a Courierust TLS server
-//! validated by curl / openssl s_client) reuses the `network` server mode.
+//! TLS version window: `COURIERUST_TLS_MIN_VERSION` /
+//! `COURIERUST_TLS_MAX_VERSION` (e.g. `TLSv1.2`) pin the ClientHello. A
+//! TLS 1.2-only peer (OpenSSL `s_server -tls1_2`, nginx with
+//! `ssl_protocols TLSv1.2`) MUST NOT see a `supported_versions` extension
+//! advertising TLS 1.3 — OpenSSL rejects such a ClientHello outright.
+//! The mirror direction (a Courierust TLS server validated by curl /
+//! openssl s_client) reuses the `network` server mode.
 
 use courierust::courierust_client::{Client, ClientConfig, TlsSettings};
 use courierust::courierust_http::method::Method;
 use courierust::courierust_http::request::Request;
+use courierust::courierust_tls::TlsVersion;
+
+fn version_from_env(name: &str, fallback: TlsVersion) -> TlsVersion {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| match v.as_str() {
+            "TLSv1.2" | "TLSv1_2" | "1.2" => Some(TlsVersion::Tls12),
+            "TLSv1.3" | "TLSv1_3" | "1.3" => Some(TlsVersion::Tls13),
+            _ => None,
+        })
+        .unwrap_or(fallback)
+}
 
 fn main() {
     let url = std::env::var("COURIERUST_TLS_URL").expect("COURIERUST_TLS_URL required");
     let root_path = std::env::var("COURIERUST_TLS_ROOT").expect("COURIERUST_TLS_ROOT required");
     let proto = std::env::var("COURIERUST_TLS_PROTO").unwrap_or_else(|_| "h1".to_string());
     let http2 = proto == "h2";
+    let min_version = version_from_env("COURIERUST_TLS_MIN_VERSION", TlsVersion::Tls12);
+    let max_version = version_from_env("COURIERUST_TLS_MAX_VERSION", TlsVersion::Tls13);
 
     let mut roots = courierust::courierust_tls::RootStore::new();
     roots.add_der(
@@ -38,6 +51,8 @@ fn main() {
                 vec![b"http/1.1".to_vec()]
             },
             now,
+            min_version,
+            max_version,
         }),
         ..Default::default()
     });

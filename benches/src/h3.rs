@@ -95,6 +95,7 @@ fn main() {
             verify: true,
             alpn: vec![b"h3".to_vec()],
             now,
+            ..Default::default()
         }),
         ..Default::default()
     };

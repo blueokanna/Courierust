@@ -106,6 +106,15 @@ cp server.pem ca.pem
 client_vs_s_server() {
   local version="$1" flag="$2"
   local port=$((30000 + RANDOM % 20000))
+  # Pin the client's offered window to the forced server version: a TLS
+  # 1.2-only peer must not see a supported_versions extension advertising
+  # TLS 1.3 (OpenSSL rejects such a ClientHello with protocol_version).
+  if [[ "$version" == "TLSv1.2" ]]; then
+    export COURIERUST_TLS_MIN_VERSION="TLSv1.2"
+    export COURIERUST_TLS_MAX_VERSION="TLSv1.2"
+  else
+    unset COURIERUST_TLS_MIN_VERSION COURIERUST_TLS_MAX_VERSION 2>/dev/null || true
+  fi
   "$OPENSSL_BIN" s_server -accept "127.0.0.1:$port" -cert server.pem -key server.key \
     "$flag" -www -quiet > s_server.log 2>&1 &
   local pid=$!
@@ -139,11 +148,16 @@ curl_vs_server() {
   local version="$1" flag="$2" http2="$3"
   local proto="h1" extra=()
   [[ "$http2" == 1 ]] && { proto="h2"; extra+=(--http2); }
-  local http
+  # Report the *actually negotiated* TLS version (%{ssl_version}) — a
+  # forced --tlsv1.2 can still be answered with TLS 1.3 by a peer that
+  # refuses 1.2, and recording the requested value would fake the row.
+  local http actual
   http=$("$CURL_BIN" -sS --cacert ca.pem --max-time 15 "${extra[@]}" "$flag" \
-    -o curl_body.txt -w '%{http_code}' "https://127.0.0.1:$PORT_B/bench" 2>curl_err.txt || true)
+    -w '%{http_code} %{ssl_version}' -o curl_body.txt "https://127.0.0.1:$PORT_B/bench" 2>curl_err.txt || true)
+  actual="${http##* }"
+  http="${http%% *}"
   if [[ "$http" == "200" ]]; then
-    record "TLSINTEROP|role=server|peer=curl|tls=$version|protocol=$proto|status=ok|http=200"
+    record "TLSINTEROP|role=server|peer=curl|tls=$version|negotiated=$actual|protocol=$proto|status=ok|http=200"
   else
     echo "--- curl $proto error ---"
     cat curl_err.txt 2>/dev/null || true
@@ -203,6 +217,12 @@ if command -v "$NGINX_BIN" >/dev/null 2>&1; then
   client_vs_nginx() {
     local version="$1"
     local port=$((30000 + RANDOM % 20000))
+    if [[ "$version" == "TLSv1.2" ]]; then
+      export COURIERUST_TLS_MIN_VERSION="TLSv1.2"
+      export COURIERUST_TLS_MAX_VERSION="TLSv1.2"
+    else
+      unset COURIERUST_TLS_MIN_VERSION COURIERUST_TLS_MAX_VERSION 2>/dev/null || true
+    fi
     cat > nginx.conf <<EOF
 worker_processes 1;
 pid $WORK/nginx.pid;

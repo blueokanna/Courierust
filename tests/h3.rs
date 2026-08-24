@@ -67,6 +67,7 @@ fn h3_client(max_body: usize, read_timeout: Duration) -> Client {
             verify: true,
             alpn: vec![b"h3".to_vec()],
             now: common::NOW,
+            ..Default::default()
         }),
         ..Default::default()
     })
@@ -221,6 +222,7 @@ fn h3_rejects_untrusted_certificate() {
             verify: true,
             alpn: vec![b"h3".to_vec()],
             now: common::NOW,
+            ..Default::default()
         }),
         ..Default::default()
     });
@@ -278,6 +280,7 @@ fn h3_rejects_expired_certificate() {
             verify: true,
             alpn: vec![b"h3".to_vec()],
             now: common::NOW, // 2027: far outside the 2020..2021 window
+            ..Default::default()
         }),
         ..Default::default()
     });
@@ -333,6 +336,7 @@ fn h3_rejects_hostname_mismatch() {
             verify: true,
             alpn: vec![b"h3".to_vec()],
             now: common::NOW,
+            ..Default::default()
         }),
         ..Default::default()
     });

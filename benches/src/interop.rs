@@ -245,6 +245,7 @@ fn courierust_tls_client(
             verify,
             alpn,
             now: unix_now(),
+            ..Default::default()
         }),
         ..Default::default()
     })
@@ -826,6 +827,7 @@ fn courierust_h3_client() -> Client {
             verify: true,
             alpn: vec![b"h3".to_vec()],
             now: unix_now(),
+            ..Default::default()
         }),
         ..Default::default()
     })

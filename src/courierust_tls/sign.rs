@@ -122,7 +122,13 @@ pub(crate) fn sign_tls12_server_key_exchange(
                 None => Err(TlsError::Certificate("ECDSA signing failed".into())),
             }
         }
-        ParsedKey::Ed25519(_) => Ok(None),
+        ParsedKey::Ed25519(seed) => {
+            // RFC 8422 §4.3: Ed25519 signs the raw SKE params with scheme
+            // 0x0807 (no separate digest). The wire form is the two-byte
+            // scheme, parsed by the peer as hash_alg=0x08, sig_alg=0x07.
+            let sig = ed25519::sign(&seed, message);
+            Ok(Some((0x08, 0x07, sig.to_vec())))
+        }
     }
 }
 

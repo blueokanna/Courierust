@@ -6238,6 +6238,7 @@ mod tests {
                 verify: true,
                 alpn: vec![b"h3".to_vec()],
                 now: crate::courierust_tls::testdata::NOW,
+                ..Default::default()
             }),
             max_header_list: 16 * 1024,
             max_body,

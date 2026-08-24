@@ -62,6 +62,7 @@ fn main() -> courierust::Result<()> {
             verify: true,
             alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
             now,
+            ..Default::default()
         }),
         ..Default::default()
     };

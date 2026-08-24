@@ -852,6 +852,7 @@ fn https_client_config(http2: bool) -> ClientConfig {
                 vec![b"http/1.1".to_vec()]
             },
             now: common::NOW,
+            ..Default::default()
         }),
         ..Default::default()
     }
@@ -911,6 +912,7 @@ fn https_rejects_untrusted_server() {
             verify: true,
             alpn: vec![b"http/1.1".to_vec()],
             now: common::NOW,
+            ..Default::default()
         }),
         ..Default::default()
     };
@@ -979,6 +981,7 @@ fn https_client_enforces_alpn_agreement() {
             verify: true,
             alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
             now: common::NOW,
+            ..Default::default()
         }),
         ..Default::default()
     });
@@ -1005,6 +1008,7 @@ fn https_verify_disabled_accepts_self_signed() {
             verify: false,
             alpn: vec![b"http/1.1".to_vec()],
             now: common::NOW,
+            ..Default::default()
         }),
         ..Default::default()
     });
@@ -1132,6 +1136,7 @@ fn tls_rejects_expired_certificate() {
             verify: true,
             alpn: vec![b"http/1.1".to_vec()],
             now: common::NOW, // 2027-01-14: far outside 2020..2021
+            ..Default::default()
         }),
         ..Default::default()
     });
@@ -1172,6 +1177,7 @@ fn tls_rejects_untrusted_issuer_chain() {
             verify: true,
             alpn: vec![b"http/1.1".to_vec()],
             now: common::NOW,
+            ..Default::default()
         }),
         ..Default::default()
     });
@@ -1200,6 +1206,7 @@ fn tls_accepts_self_signed_when_explicitly_trusted() {
             verify: true,
             alpn: vec![b"http/1.1".to_vec()],
             now: common::NOW,
+            ..Default::default()
         }),
         ..Default::default()
     });

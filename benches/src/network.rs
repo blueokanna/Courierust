@@ -153,6 +153,7 @@ fn client() {
                 vec![b"http/1.1".to_vec()]
             },
             now: now_unix(),
+            ..Default::default()
         })
     } else {
         None

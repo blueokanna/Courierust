@@ -54,13 +54,11 @@ fn h3_automatic_bidirectional_key_update_keeps_connection_alive() {
             verify: true,
             alpn: vec![b"h3".to_vec()],
             now: common::NOW,
+            ..Default::default()
         }),
         ..Default::default()
     });
 
-    // A single pooled QUIC connection; enough requests that both the
-    // client and the server pass the (tiny) key-update threshold many
-    // times, in both directions.
     for i in 0..400 {
         let resp = client
             .get(&format!("https://{addr}/key-update-{i}"))

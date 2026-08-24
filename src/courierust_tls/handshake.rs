@@ -57,6 +57,10 @@ pub(crate) const EXT_COOKIE: u16 = 0x002c;
 const EXT_KEY_SHARE: u16 = 0x0033;
 /// QUIC transport parameters (RFC 9001 section 5.2).
 pub(crate) const EXT_QUIC_TRANSPORT_PARAMETERS: u16 = 0x0039;
+/// Secure renegotiation indicator (RFC 5746 §3.2): empty for a fresh
+/// handshake. TLS 1.2 servers require it to permit renegotiation; TLS
+/// 1.3 does not use it.
+const EXT_RENEGOTIATION_INFO: u16 = 0xff01;
 
 /// Named group for X25519.
 pub(crate) const GROUP_X25519: u16 = 0x001d;
@@ -319,11 +323,20 @@ pub(crate) fn build_client_hello_negotiated(
         exts.push((EXT_SERVER_NAME, server_name_ext));
     }
 
-    // supported_groups: X25519 + secp256r1.
+    // supported_groups: only curves the client can actually complete ECDHE
+    // with in the versions it offers. The TLS 1.3 key share uses X25519;
+    // TLS 1.2 ECDHE uses secp256r1. A TLS 1.2-only client MUST NOT
+    // advertise X25519 — a TLS 1.2 server would select it and the client
+    // has no TLS 1.2 X25519 key exchange (OpenSSL does exactly this).
     let mut groups = Vec::new();
-    groups.extend_from_slice(&[0x00, 0x04]); // list len 4
-    groups.extend_from_slice(&(0x001d_u16).to_be_bytes()); // X25519
-    groups.extend_from_slice(&super::tls12::GROUP_SECP256R1.to_be_bytes()); // secp256r1
+    if offer13 {
+        groups.extend_from_slice(&[0x00, 0x04]); // 2 curves
+        groups.extend_from_slice(&GROUP_X25519.to_be_bytes()); // X25519
+        groups.extend_from_slice(&super::tls12::GROUP_SECP256R1.to_be_bytes()); // secp256r1
+    } else {
+        groups.extend_from_slice(&[0x00, 0x02]); // 1 curve
+        groups.extend_from_slice(&super::tls12::GROUP_SECP256R1.to_be_bytes());
+    }
     exts.push((EXT_SUPPORTED_GROUPS, groups));
 
     // signature_algorithms: TLS 1.3 schemes + TLS 1.2 schemes.
@@ -339,6 +352,12 @@ pub(crate) fn build_client_hello_negotiated(
     // ec_point_formats (required by TLS 1.2 ECDHE): uncompressed only.
     if offer12 {
         exts.push((EXT_EC_POINT_FORMATS, vec![1, 0]));
+        // RFC 5746 §3.2 secure renegotiation indicator. A fresh
+        // handshake's `renegotiated_connection` is an empty vector, so
+        // the extension_data is a single 0x00 length byte. OpenSSL
+        // rejects a TLS 1.2 ClientHello without it ("unsafe legacy
+        // renegotiation disabled").
+        exts.push((EXT_RENEGOTIATION_INFO, vec![0x00]));
     }
 
     // supported_versions + key_share only when offering TLS 1.3.
