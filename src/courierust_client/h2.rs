@@ -90,9 +90,12 @@ impl H2Conn {
     }
 
     pub(crate) fn release(&self) {
+        // `fetch_update` (Rust 1.45) retries the CAS, so a release under
+        // contention is never dropped; `try_update` (Rust 1.95) is both
+        // above our MSRV and can return `Err`, leaking a reservation.
         let _ = self
             .reservations
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                 Some(value.saturating_sub(1))
             });
     }

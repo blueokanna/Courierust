@@ -294,16 +294,17 @@ pub fn decode_packed_varints(payload: &[u8]) -> Result<Vec<u64>> {
 /// caller must have validated that `payload.len()` is a multiple of 8;
 /// the chunk conversion below is therefore infallible.
 pub fn decode_packed_fixed64s(payload: &[u8]) -> Result<Vec<u64>> {
-    if !payload.len().is_multiple_of(8) {
+    // `% 8 != 0` is total (usize remainder never overflows; constant
+    // non-zero divisor cannot panic), and guarantees `chunks_exact(8)`
+    // below yields only full 8-byte chunks.
+    if payload.len() % 8 != 0 {
         return Err(Error::protocol(
             "protobuf packed fixed64 length not a multiple of 8",
         ));
     }
     Ok(payload
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .map(|c| u64::from_le_bytes(*c))
+        .chunks_exact(8)
+        .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
         .collect())
 }
 
@@ -311,16 +312,17 @@ pub fn decode_packed_fixed64s(payload: &[u8]) -> Result<Vec<u64>> {
 /// caller must have validated that `payload.len()` is a multiple of 4;
 /// the chunk conversion below is therefore infallible.
 pub fn decode_packed_fixed32s(payload: &[u8]) -> Result<Vec<u32>> {
-    if !payload.len().is_multiple_of(4) {
+    // `% 4 != 0` is total (usize remainder never overflows; constant
+    // non-zero divisor cannot panic), and guarantees `chunks_exact(4)`
+    // below yields only full 4-byte chunks.
+    if payload.len() % 4 != 0 {
         return Err(Error::protocol(
             "protobuf packed fixed32 length not a multiple of 4",
         ));
     }
     Ok(payload
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| u32::from_le_bytes(*c))
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect())
 }
 

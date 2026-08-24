@@ -143,7 +143,10 @@ impl Stats {
         if amount == 0 {
             return;
         }
-        let _ = target.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        // `fetch_update` (Rust 1.45) retries the CAS so the decrement is
+        // always applied; `try_update` (Rust 1.95) is above our MSRV and
+        // can be lost under contention, overstating the live counter.
+        let _ = target.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(current.saturating_sub(amount))
         });
     }

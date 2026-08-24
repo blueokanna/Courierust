@@ -524,7 +524,7 @@ pub(crate) fn parse_client_hello12(body: &[u8]) -> TlsResult<ClientHello12> {
         .ok_or_else(|| TlsError::Protocol("bad CH".into()))?
         .to_vec();
     let suites_len = c.u16().ok_or_else(|| TlsError::Protocol("bad CH".into()))? as usize;
-    if suites_len < 2 || !suites_len.is_multiple_of(2) {
+    if suites_len < 2 || suites_len % 2 != 0 {
         return Err(TlsError::Protocol("bad CH suites".into()));
     }
     let suites = c

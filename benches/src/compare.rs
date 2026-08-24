@@ -92,7 +92,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 
 fn comparison_repetitions() -> usize {
     let requested = env_usize("BENCH_REPETITIONS", 2);
-    if requested.is_multiple_of(2) {
+    if requested % 2 == 0 {
         requested
     } else {
         requested.checked_add(1).unwrap_or(requested - 1)

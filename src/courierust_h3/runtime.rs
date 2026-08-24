@@ -529,9 +529,12 @@ impl H3Conn {
     }
 
     pub(crate) fn release(&self) {
+        // `fetch_update` (Rust 1.45) retries the CAS, so a release under
+        // contention is never dropped; `try_update` (Rust 1.95) is both
+        // above our MSRV and can return `Err`, leaking a reservation.
         let _ = self
             .reservations
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                 Some(value.saturating_sub(1))
             });
     }
@@ -1138,7 +1141,7 @@ fn handle_server_datagram(
     let original_dcid = token.as_ref().map(|value| value.original_dcid.as_slice());
     if token
         .as_ref()
-        .is_none_or(|value| value.retry_dcid != meta.dcid)
+        .map_or(true, |value| value.retry_dcid != meta.dcid)
     {
         let Ok(retry_dcid) = random_cid() else {
             return;
@@ -3873,7 +3876,7 @@ fn encode_retry_packet(
 }
 
 fn parse_retry_packet(buf: &[u8]) -> Result<Option<RetryPacket>> {
-    if buf.first().is_none_or(|first| first & 0x80 == 0) {
+    if buf.first().map_or(true, |first| first & 0x80 == 0) {
         return Ok(None);
     }
     let identity = parse_long_header_identity(buf)?;
@@ -3904,7 +3907,7 @@ fn parse_retry_packet(buf: &[u8]) -> Result<Option<RetryPacket>> {
 }
 
 fn version_negotiation_versions(buf: &[u8]) -> Result<Option<VersionNegotiationPacket>> {
-    if buf.first().is_none_or(|first| first & 0x80 == 0) {
+    if buf.first().map_or(true, |first| first & 0x80 == 0) {
         return Ok(None);
     }
     let identity = parse_long_header_identity(buf)?;
@@ -3912,17 +3915,19 @@ fn version_negotiation_versions(buf: &[u8]) -> Result<Option<VersionNegotiationP
         return Ok(None);
     }
     let versions = &buf[identity.payload_offset..];
-    if versions.is_empty() || !versions.len().is_multiple_of(4) {
+    // `% 4 != 0` is total (usize remainder never overflows; constant
+    // non-zero divisor cannot panic), and guarantees `chunks_exact(4)`
+    // below yields only full 4-byte chunks.
+    if versions.is_empty() || versions.len() % 4 != 0 {
         return Err(protocol("malformed QUIC Version Negotiation packet"));
     }
-    let (version_chunks, remainder) = versions.as_chunks::<4>();
+    let version_blocks = versions.chunks_exact(4);
     debug_assert!(
-        remainder.is_empty(),
+        version_blocks.remainder().is_empty(),
         "version list length checked as multiple of 4"
     );
-    let versions = version_chunks
-        .iter()
-        .map(|chunk| u32::from_be_bytes(*chunk))
+    let versions = version_blocks
+        .map(|chunk| u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect();
     Ok(Some(VersionNegotiationPacket {
         dcid: identity.dcid,
@@ -4516,7 +4521,7 @@ impl QuicTransport {
                 space.received.remove(&first);
             }
         }
-        if space.largest_received.is_none_or(|largest| pn > largest) {
+        if space.largest_received.map_or(true, |largest| pn > largest) {
             space.largest_received = Some(pn);
         }
         if !self.server && level == INITIAL && !meta.scid.is_empty() {
@@ -4587,7 +4592,13 @@ impl QuicTransport {
                 self.smoothed_rtt = Some(sample);
                 self.rtt_variance = sample / 2;
             } else if let Some(smoothed) = self.smoothed_rtt {
-                let difference = smoothed.abs_diff(sample);
+                // `Duration::abs_diff` is only stable from Rust 1.85; this
+                // branch keeps MSRV 1.78 (both operands are `Duration`).
+                let difference = if smoothed >= sample {
+                    smoothed - sample
+                } else {
+                    sample - smoothed
+                };
                 self.rtt_variance = (self.rtt_variance * 3 + difference) / 4;
                 self.smoothed_rtt = Some((smoothed * 7 + sample) / 8);
             }
@@ -5339,7 +5350,7 @@ impl QuicTransport {
             && self.spaces[level].ack_pending
             && self.spaces[level]
                 .ack_deadline
-                .is_none_or(|deadline| deadline <= Instant::now());
+                .map_or(true, |deadline| deadline <= Instant::now());
         // Owned scratch outlives `frames` below so the piggybacked ACK
         // slice stays valid for the whole packet build.
         let mut piggyback = Vec::new();
@@ -5671,7 +5682,7 @@ fn acknowledge(
     // acknowledged packet stays within `largest_sent_ever` and is legal
     // (peers re-ACK when they receive a retransmission), so only an ACK
     // beyond the highest number ever sent is rejected.
-    if largest_sent_ever.is_none_or(|max| largest > max) {
+    if largest_sent_ever.map_or(true, |max| largest > max) {
         return Err(protocol("ACK acknowledges an unsent packet number"));
     }
     let now = Instant::now();

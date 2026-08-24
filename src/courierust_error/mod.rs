@@ -161,7 +161,8 @@ impl fmt::Display for Error {
     }
 }
 
-impl core::error::Error for Error {}
+#[cfg(feature = "std")]
+impl std::error::Error for Error {}
 
 impl From<core::str::Utf8Error> for Error {
     fn from(e: core::str::Utf8Error) -> Self {

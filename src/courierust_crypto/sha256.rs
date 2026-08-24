@@ -36,12 +36,12 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 
     let mut h = H0;
 
-    let (chunks, remainder) = msg.as_chunks::<64>();
+    let mut blocks = msg.chunks_exact(64);
     assert!(
-        remainder.is_empty(),
+        blocks.remainder().is_empty(),
         "SHA-256 padding must form full blocks"
     );
-    for chunk in chunks {
+    for chunk in &mut blocks {
         let mut w = [0u32; 64];
         for (i, word) in w.iter_mut().enumerate().take(16) {
             *word = u32::from_be_bytes([

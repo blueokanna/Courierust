@@ -459,7 +459,9 @@ pub(crate) fn client_hello_offers_tls13(body: &[u8]) -> TlsResult<bool> {
     c.take(sid_len)
         .ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
     let suites_len = c.u16().ok_or_else(|| TlsError::Protocol("bad CH".into()))? as usize;
-    if suites_len < 2 || !suites_len.is_multiple_of(2) {
+    // `% 2 != 0` is total (usize remainder never overflows; constant
+    // non-zero divisor cannot panic).
+    if suites_len < 2 || suites_len % 2 != 0 {
         return Err(TlsError::Protocol("bad CH suites".into()));
     }
     c.take(suites_len)
@@ -1412,7 +1414,7 @@ pub(crate) fn parse_client_hello(
         .to_vec();
     // cipher suites
     let suites_len = c.u16().ok_or_else(|| TlsError::Protocol("bad CH".into()))? as usize;
-    if suites_len < 2 || !suites_len.is_multiple_of(2) {
+    if suites_len < 2 || suites_len % 2 != 0 {
         return Err(TlsError::Protocol("bad CH suites".into()));
     }
     let suites = c
@@ -1544,7 +1546,7 @@ pub(crate) fn parse_client_hello(
     let suite = CLIENT_SUITES
         .iter()
         .copied()
-        .filter(|s| suite_hash_pref.is_none_or(|h| s.hash() == h))
+        .filter(|s| suite_hash_pref.map_or(true, |h| s.hash() == h))
         .find(|s| offered.contains(&s.wire()))
         .ok_or_else(|| TlsError::Protocol("no shared cipher suite".into()))?;
     Ok(ClientHelloInfo {

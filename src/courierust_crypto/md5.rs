@@ -40,9 +40,12 @@ pub fn md5(data: &[u8]) -> [u8; 16] {
     }
     msg.extend_from_slice(&bit_len.to_le_bytes());
 
-    let (chunks, remainder) = msg.as_chunks::<64>();
-    assert!(remainder.is_empty(), "MD5 padding must form full blocks");
-    for chunk in chunks {
+    let mut blocks = msg.chunks_exact(64);
+    assert!(
+        blocks.remainder().is_empty(),
+        "MD5 padding must form full blocks"
+    );
+    for chunk in &mut blocks {
         let mut m = [0u32; 16];
         for (i, w) in m.iter_mut().enumerate() {
             *w = u32::from_le_bytes([

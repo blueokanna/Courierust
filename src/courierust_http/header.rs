@@ -31,16 +31,14 @@ impl HeaderName {
         if !is_token(b) {
             return Err(Error::invalid_header_name());
         }
-        let mut lower = Vec::with_capacity(b.len());
+        // Build the lowercased name directly into the owned buffer: one
+        // allocation instead of Vec + String + Box<str>. Tokens are
+        // ASCII, so `as char` cannot produce non-ASCII bytes.
+        let mut lower = String::with_capacity(b.len());
         for &c in b {
-            lower.push(c.to_ascii_lowercase());
+            lower.push(c.to_ascii_lowercase() as char);
         }
-        // Safety of the invariant: we just lowercased and validated tokens.
-        Ok(Self(
-            String::from_utf8(lower)
-                .map_err(|_| Error::invalid_header_name())?
-                .into_boxed_str(),
-        ))
+        Ok(Self(lower.into_boxed_str()))
     }
 
     /// A static header name, validated at construction.

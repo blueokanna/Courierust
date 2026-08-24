@@ -2,6 +2,7 @@
 name = "courierust"
 version = "1.0.3"
 edition = "2021"
+rust-version = "1.78"
 license = "Apache-2.0"
 authors = ["blueokanna", "HyphenTeam"]
 description = "no_std HTTP and gRPC engine with work-stealing, RFC 9218, and JA3/JA4 fingerprinting."

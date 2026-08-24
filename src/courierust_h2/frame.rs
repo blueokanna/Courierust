@@ -331,16 +331,20 @@ impl Frame {
                         entries: Vec::new(),
                     });
                 }
-                if !payload.len().is_multiple_of(6) {
+                // `% 6 != 0` is total: `usize` remainder never overflows
+                // and the divisor is a non-zero constant, so it cannot
+                // panic. Once this passes, `chunks_exact(6)` below can
+                // only yield full 6-byte chunks (indexing is infallible).
+                if payload.len() % 6 != 0 {
                     return Err(Error::h2(
                         ErrorCode::FrameSizeError.as_u32(),
                         "SETTINGS length % 6 != 0",
                     ));
                 }
-                let (chunks, remainder) = payload.as_chunks::<6>();
-                debug_assert!(remainder.is_empty());
-                let mut entries = Vec::with_capacity(chunks.len());
-                for c in chunks {
+                let mut settings_blocks = payload.chunks_exact(6);
+                debug_assert!(settings_blocks.remainder().is_empty());
+                let mut entries = Vec::with_capacity(settings_blocks.len());
+                for c in &mut settings_blocks {
                     let id = u16::from_be_bytes([c[0], c[1]]);
                     let value = u32::from_be_bytes([c[2], c[3], c[4], c[5]]);
                     entries.push(Setting { id, value });

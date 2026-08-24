@@ -151,6 +151,9 @@ struct IncrRequest {
     line: Vec<u8>,
     /// Raw request line for the in-flight request.
     req_line: Vec<u8>,
+    /// The request line parsed exactly once when the header block ended
+    /// (re-parsed by neither `body_length` nor `finish_request`).
+    parsed_req_line: Option<crate::courierust_h1::RequestLine>,
     /// Accumulated headers.
     headers: HeaderMap,
     /// Accumulated body bytes.
@@ -168,6 +171,7 @@ impl IncrRequest {
             pos: 0,
             line: Vec::with_capacity(128),
             req_line: Vec::new(),
+            parsed_req_line: None,
             headers: HeaderMap::new(),
             body: Vec::new(),
             header_bytes: 0,
@@ -286,6 +290,7 @@ impl IncrRequest {
                     if trimmed.is_empty() {
                         let rl = courierust_h1::parse_request_line(&self.req_line)?;
                         let bl = courierust_h1::body_length(&self.headers, Some(&rl.method), None)?;
+                        self.parsed_req_line = Some(rl);
                         self.phase = match bl {
                             courierust_h1::BodyLen::None => Phase::Done,
                             courierust_h1::BodyLen::Length(n) => {
@@ -430,7 +435,12 @@ impl IncrRequest {
     /// Build the parsed request and reset per-request state (buffered
     /// pipelined bytes are kept for the next call).
     fn finish_request(&mut self) -> Result<Request<Body>> {
-        let rl = courierust_h1::parse_request_line(&self.req_line)?;
+        // The request line was parsed once when the header block ended;
+        // re-parsing here would duplicate that work on every request.
+        let rl = self
+            .parsed_req_line
+            .take()
+            .ok_or_else(|| Error::protocol("request line not parsed"))?;
         self.req_line.clear();
         let headers = core::mem::take(&mut self.headers);
         self.header_bytes = 0;
@@ -504,8 +514,8 @@ impl EventConn {
                 Some(req) => {
                     let request_close = courierust_h1::wants_close(&req.headers);
                     let resp = handler.handle(req);
-                    let (wire, keep_alive) = build_response(resp, config, request_close)?;
-                    self.out = wire;
+                    self.out.clear();
+                    let keep_alive = build_response(resp, config, request_close, &mut self.out)?;
                     self.out_pos = 0;
                     self.keep_alive = keep_alive;
                     match self.write_more()? {
@@ -540,7 +550,7 @@ impl EventConn {
                 Err(e) => return Err(Error::io(e.to_string())),
             }
         }
-        self.out = Vec::new();
+        self.out.clear();
         self.out_pos = 0;
         if self.keep_alive {
             Ok(StepOutcome::Idle)
@@ -551,14 +561,17 @@ impl EventConn {
 }
 
 /// Serialize a response (head + body, chunked for channel bodies) into
-/// wire bytes and decide keep-alive. `request_close` reflects a request
+/// `out` and decide keep-alive. The caller owns the buffer (`out` is the
+/// connection's write buffer), so steady-state responses perform no
+/// per-request allocation. `request_close` reflects a request
 /// `Connection: close` token, which forces the connection closed (RFC
 /// 7230 §6.3).
 fn build_response(
     resp: Response<Body>,
     config: &ServerConfig,
     request_close: bool,
-) -> Result<(Vec<u8>, bool)> {
+    out: &mut Vec<u8>,
+) -> Result<bool> {
     // `keep_alive_requested` already applies the exact-token `Connection`
     // semantics (a `closex` token does not close); no separate substring
     // check here, or the two paths would disagree.
@@ -603,11 +616,11 @@ fn build_response(
         HeaderValue::from_static(if keep_alive { "keep-alive" } else { "close" }),
     );
 
-    let mut wire = Vec::with_capacity(1024);
-    courierust_h1::write_response_head(&mut wire, resp.status, Version::HTTP_11, &out_headers)?;
+    let mut out = out;
+    courierust_h1::write_response_head(&mut out, resp.status, Version::HTTP_11, &out_headers)?;
     match resp.body {
         Body::Empty => {}
-        Body::Bytes(b) => wire.extend_from_slice(&b),
+        Body::Bytes(b) => out.extend_from_slice(&b),
         Body::Channel(rx) => {
             let timeout = config.read_timeout;
             loop {
@@ -622,18 +635,18 @@ fn build_response(
                             continue;
                         }
                         let sz = courierust_h1::IToA::new(b.len());
-                        wire.extend_from_slice(sz.as_slice());
-                        wire.extend_from_slice(b"\r\n");
-                        wire.extend_from_slice(&b);
-                        wire.extend_from_slice(b"\r\n");
+                        out.extend_from_slice(sz.as_slice());
+                        out.extend_from_slice(b"\r\n");
+                        out.extend_from_slice(&b);
+                        out.extend_from_slice(b"\r\n");
                     }
                     Err(()) => break,
                 }
             }
-            wire.extend_from_slice(b"0\r\n\r\n");
+            out.extend_from_slice(b"0\r\n\r\n");
         }
     }
-    Ok((wire, keep_alive))
+    Ok(keep_alive)
 }
 
 // ---------------------------------------------------------------------
@@ -791,10 +804,15 @@ fn handle_msg(
                 return;
             }
             // The accept thread hands us a blocking socket; the event
-            // loop requires non-blocking mode.
+            // loop requires non-blocking mode. `set_nodelay` disables
+            // Nagle so a small response write is not held back by an
+            // un-ACKed segment — without it, keep-alive requests on
+            // loopback stall tens of milliseconds per request (the
+            // exact issue the benchmark had to fix on the hyper side).
             if stream.set_nonblocking(true).is_err() {
                 return;
             }
+            let _ = stream.set_nodelay(true);
             if let Some(s) = stats {
                 s.connections_active.fetch_add(1, Ordering::Relaxed);
             }

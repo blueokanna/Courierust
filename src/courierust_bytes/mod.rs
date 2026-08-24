@@ -12,11 +12,21 @@ use core::fmt;
 use core::ops::{Deref, Range};
 
 /// Immutable byte buffer with O(1) slicing and cheap clone.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Bytes {
     buf: Arc<[u8]>,
     start: usize,
     len: usize,
+}
+
+impl Default for Bytes {
+    /// Empty buffer (no allocation). Kept explicit instead of derived:
+    /// deriving `Default` needs `[u8]: Default`, which is only stable from
+    /// Rust 1.79 — this manual impl keeps MSRV 1.78.
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Bytes {

@@ -350,7 +350,7 @@ fn inflate_stored(br: &mut BitReader, out: &mut Vec<u8>, max_out: usize) -> Resu
     if (len ^ 0xffff) != nlen {
         return Err(Error::protocol("deflate: stored block length mismatch"));
     }
-    if out.len().checked_add(len).is_none_or(|t| t > max_out) {
+    if out.len().checked_add(len).map_or(true, |t| t > max_out) {
         return Err(Error::overflow("deflate: output exceeds limit"));
     }
     if br.pos + len > br.data.len() {
@@ -403,14 +403,14 @@ fn inflate_dynamic(br: &mut BitReader, out: &mut Vec<u8>, max_out: usize) -> Res
                 if lens.len() + rep > total {
                     return Err(Error::protocol("deflate: code-length repeat overflow"));
                 }
-                lens.extend(core::iter::repeat_n(0, rep));
+                lens.extend(core::iter::repeat(0).take(rep));
             }
             18 => {
                 let rep = 11 + br.read_bits(7)? as usize;
                 if lens.len() + rep > total {
                     return Err(Error::protocol("deflate: code-length repeat overflow"));
                 }
-                lens.extend(core::iter::repeat_n(0, rep));
+                lens.extend(core::iter::repeat(0).take(rep));
             }
             _ => return Err(Error::protocol("deflate: invalid code-length symbol")),
         }
@@ -462,7 +462,7 @@ fn inflate_block(
             if distance == 0 || distance > out.len() {
                 return Err(Error::protocol("deflate: invalid back-reference distance"));
             }
-            if out.len().checked_add(len).is_none_or(|t| t > max_out) {
+            if out.len().checked_add(len).map_or(true, |t| t > max_out) {
                 return Err(Error::overflow("deflate: output exceeds limit"));
             }
             let start = out.len() - distance;
