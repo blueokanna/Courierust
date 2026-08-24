@@ -258,6 +258,7 @@ fn bench_https(requests: usize, payload: Payload, server_threads: usize) {
             tls: Some(ServerTls {
                 identity,
                 alpn: vec![b"h2".to_vec()],
+                ..Default::default()
             }),
             ..Default::default()
         },

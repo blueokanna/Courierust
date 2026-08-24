@@ -711,6 +711,7 @@ fn h3_server(payload: Payload) -> SocketAddr {
             tls: Some(ServerTls {
                 identity,
                 alpn: vec![b"h3".to_vec()],
+                ..Default::default()
             }),
             threads: 4,
             ..Default::default()

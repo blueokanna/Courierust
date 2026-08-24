@@ -27,6 +27,7 @@ fn h3_automatic_bidirectional_key_update_keeps_connection_alive() {
             tls: Some(ServerTls {
                 identity: common::server_identity(),
                 alpn: vec![b"h3".to_vec()],
+                ..Default::default()
             }),
             ..Default::default()
         },

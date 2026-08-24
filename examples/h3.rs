@@ -40,6 +40,7 @@ fn main() -> courierust::Result<()> {
         tls: Some(ServerTls {
             identity,
             alpn: vec![b"h3".to_vec()],
+            ..Default::default()
         }),
         ..Default::default()
     };

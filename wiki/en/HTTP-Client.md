@@ -137,6 +137,6 @@ match client.get("http://127.0.0.1:9/") {
 
 ## What you should know
 
-- **HTTPS uses the built-in TLS 1.3 implementation when configured.** The default client has `tls: None` and rejects `https://`; provide a `RootStore` through `ClientConfig::tls` or use `Client::with_tls_roots`. There is no bundled CA set. ALPN must agree with `ClientConfig::http2` (`h2` for HTTP/2, `http/1.1` otherwise).
+- **HTTPS uses the built-in TLS 1.2 + TLS 1.3 implementation when configured.** The default client has `tls: None` and rejects `https://`; provide a `RootStore` through `ClientConfig::tls` or use `Client::with_tls_roots`. There is no bundled CA set. ALPN must agree with `ClientConfig::http2` (`h2` for HTTP/2, `http/1.1` otherwise).
 - **HTTP/2 concurrency is connection-policy dependent.** Requests are multiplexed by one driver per connection. Set `max_connections_per_host` above one when independent HTTP/2 drivers are needed for caller-level parallelism; benchmark the full latency tail for the selected value.
 - **Streaming request bodies are HTTP/2-only.** `Client::execute` materializes a `Body::Channel` request body into memory before sending; use `execute_h2_stream` for true client-streaming uploads.

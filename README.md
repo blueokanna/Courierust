@@ -84,7 +84,7 @@ Slow-loris and idle-herd protection is enforced before workers are ever involved
 This crate treats parsers as attack surface. Beyond the usual limits (header/line/body caps everywhere), the notable defenses:
 
 - **Request smuggling (CWE-444).** Duplicate `Content-Length` with differing values is rejected; `Transfer-Encoding` is parsed as a codeword list where `chunked` must be the final, single occurrence (`Transfer-Encoding: notchunked`, `chunked, gzip` and empty codewords are all rejected); a request line must be exactly three tokens. Critically, the **blocking and the event-driven incremental parsers share the same chunk-size parser and framing rules** — two code paths that disagree on a request's meaning are exactly how smuggling happens behind a proxy, so there is exactly one authority.
-- **TLS record layer.** Ciphertext length bounds, padding validation, inner content-type checks, and per-direction sequence numbers (tampered records fail `bad_record_mac`). The decrypted handshake buffer is capped at the protocol's 16 MiB maximum so a peer streaming endless handshake records cannot grow memory without bound. Handshakes run under a dedicated `handshake_timeout` (10 s default) on both client and server, so a peer that connects and stalls mid-handshake releases its worker/caller instead of holding it for the full read timeout.
+- **TLS record layer.** Ciphertext length bounds, padding validation, inner content-type checks, and per-direction sequence numbers (tampered records fail `bad_record_mac`). TLS 1.2 shares the AEAD discipline: only AEAD suites are implemented (RFC 5246 §6.2.3.3 AAD framing; CBC/HMAC, RC4 and static-RSA are never offered), and Finished `verify_data` is compared in constant time on both versions. The decrypted handshake buffer is capped at the protocol's 16 MiB maximum so a peer streaming endless handshake records cannot grow memory without bound. Handshakes run under a dedicated `handshake_timeout` (10 s default) on both client and server, so a peer that connects and stalls mid-handshake releases its worker/caller instead of holding it for the full read timeout.
 - **TLS trust.** Chain validation (validity, name chaining, signatures, CA/key-usage, trust anchor), RFC 6125 hostname matching including IP SANs and single-wildcard, and EKU enforcement (a leaf with an EKU extension must permit `serverAuth`). `verify: false` exists for testing and truly-unanchored peers and still verifies `CertificateVerify` + `Finished` — the handshake stays cryptographically sound.
 - **HTTP/2.** HPACK bombs (integer overflow, header-list cap, dynamic-table size, Huffman EOS/padding) are rejected; flow-control windows are checked per frame at stream and connection level (overflow is `FLOW_CONTROL_ERROR`); DATA on bodyless messages, `content-length` mismatches at stream end, and RST on idle streams are all stream/connection errors; `SETTINGS_TIMEOUT` and keepalive dead-peer detection close silent peers.
 - **Redirects never forward `Authorization` / `Cookie` across origins** (RFC 9110 §15.4).
@@ -155,11 +155,11 @@ let client = GrpcClient::new("http://127.0.0.1:50051")?;
 let reply = client.call("helloworld.Greeter/SayHello", Bytes::from("world"))?;
 ```
 
-## HTTPS (built-in TLS 1.3)
+## HTTPS (built-in TLS 1.2 + TLS 1.3)
 
-Since 0.1, the crate ships a from-scratch, zero-dependency TLS 1.3
-implementation (RFC 8446), so `https://` is a first-class capability of
-the same client and server:
+Since 0.1, the crate ships a from-scratch, zero-dependency TLS stack —
+**TLS 1.3 (RFC 8446) and TLS 1.2 (RFC 5246 / RFC 8422)** — so
+`https://` is a first-class capability of the same client and server:
 
 ```rust
 use courierust::courierust_client::{Client, ClientConfig, TlsSettings as ClientTls};
@@ -196,17 +196,39 @@ let client = Client::with_config(client_cfg);
 let resp = client.get("https://example.com/")?;
 ```
 
-Supported TLS 1.3 profile: `TLS_CHACHA20_POLY1305_SHA256`,
-`TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`; X25519 key
-exchange; RSA-PSS / RSA-PKCS#1 v1.5 / ECDSA P-256 / Ed25519 certificate
-signatures; full X.509 chain validation (validity windows, name
-chaining, signature verification, basic-constraints / key-usage,
-RFC 6125 hostname matching incl. IP SANs, plus a pluggable root store).
-**TLS 1.3 only, by policy:** TLS 1.2 and earlier are explicitly rejected
-— a TLS 1.2 ClientHello is refused with no silent protocol downgrade
-(covered by an integration test), and 0-RTT / session resumption / PSK
-are never offered. For QUIC the ALPN must be `h3`; for HTTPS the ALPN
-must be `h2` or `http/1.1`.
+Supported TLS profiles:
+
+- **TLS 1.3 (RFC 8446):** `TLS_CHACHA20_POLY1305_SHA256`,
+  `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`; X25519 key
+  exchange.
+- **TLS 1.2 (RFC 5246 / RFC 8422):** AEAD-only ECDHE suites —
+  `ECDHE-ECDSA-AES128-GCM-SHA256`, `ECDHE-ECDSA-AES256-GCM-SHA384`,
+  `ECDHE-ECDSA-CHACHA20-POLY1305-SHA256` and the three `ECDHE-RSA-*`
+  twins (secp256r1 ECDHE). CBC/HMAC, static-RSA and RC4 suites are
+  never offered — the record layer only implements AEAD. The RFC 5746
+  `renegotiation_info` indicator is sent and echoed, and X25519 is
+  advertised only when TLS 1.3 is also offered (a TLS 1.2-only
+  ClientHello advertises secp256r1 only, so a TLS 1.2 server can never
+  select a group the client cannot complete).
+
+Both versions share the same identity, certificate chain validation
+and trust model: RSA-PSS / RSA-PKCS#1 v1.5 / ECDSA P-256 / P-384 /
+Ed25519 certificate signatures; full X.509 chain validation (validity
+windows, name chaining, signature verification, basic-constraints /
+key-usage, RFC 6125 hostname matching incl. IP SANs and the
+CVE-2025-61727 excluded-subtree wildcard rule, plus a pluggable root
+store).
+
+**The version window is fully configurable.** `TlsSettings::min_version`
+/ `max_version` on both client and server (default `Tls12..=Tls13`)
+control what is offered and negotiated. Pinning both to `Tls13` restores
+a TLS 1.3-only policy; a TLS 1.2 server that accepted a TLS
+1.3-capable client still writes the RFC 8446 §4.1.3 downgrade sentinel
+into its ServerHello random so the client can detect the downgrade, and
+a TLS 1.3-only client refuses a TLS 1.2 ServerHello with no silent
+protocol downgrade. 0-RTT / session resumption / PSK are never offered.
+For QUIC the ALPN must be `h3`; for HTTPS the ALPN must be `h2` or
+`http/1.1`.
 Run `cargo run --example https` for a self-signed end-to-end demo,
 `cargo run --example h3` for an HTTP/3 (QUIC v1 + TLS 1.3) end-to-end demo
 (cold connect vs pooled reuse, large-response flow control, concurrent
@@ -248,12 +270,12 @@ Building with `--no-default-features` compiles only the protocol core, suitable 
 Things this crate deliberately does not do:
 
 - **HTTP/3 / QUIC has a dependency-free built-in path, with a declared protocol boundary.** `courierust_h3` runs HTTP/3 request/response over a std UDP reactor with QUIC v1 packet protection, the built-in TLS 1.3 adapter, ALPN `h3`, bounded CRYPTO/stream reassembly, Retry integrity and token-bound address validation, Version Negotiation, pre-validation 3x anti-amplification, ACK ranges, fresh-packet-number retransmission, RTT/RTO sampling, a bounded congestion window, control/QPACK streams, trailers, and GOAWAY validation. It is not yet a complete Internet QUIC implementation: full PTO/time-threshold loss recovery, dynamic local `MAX_DATA`/`MAX_STREAM_DATA` credit updates, connection migration/path validation, stateless reset, 0-RTT/session tickets, automatic and bidirectional key update, QPACK blocked-stream acknowledgements, and independent implementation interoperability still require implementation and dedicated evidence. Do not advertise this path as universally interoperable until those gaps are closed.
-- **TLS: no PSK / 0-RTT resumption / session tickets / key update yet, and no mutual TLS.** A full 1-RTT handshake happens every time; NewSessionTicket from a peer is ignored; the server does not request client certificates. Benchmark TLS rows therefore report `session_resumption=n/a` rather than assuming it.
+- **TLS: no PSK / 0-RTT resumption / session tickets / key update yet, and no mutual TLS.** A full 1-RTT handshake happens every time; NewSessionTicket from a peer is ignored; TLS 1.2 session ids are carried but never resumed; the server does not request client certificates. Benchmark TLS rows therefore report `session_resumption=n/a` rather than assuming it.
 - **Event-driven server is default on every platform and HTTP/1.1-only.** `ServerConfig::event_driven` (default `true`) parks idle plain-HTTP connections on a readiness poller so a small worker pool serves many idle keep-alive / SSE / long-poll connections; TLS and HTTP/2 connections still use the blocking pool model (bounded by `handshake_timeout`, `h2_idle_timeout`, and worker count). Setting it to `false` restores the legacy **one-pool-job-per-connection** model; that path is deprecated for production use — it lets a herd of idle/slow connections exhaust the pool — and exists only for comparison and debugging. The default event path bounds resource use with `max_connections` (connection cap) and `idle_timeout`.
 - **Streaming request bodies are only reliable over HTTP/2** (h2 frames naturally). Over HTTP/1.1, either send the whole body at once (`Body::Bytes`) or build chunked framing yourself.
 - **gRPC does not include protobuf, `.proto` code generation, or `grpc.reflection`.** You implement the codec traits or wire in your own protobuf-generated code; reflection needs a protobuf schema inventory, which is external by design.
 - **A synchronous handler that blocks for a long time holds a worker** (event-driven or not) — exactly as with any synchronous server; use channel response bodies for streaming. Worker occupancy is **per-connection, not per-stream**: on one HTTP/2 connection, any number of idle streams (SSE / long-poll / gRPC server-streaming) occupy the same single worker, and a slow stream never blocks its connection's other streams — both are covered by integration tests. A large herd of _connections_ is handled by the event scheduler (idle reaping + `max_connections`) rather than by adding workers.
-- **HTTPS is first-class**: the client and server ship a from-scratch TLS 1.3 implementation; `https://` needs a root store (supply your own — there is no bundled CA set). ALPN is enforced: a client configured for h2 speaking to a server that negotiates `http/1.1` — or that negotiates **no** ALPN at all — fails with a clear error instead of a silent protocol mismatch (RFC 9113 §3.3 requires ALPN `h2` over TLS).
+- **HTTPS is first-class**: the client and server ship a from-scratch TLS 1.2 + TLS 1.3 implementation; `https://` needs a root store (supply your own — there is no bundled CA set). ALPN is enforced: a client configured for h2 speaking to a server that negotiates `http/1.1` — or that negotiates **no** ALPN at all — fails with a clear error instead of a silent protocol mismatch (RFC 9113 §3.3 requires ALPN `h2` over TLS).
 - Redirects, keep-alive reuse, and friends prioritize correctness over aggressive tuning.
 
 ## Layout
@@ -274,7 +296,7 @@ src/
 ├── courierust_bytes/       # byte buffers (BytesMut)                                        [no_std]
 ├── courierust_io/          # Read/Write traits (no_std flavor)                              [no_std]
 ├── courierust_error/       # unified error type
-├── courierust_tls/         # TLS 1.3 (RFC 8446): handshake, record layer, X.509, HTTPS       [std]
+├── courierust_tls/         # TLS 1.2 + 1.3 (RFC 5246/8446): handshake, record layer, X.509, HTTPS  [std]
 ├── courierust_pool/        # work-stealing thread pool                                      [std]
 ├── courierust_net/         # TCP → io trait adapters, poller, optional stats instrumentation  [std]
 ├── courierust_body/        # streaming response bodies (channel)                            [std]
@@ -290,7 +312,7 @@ The `benches/` package is a self-contained suite (no `criterion` required) that 
 
 - HTTP/1.1 keep-alive, sequential and multi-worker parallel;
 - HTTP/2 multiplexing across many workers;
-- HTTPS (TLS 1.3 + h2) end to end through the crate's own TLS stack;
+- HTTPS (TLS 1.2/1.3 + h2) end to end through the crate's own TLS stack;
 - RFC 9218 priority scheduling;
 - a concurrency model comparison (idle-connection herd vs. worker pool) and a slow-sender herd benchmark.
 
@@ -364,8 +386,8 @@ protocol stack.
 
 ## Tests
 
-- 170 unit tests: all HPACK RFC vectors (C.2/C.3/C.4/C.6), Huffman encode/decode (plus a decode output cap), frame codec, state machine, flow control, WUCS scheduling, JA3/JA4 comparison against published records, fingerprint parsing, TLS 1.3 handshake + RFC 8448 key schedule, X.25519/Ed25519/ECDSA/RSA primitives, the DEFLATE/gzip codec (round-trips, CRC-32 vectors, corruption rejection, output-cap enforcement, and cross-checked against Python zlib output), and the poller's wake-descriptor (self-pipe) semantics.
-- 61 integration tests: real loopback TCP round trips for h1/h2/HTTPS, keep-alive reuse, chunked, redirects, h2 concurrent multiplexing, streaming responses, large-body flow-control round trips, gRPC unary/server/client/bidi streaming + error status + trailers + deadline enforcement + gzip round-trip, `grpc.health.v1.Health` `Check` + `Watch`, RFC 7540 §3.2 `h2c` Upgrade, concurrency proofs (a slow stream does not block its connection's other streams; many idle streams consume one worker; an idle-connection herd does not block fresh requests; the event scheduler reaps slow-loris connections and enforces `max_connections`; server-streaming responses flush on a short cadence; one h2 connection serves a concurrent burst without command starvation), **TLS policy / hardening** (trust rejection, expired certificate, untrusted-issuer chain, self-signed-but-explicitly-trusted, hostname mismatch, ALPN agreement, TLS 1.2 ClientHello rejection — no silent downgrade, interrupted-handshake failure, malformed-TLS-input survival, `verify:false`), and **11 HTTP/3 integration tests** (QUIC v1 + TLS 1.3 over real UDP sockets through the public `Client`/`Server`): GET/POST round trips, pooled connection reuse, 256 KiB request/response flow control in both directions, concurrent multiplexing, per-request deadline enforcement, and H3 TLS security (untrusted / expired / wrong-chain / hostname-mismatch certificates all rejected at the handshake).
+- 253 unit tests: all HPACK RFC vectors (C.2/C.3/C.4/C.6), Huffman encode/decode (plus a decode output cap), frame codec, state machine, flow control, WUCS scheduling, JA3/JA4 comparison against published records, fingerprint parsing, TLS 1.3 handshake + RFC 8448 key schedule, TLS 1.2 handshake (ECDHE-RSA/ECDSA AEAD suites, PRF, RFC 5746 renegotiation echo, Ed25519 ServerKeyExchange signing/verification), X.25519/Ed25519/ECDSA/RSA primitives, the DEFLATE/gzip codec (round-trips, CRC-32 vectors, corruption rejection, output-cap enforcement, and cross-checked against Python zlib output), and the poller's wake-descriptor (self-pipe) semantics.
+- 63 integration tests: real loopback TCP round trips for h1/h2/HTTPS, keep-alive reuse, chunked, redirects, h2 concurrent multiplexing, streaming responses, large-body flow-control round trips, gRPC unary/server/client/bidi streaming + error status + trailers + deadline enforcement + gzip round-trip, `grpc.health.v1.Health` `Check` + `Watch`, RFC 7540 §3.2 `h2c` Upgrade, concurrency proofs (a slow stream does not block its connection's other streams; many idle streams consume one worker; an idle-connection herd does not block fresh requests; the event scheduler reaps slow-loris connections and enforces `max_connections`; server-streaming responses flush on a short cadence; one h2 connection serves a concurrent burst without command starvation), **TLS policy / hardening** (trust rejection, expired certificate, untrusted-issuer chain, self-signed-but-explicitly-trusted, hostname mismatch, ALPN agreement, TLS 1.2 + TLS 1.3 round trips with RSA / P-384 / Ed25519 identities, a TLS 1.3-only client refusing a TLS 1.2 server — no silent downgrade — and the RFC 8446 downgrade sentinel, interrupted-handshake failure, malformed-TLS-input survival, `verify:false`), and **13 HTTP/3 integration tests** (QUIC v1 + TLS 1.3 over real UDP sockets through the public `Client`/`Server`): GET/POST round trips, pooled connection reuse, 256 KiB request/response flow control in both directions, concurrent multiplexing, per-request deadline enforcement, bidirectional key update, and H3 TLS security (untrusted / expired / wrong-chain / hostname-mismatch certificates all rejected at the handshake).
 - 30 hardening tests: hostile-frame inputs (oversized frames, malformed SETTINGS/PING/WINDOW_UPDATE, flow-control window overflow, HPACK header-list and Huffman bombs, truncated/EOS Huffman, pseudo-header ordering, `content-length` mismatches, forbidden `transfer-encoding`/`connection`-specific headers, `SETTINGS_MAX_CONCURRENT_STREAMS` enforcement on both ends, `h2c` liveness: SETTINGS_TIMEOUT and keepalive dead-peer detection).
 - 4 fuzz targets (`cargo-fuzz`): `h2_frame`, `hpack_block`, plus **`h1_request`** (the shared request/header/chunked path used by both server parsers) and **`h2_connection`** (the full h2 state machine driven by hostile frame streams in both roles). A nightly long-fuzz workflow runs each with a wall-clock budget; a PR-time smoke run covers the same targets in `benchmark.yml`.
 

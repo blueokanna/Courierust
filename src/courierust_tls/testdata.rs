@@ -67,8 +67,10 @@ pub(crate) fn root_store() -> crate::courierust_tls::RootStore {
 // TLS 1.2 test identity (RSA 2048, self-signed for `localhost`)
 // ---------------------------------------------------------------------
 //
-// TLS 1.2 requires a certificate key that can sign a ServerKeyExchange;
-// the Ed25519 identity above is TLS 1.3-only. This RSA 2048 certificate
+// TLS 1.2 requires a certificate key that can sign a ServerKeyExchange.
+// The Ed25519 identity above can do that too (RFC 8422 §4.3, scheme
+// 0x0807), but this RSA 2048 certificate specifically covers the
+// ECDHE_RSA suites in the TLS 1.2 matrix. This RSA 2048 certificate
 // (generated with OpenSSL 3.x, valid 2026-08-23..2036-08-20, subject
 // CN=localhost, SAN DNS:localhost + IP:127.0.0.1, CA:TRUE, serverAuth)
 // covers the TLS 1.2 ECDHE_RSA suites. The DER is embedded via

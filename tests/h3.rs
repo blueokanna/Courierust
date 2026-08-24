@@ -44,6 +44,7 @@ fn spawn_h3_server_with_identity(
             tls: Some(ServerTls {
                 identity,
                 alpn: vec![b"h3".to_vec()],
+                ..Default::default()
             }),
             ..Default::default()
         },

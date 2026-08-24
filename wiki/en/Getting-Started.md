@@ -79,7 +79,7 @@ POST -> 200 hello from client
 
 - `Server::bind_with_config("127.0.0.1:0", ...)` binds an ephemeral port; `local_addr()` tells you which one.
 - The handler is a plain `Fn(Request<Body>) -> Response<Body>`. It echoes whatever body it received.
-- `Client::with_config` with `http2: true` uses cleartext HTTP/2 prior knowledge (h2c), so this example has no TLS by design. HTTPS uses the built-in TLS 1.3 path when `ClientConfig::tls` is configured; HTTP/3 uses that TLS path with ALPN `h3` and `ClientConfig::http3: true`.
+- `Client::with_config` with `http2: true` uses cleartext HTTP/2 prior knowledge (h2c), so this example has no TLS by design. HTTPS uses the built-in TLS 1.2 + 1.3 path when `ClientConfig::tls` is configured; HTTP/3 uses that TLS path with ALPN `h3` and `ClientConfig::http3: true`.
 - `Response::with_status(200.into())` builds an empty 200; fill `.headers` and `.body` as needed.
 
 ## Next steps

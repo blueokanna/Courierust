@@ -10,7 +10,7 @@ Every example in the repository compiles and runs as-is (`cargo run --example <n
 | `priority` | RFC 9218: high-urgency stream scheduled ahead of a low-urgency backlog | `cargo run --example priority` |
 | `redirects` | 302 chains followed automatically (RFC 9110) | `cargo run --example redirects` |
 | `fingerprint` | Print the JA3 / JA4 / Chrome HTTP/2 fingerprint values | `cargo run --example fingerprint` |
-| `https` | HTTPS (TLS 1.3) end to end: self-signed Ed25519 identity, validating client, h2 + HTTP/1.1 over ALPN | `cargo run --example https` |
+| `https` | HTTPS (TLS 1.2 + 1.3) end to end: self-signed Ed25519 identity, validating client, h2 + HTTP/1.1 over ALPN | `cargo run --example https` |
 | `protocol_core` | HPACK + h2 codec over an in-memory pipe (no sockets), plus the self-contained hashes | `cargo run --example protocol_core` |
 | `diag` | Loopback h2 echo used for diagnostics | `cargo run --example diag` |
 

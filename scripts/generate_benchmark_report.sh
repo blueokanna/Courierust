@@ -488,7 +488,7 @@ tlsinterop_results=$(extract_lines '^TLSINTEROP\|' "$tls_interop_log")
     printf '%s\n' '- The `*_h2c_large_body_to_hyper` rows measure a 1 MiB POST against the same hyper h2 server. Both clients are paced by the server 64 KiB initial flow-control window (WINDOW_UPDATE round trips), and reqwest retains a large fixed wait even in the async client — these rows are NOT valid for ratio claims.'
     printf '%s\n' '- `quinn_h3_client_to_courierust` is reported `not_available` until the independent quinn+rustls QUIC/TLS handshake completes against the Courierust H3 server (a genuine interop gap, never faked).'
     printf '%s\n' '- Loopback is not cross-machine evidence. The cross-machine table is evidence only when `target_scope=remote` and `status=ok`.'
-    printf '%s\n' '- TLS rows measure the built-in TLS 1.3 path; certificate, hostname, and ALPN checks must pass for the case to be valid. `negotiated_alpn` is reported; `session_resumption=n/a` because each TLSVERIFY row is a single handshake that does not measure resumption (the stack does implement TLS 1.3 session tickets).'
+    printf '%s\n' '- TLS rows measure the built-in TLS 1.2/1.3 path; certificate, hostname, and ALPN checks must pass for the case to be valid. `negotiated_alpn` is reported; `session_resumption=n/a` because each TLSVERIFY row is a single handshake that does not measure resumption (the stack does implement TLS 1.3 session tickets).'
     printf '%s\n' '- Fuzz status is evidence only for the recorded target, run count, and duration; an unconfigured target is not a pass.'
     printf '%s\n' '- The `STATS` table is the reactor/connection/stream/syscall evidence behind the throughput rows (especially the h2 multi-worker scaling).'
 

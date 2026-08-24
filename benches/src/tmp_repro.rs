@@ -21,6 +21,7 @@ fn main() {
             tls: Some(courierust::courierust_server::TlsSettings {
                 identity,
                 alpn: vec![b"h3".to_vec()],
+                ..Default::default()
             }),
             ..Default::default()
         },

@@ -72,6 +72,7 @@ fn server() -> std::io::Result<()> {
             } else {
                 vec![b"http/1.1".to_vec()]
             },
+            ..Default::default()
         })
     } else {
         None

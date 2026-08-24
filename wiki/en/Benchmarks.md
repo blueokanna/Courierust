@@ -28,7 +28,7 @@ The benchmark profile uses thin LTO and one code-generation unit. Each suite exi
 | `h1_sequential` | HTTP/1.1 | One keep-alive client connection |
 | `h1_parallel_w*` | HTTP/1.1 | Independent clients at 1, 4, and 8 workers |
 | `h2_multiplex_w*` | h2c prior knowledge | One pooled HTTP/2 connection at 1, 8, and 32 workers |
-| `https_h2_sequential` | TLS 1.3 plus HTTP/2 | Certificate verification, ALPN, and encrypted request/response path |
+| `https_h2_sequential` | TLS 1.2/1.3 plus HTTP/2 | Certificate verification, ALPN, and encrypted request/response path |
 
 Each result records RPS, response throughput, P50/P75/P90/P95/P99 request latency, and the actual server thread count. `BENCH_REQUESTS` and `BENCH_SERVER_THREADS` can override the default request count and server worker count. HTTP/1.1 parallel cases raise the effective server thread count to at least the client worker count because the Linux blocking server model reserves one worker per idle keep-alive connection.
 

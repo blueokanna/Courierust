@@ -1,6 +1,6 @@
 # Courierust
 
-A self-contained HTTP/1.1 + HTTP/2 + gRPC stack for Rust with **zero third-party dependencies**. The protocol core (`courierust_http`, `courierust_hpack`, `courierust_h2`, `courierust_fingerprint`, `courierust_crypto`, `courierust_bytes`, `courierust_io`, `courierust_error`) compiles under `no_std + alloc`; the `std` layer adds a work-stealing thread pool, a multi-core client, a server, a built-in TLS 1.3 stack, and gRPC. All public modules carry the `courierust_` prefix so none of them collide with third-party crates of the same short name.
+A self-contained HTTP/1.1 + HTTP/2 + gRPC stack for Rust with **zero third-party dependencies**. The protocol core (`courierust_http`, `courierust_hpack`, `courierust_h2`, `courierust_fingerprint`, `courierust_crypto`, `courierust_bytes`, `courierust_io`, `courierust_error`) compiles under `no_std + alloc`; the `std` layer adds a work-stealing thread pool, a multi-core client, a server, a built-in TLS 1.2 + 1.3 stack, and gRPC. All public modules carry the `courierust_` prefix so none of them collide with third-party crates of the same short name.
 
 Every code sample below is real, runnable API usage.
 
@@ -37,7 +37,7 @@ Every code sample below is real, runnable API usage.
 | Fingerprints | JA3 / JA4 / Chrome HTTP/2 profile (self-contained MD5/SHA-256) |
 | Multi-core | work-stealing server pool, bounded client connection pools |
 | gRPC | framing + status + codec traits (protobuf itself is plug-in) |
-| TLS | built-in TLS 1.3 for client/server HTTPS; external transports are also supported |
+| TLS | built-in TLS 1.2 + 1.3 for client/server HTTPS (RFC 5246/8446); external transports are also supported |
 
 ## Repository
 

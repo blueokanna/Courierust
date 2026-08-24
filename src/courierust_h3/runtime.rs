@@ -6257,6 +6257,7 @@ mod tests {
         let tls = TlsSettings {
             identity: identity.clone(),
             alpn: vec![b"h3".to_vec()],
+            ..Default::default()
         };
         let handler: Arc<dyn Handler> = Arc::new(|_request: Request<Body>| {
             Response::<Body>::with_status(StatusCode::OK).with_body(Body::from("quic-ok"))
@@ -6290,6 +6291,7 @@ mod tests {
         let tls = TlsSettings {
             identity,
             alpn: vec![b"h3".to_vec()],
+            ..Default::default()
         };
         let handler: Arc<dyn Handler> = Arc::new(|request: Request<Body>| {
             let path = request.uri.as_str().to_string();
@@ -6377,6 +6379,7 @@ mod tests {
         let tls = TlsSettings {
             identity,
             alpn: vec![b"h3".to_vec()],
+            ..Default::default()
         };
         let handler: Arc<dyn Handler> = Arc::new(|request: Request<Body>| {
             let path = request.uri.as_str().to_string();
@@ -6455,6 +6458,7 @@ mod tests {
         let tls = TlsSettings {
             identity,
             alpn: vec![b"h3".to_vec()],
+            ..Default::default()
         };
         let body = vec![b'x'; 64 * 1024];
         let expected = body.clone();
@@ -6485,6 +6489,7 @@ mod tests {
         let tls = TlsSettings {
             identity,
             alpn: vec![b"h3".to_vec()],
+            ..Default::default()
         };
         // The request body is far larger than the initial congestion
         // window (12 KB), so it must be delivered in ACK-paced chunks.
@@ -6533,6 +6538,7 @@ mod tests {
         let tls = TlsSettings {
             identity,
             alpn: vec![b"h3".to_vec()],
+            ..Default::default()
         };
         let handler: Arc<dyn Handler> = Arc::new(|_request: Request<Body>| {
             Response::<Body>::with_status(StatusCode::OK).with_body(Body::from("ok"))
@@ -6584,6 +6590,7 @@ mod tests {
         let tls = TlsSettings {
             identity,
             alpn: vec![b"h3".to_vec()],
+            ..Default::default()
         };
         let handler: Arc<dyn Handler> = Arc::new(|_request: Request<Body>| {
             let mut trailers = HeaderMap::new();

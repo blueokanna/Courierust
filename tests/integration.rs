@@ -1,5 +1,5 @@
 //! End-to-end integration tests: real TCP client↔server over loopback,
-//! covering HTTP/1.1, HTTP/2 (h2c), HTTPS (TLS 1.3) and gRPC.
+//! covering HTTP/1.1, HTTP/2 (h2c), HTTPS (TLS 1.2 + 1.3) and gRPC.
 
 mod common;
 
@@ -803,7 +803,7 @@ fn redirect_strips_credentials_cross_origin() {
 }
 
 // ---------------------------------------------------------------------
-// HTTPS (TLS 1.3) integration tests
+// HTTPS (TLS 1.2 + 1.3) integration tests
 // ---------------------------------------------------------------------
 
 /// Spin up an HTTPS server (self-signed test identity) and return its
@@ -835,6 +835,7 @@ fn https_server_config(http2: bool) -> ServerConfig {
             } else {
                 vec![b"http/1.1".to_vec()]
             },
+            ..Default::default()
         }),
         ..Default::default()
     }
@@ -1100,7 +1101,11 @@ fn spawn_tls_server_with_identity(
         ServerConfig {
             http2: alpn.iter().any(|p| p == b"h2"),
             threads: 1,
-            tls: Some(ServerTls { identity, alpn }),
+            tls: Some(ServerTls {
+                identity,
+                alpn,
+                ..Default::default()
+            }),
             ..Default::default()
         },
     )
@@ -1239,9 +1244,11 @@ fn tls12_client_hello() -> Vec<u8> {
     record
 }
 
-/// The server speaks TLS 1.3 only: a TLS 1.2-only ClientHello must be
-/// rejected (no silent downgrade to 1.2). The failure surfaces as the
-/// connection being closed without a valid HTTP response.
+/// The server defaults to TLS 1.2..=1.3, but a *minimal* TLS 1.2
+/// ClientHello that omits the ECDHE-required `supported_groups` and
+/// `signature_algorithms` extensions cannot complete a key exchange and
+/// must be rejected — never answered with a downgraded static-RSA or
+/// plaintext HTTP response.
 #[test]
 fn tls_server_rejects_tls12_client_hello() {
     use std::io::{Read, Write};
@@ -1260,7 +1267,7 @@ fn tls_server_rejects_tls12_client_hello() {
         match stream.read(&mut buf) {
             Ok(0) => break 'check true,
             Ok(n) => {
-                // A TLS 1.3 stack must not answer a 1.2 hello with an
+                // The server must not answer the incomplete hello with an
                 // HTTP response; an alert record (0x15) or close is the
                 // expected outcome.
                 if buf[0] == 0x15 {

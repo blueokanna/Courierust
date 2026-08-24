@@ -210,7 +210,7 @@ fn courierust_tls_server(alpn: Vec<Vec<u8>>) -> std::net::SocketAddr {
         "127.0.0.1:0",
         ServerConfig {
             http2,
-            tls: Some(ServerTls { identity, alpn }),
+            tls: Some(ServerTls { identity, alpn, ..Default::default() }),
             ..Default::default()
         },
     )
@@ -792,6 +792,7 @@ fn courierust_h3_server() -> std::net::SocketAddr {
             tls: Some(ServerTls {
                 identity,
                 alpn: vec![b"h3".to_vec()],
+                ..Default::default()
             }),
             ..Default::default()
         },

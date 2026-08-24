@@ -139,10 +139,9 @@ let client = GrpcClient::new("http://127.0.0.1:50051")?;
 let reply = client.call("helloworld.Greeter/SayHello", Bytes::from("world"))?;
 ```
 
-## HTTPS（内置 TLS 1.3）
+## HTTPS（内置 TLS 1.2 + TLS 1.3）
 
-自 0.1 起，本 crate 自带一套零依赖、从零实现的 TLS 1.3（RFC 8446），
-因此 `https://` 成为同一套客户端/服务端的一等公民能力：
+自 0.1 起，本 crate 自带一套零依赖、从零实现的 TLS 栈——**TLS 1.3（RFC 8446）与 TLS 1.2（RFC 5246 / RFC 8422）**——因此 `https://` 成为同一套客户端/服务端的一等公民能力：
 
 ```rust
 use courierust::courierust_client::{Client, ClientConfig, TlsSettings as ClientTls};
@@ -179,12 +178,31 @@ let client = Client::with_config(client_cfg);
 let resp = client.get("https://example.com/")?;
 ```
 
-支持的 TLS 1.3 配置：`TLS_CHACHA20_POLY1305_SHA256`、
-`TLS_AES_128_GCM_SHA256`、`TLS_AES_256_GCM_SHA384`；X25519 密钥交换；
-RSA-PSS / RSA-PKCS#1 v1.5 / ECDSA P-256 / Ed25519 证书签名；完整的
-X.509 链校验（有效期、名称链、签名验证、basic-constraints /
-key-usage、RFC 6125 主机名校验含 IP SAN、可插拔根证书库）。
-**策略上仅支持 TLS 1.3：** TLS 1.2 及更早版本被明确拒绝——TLS 1.2 ClientHello 会被拒绝且绝不静默降级（有集成测试覆盖），也从不提供 0-RTT / 会话恢复 / PSK。QUIC 必须协商 ALPN `h3`；HTTPS 的 ALPN 必须是 `h2` 或 `http/1.1`。
+支持的 TLS 配置：
+
+- **TLS 1.3（RFC 8446）：** `TLS_CHACHA20_POLY1305_SHA256`、
+  `TLS_AES_128_GCM_SHA256`、`TLS_AES_256_GCM_SHA384`；X25519 密钥交换。
+- **TLS 1.2（RFC 5246 / RFC 8422）：** 仅 AEAD 的 ECDHE 套件——
+  `ECDHE-ECDSA-AES128-GCM-SHA256`、`ECDHE-ECDSA-AES256-GCM-SHA384`、
+  `ECDHE-ECDSA-CHACHA20-POLY1305-SHA256` 以及对应的三个 `ECDHE-RSA-*`（
+  secp256r1 ECDHE）。CBC/HMAC、静态 RSA 与 RC4 套件永不提供——记录层只
+  实现 AEAD。RFC 5746 `renegotiation_info` 指示器会发送并回显；X25519
+  只在同时提供 TLS 1.3 时声明（纯 TLS 1.2 的 ClientHello 只声明
+  secp256r1，TLS 1.2 服务器永远不会选出客户端无法完成的群）。
+
+两个版本共享同一套身份、证书链校验与信任模型：RSA-PSS /
+RSA-PKCS#1 v1.5 / ECDSA P-256 / P-384 / Ed25519 证书签名；完整的 X.509
+链校验（有效期、名称链、签名验证、basic-constraints / key-usage、RFC
+6125 主机名校验含 IP SAN 与 CVE-2025-61727 排除子树通配符规则、可插拔
+根证书库）。
+
+**版本窗口完全可配置。** 客户端与服务端的 `TlsSettings::min_version` /
+`max_version`（默认 `Tls12..=Tls13`）控制提供与协商的范围。两端都钉到
+`Tls13` 即恢复纯 TLS 1.3 策略；接受过 TLS 1.3 客户端的 TLS 1.2 服务器
+仍会把 RFC 8446 §4.1.3 降级哨兵写进 ServerHello 随机数，使客户端能检测
+到降级；纯 TLS 1.3 客户端遇到 TLS 1.2 ServerHello 会拒绝且绝不静默降
+级。从不提供 0-RTT / 会话恢复 / PSK。QUIC 必须协商 ALPN `h3`；HTTPS
+的 ALPN 必须是 `h2` 或 `http/1.1`。
 `cargo run --example https` 可跑一个自签名证书的端到端示例；`cargo run --example h3` 是 HTTP/3（QUIC v1 + TLS 1.3）端到端示例（冷连接 vs 池化复用、大响应流控、并发多路复用、证书拒绝）；`cargo run --example grpc_streaming` 演示 gRPC 服务端流/客户端流/双向流、deadline、gzip 压缩协商与元数据/拦截器。
 
 ## 指纹：让连接「看起来像」 Chrome
@@ -220,12 +238,12 @@ courierust = { version = "0.1", default-features = false }
 这个仓库刻意不做的，以及你接手前应该知道的：
 
 - **HTTP/3 / QUIC 已有零依赖的内置路径，但协议边界必须如实理解**。`courierust_h3` 通过 std UDP reactor 运行 HTTP/3 请求/响应，包含 QUIC v1 包保护、内置 TLS 1.3、ALPN `h3`、有界 CRYPTO/stream 重组、Retry 完整性校验与 token 绑定的地址验证、Version Negotiation、验证前 3x anti-amplification、ACK range、使用新包号的重传、RTT/RTO 采样、有界拥塞窗口、控制/QPACK 流、trailer 与 GOAWAY 校验。它还不是完整的互联网级 QUIC 实现：完整 PTO/时间阈值丢包恢复、动态本地 `MAX_DATA`/`MAX_STREAM_DATA` credit 更新、连接迁移与路径验证、stateless reset、0-RTT/session ticket、自动及双向 key update、QPACK blocked-stream acknowledgement，以及独立实现互操作仍需实现和专门证据。在这些缺口关闭前，不应宣称对外普遍互通。
-- **TLS 暂无 PSK / 0-RTT 恢复 / session ticket / key update，也无双向 mTLS**。每次都做完整 1-RTT 握手；对端发来的 NewSessionTicket 会被忽略；服务端不请求客户端证书。基准里的 TLS 行因此如实报告 `session_resumption=n/a`。
+- **TLS 暂无 PSK / 0-RTT 恢复 / session ticket / key update，也无双向 mTLS**。每次都做完整 1-RTT 握手；对端发来的 NewSessionTicket 会被忽略；TLS 1.2 session id 会携带但从不用于恢复；服务端不请求客户端证书。基准里的 TLS 行因此如实报告 `session_resumption=n/a`。
 - **事件驱动服务器全平台默认开启，只处理 HTTP/1.1**。`ServerConfig::event_driven`（默认 `true`）把空闲明文 HTTP 连接挂在轮询器上（Winsock `select` / POSIX `poll`），少量 worker 即可服务大量 idle keep-alive / SSE / 长轮询连接；TLS 与 HTTP/2 连接仍走阻塞池模型（由 `handshake_timeout`、`h2_idle_timeout` 与 worker 数共同约束）。设为 `false` 恢复旧的**每连接一池任务**模型；该路径已不建议用于生产——空闲/慢连接群会耗尽池——仅作对比与调试，默认事件路径用 `max_connections`（连接上限）与 `idle_timeout` 约束资源。
 - **请求体流式上传目前只在 HTTP/2 下可靠**（h2 天然分帧）。HTTP/1.1 的请求体要么一次性给全（`Body::Bytes`），要么你自己拼 chunked。
 - **gRPC 不含 protobuf、`.proto` 代码生成与 `grpc.reflection`**。消息编解码需要你实现 codec trait 或接你自己的 protobuf 生成代码；reflection 需要 protobuf 模式清单，属外部职责。
 - **长时间阻塞的同步 handler 会占住一个 worker**（事件驱动与否都一样）——任何同步服务器的通病；流式场景用 channel 响应体。worker 占用**按连接而非按流**：一条连接上的任意空闲流只占同一个 worker，慢流不阻塞同连接其他流——两者均有集成测试覆盖。
-- **HTTPS 是一等公民**：客户端与服务端内置从零实现的 TLS 1.3；`https://` 需要自备根证书库（无内置 CA）。**ALPN 强制一致**：配置 h2 的客户端连到协商出 `http/1.1` 的服务器，或对方**完全未协商 ALPN**（RFC 9113 §3.3 要求 TLS 上必须用 ALPN `h2`），都会得到明确错误而非静默协议错乱。
+- **HTTPS 是一等公民**：客户端与服务端内置从零实现的 TLS 1.2 + TLS 1.3；`https://` 需要自备根证书库（无内置 CA）。**ALPN 强制一致**：配置 h2 的客户端连到协商出 `http/1.1` 的服务器，或对方**完全未协商 ALPN**（RFC 9113 §3.3 要求 TLS 上必须用 ALPN `h2`），都会得到明确错误而非静默协议错乱。
 - 客户端重定向、keep-alive 复用等策略以「正确」为先，未做激进调优。
 
 ## 目录结构
@@ -244,7 +262,7 @@ src/
 ├── courierust_bytes/       # 字节缓冲（BytesMut）                              [no_std]
 ├── courierust_io/          # Read/Write trait（no_std 版）                     [no_std]
 ├── courierust_error/       # 统一错误类型
-├── courierust_tls/         # TLS 1.3（RFC 8446）：握手、记录层、X.509、HTTPS    [std]
+├── courierust_tls/         # TLS 1.2 + 1.3（RFC 5246/8446）：握手、记录层、X.509、HTTPS    [std]
 ├── courierust_pool/        # 工作窃取线程池                                    [std]
 ├── courierust_net/         # TCP → io trait 适配、轮询器、可选 stats 埋点      [std]
 ├── courierust_body/        # 流式响应体（channel）                             [std]
@@ -260,7 +278,7 @@ src/
 
 - HTTP/1.1 keep-alive，顺序与多 worker 并行；
 - HTTP/2 多 worker 多路复用；
-- HTTPS（TLS 1.3 + h2）经本仓库自带 TLS 栈的端到端；
+- HTTPS（TLS 1.2/1.3 + h2）经本仓库自带 TLS 栈的端到端；
 - RFC 9218 优先级调度；
 - 并发模型对比（空闲连接群 vs worker 池）与慢发送者群基准。
 
@@ -295,8 +313,8 @@ cargo fuzz run h2_frame --fuzz-dir fuzz -- -runs=10000
 
 ## 测试
 
-- 单元测试 170 个：覆盖 HPACK 全部 RFC 向量（C.2/C.3/C.4/C.6）、Huffman 编解码（含解码输出上限）、帧编解码、状态机、流控、WUCS 调度、JA3/JA4 公开记录比对、指纹解析、TLS 1.3 握手与 RFC 8448 密钥调度、X.25519/Ed25519/ECDSA/RSA 原语、DEFLATE/gzip 编解码（往返、CRC-32 向量、损坏拒绝、输出上限、与 Python zlib 输出交叉验证），以及轮询器 self-pipe（唤醒描述符）语义。
-- 集成测试 61 个：真实 TCP 环回上的 h1/h2/HTTPS 请求往返、keep-alive 复用、chunked、重定向、h2 并发多路复用、流式响应、大体积流控往返、gRPC unary/服务端流/客户端流/双向流与错误状态/trailers/deadline 执行、gzip 往返、`grpc.health.v1.Health` `Check` + `Watch`、RFC 7540 §3.2 `h2c` Upgrade、**TLS 策略/加固**（信任拒绝、过期证书、不可信签发链、自签名但显式信任、主机名不匹配、ALPN 一致、TLS 1.2 ClientHello 拒绝——绝不静默降级、握手中断失败、畸形 TLS 输入存活、`verify:false`）、并发证明（慢流不阻塞同连接其他流；大量空闲流按连接而非按流占 worker；空闲连接羊群不阻塞新请求；事件调度器回收 slow-loris 并执行 `max_connections`；服务端流式响应按短节奏冲刷；单条 h2 连接并发突发不饥饿），以及 **11 个 HTTP/3 集成测试**（QUIC v1 + TLS 1.3 真实 UDP 套接字、走公共 `Client`/`Server`）：GET/POST 往返、池化连接复用、双向 256 KiB 请求/响应流控、并发多路复用、每请求 deadline 执行，以及 H3 TLS 安全（不信任 / 过期 / 错误证书链 / 主机名不匹配证书均在握手阶段拒绝）。
+- 单元测试 253 个：覆盖 HPACK 全部 RFC 向量（C.2/C.3/C.4/C.6）、Huffman 编解码（含解码输出上限）、帧编解码、状态机、流控、WUCS 调度、JA3/JA4 公开记录比对、指纹解析、TLS 1.3 握手与 RFC 8448 密钥调度、TLS 1.2 握手（ECDHE-RSA/ECDSA AEAD 套件、PRF、RFC 5746 重协商回显、Ed25519 ServerKeyExchange 签名/验证）、X.25519/Ed25519/ECDSA/RSA 原语、DEFLATE/gzip 编解码（往返、CRC-32 向量、损坏拒绝、输出上限、与 Python zlib 输出交叉验证），以及轮询器 self-pipe（唤醒描述符）语义。
+- 集成测试 63 个：真实 TCP 环回上的 h1/h2/HTTPS 请求往返、keep-alive 复用、chunked、重定向、h2 并发多路复用、流式响应、大体积流控往返、gRPC unary/服务端流/客户端流/双向流与错误状态/trailers/deadline 执行、gzip 往返、`grpc.health.v1.Health` `Check` + `Watch`、RFC 7540 §3.2 `h2c` Upgrade、**TLS 策略/加固**（信任拒绝、过期证书、不可信签发链、自签名但显式信任、主机名不匹配、ALPN 一致、TLS 1.2 与 TLS 1.3 分别用 RSA / P-384 / Ed25519 身份的完整往返、纯 TLS 1.3 客户端拒绝 TLS 1.2 服务器——绝不静默降级——与 RFC 8446 降级哨兵、握手中断失败、畸形 TLS 输入存活、`verify:false`）、并发证明（慢流不阻塞同连接其他流；大量空闲流按连接而非按流占 worker；空闲连接羊群不阻塞新请求；事件调度器回收 slow-loris 并执行 `max_connections`；服务端流式响应按短节奏冲刷；单条 h2 连接并发突发不饥饿），以及 **13 个 HTTP/3 集成测试**（QUIC v1 + TLS 1.3 真实 UDP 套接字、走公共 `Client`/`Server`）：GET/POST 往返、池化连接复用、双向 256 KiB 请求/响应流控、并发多路复用、每请求 deadline 执行、双向 key update，以及 H3 TLS 安全（不信任 / 过期 / 错误证书链 / 主机名不匹配证书均在握手阶段拒绝）。
 - 加固测试 30 个：恶意帧输入（超长帧、畸形 SETTINGS/PING/WINDOW_UPDATE、流控窗口溢出、HPACK 头表与 Huffman 炸弹、截断/EOS Huffman、伪头顺序、`content-length` 不一致、非法 `transfer-encoding`/`connection` 系头、两端 `SETTINGS_MAX_CONCURRENT_STREAMS` 强制、`h2c` 存活检测：SETTINGS_TIMEOUT 与 keepalive 死对端检测）。
 
 ```bash

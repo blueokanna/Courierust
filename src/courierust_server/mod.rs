@@ -33,6 +33,29 @@ pub struct TlsSettings {
     /// ALPN protocols offered (the first client match wins; `h2` selects
     /// HTTP/2, anything else falls back to HTTP/1.1).
     pub alpn: Vec<Vec<u8>>,
+    /// Lowest TLS version the server will negotiate.
+    pub min_version: crate::courierust_tls::TlsVersion,
+    /// Highest TLS version the server will negotiate.
+    pub max_version: crate::courierust_tls::TlsVersion,
+}
+
+impl Default for TlsSettings {
+    /// An empty identity with the default TLS 1.2..=1.3 window. This
+    /// exists so call sites can write `TlsSettings { identity, alpn,
+    /// ..Default::default() }`; the identity and ALPN are always provided
+    /// explicitly in practice.
+    fn default() -> Self {
+        Self {
+            identity: crate::courierust_tls::Identity {
+                cert_chain: Vec::new(),
+                private_key: Vec::new(),
+                is_rsa: false,
+            },
+            alpn: Vec::new(),
+            min_version: crate::courierust_tls::TlsVersion::Tls12,
+            max_version: crate::courierust_tls::TlsVersion::Tls13,
+        }
+    }
 }
 
 /// Server configuration.
@@ -401,6 +424,8 @@ pub(crate) fn serve_accepted(
                 crate::courierust_tls::TlsAcceptor::new(crate::courierust_tls::ServerConfig {
                     identity: t.identity.clone(),
                     alpn: t.alpn.clone(),
+                    min_version: t.min_version,
+                    max_version: t.max_version,
                     ..Default::default()
                 });
             let arc = Arc::new(stream);

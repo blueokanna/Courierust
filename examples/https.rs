@@ -1,4 +1,4 @@
-//! HTTPS (TLS 1.3) end-to-end example: a server with a self-signed
+//! HTTPS (TLS 1.2 + 1.3) end-to-end example: a server with a self-signed
 //! Ed25519 identity and a client that validates it, speaking `https://`.
 //!
 //! The identity files live in `tests/certs/` (DER):
@@ -33,6 +33,7 @@ fn main() -> courierust::Result<()> {
         tls: Some(ServerTls {
             identity,
             alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            ..Default::default()
         }),
         ..Default::default()
     };
