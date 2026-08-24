@@ -5077,7 +5077,7 @@ impl QuicTransport {
             && self.spaces[level].ack_pending
             && self.spaces[level]
                 .ack_deadline
-                .map_or(true, |deadline| deadline <= Instant::now());
+                .is_none_or(|deadline| deadline <= Instant::now());
         // Owned scratch outlives `frames` below so the piggybacked ACK
         // slice stays valid for the whole packet build.
         let mut piggyback = Vec::new();
