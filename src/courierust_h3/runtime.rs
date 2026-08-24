@@ -131,6 +131,16 @@ fn h3_role(server: bool) -> &'static str {
         "client"
     }
 }
+
+/// `COURIERUST_H3_RETRY=0` disables the server's Retry address
+/// validation (benchmark knob; default Retry is on). Without Retry the
+/// per-connection anti-amplification limit still applies, so the 3x
+/// amplification bound is preserved — only the extra address-validation
+/// round trip is removed.
+fn h3_retry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("COURIERUST_H3_RETRY").ok().as_deref() != Some("0"))
+}
 /// RFC 9000 §9.3.3: PATH_CHALLENGE probe timeout — after this long without
 /// a matching PATH_RESPONSE the probe is retried once, then the pending
 /// path is abandoned (the validated path remains authoritative).
@@ -757,22 +767,28 @@ fn run_client_driver(
             wait_ms = wait_ms.min(remaining.as_millis().min(i64::MAX as u128) as i64);
         }
         let wait_started = Instant::now();
+        if h3_packet_trace() {
+            eprintln!(
+                "H3TRACE|client|poll-enter wait_ms={wait_ms} active={} waiting={} unacked={}",
+                conn.active.len(),
+                conn.waiting.len(),
+                conn.transport.unacknowledged_bytes()
+            );
+        }
         let ready = match poller.wait(wait_ms.max(1) as i32, Some(wake_fd)) {
             Ok(ready) => ready,
             Err(error) => return finish(conn, &socket, io_error(error.to_string())),
         };
-        // Tail instrumentation: a long poll here means a lost wake
-        // deferred command dispatch (or response handling) — the client
-        // side of the H3 tail.
-        if std::env::var_os("COURIERUST_H3_TRACE").is_some() {
+        // Per-poll timeline (COURIERUST_H3_TRACE): a long wait here means
+        // a lost wake deferred command dispatch or response handling — the
+        // client side of the H3 tail.
+        if h3_packet_trace() {
             let wait_us = wait_started.elapsed().as_micros() as u64;
-            if wait_us > 1000 {
-                eprintln!(
-                    "H3TRACE|client|poll-wait={wait_us}us ready={ready:?} active={} waiting={}",
-                    conn.active.len(),
-                    conn.waiting.len()
-                );
-            }
+            eprintln!(
+                "H3TRACE|client|poll-return wait_us={wait_us} ready={ready:?} active={} waiting={}",
+                conn.active.len(),
+                conn.waiting.len()
+            );
         }
         if ready.contains(&SOCKET_ID) {
             // Bounded drain: mirror the server so a flood cannot starve
@@ -1172,10 +1188,6 @@ fn handle_server_datagram(
             }
         }
     }
-    // RFC 9000 §10.3: a short-header packet for an unknown connection ID
-    // (the connection is gone) triggers a stateless reset. The token is
-    // derived deterministically from the destination CID, so no state is
-    // needed.
     if !datagram.is_empty() && datagram[0] & 0x80 == 0 && datagram[0] & 0x40 != 0 {
         if let Some(dcid) = packet_destination_cid(datagram) {
             let token = stateless_reset_token(reset_key, dcid);
@@ -1201,9 +1213,10 @@ fn handle_server_datagram(
     };
     let token = retry_protector.validate(peer, &meta.token);
     let original_dcid = token.as_ref().map(|value| value.original_dcid.as_slice());
-    if token
-        .as_ref()
-        .map_or(true, |value| value.retry_dcid != meta.dcid)
+    if h3_retry_enabled()
+        && token
+            .as_ref()
+            .map_or(true, |value| value.retry_dcid != meta.dcid)
     {
         let Ok(retry_dcid) = random_cid() else {
             return;
@@ -1355,6 +1368,10 @@ struct ActiveRequest {
     created: Instant,
     sent_at: Option<Instant>,
     headers_at: Option<Instant>,
+    /// True while the body upload is parked on a WouldBlock (flow-control
+    /// or congestion-window backpressure), for the credit-blocked/resumed
+    /// timeline events.
+    credit_blocked: bool,
 }
 
 struct ClientConnection {
@@ -1458,11 +1475,6 @@ impl ClientConnection {
         if source == self.transport.peer.unwrap_or(source)
             || self.transport.pending_peer == Some(source)
         {
-            // Version Negotiation / Retry packets are unauthenticated.
-            // Per RFC 9000 §5.2 a packet that cannot be processed MUST be
-            // discarded, never fatal: a malformed long header (bad CID
-            // lengths, truncated integrity tag) from the server address is
-            // dropped rather than tearing the connection down.
             if let Ok(Some(version_negotiation)) = version_negotiation_versions(datagram) {
                 if version_negotiation.dcid == self.transport.local_cid {
                     if version_negotiation.scid != self.transport.original_dcid {
@@ -1502,9 +1514,6 @@ impl ClientConnection {
                 if !self.transport.apply_retry(retry.scid, retry.token)? {
                     return Err(protocol("multiple QUIC Retry packets are not permitted"));
                 }
-                // RFC 9000 §7.3: record the Retry SCID so the server's
-                // `retry_source_connection_id` transport parameter can be
-                // validated during the TLS handshake.
                 let retry_scid = self.transport.initial_dcid.clone();
                 self.tls.set_retry_source_cid(retry_scid);
                 self.tls_initial_sent = false;
@@ -1517,13 +1526,6 @@ impl ClientConnection {
             let (level, _pn, frames, packet_len) = match opened {
                 Ok(Some(value)) => value,
                 _ => {
-                    // RFC 9000 §10.3.3: a packet that fails to authenticate
-                    // (or is malformed) MUST NOT close the connection — it
-                    // is dropped. The single authenticated exception is a
-                    // stateless reset: an undecryptable short-header packet
-                    // whose final 16 bytes match the peer's advertised
-                    // token means the peer lost connection state and is
-                    // telling us to go away.
                     if self.transport.is_stateless_reset(&datagram[consumed..]) {
                         return Err(protocol("peer sent a stateless reset"));
                     }
@@ -1534,9 +1536,6 @@ impl ClientConnection {
                 return Err(protocol("QUIC packet decoder made no progress"));
             }
             consumed += packet_len;
-            // Path validation (RFC 9000 §9.3): answer the peer's
-            // PATH_CHALLENGE on the path it arrived on, and commit a
-            // migration when a PATH_RESPONSE echoes our probe token.
             for frame in &frames {
                 match frame {
                     QFrame::PathChallenge(token) => {
@@ -1548,9 +1547,6 @@ impl ClientConnection {
                     _ => {}
                 }
             }
-            // An authenticated packet from a brand-new source address is a
-            // migration attempt or a NAT rebinding: validate the path
-            // before switching traffic to it.
             if source != self.transport.peer.unwrap_or(source)
                 && self.transport.pending_peer != Some(source)
             {
@@ -1605,10 +1601,6 @@ impl ClientConnection {
                                     packet_keys_from_flight(flight.application_read)?,
                                     packet_keys_from_flight(flight.application_write)?,
                                 );
-                                // The server's transport parameters arrive in
-                                // EncryptedExtensions (RFC 9001 §8.2), so they
-                                // only become available once the handshake
-                                // flight has been processed.
                                 if let Some(parameters) = self.tls.peer_transport() {
                                     self.transport.set_peer_transport(parameters);
                                 }
@@ -1634,10 +1626,6 @@ impl ClientConnection {
                         ack = true;
                     }
                     QFrame::ConnectionClose { .. } => {
-                        // RFC 9000 §10.2: a peer CONNECTION_CLOSE is normal
-                        // termination, not a protocol error. The driver fails
-                        // outstanding requests without answering with its own
-                        // CONNECTION_CLOSE.
                         self.peer_closed = true;
                         return Ok(());
                     }
@@ -1658,19 +1646,10 @@ impl ClientConnection {
         self.transport.flush_acks(socket)?;
         self.transport
             .check_path_validation_timeout(socket, Instant::now())?;
-        // Raise the advertised connection-level receive window as the
-        // application consumes data, so a long-lived connection is not
-        // capped at `initial_max_data` (which otherwise tears the
-        // connection down mid-transfer).
         self.transport.replenish_connection_window(socket)?;
-        // Same for per-stream windows: a long-lived stream must not be
-        // capped at its initial `MAX_STREAM_DATA` either.
         self.transport.replenish_stream_windows(socket)?;
-        // And the stream-count limits (RFC 9000 §4.6): a long-lived
-        // connection must not stop at the initial MAX_STREAMS.
         self.transport.replenish_stream_limits(socket)?;
         self.transport.retransmit(socket)?;
-        // Automatic bidirectional key update (RFC 9001 §6).
         self.transport.maybe_key_update();
         if !self.tls_initial_sent {
             self.transport
@@ -1683,11 +1662,7 @@ impl ClientConnection {
             self.ensure_control_sent(socket)?;
             self.flush_qpack(socket)?;
             self.flush_requests(socket)?;
-            // QPACK encoder-stream instructions produced while building
-            // this batch of requests go out before the next batch.
             self.flush_qpack(socket)?;
-            // Resume request bodies deferred by the congestion window;
-            // remaining chunks go out once ACKs free credit.
             let resumable: Vec<u64> = self
                 .active
                 .iter()
@@ -1741,9 +1716,6 @@ impl ClientConnection {
             ),
         ])
         .to_bytes();
-        // Control streams are tiny and idempotent; if the congestion
-        // window is momentarily full, defer and retry on the next tick
-        // (the peer deduplicates a re-send).
         match self
             .transport
             .send_stream(socket, APPLICATION, 2, &control_stream(settings), false)
@@ -1777,9 +1749,6 @@ impl ClientConnection {
         self.control_sent = true;
         self.flush_qpack(socket)
     }
-
-    /// Send a GOAWAY frame on the control stream before closing so the
-    /// peer learns which request streams were processed (RFC 9114 §7.2.8).
     fn send_goaway(&mut self, socket: &UdpSocket) -> Result<()> {
         if self.goaway_sent || !self.control_sent {
             return Ok(());
@@ -1838,9 +1807,6 @@ impl ClientConnection {
     /// cleanly instead of half-sending a body the peer can never accept.
     fn flush_requests(&mut self, socket: &UdpSocket) -> Result<()> {
         if !self.handshake_complete || !self.control_received {
-            // Tail instrumentation: a request stuck here is a connection
-            // that never finished the handshake/SETTINGS — the client
-            // side of a handoff stall.
             if !self.waiting.is_empty() && std::env::var_os("COURIERUST_H3_TRACE").is_some() {
                 eprintln!(
                     "H3TRACE|client|flush-deferred: handshake={} control={} waiting={}",
@@ -1866,10 +1832,6 @@ impl ClientConnection {
                 self.waiting.push_front(request);
                 break;
             }
-            // RFC 9000 §4.6: respect the peer's advertised cumulative
-            // stream-count limit (raised by MAX_STREAMS frames). If the
-            // limit is exhausted, fail the request cleanly instead of
-            // blocking forever.
             let peer_limit = self.transport.peer_stream_count_limit();
             if self.next_stream_index >= peer_limit {
                 let _ = request
@@ -1882,6 +1844,9 @@ impl ClientConnection {
                 .next_stream_index
                 .checked_add(1)
                 .ok_or_else(|| protocol("HTTP/3 stream id exhausted"))?;
+            if h3_packet_trace() {
+                eprintln!("H3TRACE|client|stream-created stream={stream_id}");
+            }
             let outbound_limit = self.max_header_list.min(self.peer_max_header_list);
             let wire = match build_request_wire(
                 request.request,
@@ -1911,6 +1876,7 @@ impl ClientConnection {
                 created: Instant::now(),
                 sent_at: None,
                 headers_at: None,
+                credit_blocked: false,
             };
             if let Err(error) =
                 send_request_chunks(&mut self.transport, socket, stream_id, &mut active)
@@ -2248,8 +2214,37 @@ fn send_request_chunks(
             &active.wire[active.offset..end],
             fin,
         ) {
-            Ok(()) => active.offset = end,
-            Err(error) if error.kind == ErrorKind::WouldBlock => return Ok(()),
+            Ok(()) => {
+                if active.credit_blocked {
+                    active.credit_blocked = false;
+                    if h3_packet_trace() {
+                        eprintln!(
+                            "H3TRACE|client|credit-resumed stream={stream_id} offset={}/{}",
+                            active.offset,
+                            active.wire.len()
+                        );
+                    }
+                }
+                active.offset = end
+            }
+            Err(error) if error.kind == ErrorKind::WouldBlock => {
+                // Flow-control / congestion-window backpressure: the body
+                // upload is parked here until ACKs or credit free the
+                // window — the exact stall a 64 KiB upload tail points at.
+                if !active.credit_blocked {
+                    active.credit_blocked = true;
+                    if h3_packet_trace() {
+                        eprintln!(
+                            "H3TRACE|client|credit-blocked stream={stream_id} offset={}/{} cwnd={} unacked={}",
+                            active.offset,
+                            active.wire.len(),
+                            transport.congestion_window,
+                            transport.unacknowledged_bytes()
+                        );
+                    }
+                }
+                return Ok(());
+            }
             Err(error) => return Err(error),
         }
     }
@@ -2492,6 +2487,9 @@ impl ServerConnection {
                                 packet_keys_from_flight(flight.application_write)?,
                             );
                             self.handshake_complete = true;
+                            if h3_packet_trace() {
+                                eprintln!("H3TRACE|client|handshake-complete");
+                            }
                             self.send_control(socket)?;
                         }
                     }
@@ -5347,6 +5345,13 @@ impl QuicTransport {
         }
         if lost {
             self.on_loss();
+        }
+        if h3_packet_trace() && (lost || probe_armed) {
+            eprintln!(
+                "H3TRACE|client|retransmit lost={lost} probe={probe_armed} cwnd={} unacked={}",
+                self.congestion_window,
+                self.unacknowledged_bytes()
+            );
         }
         for (pn, level, frames, pad_initial, retransmits) in resend {
             match self.send_frames_with_retransmits(
