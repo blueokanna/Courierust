@@ -460,10 +460,7 @@ mod tests {
             let ready = p.wait(1000, Some(wfd)).unwrap();
             let elapsed = started.elapsed();
             max = max.max(elapsed);
-            assert!(
-                ready.contains(&WAKE_ID),
-                "wake {i} lost: ready={ready:?}"
-            );
+            assert!(ready.contains(&WAKE_ID), "wake {i} lost: ready={ready:?}");
             drain_wake(&reader);
         }
         assert!(

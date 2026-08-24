@@ -872,9 +872,7 @@ fn run_server(
         if std::env::var_os("COURIERUST_H3_TRACE").is_some() {
             let wait_us = wait_started.elapsed().as_micros() as u64;
             if wait_us > 1000 {
-                eprintln!(
-                    "H3TRACE|server|poll-wait={wait_us}us ready={ready:?}"
-                );
+                eprintln!("H3TRACE|server|poll-wait={wait_us}us ready={ready:?}");
             }
         }
         if ready.contains(&SOCKET_ID) {
@@ -1197,9 +1195,7 @@ impl Drop for H3ActiveGuard {
 /// Slow-request trace threshold in µs. `None` disables tracing. Gated by
 /// `COURIERUST_H3_TRACE` (enable) and `COURIERUST_H3_TRACE_MS` (default 2).
 fn h3_trace_threshold_us() -> Option<u64> {
-    if std::env::var_os("COURIERUST_H3_TRACE").is_none() {
-        return None;
-    }
+    std::env::var_os("COURIERUST_H3_TRACE")?;
     let ms = std::env::var("COURIERUST_H3_TRACE_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -1207,7 +1203,8 @@ fn h3_trace_threshold_us() -> Option<u64> {
     Some(ms.saturating_mul(1000))
 }
 
-fn h3_open_stream(stats: Option<&Arc<Stats>>, active: &mut BTreeSet<u64>, id: u64) {    if !active.insert(id) {
+fn h3_open_stream(stats: Option<&Arc<Stats>>, active: &mut BTreeSet<u64>, id: u64) {
+    if !active.insert(id) {
         return;
     }
     if let Some(stats) = stats {
@@ -4021,7 +4018,8 @@ struct QuicTransport {
     spaces: [PacketSpace; 3],
     crypto_send_offsets: [u64; 3],
     queued_streams: VecDeque<QueuedStream>,
-    congestion_window: usize,    slow_start_threshold: usize,
+    congestion_window: usize,
+    slow_start_threshold: usize,
     smoothed_rtt: Option<Duration>,
     rtt_variance: Duration,
     latest_rtt: Option<Duration>,
@@ -4798,14 +4796,9 @@ impl QuicTransport {
     }
 
     fn flush_queued_streams(&mut self, socket: &UdpSocket) -> Result<()> {
-        while let Some(mut queued) = self.queued_streams.pop_front() {
-            // Tail instrumentation: a response that waits here is a
-            // worker→reactor→flush stall, visible to the client as
-            // wait_headers/recv_body latency.
+        while let Some(queued) = self.queued_streams.pop_front() {
             if let Some(threshold) = h3_trace_threshold_us() {
-                let wait = Instant::now()
-                    .duration_since(queued.queued_at)
-                    .as_micros() as u64;
+                let wait = Instant::now().duration_since(queued.queued_at).as_micros() as u64;
                 if wait > threshold {
                     eprintln!(
                         "H3TRACE|server|response-queue-wait|stream={}|wait_us={wait}|offset={}/{}|cwnd={}|unacked={}",
