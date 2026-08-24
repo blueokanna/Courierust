@@ -4748,6 +4748,11 @@ impl QuicTransport {
     /// once per invocation.
     fn detect_lost_packets(&mut self, level: LevelIndex, now: Instant) -> usize {
         let threshold = self.loss_detection_threshold();
+        let rtt = self
+            .smoothed_rtt
+            .or(self.latest_rtt)
+            .unwrap_or(Duration::from_millis(100));
+        let reorder_window = (rtt / 8).max(Duration::from_millis(1));
         let space = &mut self.spaces[level];
         let largest_acked = space.largest_acked;
         let mut lost: Vec<u64> = Vec::new();
@@ -4757,7 +4762,8 @@ impl QuicTransport {
             }
             let over_time = now.duration_since(packet.sent_at) >= threshold;
             let over_packet = largest_acked
-                .is_some_and(|la| la.saturating_sub(pn) >= PACKET_THRESHOLD && pn < la);
+                .is_some_and(|la| la.saturating_sub(pn) >= PACKET_THRESHOLD && pn < la)
+                && now.duration_since(packet.sent_at) >= reorder_window;
             if over_time || over_packet {
                 lost.push(pn);
             }
@@ -5747,12 +5753,6 @@ fn send_datagram(socket: &UdpSocket, peer: Option<SocketAddr>, wire: &[u8]) -> R
     };
     match result {
         Ok(_) => Ok(()),
-        // A full UDP send buffer is transient backpressure, not a
-        // failure. Mapping it to WouldBlock keeps every deferral guard
-        // (retransmit re-queue, stream-chunk resume, crypto resume)
-        // working; mapping it to Io here is what let a loaded Linux
-        // runner treat a momentary EAGAIN as fatal and tear the
-        // connection down mid-transfer.
         Err(e)
             if e.kind() == std::io::ErrorKind::WouldBlock
                 || e.kind() == std::io::ErrorKind::TimedOut =>
@@ -5792,11 +5792,6 @@ fn acknowledge(
     largest: u64,
     ranges: &[(u64, u64)],
 ) -> Result<(usize, Option<Duration>)> {
-    // RFC 9000 §13.1: an ACK that acknowledges a packet number the sender
-    // never sent is a protocol error. A duplicate ACK of an already-
-    // acknowledged packet stays within `largest_sent_ever` and is legal
-    // (peers re-ACK when they receive a retransmission), so only an ACK
-    // beyond the highest number ever sent is rejected.
     if largest_sent_ever.map_or(true, |max| largest > max) {
         return Err(protocol("ACK acknowledges an unsent packet number"));
     }
@@ -6056,6 +6051,44 @@ mod tests {
             matches!(opened, Ok(None)),
             "an undecryptable packet must be dropped, got {opened:?}"
         );
+    }
+
+    /// RFC 9002 §6.1.1: the packet-number loss threshold applies only to
+    /// packets older than the reordering window (max(1/8·RTT, 1 ms)). A
+    /// burst whose ACKs coalesce on loopback must not be declared lost
+    /// the moment a later packet is acknowledged — that false loss halves
+    /// cwnd and spawns the retransmit storm behind the H3 64 KiB tail.
+    #[test]
+    fn packet_threshold_loss_requires_reorder_window() {
+        let mut conn =
+            QuicTransport::client(vec![0x11; 8], vec![0x22; 8], vec![0x33; 8], None).unwrap();
+        conn.smoothed_rtt = Some(Duration::from_millis(10));
+        conn.latest_rtt = Some(Duration::from_millis(10));
+        // Reorder window = max(10ms/8, 1ms) = 1.25 ms.
+        let reorder_window = Duration::from_micros(1250);
+        conn.spaces[APPLICATION].largest_acked = Some(100);
+        let now = Instant::now();
+        let insert = |conn: &mut QuicTransport, pn: u64, age: Duration| {
+            conn.spaces[APPLICATION].sent.insert(
+                pn,
+                SentPacket {
+                    frames: Vec::new(),
+                    pad_initial: false,
+                    sent_at: now - age,
+                    retransmits: 0,
+                    ack_eliciting: true,
+                    size: 1200,
+                    pending_resend: false,
+                },
+            );
+        };
+        // 4 numbers behind the largest ACK but younger than the reorder
+        // window: NOT lost (this is the loopback ACK-coalescing case).
+        insert(&mut conn, 96, reorder_window - Duration::from_micros(100));
+        assert_eq!(conn.detect_lost_packets(APPLICATION, now), 0);
+        // 4 numbers behind and past the reorder window: lost.
+        insert(&mut conn, 96, reorder_window + Duration::from_micros(100));
+        assert_eq!(conn.detect_lost_packets(APPLICATION, now), 1);
     }
 
     /// The same guarantee at the `on_datagram` level (client role): the

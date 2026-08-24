@@ -971,19 +971,24 @@ fn event_loop(
         //    it happens. The timeout therefore only bounds the wait when
         //    nothing at all is happening — it never sits in the request
         //    latency path.
-        let wait_ms = match idle_timeout {
-            Some(t) => {
-                let now = Instant::now();
-                let next = activity
-                    .values()
-                    .map(|at| {
-                        t.checked_sub(now.duration_since(*at))
-                            .unwrap_or(Duration::ZERO)
-                    })
-                    .min()
-                    .unwrap_or(Duration::from_secs(3600));
-                next.as_millis().min(poll_timeout as u128).max(1) as i32
-            }
+        let now = Instant::now();
+        // Earliest remaining idle deadline across connections; `None`
+        // when idle reaping is disabled. Reused by the poll wait (so an
+        // expiring connection is reaped promptly) and by the reap scan
+        // (skipped when no connection can have crossed the deadline
+        // inside this iteration).
+        let next_idle = idle_timeout.map(|t| {
+            activity
+                .values()
+                .map(|at| {
+                    t.checked_sub(now.duration_since(*at))
+                        .unwrap_or(Duration::ZERO)
+                })
+                .min()
+                .unwrap_or(Duration::from_secs(3600))
+        });
+        let wait_ms = match next_idle {
+            Some(next) => next.as_millis().min(poll_timeout as u128).max(1) as i32,
             None => poll_timeout,
         };
         let ready = match poller.wait(wait_ms, Some(wake_fd)) {
@@ -1129,26 +1134,34 @@ fn event_loop(
 
         // 6. Reap connections that have made no progress for the idle
         //    timeout (slow-loris / idle keep-alive bound). The registry
-        //    is locked once per scan, not once per candidate.
+        //    is locked once per scan, not once per candidate. The scan
+        //    runs only when a deadline falls inside the poll window —
+        //    otherwise nothing can have expired, and the per-iteration
+        //    registry lock + key copy is pure overhead on every request.
         if let Some(t) = idle_timeout {
-            let now = Instant::now();
-            let mut expired = Vec::new();
-            let registered: HashSet<usize> = registry.lock().unwrap().keys().copied().collect();
-            for (&id, &at) in &activity {
-                if now.duration_since(at) < t {
-                    continue;
+            let near_idle = next_idle
+                .map(|next| next <= Duration::from_millis(poll_timeout as u64))
+                .unwrap_or(false);
+            if near_idle {
+                let now = Instant::now();
+                let mut expired = Vec::new();
+                let registered: HashSet<usize> = registry.lock().unwrap().keys().copied().collect();
+                for (&id, &at) in &activity {
+                    if now.duration_since(at) < t {
+                        continue;
+                    }
+                    if pending.contains_key(&id) || registered.contains(&id) {
+                        expired.push(id);
+                    }
                 }
-                if pending.contains_key(&id) || registered.contains(&id) {
-                    expired.push(id);
-                }
-            }
-            for id in expired {
-                poller.unregister(id);
-                pending.remove(&id);
-                registry.lock().unwrap().remove(&id);
-                if activity.remove(&id).is_some() {
-                    if let Some(s) = stats {
-                        Stats::decrement(&s.connections_active, 1);
+                for id in expired {
+                    poller.unregister(id);
+                    pending.remove(&id);
+                    registry.lock().unwrap().remove(&id);
+                    if activity.remove(&id).is_some() {
+                        if let Some(s) = stats {
+                            Stats::decrement(&s.connections_active, 1);
+                        }
                     }
                 }
             }
@@ -1178,14 +1191,18 @@ fn event_worker(
                 Some(c) => c,
                 None => continue,
             };
-            // Handoff measurement: how long the connection sat parked on
-            // the reactor between this worker's last release and this
-            // dispatch pickup (worker → reactor → worker round trip).
-            let handoff_us = conn
-                .parked_at
-                .take()
-                .map(|at| at.elapsed().as_micros() as u64)
-                .unwrap_or(0);
+            // Handoff measurement (trace-only): how long the connection
+            // sat parked on the reactor between this worker's last release
+            // and this dispatch pickup. Kept behind `conn.trace` so the
+            // steady-state path pays no `Instant::now()` at all.
+            let handoff_us = if conn.trace {
+                conn.parked_at
+                    .take()
+                    .map(|at| at.elapsed().as_micros() as u64)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
             if conn.trace && conn.trace_requests > 0 {
                 eprintln!(
                     "H1SEG|id={id}|reqs={}|parse_us={}|handler_us={}|build_us={}|write_us={}|handoff_us={handoff_us}",
@@ -1196,11 +1213,13 @@ fn event_worker(
                     conn.write_us,
                 );
             }
-            conn.trace_requests = 0;
-            conn.parse_us = 0;
-            conn.handler_us = 0;
-            conn.build_us = 0;
-            conn.write_us = 0;
+            if conn.trace {
+                conn.trace_requests = 0;
+                conn.parse_us = 0;
+                conn.handler_us = 0;
+                conn.build_us = 0;
+                conn.write_us = 0;
+            }
             let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 conn.step(handler, config)
             }));
@@ -1212,7 +1231,9 @@ fn event_worker(
                 StepOutcome::Idle | StepOutcome::NeedWrite => {
                     let fd = fd_of(&conn.socket);
                     let want_write = matches!(outcome, StepOutcome::NeedWrite);
-                    conn.parked_at = Some(Instant::now());
+                    if conn.trace {
+                        conn.parked_at = Some(Instant::now());
+                    }
                     registry.lock().unwrap().insert(id, conn);
                     let _ = msg_tx.send(EventMsg::Register { id, fd, want_write });
                     wake_nudge(wake_writer);
