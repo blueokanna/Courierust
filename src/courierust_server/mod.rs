@@ -37,6 +37,12 @@ pub struct TlsSettings {
     pub min_version: crate::courierust_tls::TlsVersion,
     /// Highest TLS version the server will negotiate.
     pub max_version: crate::courierust_tls::TlsVersion,
+    /// Session-ticket encryption key for TLS 1.3 resumption. Derived
+    /// randomly when these settings are built (once per server process),
+    /// so a ticket issued on one connection is accepted on the next —
+    /// that is what makes resumption real across pooled clients. Set a
+    /// fixed key to share tickets across server instances.
+    pub session_ticket_key: [u8; 32],
 }
 
 impl Default for TlsSettings {
@@ -45,6 +51,8 @@ impl Default for TlsSettings {
     /// ..Default::default() }`; the identity and ALPN are always provided
     /// explicitly in practice.
     fn default() -> Self {
+        let mut ticket_key = [0u8; 32];
+        let _ = crate::courierust_tls::crypto::rng::fill_random(&mut ticket_key);
         Self {
             identity: crate::courierust_tls::Identity {
                 cert_chain: Vec::new(),
@@ -54,6 +62,7 @@ impl Default for TlsSettings {
             alpn: Vec::new(),
             min_version: crate::courierust_tls::TlsVersion::Tls12,
             max_version: crate::courierust_tls::TlsVersion::Tls13,
+            session_ticket_key: ticket_key,
         }
     }
 }
@@ -426,7 +435,11 @@ pub(crate) fn serve_accepted(
                     alpn: t.alpn.clone(),
                     min_version: t.min_version,
                     max_version: t.max_version,
-                    ..Default::default()
+                    // A per-process stable ticket key: tickets issued on
+                    // one connection are accepted on the next, so pooled
+                    // clients actually resume instead of paying a full
+                    // handshake every time.
+                    session_ticket_key: Some(t.session_ticket_key),
                 });
             let arc = Arc::new(stream);
             let peer = arc

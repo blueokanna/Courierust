@@ -15,9 +15,13 @@
 //! * X.509 chain validation with a pluggable root store (no bundled
 //!   root certificates — supply your own roots via [`RootStore`]).
 //!
-//! Honest scope note: 0-RTT early data and key updates are not
-//! implemented; resumption uses the standard 1-RTT PSK path (session
-//! tickets with psk_dhe_ke) and a full handshake is performed otherwise.
+//! Honest scope note: 0-RTT / early data are not offered (replay
+//! protection is deliberately not taken on); the record-layer TLS 1.3
+//! KeyUpdate message is not sent (QUIC key updates are handled at the
+//! transport layer via the key-phase bit). TLS 1.3 session resumption is
+//! implemented — server-issued session tickets, 1-RTT PSK via
+//! psk_dhe_ke, client-side session store — and a full handshake is
+//! performed when no usable ticket is cached.
 //! The certificate verification performs chain building against the
 //! provided roots, validity-window and hostname checks, and standard
 //! key-usage/basic-constraints enforcement.
@@ -867,6 +871,7 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> crate::couri
 // ---------------------------------------------------------------------
 
 /// Client-side TLS configuration.
+#[derive(Clone)]
 pub struct ClientConfig {
     /// Trust anchors for server certificate validation.
     pub roots: RootStore,
@@ -898,7 +903,10 @@ impl Default for ClientConfig {
     }
 }
 
-/// A TLS 1.2 / 1.3 client connector.
+/// A TLS 1.2 / 1.3 client connector. Cloning shares the resumption-session
+/// store (an `Arc`), so a per-request connector fork still resumes against
+/// sessions captured on an earlier connection.
+#[derive(Clone)]
 pub struct TlsConnector {
     config: ClientConfig,
     /// Resumable sessions (NewSessionTickets), keyed by server name.
@@ -924,6 +932,11 @@ impl TlsConnector {
     /// Forget every cached resumption session.
     pub fn clear_sessions(&self) {
         self.sessions.lock().unwrap().clear();
+    }
+
+    /// Number of cached resumption sessions (diagnostics / tests).
+    pub fn session_count(&self) -> usize {
+        self.sessions.lock().unwrap().len()
     }
 
     /// Find a fresh resumption session for `hostname`.

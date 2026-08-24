@@ -62,6 +62,7 @@ pub mod courierust_hpack;
 pub mod courierust_http;
 pub mod courierust_io;
 pub mod courierust_quic;
+pub mod courierust_h1;
 #[cfg(feature = "std")]
 pub mod courierust_tls;
 
@@ -71,8 +72,6 @@ pub mod courierust_body;
 pub mod courierust_client;
 #[cfg(feature = "std")]
 pub mod courierust_grpc;
-#[cfg(feature = "std")]
-pub mod courierust_h1;
 #[cfg(feature = "std")]
 pub mod courierust_net;
 #[cfg(feature = "std")]

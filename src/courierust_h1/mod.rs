@@ -2,6 +2,7 @@
 //! request/status line parsing, header block reading, body framing
 //! (Content-Length / chunked) and head serialization.
 
+use alloc::vec::Vec;
 use crate::courierust_bytes::Bytes;
 use crate::courierust_error::{Error, Result};
 use crate::courierust_http::header::{HeaderMap, HeaderName, HeaderValue};
@@ -72,7 +73,10 @@ pub fn parse_status_line(line: &[u8]) -> Result<(StatusCode, Version)> {
     let code = parts
         .next()
         .ok_or_else(|| Error::protocol("missing status code"))?;
-    let code: u16 = std::str::from_utf8(code)
+    if code.len() != 3 || !code.iter().all(|c| c.is_ascii_digit()) {
+        return Err(Error::protocol("status code must be 3 digits"));
+    }
+    let code: u16 = core::str::from_utf8(code)
         .map_err(|_| Error::protocol("non-ASCII status code"))?
         .parse()
         .map_err(|_| Error::protocol("invalid status code"))?;
@@ -704,6 +708,20 @@ mod tests {
     #[test]
     fn request_line_normal_accepted() {
         assert!(parse_request_line(b"GET /a?b HTTP/1.1\r\n").is_ok());
+    }
+
+    /// RFC 9112 §2.3: status-code = 3DIGIT. Leading zeros, wrong widths
+    /// and non-digits must be rejected, not silently canonicalized.
+    #[test]
+    fn status_line_requires_three_digits() {
+        assert!(parse_status_line(b"HTTP/1.1 200 OK\r\n").is_ok());
+        assert!(parse_status_line(b"HTTP/1.1 404 Not Found\r\n").is_ok());
+        assert!(parse_status_line(b"HTTP/1.1 0200 OK\r\n").is_err()); // leading zero
+        assert!(parse_status_line(b"HTTP/1.1 2000 OK\r\n").is_err()); // 4 digits
+        assert!(parse_status_line(b"HTTP/1.1 20 OK\r\n").is_err()); // 2 digits
+        assert!(parse_status_line(b"HTTP/1.1 2a0 OK\r\n").is_err()); // non-digit
+        assert!(parse_status_line(b"HTTP/1.1 999 OK\r\n").is_err()); // out of range
+        assert!(parse_status_line(b"HTTP/1.1 099 OK\r\n").is_err()); // 3 digits but < 100
     }
 
     /// Chunk-size parsing is shared by the blocking and event-driven

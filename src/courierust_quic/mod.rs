@@ -6,20 +6,16 @@
 //! protection. The `courierust_h3` runtime supplies UDP I/O and the QUIC-TLS
 //! adapter for the built-in HTTP/3 path.
 //!
-//! The runtime is intentionally explicit about its current protocol boundary:
-//! it supports one validated QUIC v1 path with TLS 1.3, AEAD/header
-//! protection, Retry integrity and address validation, Version Negotiation,
-//! the server 3x anti-amplification limit before validation, bounded
-//! CRYPTO/stream reassembly, ACK ranges, retransmission with fresh packet
-//! numbers, RTT/RTO sampling, a bounded congestion window, and HTTP/3
-//! request/response exchange. This is a complete implementation of the
-//! subset exercised by the built-in runtime, not a claim of the complete
-//! Internet QUIC feature set. Full PTO/time-threshold loss recovery, dynamic
-//! local MAX_DATA/MAX_STREAM_DATA credit updates, connection migration and
-//! path validation, stateless reset, 0-RTT/session tickets, automatic and
-//! bidirectional key update, QPACK blocked-stream acknowledgements, and
-//! independent implementation interoperability still require dedicated work
-//! and tests. Everything in this codec is tested against the relevant RFC
+//! The runtime is intentionally explicit about its protocol boundary. The
+//! long tail of the RFC 9000/9001/9002 transport is implemented and
+//! exercised by the built-in runtime: PTO/time-threshold loss recovery,
+//! dynamic local MAX_DATA/MAX_STREAM_DATA/MAX_STREAMS credit updates,
+//! connection migration and path validation, stateless reset (generation and
+//! validation), automatic bidirectional key update with the one-at-a-time
+//! guard, and QPACK blocked-stream acknowledgements. Deliberately out of
+//! scope: 0-RTT / early data and independent implementation interoperability
+//! (which still needs dedicated evidence before broad external interop is
+//! advertised). Everything in this codec is tested against the relevant RFC
 //! examples and the supported runtime paths.
 
 #![deny(unsafe_code)]

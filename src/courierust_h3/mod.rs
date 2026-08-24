@@ -16,16 +16,16 @@
 //! ALPN `h3`, control/QPACK streams, request streams, response trailers,
 //! GOAWAY validation, retransmission, and strict stream reassembly.
 //!
-//! It is not a blanket claim of full RFC 9000/9001/9114 deployment readiness.
-//! The runtime includes QUIC Retry integrity and token-bound address
-//! validation, Version Negotiation, pre-validation anti-amplification, bounded
-//! congestion/RTT retransmission, and receive-side key-phase handling. Full
-//! PTO/time-threshold loss recovery, dynamic local flow-control credit,
-//! connection migration/path validation, stateless reset, 0-RTT/session
-//! tickets, automatic and bidirectional key update, QPACK blocked-stream
-//! acknowledgements, and independent implementation interoperability remain
-//! outside the current runtime and must be completed before advertising broad
-//! external interoperability.
+//! It is not a blanket claim of full RFC 9000/9001/9114 deployment readiness,
+//! but the transport long tail is implemented and exercised: PTO/time-threshold
+//! loss recovery, dynamic local flow-control credit (MAX_DATA / MAX_STREAM_DATA
+//! / MAX_STREAMS), connection migration and path validation, stateless reset
+//! (generation and validation), automatic bidirectional key update with the
+//! one-at-a-time guard, and QPACK blocked-stream acknowledgements (Section
+//! Acknowledgment / Stream Cancellation / Insert Count Increment on the decoder
+//! stream). Deliberately out of scope: 0-RTT / early data (replay protection is
+//! not taken on) and independent implementation interoperability, which must be
+//! demonstrated before advertising broad external interop.
 
 #![deny(unsafe_code)]
 

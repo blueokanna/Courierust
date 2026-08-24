@@ -201,7 +201,8 @@ RSA-PKCS#1 v1.5 / ECDSA P-256 / P-384 / Ed25519 证书签名；完整的 X.509
 `Tls13` 即恢复纯 TLS 1.3 策略；接受过 TLS 1.3 客户端的 TLS 1.2 服务器
 仍会把 RFC 8446 §4.1.3 降级哨兵写进 ServerHello 随机数，使客户端能检测
 到降级；纯 TLS 1.3 客户端遇到 TLS 1.2 ServerHello 会拒绝且绝不静默降
-级。从不提供 0-RTT / 会话恢复 / PSK。QUIC 必须协商 ALPN `h3`；HTTPS
+级。从不提供 0-RTT / early data；TLS 1.3 会话恢复走标准 1-RTT PSK
+路径（服务端签发 session ticket，`psk_dhe_ke`）。QUIC 必须协商 ALPN `h3`；HTTPS
 的 ALPN 必须是 `h2` 或 `http/1.1`。
 `cargo run --example https` 可跑一个自签名证书的端到端示例；`cargo run --example h3` 是 HTTP/3（QUIC v1 + TLS 1.3）端到端示例（冷连接 vs 池化复用、大响应流控、并发多路复用、证书拒绝）；`cargo run --example grpc_streaming` 演示 gRPC 服务端流/客户端流/双向流、deadline、gzip 压缩协商与元数据/拦截器。
 
@@ -237,8 +238,8 @@ courierust = { version = "0.1", default-features = false }
 
 这个仓库刻意不做的，以及你接手前应该知道的：
 
-- **HTTP/3 / QUIC 已有零依赖的内置路径，但协议边界必须如实理解**。`courierust_h3` 通过 std UDP reactor 运行 HTTP/3 请求/响应，包含 QUIC v1 包保护、内置 TLS 1.3、ALPN `h3`、有界 CRYPTO/stream 重组、Retry 完整性校验与 token 绑定的地址验证、Version Negotiation、验证前 3x anti-amplification、ACK range、使用新包号的重传、RTT/RTO 采样、有界拥塞窗口、控制/QPACK 流、trailer 与 GOAWAY 校验。它还不是完整的互联网级 QUIC 实现：完整 PTO/时间阈值丢包恢复、动态本地 `MAX_DATA`/`MAX_STREAM_DATA` credit 更新、连接迁移与路径验证、stateless reset、0-RTT/session ticket、自动及双向 key update、QPACK blocked-stream acknowledgement，以及独立实现互操作仍需实现和专门证据。在这些缺口关闭前，不应宣称对外普遍互通。
-- **TLS 暂无 PSK / 0-RTT 恢复 / session ticket / key update，也无双向 mTLS**。每次都做完整 1-RTT 握手；对端发来的 NewSessionTicket 会被忽略；TLS 1.2 session id 会携带但从不用于恢复；服务端不请求客户端证书。基准里的 TLS 行因此如实报告 `session_resumption=n/a`。
+- **HTTP/3 / QUIC 已有零依赖的内置路径，但协议边界必须如实理解**。`courierust_h3` 通过 std UDP reactor 运行 HTTP/3 请求/响应，包含 QUIC v1 包保护、内置 TLS 1.3、ALPN `h3`、有界 CRYPTO/stream 重组、Retry 完整性校验与 token 绑定的地址验证、Version Negotiation、验证前 3x anti-amplification、ACK range、使用新包号的重传、RTT/RTO 采样、有界拥塞窗口、控制/QPACK 流、trailer 与 GOAWAY 校验。它还不是完整的互联网级 QUIC 实现的含义是：0-RTT 与独立互操作仍开放，但传输长尾已实现并有测试覆盖：完整 PTO/时间阈值丢包恢复、动态本地 `MAX_DATA`/`MAX_STREAM_DATA`/`MAX_STREAMS` credit 更新、连接迁移与路径验证（PATH_CHALLENGE/RESPONSE）、stateless reset（生成与校验）、带单次保护的双向自动 key update、QPACK blocked-stream acknowledgement（解码器流上的 Section Acknowledgment / Stream Cancellation / Insert Count Increment）。刻意不做：0-RTT / early data（不承担重放防护的复杂度），以及独立实现互操作（quinn+h3 握手互操作缺口在基准套件里如实上报而非造假）。这两项是宣称对外普遍互通前的剩余事项。
+- **TLS 无 0-RTT、无双向 mTLS**。TLS 1.3 会话恢复已在 TLS 层实现（服务端签发 session ticket、1-RTT PSK `psk_dhe_ke`、按主机名分键的客户端会话缓存）并有单元测试；但池化客户端目前每个请求新建 connector，跨连接恢复尚未在基准里实际生效（基准行因此如实报告 `session_resumption=n/a`）。0-RTT / early data 从不提供。TLS 1.2 session id 会携带但从不用于恢复。服务端不请求客户端证书。
 - **事件驱动服务器全平台默认开启，只处理 HTTP/1.1**。`ServerConfig::event_driven`（默认 `true`）把空闲明文 HTTP 连接挂在轮询器上（Winsock `select` / POSIX `poll`），少量 worker 即可服务大量 idle keep-alive / SSE / 长轮询连接；TLS 与 HTTP/2 连接仍走阻塞池模型（由 `handshake_timeout`、`h2_idle_timeout` 与 worker 数共同约束）。设为 `false` 恢复旧的**每连接一池任务**模型；该路径已不建议用于生产——空闲/慢连接群会耗尽池——仅作对比与调试，默认事件路径用 `max_connections`（连接上限）与 `idle_timeout` 约束资源。
 - **请求体流式上传目前只在 HTTP/2 下可靠**（h2 天然分帧）。HTTP/1.1 的请求体要么一次性给全（`Body::Bytes`），要么你自己拼 chunked。
 - **gRPC 不含 protobuf、`.proto` 代码生成与 `grpc.reflection`**。消息编解码需要你实现 codec trait 或接你自己的 protobuf 生成代码；reflection 需要 protobuf 模式清单，属外部职责。

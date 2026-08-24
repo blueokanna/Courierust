@@ -402,16 +402,35 @@ pub(crate) fn spawn_server(
     handler: Arc<dyn Handler>,
     config: ServerConfig,
 ) -> std::io::Result<Http3Handle> {
+    // macOS (BSD) requires `SO_REUSEADDR` on the UDP socket before it
+    // may share its numeric port with the TCP listener; other platforms
+    // bind directly (see `courierust_net::udp`).
+    let socket = crate::courierust_net::udp::bind_udp(addr)?;
+    spawn_server_with_socket(socket, tls, handler, config)
+}
+
+/// Start the reactor on an already-bound UDP socket.
+///
+/// Callers that can choose their own port (tests) use this to sidestep
+/// two port-selection hazards that a TCP-derived port can hit on
+/// Windows: the probe-then-bind race (the socket stays bound, so no
+/// other socket can steal the port between choosing and binding), and
+/// the independent TCP/UDP excluded-port ranges (Hyper-V/WinNAT reserve
+/// ranges where a port a TCP socket just freed can still be unbindable
+/// by UDP — WSAEACCES/10013). Probing with UDP makes the port UDP-valid
+/// by construction.
+pub(crate) fn spawn_server_with_socket(
+    socket: std::net::UdpSocket,
+    tls: &TlsSettings,
+    handler: Arc<dyn Handler>,
+    config: ServerConfig,
+) -> std::io::Result<Http3Handle> {
     if !tls.alpn.iter().any(|protocol| protocol.as_slice() == b"h3") {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "HTTP/3 requires ServerConfig TLS ALPN to include h3",
         ));
     }
-    // macOS (BSD) requires `SO_REUSEADDR` on the UDP socket before it
-    // may share its numeric port with the TCP listener; other platforms
-    // bind directly (see `courierust_net::udp`).
-    let socket = crate::courierust_net::udp::bind_udp(addr)?;
     socket.set_nonblocking(true)?;
     let identity = tls.identity.clone();
     let alpn = tls.alpn.clone();
@@ -6247,12 +6266,30 @@ mod tests {
         })
     }
 
+    /// Bind the HTTP/3 test reactor on an OS-assigned UDP port and return
+    /// its address. The port is probed with a UDP socket (not a TCP one)
+    /// and that same socket is handed to the reactor, which guarantees
+    /// two things on every platform: the port is valid for UDP (on
+    /// Windows the TCP and UDP excluded-port ranges are independent —
+    /// Hyper-V/WinNAT reserve ranges where a TCP-released port can still
+    /// be unbindable by UDP, surfacing as WSAEACCES/10013), and no other
+    /// test can steal the port between probing and binding (the socket
+    /// is held open the whole time).
+    fn spawn_h3_server(
+        tls: &TlsSettings,
+        handler: Arc<dyn Handler>,
+        config: ServerConfig,
+    ) -> (SocketAddr, Http3Handle) {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let handle =
+            crate::courierust_h3::runtime::spawn_server_with_socket(socket, tls, handler, config)
+                .unwrap();
+        (addr, handle)
+    }
+
     #[test]
     fn loopback_quic_tls_http3_round_trip() {
-        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = tcp.local_addr().unwrap();
-        drop(tcp);
-
         let identity = crate::courierust_tls::testdata::server_identity();
         let tls = TlsSettings {
             identity: identity.clone(),
@@ -6268,7 +6305,7 @@ mod tests {
             max_body: 1024 * 1024,
             ..ServerConfig::default()
         };
-        let _server = spawn_server(addr, &tls, handler, config).unwrap();
+        let (addr, _server) = spawn_h3_server(&tls, handler, config);
 
         let client = h3_client(1024 * 1024, Duration::from_secs(5));
         let response = client
@@ -6284,9 +6321,6 @@ mod tests {
         // The pool must multiplex sequential requests over one QUIC
         // connection: after the handshake, response bodies arrive on
         // fresh streams without a second handshake round.
-        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = tcp.local_addr().unwrap();
-        drop(tcp);
         let identity = crate::courierust_tls::testdata::server_identity();
         let tls = TlsSettings {
             identity,
@@ -6303,7 +6337,7 @@ mod tests {
             max_body: 1024 * 1024,
             ..ServerConfig::default()
         };
-        let _server = spawn_server(addr, &tls, handler, config).unwrap();
+        let (addr, _server) = spawn_h3_server(&tls, handler, config);
 
         let client = h3_client(1024 * 1024, Duration::from_secs(5));
         for i in 0..50 {
@@ -6372,9 +6406,6 @@ mod tests {
     /// instead of dropping the packets from the new address.
     #[test]
     fn loopback_http3_survives_client_nat_rebinding() {
-        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = tcp.local_addr().unwrap();
-        drop(tcp);
         let identity = crate::courierust_tls::testdata::server_identity();
         let tls = TlsSettings {
             identity,
@@ -6391,7 +6422,7 @@ mod tests {
             max_body: 1024 * 1024,
             ..ServerConfig::default()
         };
-        let _server = spawn_server(addr, &tls, handler, config).unwrap();
+        let (addr, _server) = spawn_h3_server(&tls, handler, config);
 
         let options = ClientRequestOptions {
             roots: crate::courierust_tls::testdata::root_store(),
@@ -6451,9 +6482,6 @@ mod tests {
 
     #[test]
     fn loopback_http3_large_response_drains_congestion_queue() {
-        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = tcp.local_addr().unwrap();
-        drop(tcp);
         let identity = crate::courierust_tls::testdata::server_identity();
         let tls = TlsSettings {
             identity,
@@ -6471,7 +6499,7 @@ mod tests {
             max_body: 128 * 1024,
             ..ServerConfig::default()
         };
-        let _server = spawn_server(addr, &tls, handler, config).unwrap();
+        let (addr, _server) = spawn_h3_server(&tls, handler, config);
         let client = h3_client(128 * 1024, Duration::from_secs(10));
         let response = client
             .get(&format!("https://localhost:{}/large", addr.port()))
@@ -6482,9 +6510,6 @@ mod tests {
 
     #[test]
     fn loopback_http3_large_request_body_is_fully_delivered() {
-        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = tcp.local_addr().unwrap();
-        drop(tcp);
         let identity = crate::courierust_tls::testdata::server_identity();
         let tls = TlsSettings {
             identity,
@@ -6507,7 +6532,7 @@ mod tests {
             max_body: 128 * 1024,
             ..ServerConfig::default()
         };
-        let _server = spawn_server(addr, &tls, handler, config).unwrap();
+        let (addr, _server) = spawn_h3_server(&tls, handler, config);
         let client = h3_client(128 * 1024, Duration::from_secs(15));
         let body = vec![b'p'; expected_len];
         let request = Request::<Body>::new(Method::POST, "/upload").with_body(Body::from(body));
@@ -6531,9 +6556,6 @@ mod tests {
         // per-request cost of the pooled HTTP/3 client once the QUIC/TLS
         // handshake is amortized over the reused connection. Run with
         // `-- --nocapture`.
-        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = tcp.local_addr().unwrap();
-        drop(tcp);
         let identity = crate::courierust_tls::testdata::server_identity();
         let tls = TlsSettings {
             identity,
@@ -6549,7 +6571,7 @@ mod tests {
             max_body: 1024 * 1024,
             ..ServerConfig::default()
         };
-        let _server = spawn_server(addr, &tls, handler, config).unwrap();
+        let (addr, _server) = spawn_h3_server(&tls, handler, config);
 
         let client = h3_client(1024 * 1024, Duration::from_secs(5));
         let url = format!("https://localhost:{}/bench", addr.port());
@@ -6583,9 +6605,6 @@ mod tests {
     /// (the client already decoded them; the server never sent them).
     #[test]
     fn loopback_http3_response_trailers_round_trip() {
-        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = tcp.local_addr().unwrap();
-        drop(tcp);
         let identity = crate::courierust_tls::testdata::server_identity();
         let tls = TlsSettings {
             identity,
@@ -6609,7 +6628,7 @@ mod tests {
             max_body: 1024 * 1024,
             ..ServerConfig::default()
         };
-        let _server = spawn_server(addr, &tls, handler, config).unwrap();
+        let (addr, _server) = spawn_h3_server(&tls, handler, config);
 
         let client = h3_client(1024 * 1024, Duration::from_secs(5));
         let response = client

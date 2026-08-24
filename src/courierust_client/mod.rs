@@ -64,6 +64,25 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Upper bound on the per-authority TLS connector cache. Each connector
+/// owns a bounded resumption-session store; the cache itself is capped so
+/// a client that touches a very large number of distinct hosts does not
+/// accumulate connectors without bound.
+const TLS_CONNECTOR_CACHE_MAX: usize = 256;
+
+/// The TLS connector configuration derived from the client's settings —
+/// fixed per client, so one configuration serves every cached connector.
+fn connector_config(t: &TlsSettings) -> crate::courierust_tls::ClientConfig {
+    crate::courierust_tls::ClientConfig {
+        roots: t.roots.clone(),
+        verify: t.verify,
+        alpn: t.alpn.clone(),
+        now: t.now,
+        min_version: t.min_version,
+        max_version: t.max_version,
+    }
+}
+
 /// Client configuration.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -175,6 +194,12 @@ struct ClientInner {
     h3_open_cv: std::sync::Condvar,
     /// h3 connections currently being opened, keyed by authority.
     pending_h3_opens: Mutex<HashMap<String, usize>>,
+    /// TLS connectors per authority. Each connector owns a resumption-session
+    /// store keyed by hostname, so a fresh connection to a host that already
+    /// handed us a session ticket resumes (1-RTT) instead of paying a full
+    /// handshake. The connector configuration (roots, verify, ALPN, version
+    /// window) is fixed per client — it all comes from `ClientConfig::tls`.
+    tls_connectors: Mutex<HashMap<String, Arc<crate::courierust_tls::TlsConnector>>>,
     /// Global request sequence (instrumentation).
     seq: AtomicUsize,
 }
@@ -242,6 +267,7 @@ impl Client {
                 h3_pool: Mutex::new(HashMap::new()),
                 h3_open_cv: std::sync::Condvar::new(),
                 pending_h3_opens: Mutex::new(HashMap::new()),
+                tls_connectors: Mutex::new(HashMap::new()),
                 seq: AtomicUsize::new(0),
             }),
         }
@@ -293,7 +319,7 @@ impl Client {
         req: Request<Body>,
         priority: Priority,
     ) -> Result<crate::courierust_client::h2::H2Response> {
-        let tls = self.tls_for_scheme(&url.scheme)?;
+        let tls = self.tls_for_scheme(&url.scheme, &url.authority())?;
         let addr = resolve_addr(&url.host, url.port)?;
         let authority = url.authority();
         self.execute_h2(url, &authority, addr, tls, req, priority)
@@ -349,10 +375,10 @@ impl Client {
         } else {
             req
         };
-        let tls = self.tls_for_scheme(&url.scheme)?;
+        let authority = url.authority();
+        let tls = self.tls_for_scheme(&url.scheme, &authority)?;
         self.inner.seq.fetch_add(1, Ordering::Relaxed);
         let addr = resolve_addr(&url.host, url.port)?;
-        let authority = url.authority();
         if self.inner.config.http3 {
             if url.scheme != "https" {
                 return Err(Error::protocol("HTTP/3 requires an https:// URL"));
@@ -381,20 +407,37 @@ impl Client {
 
     /// Resolve the TLS connector for a scheme, or reject unsupported /
     /// unconfigured `https`.
-    fn tls_for_scheme(&self, scheme: &str) -> Result<Option<crate::courierust_tls::TlsConnector>> {
+    ///
+    /// Connectors are cached per authority (bounded), so the resumption
+    /// sessions captured on one connection to a host are offered on the
+    /// next fresh connection to the same host — a full TLS handshake is
+    /// paid once per authority, not once per connection. Past the cache
+    /// cap a new connector is created without caching (a defensive bound
+    /// against unbounded growth for a client touching thousands of hosts).
+    fn tls_for_scheme(
+        &self,
+        scheme: &str,
+        authority: &str,
+    ) -> Result<Option<crate::courierust_tls::TlsConnector>> {
         match scheme {
             "http" => Ok(None),
             "https" => match &self.inner.config.tls {
-                Some(t) => Ok(Some(crate::courierust_tls::TlsConnector::new(
-                    crate::courierust_tls::ClientConfig {
-                        roots: t.roots.clone(),
-                        verify: t.verify,
-                        alpn: t.alpn.clone(),
-                        now: t.now,
-                        min_version: t.min_version,
-                        max_version: t.max_version,
-                    },
-                ))),
+                Some(t) => {
+                    let mut cache = self.inner.tls_connectors.lock().unwrap();
+                    if cache.len() >= TLS_CONNECTOR_CACHE_MAX && !cache.contains_key(authority) {
+                        return Ok(Some(crate::courierust_tls::TlsConnector::new(
+                            connector_config(t),
+                        )));
+                    }
+                    let connector = cache
+                        .entry(authority.to_string())
+                        .or_insert_with(|| {
+                            Arc::new(crate::courierust_tls::TlsConnector::new(
+                                connector_config(t),
+                            ))
+                        });
+                    Ok(Some((**connector).clone()))
+                }
                 None => Err(Error::protocol(
                     "https requires TLS settings (set ClientConfig.tls)",
                 )),
@@ -452,7 +495,7 @@ impl Client {
         req: Request<Body>,
         priority: Priority,
     ) -> Result<crate::courierust_client::h2::H2Response> {
-        let tls = self.tls_for_scheme(&url.scheme)?;
+        let tls = self.tls_for_scheme(&url.scheme, &url.authority())?;
         let addr = resolve_addr(&url.host, url.port)?;
         let authority = url.authority();
         self.execute_h2(url, &authority, addr, tls, req, priority)
@@ -1079,4 +1122,85 @@ fn resolve_redirect(base: &Url, location: &str) -> Result<Url> {
         s = format!("{scheme}:{}", location);
     }
     Url::parse(&s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::courierust_http::header::{HeaderName, HeaderValue};
+    use crate::courierust_http::response::Response;
+    use crate::courierust_server::{Server, ServerConfig, TlsSettings as ServerTls};
+    use crate::courierust_tls::testdata;
+
+    /// TLS session resumption, wired through the public client: the first
+    /// request to an authority pays a full handshake and captures a
+    /// session ticket; the second request (a fresh connection — the
+    /// server answers `Connection: close`, so the keep-alive pool never
+    /// reuses) reuses the cached connector and resumes with 1-RTT.
+    ///
+    /// The server keeps a per-process ticket key (see
+    /// [`ServerTls::session_ticket_key`]), which is what makes the
+    /// ticket issued on connection 1 decryptable on connection 2.
+    #[test]
+    fn tls_session_resumption_across_client_connections() {
+        let handler = |req: Request<Body>| -> Response<Body> {
+            let mut resp = Response::<Body>::with_status(StatusCode::OK)
+                .with_body(Body::from(format!("echo:{}", req.uri.as_str())));
+            resp.headers.insert(
+                HeaderName::from_static("connection"),
+                HeaderValue::from_static("close"),
+            );
+            resp
+        };
+        let server = Server::bind_with_config(
+            "127.0.0.1:0",
+            ServerConfig {
+                http2: false,
+                threads: 1,
+                tls: Some(ServerTls {
+                    identity: testdata::server_identity(),
+                    alpn: vec![b"http/1.1".to_vec()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let addr = server.local_addr().unwrap();
+        let _handle = server.serve_background(handler).unwrap();
+
+        let client = Client::with_config(ClientConfig {
+            http2: false,
+            tls: Some(TlsSettings {
+                roots: testdata::root_store(),
+                verify: true,
+                alpn: vec![b"http/1.1".to_vec()],
+                now: testdata::NOW,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        // First request: full handshake, connector cached, ticket captured.
+        let resp = client.get(&format!("https://{addr}/one")).unwrap();
+        assert_eq!(resp.status.as_u16(), 200);
+        {
+            let cache = client.inner.tls_connectors.lock().unwrap();
+            assert_eq!(cache.len(), 1, "one connector cached for the authority");
+            let connector = cache.values().next().expect("connector present");
+            assert!(
+                connector.session_count() > 0,
+                "the first handshake must capture a session ticket"
+            );
+        }
+
+        // Second request: fresh TLS connection (never pooled), same
+        // cached connector → the PSK is offered and the handshake resumes.
+        let resp = client.get(&format!("https://{addr}/two")).unwrap();
+        assert_eq!(resp.status.as_u16(), 200);
+        {
+            let cache = client.inner.tls_connectors.lock().unwrap();
+            assert_eq!(cache.len(), 1, "connector must not be duplicated");
+        }
+    }
 }
