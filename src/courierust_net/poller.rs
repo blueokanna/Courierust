@@ -444,6 +444,72 @@ mod tests {
     }
 
     #[test]
+    fn wake_latency_stays_sub_millisecond() {
+        use crate::courierust_server::event::{drain_wake, wake_nudge, wakeup_pair};
+        // 100 round-trips of wake → poll must each interrupt well under a
+        // poll timeout. A slow self-pipe here is the worker→reactor
+        // handoff stall behind the H3 tail (a lost/lagged wake parks the
+        // loop for a full poll timeout).
+        let (reader, writer) = wakeup_pair().unwrap();
+        let mut p = Poller::new();
+        let wfd = fd_of(&reader);
+        let mut max = std::time::Duration::ZERO;
+        for i in 0..100 {
+            wake_nudge(&writer);
+            let started = std::time::Instant::now();
+            let ready = p.wait(1000, Some(wfd)).unwrap();
+            let elapsed = started.elapsed();
+            max = max.max(elapsed);
+            assert!(
+                ready.contains(&WAKE_ID),
+                "wake {i} lost: ready={ready:?}"
+            );
+            drain_wake(&reader);
+        }
+        assert!(
+            max < std::time::Duration::from_millis(3),
+            "wake latency too high: max={max:?}"
+        );
+    }
+
+    #[test]
+    fn wake_interrupts_already_blocked_wait() {
+        use crate::courierust_server::event::{drain_wake, wake_nudge, wakeup_pair};
+        use std::sync::Arc;
+        use std::time::Instant;
+        // The production pattern: the reactor is already parked in `wait`
+        // when a worker completes and writes the wake byte. A wake that
+        // only works when written *before* the poll starts would leave a
+        // worker→reactor handoff parked for a full poll timeout.
+        let (reader, writer) = wakeup_pair().unwrap();
+        let writer = Arc::new(writer);
+        let mut p = Poller::new();
+        let wfd = fd_of(&reader);
+        let mut max = std::time::Duration::ZERO;
+        for _ in 0..100 {
+            let writer = writer.clone();
+            let nudger = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+                wake_nudge(&writer);
+            });
+            let started = Instant::now();
+            let ready = p.wait(1000, Some(wfd)).unwrap();
+            let elapsed = started.elapsed();
+            max = max.max(elapsed);
+            assert!(
+                ready.contains(&WAKE_ID),
+                "wake lost while wait was blocked: {ready:?}"
+            );
+            nudger.join().unwrap();
+            drain_wake(&reader);
+        }
+        assert!(
+            max < std::time::Duration::from_millis(3),
+            "blocked-wait wake latency too high: max={max:?}"
+        );
+    }
+
+    #[test]
     fn wake_fires_alongside_connection_ready() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();

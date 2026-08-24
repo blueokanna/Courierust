@@ -145,6 +145,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]

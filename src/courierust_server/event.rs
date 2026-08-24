@@ -739,8 +739,13 @@ pub(crate) fn wakeup_pair() -> std::io::Result<(TcpStream, TcpStream)> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let writer = TcpStream::connect(listener.local_addr()?)?;
     let (reader, _) = listener.accept()?;
+    // No Nagle: a wake is one byte and must reach the reader's receive
+    // buffer immediately — a delayed-ACK/Nagle pause here would hold a
+    // worker→reactor handoff open for a full poll timeout.
     reader.set_nonblocking(true)?;
     writer.set_nonblocking(true)?;
+    let _ = reader.set_nodelay(true);
+    let _ = writer.set_nodelay(true);
     Ok((reader, writer))
 }
 

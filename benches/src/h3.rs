@@ -86,6 +86,10 @@ fn main() {
         .unwrap_or(0);
     let client_cfg = ClientConfig {
         http3: true,
+        // One pooled QUIC connection per authority: the headline number
+        // is the warm per-request cost of connection reuse, not a
+        // connection-per-worker warm-up artifact.
+        max_connections_per_host: 1,
         tls: Some(ClientTls {
             roots,
             verify: true,

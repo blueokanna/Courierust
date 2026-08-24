@@ -139,6 +139,41 @@ type UnblockedSection = (u64, Vec<FieldLine>);
 /// self-pipe both wake the poller immediately; this only paces idle
 /// periodic work (retransmit, response queue).
 const SERVER_IDLE_TIMEOUT_MS: i32 = 5;
+/// Override for the server/loopback reactor poll timeout, in ms.
+/// `COURIERUST_H3_SERVER_POLL_MS` (default `SERVER_IDLE_TIMEOUT_MS`).
+/// Smaller values trade a little CPU for tighter wake latency on
+/// platforms where the self-pipe does not always interrupt the poll.
+fn server_poll_ms() -> i32 {
+    std::env::var("COURIERUST_H3_SERVER_POLL_MS")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .filter(|v| *v >= 1)
+        .unwrap_or(SERVER_IDLE_TIMEOUT_MS)
+}
+
+/// Client driver poll timeout while the connection is busy (outstanding
+/// requests or unacknowledged data), in ms.
+/// `COURIERUST_H3_CLIENT_POLL_MS` (default 5). Small values bound how
+/// long a lost wake defers command dispatch.
+fn client_busy_poll_ms() -> i32 {
+    std::env::var("COURIERUST_H3_CLIENT_POLL_MS")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .filter(|v| *v >= 1)
+        .unwrap_or(5)
+}
+
+/// Client driver poll timeout while the connection is idle (no active
+/// work), in ms. `COURIERUST_H3_CLIENT_IDLE_POLL_MS` (default 10).
+/// Small enough that a lost wake does not park an incoming command for
+/// the old 50 ms; large enough to stay cheap for many idle connections.
+fn client_idle_poll_ms() -> i32 {
+    std::env::var("COURIERUST_H3_CLIENT_IDLE_POLL_MS")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .filter(|v| *v >= 1)
+        .unwrap_or(10)
+}
 /// Poller id for the reactor's UDP socket (see `Poller::register`).
 const SOCKET_ID: usize = 1;
 
@@ -628,9 +663,9 @@ fn run_client_driver(
         }
 
         let mut wait_ms: i64 = if conn.has_work() || conn.transport.has_unacknowledged() {
-            5
+            client_busy_poll_ms() as i64
         } else {
-            50
+            client_idle_poll_ms() as i64
         };
         if conn.is_idle() {
             let remaining = idle.saturating_sub(now.duration_since(last_activity));
@@ -640,10 +675,24 @@ fn run_client_driver(
             let remaining = deadline.saturating_duration_since(now);
             wait_ms = wait_ms.min(remaining.as_millis().min(i64::MAX as u128) as i64);
         }
+        let wait_started = Instant::now();
         let ready = match poller.wait(wait_ms.max(1) as i32, Some(wake_fd)) {
             Ok(ready) => ready,
             Err(error) => return finish(conn, &socket, io_error(error.to_string())),
         };
+        // Tail instrumentation: a long poll here means a lost wake
+        // deferred command dispatch (or response handling) — the client
+        // side of the H3 tail.
+        if std::env::var_os("COURIERUST_H3_TRACE").is_some() {
+            let wait_us = wait_started.elapsed().as_micros() as u64;
+            if wait_us > 1000 {
+                eprintln!(
+                    "H3TRACE|client|poll-wait={wait_us}us ready={ready:?} active={} waiting={}",
+                    conn.active.len(),
+                    conn.waiting.len()
+                );
+            }
+        }
         if ready.contains(&SOCKET_ID) {
             // Bounded drain: mirror the server so a flood cannot starve
             // `on_tick` / deadline handling between datagram batches.
@@ -804,9 +853,30 @@ fn run_server(
     poller.register(SOCKET_ID, udp_fd_of(&socket), false);
 
     loop {
+        let wait_started = Instant::now();
+        // While handlers are in flight a completed response must flush
+        // promptly. A lost self-pipe wake would otherwise park it for a
+        // full poll timeout; poll tightly with work outstanding (the wake
+        // still wins the moment it fires).
+        let poll_ms = if active_tasks.load(Ordering::Acquire) > 0 {
+            server_poll_ms().min(1)
+        } else {
+            server_poll_ms()
+        };
         let ready = poller
-            .wait(SERVER_IDLE_TIMEOUT_MS, Some(wake_fd))
+            .wait(poll_ms, Some(wake_fd))
             .map_err(|e| io_error(e.to_string()))?;
+        // Tail instrumentation: a wake that fails to interrupt the poll
+        // shows up here as a multi-ms wait, i.e. a worker→reactor handoff
+        // stall that surfaces as client-side wait_headers latency.
+        if std::env::var_os("COURIERUST_H3_TRACE").is_some() {
+            let wait_us = wait_started.elapsed().as_micros() as u64;
+            if wait_us > 1000 {
+                eprintln!(
+                    "H3TRACE|server|poll-wait={wait_us}us ready={ready:?}"
+                );
+            }
+        }
         if ready.contains(&SOCKET_ID) {
             // Bounded drain: a flood (or zero-length datagrams) must not
             // starve the connection sweep that runs after this loop,
@@ -827,6 +897,7 @@ fn run_server(
         }
         while let Ok(completed) = completed_rx.try_recv() {
             if let Some(connection) = state.connections.get_mut(&completed.connection_id) {
+                connection.trace_response(&completed);
                 connection.queue_response(completed.stream_id, completed.response);
             }
             active_tasks.fetch_sub(1, Ordering::Relaxed);
@@ -901,6 +972,7 @@ fn run_server(
                 let max_body = state.config.max_body;
                 let connection_id = connection_id.clone();
                 let wake = wake_writer.clone();
+                let received_at = request.received_at;
                 pool.spawn(move || {
                     let response = match panic::catch_unwind(AssertUnwindSafe(|| {
                         let response = handler.handle(request.request);
@@ -913,6 +985,8 @@ fn run_server(
                         connection_id,
                         stream_id: request.stream_id,
                         response,
+                        received_at,
+                        completed_at: Instant::now(),
                     });
                     // Wake the reactor so the completed response is
                     // flushed without waiting for the next poll tick.
@@ -1104,6 +1178,10 @@ struct CompletedResponse {
     connection_id: Vec<u8>,
     stream_id: u64,
     response: Result<Response<Body>>,
+    /// Tail instrumentation: when the request stream was fully received.
+    received_at: Instant,
+    /// When the handler finished (worker side).
+    completed_at: Instant,
 }
 
 struct H3ActiveGuard {
@@ -1116,8 +1194,20 @@ impl Drop for H3ActiveGuard {
     }
 }
 
-fn h3_open_stream(stats: Option<&Arc<Stats>>, active: &mut BTreeSet<u64>, id: u64) {
-    if !active.insert(id) {
+/// Slow-request trace threshold in µs. `None` disables tracing. Gated by
+/// `COURIERUST_H3_TRACE` (enable) and `COURIERUST_H3_TRACE_MS` (default 2).
+fn h3_trace_threshold_us() -> Option<u64> {
+    if std::env::var_os("COURIERUST_H3_TRACE").is_none() {
+        return None;
+    }
+    let ms = std::env::var("COURIERUST_H3_TRACE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(2);
+    Some(ms.saturating_mul(1000))
+}
+
+fn h3_open_stream(stats: Option<&Arc<Stats>>, active: &mut BTreeSet<u64>, id: u64) {    if !active.insert(id) {
         return;
     }
     if let Some(stats) = stats {
@@ -1156,6 +1246,8 @@ impl Drop for ServerConnection {
 struct PendingRequest {
     stream_id: u64,
     request: Request<Body>,
+    /// Tail instrumentation: when the request stream was fully received.
+    received_at: Instant,
 }
 
 /// A request queued on a pooled client connection, waiting for the
@@ -1176,6 +1268,12 @@ struct ActiveRequest {
     reply: mpsc::Sender<Result<Response<Body>>>,
     response: Option<Response<Body>>,
     deadline: Instant,
+    // Tail instrumentation (COURIERUST_H3_TRACE): phase timestamps so a
+    // slow request is attributed to send / wait-headers / receive-body
+    // instead of surfacing as an opaque P99 spike.
+    created: Instant,
+    sent_at: Option<Instant>,
+    headers_at: Option<Instant>,
 }
 
 struct ClientConnection {
@@ -1659,10 +1757,27 @@ impl ClientConnection {
     /// cleanly instead of half-sending a body the peer can never accept.
     fn flush_requests(&mut self, socket: &UdpSocket) -> Result<()> {
         if !self.handshake_complete || !self.control_received {
+            // Tail instrumentation: a request stuck here is a connection
+            // that never finished the handshake/SETTINGS — the client
+            // side of a handoff stall.
+            if !self.waiting.is_empty() && std::env::var_os("COURIERUST_H3_TRACE").is_some() {
+                eprintln!(
+                    "H3TRACE|client|flush-deferred: handshake={} control={} waiting={}",
+                    self.handshake_complete,
+                    self.control_received,
+                    self.waiting.len()
+                );
+            }
             return Ok(());
         }
         self.ensure_control_sent(socket)?;
         if !self.control_sent {
+            if std::env::var_os("COURIERUST_H3_TRACE").is_some() && !self.waiting.is_empty() {
+                eprintln!(
+                    "H3TRACE|client|flush-deferred: control-not-sent waiting={}",
+                    self.waiting.len()
+                );
+            }
             return Ok(());
         }
         while let Some(request) = self.waiting.pop_front() {
@@ -1712,6 +1827,9 @@ impl ClientConnection {
                 reply: request.reply,
                 response: None,
                 deadline: request.deadline,
+                created: Instant::now(),
+                sent_at: None,
+                headers_at: None,
             };
             if let Err(error) =
                 send_request_chunks(&mut self.transport, socket, stream_id, &mut active)
@@ -1775,6 +1893,45 @@ impl ClientConnection {
             }
             self.fail_stream(stream_id, Error::new(ErrorKind::Timeout));
         }
+    }
+
+    /// Emit a per-request timeline when it exceeded the trace threshold.
+    /// Splits total latency into send / wait-headers / receive-body so a
+    /// slow path is attributed to a phase, plus the connection state at
+    /// completion (cwnd, unacked, queue depths) to distinguish "sender
+    /// blocked on ACK" from "peer handling" from "receiver flow control".
+    fn trace_request(&self, stream_id: &u64, request: &ActiveRequest, done: Instant) {
+        let Some(threshold) = h3_trace_threshold_us() else {
+            return;
+        };
+        let total = done.duration_since(request.created).as_micros() as u64;
+        if total < threshold {
+            return;
+        }
+        let send = request
+            .sent_at
+            .map(|t| t.duration_since(request.created).as_micros() as u64)
+            .unwrap_or(0);
+        let wait_headers = match (request.sent_at, request.headers_at) {
+            (Some(s), Some(h)) => h.duration_since(s).as_micros() as u64,
+            (Some(s), None) => done.duration_since(s).as_micros() as u64,
+            _ => 0,
+        };
+        let recv_body = request
+            .headers_at
+            .map(|h| done.duration_since(h).as_micros() as u64)
+            .unwrap_or(0);
+        eprintln!(
+            "H3TRACE|client|stream={stream_id}|total_us={total}|send_us={send}|wait_headers_us={wait_headers}|recv_body_us={recv_body}|sent={}/{}\n  cwnd={} unacked={} active={} waiting={} peer_max_data={} sent_data={}",
+            request.offset,
+            request.wire.len(),
+            self.transport.congestion_window,
+            self.transport.unacknowledged_bytes(),
+            self.active.len(),
+            self.waiting.len(),
+            self.transport.peer_max_data,
+            self.transport.sent_data,
+        );
     }
 
     /// Drop one active stream and report `error` to its caller.
@@ -1891,6 +2048,9 @@ impl ClientConnection {
                     },
                     &mut request.response,
                 )?;
+                if request.response.is_some() && request.headers_at.is_none() {
+                    request.headers_at = Some(Instant::now());
+                }
                 request.response.is_some()
             };
             if finished {
@@ -1898,6 +2058,7 @@ impl ClientConnection {
                     .active
                     .remove(&id)
                     .expect("request present while receiving its response");
+                self.trace_request(&id, &request, Instant::now());
                 let response = request.response.take().expect("response just completed");
                 let _ = request.reply.send(Ok(response));
                 h3_close_stream(self.stats.as_ref(), &mut self.active_streams, id);
@@ -2010,6 +2171,9 @@ fn send_request_chunks(
             Err(error) if error.kind == ErrorKind::WouldBlock => return Ok(()),
             Err(error) => return Err(error),
         }
+    }
+    if active.offset >= active.wire.len() && active.sent_at.is_none() {
+        active.sent_at = Some(Instant::now());
     }
     if active.wire.is_empty() {
         transport.send_stream_chunk(socket, APPLICATION, stream_id, 0, &[], true)?;
@@ -2343,7 +2507,20 @@ impl ServerConnection {
             .send_stream(socket, APPLICATION, 3, &control_stream(settings), false)
         {
             Ok(()) => {}
-            Err(error) if error.kind == ErrorKind::WouldBlock => return Ok(()),
+            Err(error) if error.kind == ErrorKind::WouldBlock => {
+                // The peer has not ACKed enough in-flight handshake data
+                // to admit the control stream; on_tick retries. Trace it
+                // because a connection parked here holds the client's
+                // requests hostage until the SETTINGS gets out.
+                if std::env::var_os("COURIERUST_H3_TRACE").is_some() {
+                    eprintln!(
+                        "H3TRACE|server|control-deferred: cwnd={} unacked={}",
+                        self.transport.congestion_window,
+                        self.transport.unacknowledged_bytes()
+                    );
+                }
+                return Ok(());
+            }
             Err(error) => return Err(error),
         }
         match self.transport.send_stream(
@@ -2538,6 +2715,32 @@ impl ServerConnection {
 
     fn push_request_front(&mut self, request: PendingRequest) {
         self.pending_requests.push_front(request);
+    }
+
+    /// Emit the worker→reactor handoff time when it exceeded the trace
+    /// threshold: received → handler done → queued. This isolates the
+    /// handoff that otherwise shows up as client-side wait_headers
+    /// latency.
+    fn trace_response(&self, completed: &CompletedResponse) {
+        let Some(threshold) = h3_trace_threshold_us() else {
+            return;
+        };
+        let now = Instant::now();
+        let total = now.duration_since(completed.received_at).as_micros() as u64;
+        if total < threshold {
+            return;
+        }
+        let handler = completed
+            .completed_at
+            .duration_since(completed.received_at)
+            .as_micros() as u64;
+        let queue = now.duration_since(completed.completed_at).as_micros() as u64;
+        eprintln!(
+            "H3TRACE|server|stream={}|total_us={total}|handler_us={handler}|queue_us={queue}|pending={}|handshake={}",
+            completed.stream_id,
+            self.pending_requests.len(),
+            self.handshake_complete,
+        );
     }
 
     fn queue_response(&mut self, stream_id: u64, result: Result<Response<Body>>) {
@@ -3128,6 +3331,7 @@ fn drain_request_frames(
         requests.push_back(PendingRequest {
             stream_id: stream.id,
             request,
+            received_at: Instant::now(),
         });
     }
     Ok(())
@@ -3765,6 +3969,16 @@ struct SentPacket {
     pending_resend: bool,
 }
 
+/// A response body queued for the wire. `queued_at` feeds the tail
+/// instrumentation that splits worker→reactor handoff from the actual
+/// flush — the two surfaces where a slow response hides from the client.
+struct QueuedStream {
+    id: u64,
+    wire: Vec<u8>,
+    offset: usize,
+    queued_at: Instant,
+}
+
 struct QuicTransport {
     server: bool,
     peer: Option<SocketAddr>,
@@ -3806,9 +4020,8 @@ struct QuicTransport {
     send_update_pending: bool,
     spaces: [PacketSpace; 3],
     crypto_send_offsets: [u64; 3],
-    queued_streams: VecDeque<(u64, Vec<u8>, usize)>,
-    congestion_window: usize,
-    slow_start_threshold: usize,
+    queued_streams: VecDeque<QueuedStream>,
+    congestion_window: usize,    slow_start_threshold: usize,
     smoothed_rtt: Option<Duration>,
     rtt_variance: Duration,
     latest_rtt: Option<Duration>,
@@ -4553,17 +4766,22 @@ impl QuicTransport {
         let queued = self
             .queued_streams
             .iter()
-            .map(|(_, bytes, offset)| bytes.len().saturating_sub(*offset))
+            .map(|s| s.wire.len().saturating_sub(s.offset))
             .fold(0usize, usize::saturating_add);
         if queued.saturating_add(wire.len()) > MAX_H3_CONNECTION_BUFFER {
             return Err(protocol("HTTP/3 response queue limit exceeded"));
         }
-        self.queued_streams.push_back((id, wire, 0));
+        self.queued_streams.push_back(QueuedStream {
+            id,
+            wire,
+            offset: 0,
+            queued_at: Instant::now(),
+        });
         if std::env::var_os("COURIERUST_H3_DEBUG").is_some() {
             eprintln!(
                 "H3SERVER wire-queued: stream={} len={}",
                 id,
-                self.queued_streams.back().map_or(0, |(_, b, _)| b.len())
+                self.queued_streams.back().map_or(0, |s| s.wire.len())
             );
         }
         if let Some(stats) = self.stats.as_deref() {
@@ -4575,22 +4793,49 @@ impl QuicTransport {
     fn queued_bytes(&self) -> usize {
         self.queued_streams
             .iter()
-            .map(|(_, bytes, offset)| bytes.len().saturating_sub(*offset))
+            .map(|s| s.wire.len().saturating_sub(s.offset))
             .fold(0usize, usize::saturating_add)
     }
 
     fn flush_queued_streams(&mut self, socket: &UdpSocket) -> Result<()> {
-        while let Some((id, wire, mut offset)) = self.queued_streams.pop_front() {
+        while let Some(mut queued) = self.queued_streams.pop_front() {
+            // Tail instrumentation: a response that waits here is a
+            // worker→reactor→flush stall, visible to the client as
+            // wait_headers/recv_body latency.
+            if let Some(threshold) = h3_trace_threshold_us() {
+                let wait = Instant::now()
+                    .duration_since(queued.queued_at)
+                    .as_micros() as u64;
+                if wait > threshold {
+                    eprintln!(
+                        "H3TRACE|server|response-queue-wait|stream={}|wait_us={wait}|offset={}/{}|cwnd={}|unacked={}",
+                        queued.id,
+                        queued.offset,
+                        queued.wire.len(),
+                        self.congestion_window,
+                        self.unacknowledged_bytes(),
+                    );
+                }
+            }
+            let id = queued.id;
+            let wire = queued.wire;
+            let offset = queued.offset;
             if wire.is_empty() {
                 if let Err(error) = self.send_stream_chunk(socket, APPLICATION, id, 0, &[], true) {
                     if error.kind == ErrorKind::WouldBlock {
-                        self.queued_streams.push_front((id, wire, offset));
+                        self.queued_streams.push_front(QueuedStream {
+                            id,
+                            wire,
+                            offset,
+                            queued_at: queued.queued_at,
+                        });
                         return Ok(());
                     }
                     return Err(error);
                 }
                 continue;
             }
+            let mut offset = offset;
             while offset < wire.len() {
                 let take = (wire.len() - offset).min(1000);
                 let end = offset + take;
@@ -4616,7 +4861,12 @@ impl QuicTransport {
                                 self.unacknowledged_bytes()
                             );
                         }
-                        self.queued_streams.push_front((id, wire, offset));
+                        self.queued_streams.push_front(QueuedStream {
+                            id,
+                            wire,
+                            offset,
+                            queued_at: queued.queued_at,
+                        });
                         return Ok(());
                     }
                     return Err(error);

@@ -32,6 +32,7 @@ quinn = "0.11"
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "http2"] }
 rustls = "0.23"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "macros"] }
+tokio-rustls = "0.26"
 
 [[bench]]
 name = "throughput"
@@ -57,6 +58,11 @@ path = "src/interop.rs"
 name = "network"
 harness = false
 path = "src/network.rs"
+
+[[bench]]
+name = "tls_peer"
+harness = false
+path = "src/tls_peer.rs"
 
 [[bench]]
 name = "quinn_dbg"

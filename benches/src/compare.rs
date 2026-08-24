@@ -103,6 +103,51 @@ fn response_bytes(payload: Payload) -> Bytes {
     Bytes::from(vec![b'x'; payload.bytes])
 }
 
+/// Fixed-total-concurrency H2 sweep (connections × per-connection
+/// concurrency = 32): 1×32, 4×8, 8×4. Verifies the README guidance of
+/// 4–8 workers per H2 connection — scaling workers on a single driver
+/// serializes; scaling connections does not.
+fn compare_h2_connection_sweep(
+    address: SocketAddr,
+    payload: Payload,
+    requests: usize,
+    repetitions: usize,
+) {
+    for (connections, per_conn) in [(1usize, 32usize), (4usize, 8usize), (8usize, 4usize)] {
+        let workers = connections * per_conn;
+        let mut timing = None;
+        for _ in 0..repetitions {
+            let t = run_courierust_client(
+                Protocol::H2c,
+                address,
+                payload,
+                requests,
+                workers,
+                connections,
+            );
+            merge_timing(&mut timing, t);
+        }
+        print_result(
+            ResultMetadata {
+                case: Box::leak(
+                    format!("courierust_h2_conn{connections}xw{per_conn}").into_boxed_str(),
+                ),
+                layer: "client",
+                protocol: Protocol::H2c,
+                client: "courierust",
+                server: "hyper",
+                payload,
+                workers,
+                repetitions,
+                server_threads: 4,
+                pool_policy: "courierust_max_connections_per_host",
+                pool_value: connections,
+            },
+            timing.expect("comparison repetitions must be positive"),
+        );
+    }
+}
+
 /// Bind a Courierust server that serves `payload` on every request and
 /// leak its shutdown handle so it outlives the bench process.
 fn serve_courierust(config: ServerConfig, payload: Payload) -> SocketAddr {
@@ -198,10 +243,11 @@ fn run_courierust_client(
     payload: Payload,
     requests: usize,
     workers: usize,
+    max_connections: usize,
 ) -> Timing {
     let client = Client::with_config(ClientConfig {
         http2: protocol.uses_http2(),
-        max_connections_per_host: workers.max(1),
+        max_connections_per_host: max_connections,
         ..Default::default()
     });
     let url = format!("http://{address}/benchmark");
@@ -561,7 +607,9 @@ fn compare_clients(
 ) {
     let (courierust_timing, reqwest_timing) = measure_pair(
         repetitions,
-        || run_courierust_client(protocol, address, payload, requests, workers),
+        || {
+            run_courierust_client(protocol, address, payload, requests, workers, workers.max(1))
+        },
         || run_reqwest_client(protocol, address, payload, requests, workers, handle),
     );
     print_result(
@@ -882,6 +930,9 @@ fn main() {
             );
             if matches!(protocol, Protocol::H2c) && payload.bytes == SIXTY_FOUR_KIB.bytes {
                 compare_h2_large_body(hyper, payload, large_body_requests, repetitions, &handle);
+            }
+            if matches!(protocol, Protocol::H2c) && payload.bytes == ONE_KIB.bytes {
+                compare_h2_connection_sweep(hyper, payload, parallel_requests, repetitions);
             }
             if payload.bytes == ONE_KIB.bytes {
                 compare_clients(
