@@ -429,13 +429,11 @@ impl Client {
                             connector_config(t),
                         )));
                     }
-                    let connector = cache
-                        .entry(authority.to_string())
-                        .or_insert_with(|| {
-                            Arc::new(crate::courierust_tls::TlsConnector::new(
-                                connector_config(t),
-                            ))
-                        });
+                    let connector = cache.entry(authority.to_string()).or_insert_with(|| {
+                        Arc::new(crate::courierust_tls::TlsConnector::new(connector_config(
+                            t,
+                        )))
+                    });
                     Ok(Some((**connector).clone()))
                 }
                 None => Err(Error::protocol(

@@ -2,7 +2,6 @@
 //! request/status line parsing, header block reading, body framing
 //! (Content-Length / chunked) and head serialization.
 
-use alloc::vec::Vec;
 use crate::courierust_bytes::Bytes;
 use crate::courierust_error::{Error, Result};
 use crate::courierust_http::header::{HeaderMap, HeaderName, HeaderValue};
@@ -11,6 +10,7 @@ use crate::courierust_http::status::StatusCode;
 use crate::courierust_http::uri::PathAndQuery;
 use crate::courierust_http::version::Version;
 use crate::courierust_io::{BufReader, Read};
+use alloc::vec::Vec;
 
 /// Maximum size of a single header line.
 const MAX_LINE: usize = 64 * 1024;

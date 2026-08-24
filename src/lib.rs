@@ -56,13 +56,13 @@ pub mod courierust_bytes;
 pub mod courierust_crypto;
 pub mod courierust_error;
 pub mod courierust_fingerprint;
+pub mod courierust_h1;
 pub mod courierust_h2;
 pub mod courierust_h3;
 pub mod courierust_hpack;
 pub mod courierust_http;
 pub mod courierust_io;
 pub mod courierust_quic;
-pub mod courierust_h1;
 #[cfg(feature = "std")]
 pub mod courierust_tls;
 
