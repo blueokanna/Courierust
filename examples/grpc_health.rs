@@ -12,8 +12,6 @@ use courierust::courierust_grpc::health::{self, serving_status, CHECK_METHOD, WA
 use courierust::courierust_grpc::{GrpcClient, GrpcServer};
 
 fn main() -> courierust::Result<()> {
-    // A health service that reports overall SERVING and tracks one
-    // registered service.
     let service = health::HealthService::new()
         .set_overall(serving_status::SERVING)
         .set_service("greeter.Greeter", serving_status::SERVING);
@@ -23,26 +21,21 @@ fn main() -> courierust::Result<()> {
     println!("health server on {addr}");
 
     let client = GrpcClient::new(&format!("http://{addr}"))?;
-
-    // Check the overall status: HealthCheckRequest with an empty service.
     let reply = client.call(CHECK_METHOD, Bytes::new())?;
     let status = parse_health_status(&reply)?;
     assert_eq!(status, serving_status::SERVING);
     println!("overall Check -> status={status} (SERVING)");
 
-    // Check a registered service.
     let reply = client.call(CHECK_METHOD, health_request("greeter.Greeter"))?;
     let status = parse_health_status(&reply)?;
     assert_eq!(status, serving_status::SERVING);
     println!("greeter.Greeter Check -> status={status} (SERVING)");
 
-    // An unregistered service must come back SERVICE_UNKNOWN.
     let reply = client.call(CHECK_METHOD, health_request("no.such.service"))?;
     let status = parse_health_status(&reply)?;
     assert_eq!(status, serving_status::SERVICE_UNKNOWN);
     println!("no.such.service Check -> status={status} (SERVICE_UNKNOWN)");
 
-    // Watch is server-streaming: it yields the current status.
     let reply = client.call(WATCH_METHOD, health_request("greeter.Greeter"))?;
     let status = parse_health_status(&reply)?;
     assert_eq!(status, serving_status::SERVING);

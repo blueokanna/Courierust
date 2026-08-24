@@ -68,6 +68,10 @@ const MAX_H3_CONNECTION_BUFFER: usize = 64 * 1024 * 1024;
 /// connection sweep — `on_tick`/response flushing runs between drains.
 const MAX_DATAGRAMS_PER_POLL: usize = 256;
 const ACK_DELAY: Duration = Duration::from_millis(2);
+/// Lower bound of the adaptive ACK batch window: enough to coalesce a
+/// same-burst cluster on loopback/DC, small enough not to add a visible
+/// round to a single-request flow.
+const MIN_ACK_DELAY: Duration = Duration::from_micros(250);
 /// RFC 9000 §9.3.3: PATH_CHALLENGE probe timeout — after this long without
 /// a matching PATH_RESPONSE the probe is retried once, then the pending
 /// path is abandoned (the validated path remains authoritative).
@@ -674,6 +678,13 @@ fn run_client_driver(
                     Err(error) => return finish(conn, &socket, io_error(error.to_string())),
                 }
             }
+            // Flush the whole receive batch's ACKs in one pass: the
+            // interactive fast path (ack_deadline None) coalesces a burst
+            // into one ACK, and doing it here — not per datagram — keeps
+            // that coalescing while still acknowledging promptly.
+            if let Err(error) = conn.flush_acks(&socket) {
+                return finish(conn, &socket, error);
+            }
         }
         if ready.contains(&WAKE_ID) {
             drain_wake(&wake_reader);
@@ -1247,6 +1258,13 @@ impl ClientConnection {
         })
     }
 
+    /// Flush every space's due ACK in one pass. Called after a receive
+    /// batch so a burst coalesces into a single acknowledgement instead
+    /// of one per datagram.
+    fn flush_acks(&mut self, socket: &UdpSocket) -> Result<()> {
+        self.transport.flush_acks(socket)
+    }
+
     fn on_datagram(
         &mut self,
         socket: &UdpSocket,
@@ -1450,7 +1468,6 @@ impl ClientConnection {
             if ack {
                 self.transport.ack(level);
             }
-            self.transport.flush_ack(socket, level)?;
         }
         if self.handshake_complete && self.control_received {
             self.flush_requests(socket)?;
@@ -2261,7 +2278,6 @@ impl ServerConnection {
             if ack {
                 self.transport.ack(level);
             }
-            self.transport.flush_ack(socket, level)?;
         }
         Ok(())
     }
@@ -4611,19 +4627,42 @@ impl QuicTransport {
         Ok(())
     }
 
+    /// Adaptive ACK batch window: `2 × smoothed_rtt` clamped to
+    /// [MIN_ACK_DELAY, ACK_DELAY], so loopback/DC flows are not paced by a
+    /// constant 2 ms while WAN flows keep a bounded batch for bursts.
+    fn current_ack_delay(&self) -> Duration {
+        let Some(smoothed) = self.smoothed_rtt else {
+            return ACK_DELAY;
+        };
+        let window = smoothed.saturating_mul(2);
+        window.clamp(MIN_ACK_DELAY, ACK_DELAY)
+    }
+
     fn ack(&mut self, level: LevelIndex) {
-        self.spaces[level].ack_pending = true;
-        self.spaces[level].ack_deadline = Some(Instant::now() + ACK_DELAY);
+        let delay = self.current_ack_delay();
+        let space = &mut self.spaces[level];
+        if !space.ack_pending {
+            // RFC 9002 §6.2.2 interactive fast path: acknowledge the first
+            // ack-eliciting packet of a batch immediately (deadline None).
+            // Parking every ACK behind a fixed window is precisely the H3
+            // loopback tail — each cwnd-limited round waited a full
+            // ACK_DELAY. Stragglers of the same burst still coalesce.
+            space.ack_pending = true;
+            space.ack_deadline = None;
+        } else if space.ack_deadline.is_some() {
+            // A burst is coalescing: re-arm the adaptive window so late
+            // arrivals join the pending ACK instead of forcing a second.
+            space.ack_deadline = Some(Instant::now() + delay);
+        }
     }
 
     fn flush_ack(&mut self, socket: &UdpSocket, level: LevelIndex) -> Result<()> {
         if !self.spaces[level].ack_pending {
             return Ok(());
         }
-        // Batch ACKs (RFC 9002 §6.2.2): hold the ACK until the batch
-        // deadline so a burst of packets yields one ACK instead of one per
-        // datagram. `flush_acks` runs every tick, so a deferred ACK is
-        // still sent promptly once the deadline passes.
+        // Batch ACKs (RFC 9002 §6.2.2): hold the ACK until its window
+        // passes so a burst yields one ACK instead of one per datagram.
+        // `ack_deadline == None` is the interactive fast path — due now.
         if self.spaces[level]
             .ack_deadline
             .is_some_and(|deadline| deadline > Instant::now())
@@ -5027,6 +5066,40 @@ impl QuicTransport {
         retransmits: u8,
         dest: Option<SocketAddr>,
     ) -> Result<()> {
+        // Piggyback a due ACK onto any outgoing datagram (RFC 9002
+        // §6.2.2): acknowledging on a packet we are already sending costs
+        // nothing and collapses the standalone ACK round that otherwise
+        // paces every cwnd-limited transfer. `flush_ack`'s own pure-ACK
+        // packet already carries one, so skip when `frames` has an ACK.
+        let due_ack = !frames
+            .iter()
+            .any(|frame| matches!(frame, QFrame::Ack { .. }))
+            && self.spaces[level].ack_pending
+            && self.spaces[level]
+                .ack_deadline
+                .map_or(true, |deadline| deadline <= Instant::now());
+        // Owned scratch outlives `frames` below so the piggybacked ACK
+        // slice stays valid for the whole packet build.
+        let mut piggyback = Vec::new();
+        let frames = if due_ack {
+            if let Some(largest) = self.spaces[level].largest_received {
+                let ranges = ack_ranges(&self.spaces[level].received, largest);
+                piggyback.push(QFrame::Ack {
+                    largest_acked: largest,
+                    ack_delay: 0,
+                    ranges,
+                    ecn: None,
+                });
+                self.spaces[level].ack_pending = false;
+                self.spaces[level].ack_deadline = None;
+                piggyback.extend_from_slice(frames);
+                piggyback.as_slice()
+            } else {
+                frames
+            }
+        } else {
+            frames
+        };
         let key = match level {
             INITIAL => self.initial_send.clone(),
             HANDSHAKE => self

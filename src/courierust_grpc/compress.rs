@@ -12,7 +12,6 @@
 
 use crate::courierust_error::{Error, Result};
 
-/// RFC 1951 length code table for codes 257..=285: (base, extra bits).
 const LENGTH_BASE: [(u16, u8); 29] = [
     (3, 0),
     (4, 0),
@@ -259,7 +258,6 @@ impl DecodeTable {
         if left != 0 && !allow_incomplete {
             return Err(Error::protocol("deflate: incomplete code"));
         }
-        // Assign symbols in canonical order.
         let mut off = 0u32;
         for len in 1..=15 {
             table.offset[len] = off as u16;
@@ -377,7 +375,6 @@ fn inflate_dynamic(br: &mut BitReader, out: &mut Vec<u8>, max_out: usize) -> Res
     for i in 0..hclen {
         clen_lens[CLEN_ORDER[i]] = br.read_bits(3)? as u8;
     }
-    // The code-length code table must be complete (RFC 1951 §3.2.7).
     let clen_table = DecodeTable::build(&clen_lens, false)?;
     if clen_table.is_empty() {
         return Err(Error::protocol("deflate: empty code-length table"));
@@ -781,7 +778,6 @@ mod tests {
         assert_eq!(length_code(258), Some((285, 0, 258)));
         assert_eq!(length_code(11), Some((265, 1, 11)));
         assert_eq!(distance_code(1), Some((0, 0, 1)));
-        // Code 29 covers 24577..=28672 (12 extra bits = 4096 bits); larger distances and gaps are uncoded
         assert_eq!(distance_code(28672), Some((29, 12, 24577)));
         assert_eq!(distance_code(24577), Some((29, 12, 24577)));
         assert_eq!(distance_code(16385), Some((28, 12, 16385)));
@@ -791,14 +787,10 @@ mod tests {
 
     #[test]
     fn decompresses_stored_and_fixed_and_dynamic() {
-        // Hand-built stored DEFLATE block ("abc"): Header 0x01 (BFINAL=1, BTYPE=00), LEN=3, NLEN=0xFFFC.
         let mut stored = vec![0x01, 0x03, 0x00, 0xfc, 0xff];
         stored.extend_from_slice(b"abc");
         assert_eq!(inflate(&stored, 1 << 10).unwrap(), b"abc");
 
-        // Dynamic Huffman: use our compressor (fixed) as a sanity base and
-        // hand-verify the fixed table against RFC 1951 Appendix A symbols:
-        // 'A' = 0x41 -> fixed code 0x30 + 0x41 = 0x71 (8 bits, MSB first).
         let d = deflate(b"A");
         assert_eq!(inflate(&d, 1 << 10).unwrap(), b"A");
     }

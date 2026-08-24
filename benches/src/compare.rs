@@ -12,18 +12,15 @@ use courierust::courierust_client::{Client, ClientConfig};
 use courierust::courierust_http::request::Request;
 use courierust::courierust_http::response::Response;
 use courierust::courierust_server::{Server, ServerConfig, TlsSettings as ServerTls};
-use courierust_benchmark::metrics::{run_concurrent, run_sequential, Timing, MAX_SAMPLES};
+use courierust_benchmark::metrics::{metric, run_concurrent, run_sequential, stats_fields, Timing, MAX_SAMPLES};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 
-// HTTP/3 (QUIC v1 + TLS 1.3): Courierust H3 client vs quinn + h3 crate
-// against the SAME Courierust H3 server. Both reuse one pooled QUIC
-// connection, so rows are warm per-request cost.
-//
-// The server presents a proper end-entity certificate (CA:FALSE, serverAuth)
-// signed by a dedicated test CA; quinn/rustls reject a self-signed CA:TRUE
-// cert used as an end entity (CaUsedAsEndEntity).
+// HTTP/3 (QUIC v1 + TLS 1.3): Courierust H3 client vs quinn+h3 client, same
+// Courierust H3 server, one pooled QUIC connection each — warm per-request cost.
+// Server cert is a CA-signed end entity (CA:FALSE): quinn/rustls reject a
+// self-signed CA:TRUE cert used as end entity (CaUsedAsEndEntity).
 const H3_SERVER_CERT_DER: &[u8] = include_bytes!("../certs/h3_server.der");
 const H3_SERVER_KEY_DER: &[u8] = include_bytes!("../certs/h3_server_key.der");
 const H3_CA_DER: &[u8] = include_bytes!("../certs/h3_ca.der");
@@ -225,18 +222,14 @@ fn run_courierust_client(
     }
 }
 
-/// A valid mainstream-client baseline. HTTP/1.1 uses reqwest's blocking
-/// client (a plain, fair comparison for keep-alive h1). HTTP/2 prior
-/// knowledge uses the *async* reqwest client driven through a tokio
-/// multi-thread runtime.
+/// Mainstream-client baseline: reqwest blocking client for h1 (fair keep-alive
+/// comparison), async reqwest on a tokio multi-thread runtime for h2c.
 ///
-/// Pool semantics differ between the two clients and must not be
-/// conflated: Courierust's `max_connections_per_host` is a cap on *live*
-/// connections per authority, while reqwest's `pool_max_idle_per_host`
-/// is a cap on *idle pooled* connections. Setting both to the same value
-/// N is only equivalent for a sequential workload; under concurrency
-/// reqwest may open more live connections than N (it recycles up to N
-/// idle ones).
+/// Pool semantics differ — must not be conflated. Courierust
+/// `max_connections_per_host` caps *live* connections per authority; reqwest
+/// `pool_max_idle_per_host` caps *idle pooled* connections. Equal values are
+/// equivalent only sequentially; under concurrency reqwest may open more live
+/// connections than N.
 enum ReqwestClient {
     Blocking(reqwest::blocking::Client),
     Async(Arc<reqwest::Client>),
@@ -392,12 +385,9 @@ fn compare_h2_large_body(
     repetitions: usize,
     handle: &tokio::runtime::Handle,
 ) {
-    // Both clients face the SAME hyper h2 server's 64 KiB initial
-    // flow-control window: every 64 KiB of the 1 MiB request body needs
-    // a WINDOW_UPDATE round trip, so absolute per-request cost is pacing,
-    // not either client's core path. Kept for auditability; NOT valid for
-    // ratio claims — the fixed wait persists with the async client, so
-    // the "blocking-client artifact" framing was wrong.
+    // Same hyper h2 server, 64 KiB initial flow-control window: every 64 KiB of
+    // the 1 MiB body costs a WINDOW_UPDATE round trip, so absolute cost is
+    // pacing, not either client's core path. Kept for audit; NOT valid for ratios.
     let request_body = large_h2_body();
     let (courierust_timing, reqwest_timing) = measure_pair(
         repetitions,
@@ -438,12 +428,6 @@ fn compare_h2_large_body(
     );
 }
 
-fn metric(value: Option<f64>) -> String {
-    value
-        .map(|value| format!("{value:.2}"))
-        .unwrap_or_else(|| "na".to_owned())
-}
-
 fn print_result(metadata: ResultMetadata, mut timing: Timing) {
     let ResultMetadata {
         case,
@@ -460,7 +444,7 @@ fn print_result(metadata: ResultMetadata, mut timing: Timing) {
     } = metadata;
     timing.sort_samples();
     println!(
-        "RESULT|suite=compare|case={case}|layer={layer}|protocol={}|client={client}|server={server}|payload={}|bytes={}|workers={workers}|server_threads={server_threads}|pool_policy={pool_policy}|pool_value={pool_value}|repetitions={repetitions}|status=valid|reason=-|requests={}|elapsed_ms={:.3}|rps={:.1}|response_mbps={:.3}|p50_us={}|p75_us={}|p90_us={}|p95_us={}|p99_us={}|samples={}",
+        "RESULT|suite=compare|case={case}|layer={layer}|protocol={}|client={client}|server={server}|payload={}|bytes={}|workers={workers}|server_threads={server_threads}|pool_policy={pool_policy}|pool_value={pool_value}|repetitions={repetitions}|status=valid|reason=-|requests={}|elapsed_ms={:.3}|rps={:.1}|response_mbps={:.3}|p50_us={}|p75_us={}|p90_us={}|p95_us={}|p99_us={}|{}|samples={}",
         protocol.name(),
         payload.name,
         payload.bytes,
@@ -473,6 +457,7 @@ fn print_result(metadata: ResultMetadata, mut timing: Timing) {
         metric(timing.percentile_us(0.90)),
         metric(timing.percentile_us(0.95)),
         metric(timing.percentile_us(0.99)),
+        stats_fields(&timing),
         timing.samples.len(),
     );
 }
@@ -487,9 +472,8 @@ fn merge_timing(total: &mut Option<Timing>, timing: Timing) {
     }
 }
 
-/// Execute both sides in alternating order. `repetitions` is always even,
-/// so each side runs first equally often and setup/cache effects do not
-/// consistently favor one implementation.
+/// Alternate sides across repetitions (always even) so setup/cache effects
+/// do not systematically favor one implementation.
 fn measure_pair<First, Second>(repetitions: usize, first: First, second: Second) -> (Timing, Timing)
 where
     First: Fn() -> Timing,
@@ -664,11 +648,7 @@ fn compare_servers(
     );
 }
 
-// ---------------------------------------------------------------------
-// HTTP/3 (QUIC v1 + TLS 1.3): Courierust H3 client vs quinn + h3 crate
-// against the SAME Courierust H3 server. Both reuse one pooled QUIC
-// connection, so rows are warm per-request cost.
-// ---------------------------------------------------------------------
+// --- HTTP/3: Courierust H3 client vs quinn+h3 client (same H3 server, pooled conn) ---
 
 /// A Courierust HTTP/3 (QUIC v1 + TLS 1.3, ALPN `h3`) server.
 fn h3_server(payload: Payload) -> SocketAddr {
@@ -715,13 +695,9 @@ fn run_courierust_h3_client(address: SocketAddr, payload: Payload, requests: usi
     run_sequential(requests, MAX_SAMPLES, request)
 }
 
-/// quinn + h3 crate client: one long-lived QUIC connection, every
-/// request a fresh H3 stream on it (the same reuse model as the
-/// Courierust pool). 0-RTT/early-data is explicitly disabled.
-///
-/// Returns an `Err(reason)` when the independent QUIC/TLS handshake does
-/// not complete against the Courierust server — a genuine interop gap
-/// that is reported (never silently skipped or faked).
+/// quinn+h3 client: one long-lived QUIC connection, fresh H3 stream per request
+/// (same reuse model as Courierust). 0-RTT disabled. Err(reason) on an
+/// independent-handshake interop gap — reported, never faked.
 fn run_quinn_h3_client(
     address: SocketAddr,
     payload: Payload,
@@ -802,7 +778,7 @@ fn run_quinn_h3_client(
 
 fn print_quinn_not_available(payload: Payload, repetitions: usize, reason: String) {
     println!(
-        "RESULT|suite=compare|case=quinn_h3_client_to_courierust|layer=client|protocol=h3|client=quinn+h3|server=courierust-h3|payload={}|bytes={}|workers=1|server_threads=4|pool_policy=quinn_single_connection|pool_value=1|repetitions={repetitions}|status=not_available|reason=quinn_handshake_interop_pending:{reason}|requests=0|elapsed_ms=0|rps=0|response_mbps=0|p50_us=na|p75_us=na|p90_us=na|p95_us=na|p99_us=na|samples=0",
+        "RESULT|suite=compare|case=quinn_h3_client_to_courierust|layer=client|protocol=h3|client=quinn+h3|server=courierust-h3|payload={}|bytes={}|workers=1|server_threads=4|pool_policy=quinn_single_connection|pool_value=1|repetitions={repetitions}|status=not_available|reason=quinn_handshake_interop_pending:{reason}|requests=0|elapsed_ms=0|rps=0|response_mbps=0|p50_us=na|p75_us=na|p90_us=na|p95_us=na|p99_us=na|min_us=na|mean_us=na|max_us=na|stddev_us=na|p999_us=na|tail_ratio=na|samples=0",
         payload.name, payload.bytes
     );
 }

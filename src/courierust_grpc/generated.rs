@@ -72,8 +72,6 @@ mod tests {
         let stub =
             Greeter::new(crate::courierust_grpc::GrpcClient::new("http://127.0.0.1:1").unwrap());
         assert_eq!(stub.service_path(), "/helloworld.Greeter");
-        // The methods exist and are typed; calling without a server
-        // fails at the transport layer, not the type layer.
         let _ = stub.say_hello(HelloRequest::default());
         let _ = stub.watch(HelloRequest::default());
     }

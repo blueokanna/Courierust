@@ -1,33 +1,32 @@
-//! HTTP/3 (QUIC v1 + TLS 1.3) performance benchmark over the pooled
-//! connection.
+//! HTTP/3 (QUIC v1 + TLS 1.3) performance over the pooled connection.
 //!
-//! The client keeps one QUIC connection per authority alive, so the
-//! headline number is the *warm* per-request cost — a single QUIC round
-//! trip on an established connection (stream 0, 4, 8, ... multiplexed
-//! over the same connection). The *cold* cost (QUIC handshake + TLS 1.3 +
-//! server Retry address validation) is reported separately as
-//! `h3_connect`, so regressions in either the handshake or the reuse path
-//! are visible. The gap between `h3_connect` and `h3_sequential` is
-//! exactly what connection reuse buys.
+//! One pooled QUIC connection per authority: `h3_sequential`/`h3_parallel`
+//! measure the *warm* per-request cost (a single round trip on an established
+//! connection). The *cold* cost (QUIC handshake + TLS 1.3 + server Retry
+//! address validation) is reported separately as `h3_connect`; the gap
+//! between `h3_connect` and `h3_sequential` is exactly what connection
+//! reuse buys.
 //!
-//! Run from `benches/`: `cargo bench --bench h3`
-//! `BENCH_REQUESTS` overrides the request count (default 1000);
-//! `H3_WORKERS` overrides the parallel worker count (default 8).
+//! Env: `BENCH_REQUESTS` (default 1000), `H3_WORKERS` (default 8).
 //!
-//! Baseline (Windows 11, loopback, release, 2026-08-22, BENCH_REQUESTS=500):
-//! - `h3_connect`:      ~6-8 ms  (cold: QUIC handshake + TLS + Retry)
+//! Baseline (Windows 11, loopback, release, 2026-08-22):
+//! - `h3_connect`:      ~6-8 ms (cold)
 //! - `h3_sequential`:   ~3.5-5.4k rps, p50 ~170-260 µs, p99 ~0.3-0.6 ms
 //! - `h3_parallel`×8:   ~9-12k rps, p50 ~0.5-0.9 ms
 //!
-//! The Windows process timer resolution is raised to 1 ms by the poller
-//! (`timeBeginPeriod`), which removed ~1 ms periodic `select()` wakeup
-//! stalls and was the single largest warm-latency win (p99 10.7 ms → ~0.3 ms).
+//! Tail note: `h3_parallel` p99 can jump (µs→ms) on shared runners. The
+//! emitted p999/tail_ratio/stddev exist to track that — a single run is a
+//! signal, not a root cause (UDP reactor, packet queue, cwnd/ACK timers,
+//! QPACK/control flow, worker→reactor handoff, CI scheduling all shape it).
+//!
+//! The poller raises the Windows timer to 1 ms (`timeBeginPeriod`), which
+//! removed ~1 ms periodic `select()` wakeup stalls (p99 10.7 ms → ~0.3 ms).
 
 use courierust::courierust_client::{Client, ClientConfig, TlsSettings as ClientTls};
 use courierust::courierust_http::request::Request;
 use courierust::courierust_http::response::Response;
 use courierust::courierust_server::{Server, ServerConfig, TlsSettings as ServerTls};
-use courierust_benchmark::metrics::{run_concurrent, run_sequential, Timing, MAX_SAMPLES};
+use courierust_benchmark::metrics::{run_concurrent, run_sequential, stats_fields, Timing, MAX_SAMPLES};
 use std::time::Instant;
 
 const CERT_DER: &[u8] = include_bytes!("../../tests/certs/server_cert.der");
@@ -35,7 +34,7 @@ const KEY_DER: &[u8] = include_bytes!("../../tests/certs/server_key.der");
 
 fn report(label: &str, workers: usize, timing: &Timing) {
     println!(
-        "RESULT|suite=h3|case={label}|protocol=h3|mode=reuse|payload=empty|bytes=0|workers={workers}|requests={}|elapsed_ms={:.3}|rps={:.1}|p50_us={:.1}|p75_us={:.1}|p90_us={:.1}|p99_us={:.1}|samples={}",
+        "RESULT|suite=h3|case={label}|protocol=h3|mode=reuse|payload=empty|bytes=0|workers={workers}|requests={}|elapsed_ms={:.3}|rps={:.1}|p50_us={:.1}|p75_us={:.1}|p90_us={:.1}|p99_us={:.1}|{}|samples={}",
         timing.requests,
         timing.elapsed.as_secs_f64() * 1000.0,
         timing.requests_per_second(),
@@ -43,6 +42,7 @@ fn report(label: &str, workers: usize, timing: &Timing) {
         timing.percentile_us(0.75).unwrap_or(0.0),
         timing.percentile_us(0.90).unwrap_or(0.0),
         timing.percentile_us(0.99).unwrap_or(0.0),
+        stats_fields(timing),
         timing.samples.len(),
     );
 }

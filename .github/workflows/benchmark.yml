@@ -116,16 +116,10 @@ jobs:
           : > fuzz.log
           rustup toolchain install nightly --profile minimal
           cargo +nightly install cargo-fuzz --locked
-          # PR-time smoke fuzz: each target gets a short wall-clock budget
-          # (20 s) rather than a fixed run count. It is a smoke check for
-          # gross crashes, not deep state-machine exploration — the
-          # long-running workflow (fuzz-long.yml) spends 30-120 minutes
-          # per target on the nightly schedule.
-          # h2_frame / hpack_block: legacy targets. h1_request: the
-          # shared HTTP/1 request path (request line, headers, chunked
-          # framing) that both the blocking and event-driven parsers use.
-          # h2_connection: the full h2 state machine driven by hostile
-          # frame streams (client and server roles).
+          # PR smoke fuzz: 20 s wall-clock per target for gross crashes;
+          # fuzz-long.yml does deep 30-120 min runs nightly.
+          # h2_frame/hpack_block: legacy. h1_request: shared HTTP/1 parser
+          # (blocking + event-driven). h2_connection: full h2 state machine.
           for target in h2_frame hpack_block h1_request h2_connection; do
             started=$(date +%s)
             cargo +nightly fuzz run --fuzz-dir fuzz "$target" -- -max_total_time=20 -max_len=16384 -timeout=10 -rss_limit_mb=2048 >> fuzz.log 2>&1

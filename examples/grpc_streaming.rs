@@ -25,9 +25,6 @@ use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 fn main() -> courierust::Result<()> {
-    // --- Streaming service -------------------------------------------
-    // `reqs` yields the decoded request messages (blocking until each is
-    // available); `tx` streams response messages to the peer.
     let server = GrpcServer::bind_streaming(
         "127.0.0.1:0",
         |method: &str,
@@ -82,8 +79,6 @@ fn main() -> courierust::Result<()> {
     println!("gRPC streaming server on {addr}");
 
     let client = GrpcClient::new(&format!("http://{addr}"))?;
-
-    // 1. Server-streaming: one request -> a stream of responses.
     let mut stream = client.call_stream("/echo.Echo/ServerStream", Bytes::from("5"))?;
     let mut parts = Vec::new();
     while let Some(msg) = stream.next_message()? {
@@ -92,8 +87,6 @@ fn main() -> courierust::Result<()> {
     println!("ServerStream(5) -> {parts:?}");
     assert_eq!(parts, ["part-0", "part-1", "part-2", "part-3", "part-4"]);
 
-    // 2. Client-streaming: many requests -> one reply. The call ends
-    //    when the request channel is dropped (half-close).
     let (tx, rx) = mpsc::channel();
     for word in ["hello", " ", "gRPC", " ", "streaming"] {
         if tx.send(Ok(Bytes::from(word.to_string()))).is_err() {
@@ -103,10 +96,8 @@ fn main() -> courierust::Result<()> {
     drop(tx);
     let reply = client.client_stream("/echo.Echo/ClientStream", rx)?;
     println!("ClientStream(words) -> {}", reply.to_str()?);
-    // "hello"(5) + " "(1) + "gRPC"(4) + " "(1) + "streaming"(9) = 20.
     assert_eq!(reply.to_str()?, "sum=20");
 
-    // 3. Bidi streaming: many requests <-> many responses, interleaved.
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         for i in 0..5 {
@@ -114,7 +105,6 @@ fn main() -> courierust::Result<()> {
                 break;
             }
         }
-        // Dropping the sender half-closes the request stream.
     });
     let mut stream = client.bidi_stream("/echo.Echo/Bidi", rx)?;
     let mut echoes = Vec::new();
@@ -133,8 +123,6 @@ fn main() -> courierust::Result<()> {
         ]
     );
 
-    // 4. Deadline: a client with a 50 ms grpc-timeout calling `Slow`
-    //    (which sleeps 1 s) gets DEADLINE_EXCEEDED.
     let deadline_client = GrpcClient::with_config(GrpcClientConfig {
         base: format!("http://{addr}"),
         max_message_size: courierust::courierust_grpc::DEFAULT_MAX_MESSAGE_SIZE,
@@ -150,10 +138,6 @@ fn main() -> courierust::Result<()> {
     assert_eq!(err.grpc_code(), Some(DEADLINE_EXCEEDED));
     println!("Slow with 50 ms deadline -> {err}");
 
-    // 5. gzip compression negotiation: a `compress: true` client declares
-    //    `grpc-accept-encoding: gzip`, so the server gzip-compresses the
-    //    response (visible in the initial metadata); the client
-    //    decompresses it transparently.
     let gzip_client = GrpcClient::with_config(GrpcClientConfig {
         base: format!("http://{addr}"),
         max_message_size: courierust::courierust_grpc::DEFAULT_MAX_MESSAGE_SIZE,
@@ -177,7 +161,6 @@ fn main() -> courierust::Result<()> {
     assert_eq!(negotiated, "gzip", "server must negotiate gzip");
     assert_eq!(compressed_parts, ["part-0", "part-1", "part-2"]);
 
-    // 6. Per-call metadata + a request interceptor (auth tokens etc).
     let fired = Arc::new(AtomicUsize::new(0));
     let fired2 = fired.clone();
     let interceptor: Arc<dyn courierust::courierust_grpc::Interceptor> =
@@ -207,8 +190,6 @@ fn main() -> courierust::Result<()> {
         "interceptor must run per call"
     );
 
-    // Per-call metadata rides alongside (a second method, a second
-    // interceptor firing).
     let mut metadata = HeaderMap::new();
     metadata.insert(
         HeaderName::from_lowercase("x-trace-id"),

@@ -79,7 +79,6 @@ fn build_levels() -> Vec<Box<[Entry; 256]>> {
     for (sym, &(code, len)) in HUFFMAN.iter().enumerate() {
         let mut node = 0usize;
         let mut consumed = 0usize;
-        // Walk full 8-bit steps while more than 8 bits remain.
         while (len as usize) - consumed > 8 {
             let shift = (len as usize) - consumed - 8;
             let idx = ((code >> shift) & 0xFF) as usize;
@@ -94,10 +93,6 @@ fn build_levels() -> Vec<Box<[Entry; 256]>> {
             }
             consumed += 8;
         }
-        // Remaining 1..=8 bits land in this level as a leaf that covers
-        // every 8-bit window sharing the same prefix. The remaining bits
-        // are the low `rem` bits of the code, aligned to the top of the
-        // window.
         let rem = (len as usize) - consumed;
         let shift = 8 - rem;
         let idx_base = ((code & ((1u32 << rem) - 1)) << shift) as usize;
@@ -378,6 +373,32 @@ mod tests {
         let mut out2 = Vec::new();
         HuffmanDecoder::new().decode(&enc, &mut out2, 1024).unwrap();
         assert_eq!(out2, b"www.example.com");
+    }
+
+    #[test]
+    fn decode_never_panics_on_arbitrary_input() {
+        let decoder = HuffmanDecoder::new();
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut xorshift = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for len in 0..=64usize {
+            for _ in 0..2_000 {
+                let input: Vec<u8> = (0..len).map(|_| (xorshift() & 0xff) as u8).collect();
+                let cap = input.len().saturating_mul(2).max(1024);
+                let mut out = Vec::new();
+                let _ = decoder.decode(&input, &mut out, cap);
+                assert!(
+                    out.len() <= cap,
+                    "output exceeded cap: len={} cap={}",
+                    out.len(),
+                    cap
+                );
+            }
+        }
     }
 
     #[test]

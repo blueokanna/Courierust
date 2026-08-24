@@ -15,14 +15,12 @@ use courierust::courierust_h3::frame::{
 use courierust::courierust_quic::varint;
 
 fn main() -> courierust::Result<()> {
-    // --- Frame round-trips ------------------------------------------
     let frames = vec![
         Frame::Data(b"payload bytes".to_vec()),
-        Frame::Headers(vec![0xc1, 0x00]), // a (tiny) QPACK field section
-        Frame::Settings(vec![(0x1, 4096), (0x7, 100)]), // QPACK cap + blocked streams
+        Frame::Headers(vec![0xc1, 0x00]),
+        Frame::Settings(vec![(0x1, 4096), (0x7, 100)]),
         Frame::GoAway(3),
         Frame::MaxPushId(5),
-        // Extension frames must be preserved, not dropped.
         Frame::Unknown {
             frame_type: 0x21,
             payload: b"ext".to_vec(),
@@ -47,17 +45,11 @@ fn main() -> courierust::Result<()> {
     }
     println!("all frames round-tripped exactly (including extension)");
 
-    // --- Wire layout is visible -------------------------------------
     let frame = Frame::Settings(vec![(0x1, 4096)]);
     let wire = frame.to_bytes();
-    // type=0x04 (1 varint byte) + length=0x04 (1 varint byte) + payload.
-    // Payload: setting id 1 as an 8-bit-prefix integer (0x01), then
-    // value 4096 which overflows the 8-bit prefix: the escape byte 0xff
-    // is followed by (4096 - 255) = 3841 in 7-bit groups -> 0x81 0x1e.
     assert_eq!(wire, [0x04, 0x04, 0x01, 0xff, 0x81, 0x1e]);
     println!("SETTINGS {{ qpack_cap=4096 }} -> {wire:02x?}");
 
-    // --- Unidirectional stream roles --------------------------------
     let control = encode_stream_type(STREAM_TYPE_CONTROL);
     let qpe = encode_stream_type(STREAM_TYPE_QPACK_ENCODER);
     assert_eq!(varint::read(&control)?, 0);

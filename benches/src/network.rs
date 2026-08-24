@@ -11,7 +11,7 @@ use courierust::courierust_client::{Client, ClientConfig, TlsSettings as ClientT
 use courierust::courierust_http::request::Request;
 use courierust::courierust_http::response::Response;
 use courierust::courierust_server::{Server, ServerConfig, TlsSettings as ServerTls};
-use courierust_benchmark::metrics::{run_concurrent, run_sequential, Timing, MAX_SAMPLES};
+use courierust_benchmark::metrics::{metric, run_concurrent, run_sequential, stats_fields, Timing, MAX_SAMPLES};
 use std::sync::Arc;
 
 const DEFAULT_PAYLOAD: usize = 1024;
@@ -261,12 +261,6 @@ fn network_request(client: &Client, target: &str, expected: usize) {
     );
 }
 
-fn metric(value: Option<f64>) -> String {
-    value
-        .map(|v| format!("{v:.2}"))
-        .unwrap_or_else(|| "na".to_string())
-}
-
 fn print_result(
     protocol: &str,
     workers: usize,
@@ -280,7 +274,7 @@ fn print_result(
     // report readers can tell which network-condition case a row is.
     let tag = std::env::var("COURIERUST_NETWORK_TAG").unwrap_or_default();
     println!(
-        "NETWORK|role=client|status=ok|target_scope=remote|protocol={protocol}|workers={workers}|max_connections={max_connections}|requests={}|bytes={bytes}|elapsed_ms={:.3}|rps={:.1}|response_mbps={:.3}|p50_us={}|p75_us={}|p90_us={}|p95_us={}|p99_us={}|samples={}|tag={tag}|{}",
+        "NETWORK|role=client|status=ok|target_scope=remote|protocol={protocol}|workers={workers}|max_connections={max_connections}|requests={}|bytes={bytes}|elapsed_ms={:.3}|rps={:.1}|response_mbps={:.3}|p50_us={}|p75_us={}|p90_us={}|p95_us={}|p99_us={}|{}|samples={}|tag={tag}|{}",
         timing.requests,
         timing.elapsed.as_secs_f64() * 1000.0,
         timing.requests_per_second(),
@@ -290,6 +284,7 @@ fn print_result(
         metric(timing.percentile_us(0.90)),
         metric(timing.percentile_us(0.95)),
         metric(timing.percentile_us(0.99)),
+        stats_fields(&timing),
         timing.samples.len(),
         stats.render(),
     );

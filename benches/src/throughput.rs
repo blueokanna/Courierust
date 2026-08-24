@@ -12,7 +12,7 @@ use courierust::courierust_http::response::Response;
 use courierust::courierust_net::stats::Stats;
 use courierust::courierust_server::{Server, ServerConfig};
 use courierust::courierust_tls as crate_tls;
-use courierust_benchmark::metrics::{run_concurrent, run_sequential, Timing, MAX_SAMPLES};
+use courierust_benchmark::metrics::{metric, run_concurrent, run_sequential, stats_fields, Timing, MAX_SAMPLES};
 use std::sync::Arc;
 
 const EMPTY: Payload = Payload {
@@ -88,12 +88,6 @@ fn courierust_get(client: &Client, base_url: &str, path: &str, expected_bytes: u
     assert_courierust_response(response, expected_bytes);
 }
 
-fn metric(value: Option<f64>) -> String {
-    value
-        .map(|value| format!("{value:.2}"))
-        .unwrap_or_else(|| "na".to_owned())
-}
-
 fn print_result(
     case: &str,
     protocol: &str,
@@ -105,7 +99,7 @@ fn print_result(
 ) {
     timing.sort_samples();
     println!(
-        "RESULT|suite=throughput|case={case}|protocol={protocol}|mode={mode}|payload={}|bytes={}|workers={workers}|server_threads={server_threads}|requests={}|elapsed_ms={:.3}|rps={:.1}|response_mbps={:.3}|p50_us={}|p75_us={}|p90_us={}|p95_us={}|p99_us={}|samples={}",
+        "RESULT|suite=throughput|case={case}|protocol={protocol}|mode={mode}|payload={}|bytes={}|workers={workers}|server_threads={server_threads}|requests={}|elapsed_ms={:.3}|rps={:.1}|response_mbps={:.3}|p50_us={}|p75_us={}|p90_us={}|p95_us={}|p99_us={}|{}|samples={}",
         payload.name,
         payload.bytes,
         timing.requests,
@@ -117,6 +111,7 @@ fn print_result(
         metric(timing.percentile_us(0.90)),
         metric(timing.percentile_us(0.95)),
         metric(timing.percentile_us(0.99)),
+        stats_fields(&timing),
         timing.samples.len(),
     );
 }
@@ -180,12 +175,9 @@ fn print_stats(protocol: &str, case: &str, payload: Payload, workers: usize, sta
 }
 
 fn bench_h2_multiplex(payload: Payload, requests: usize, workers: usize, server_threads: usize) {
-    // Attach instrumentation to BOTH ends so the 32-worker case can be
-    // diagnosed from evidence: how many connections were really opened,
-    // how many streams ran on each, and how many read/write syscalls the
-    // transport performed. A 1-connection multiplex shows up here as
-    // `h2_connections=1` with `workers` concurrent streams — the
-    // single-driver serialization point behind the >8-worker regression.
+    // Instrument both ends so the >8-worker h2 regression is diagnosable:
+    // a 1-connection multiplex shows `h2_connections=1` with `workers`
+    // concurrent streams (the single-driver serialization point).
     let server_stats = Stats::new();
     let client_stats = Stats::new();
     let address = spawn_server(
@@ -312,13 +304,9 @@ fn bench_https(requests: usize, payload: Payload, server_threads: usize) {
     tls_verify_evidence(address, roots);
 }
 
-/// Emit the TLS verification evidence behind an HTTPS row: certificate
-/// and hostname validation both passed (otherwise the handshake would
-/// have failed), and the negotiated ALPN + cipher suite are reported as
-/// observed on the wire. `session_resumption` is `n/a` because this
-/// single-handshake check does not measure resumption (the stack does
-/// implement TLS 1.3 session tickets) — reported as not measured, never
-/// assumed.
+/// TLS evidence behind an HTTPS row: cert + hostname verified (else the
+/// handshake would fail), negotiated ALPN + cipher suite as observed on the
+/// wire. session_resumption=n/a: a single handshake does not measure it.
 fn tls_verify_evidence(address: std::net::SocketAddr, roots: crate_tls::RootStore) {
     use courierust::courierust_tls::{
         ClientConfig as TlsClientConfig, TlsConnector, TlsVersion,

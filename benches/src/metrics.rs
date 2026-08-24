@@ -1,14 +1,12 @@
-//! Shared benchmark timing and concurrency helpers.
-//!
-//! It owns timing, sampling, and concurrent start coordination, while each
-//! suite owns its protocol setup.
+//! Shared benchmark timing/concurrency helpers: timing, sampling, start-line coordination.
 
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
+/// Per-case sample cap; overshoot is downsampled with a uniform stride.
 pub const MAX_SAMPLES: usize = 2048;
 
-/// Timing data for one benchmark case.
+/// Timing for one benchmark case.
 pub struct Timing {
     pub elapsed: Duration,
     pub requests: usize,
@@ -24,10 +22,12 @@ impl Timing {
         self.requests_per_second() * response_bytes as f64 / 1_000_000.0
     }
 
+    /// Sorted before percentile reads; min/max/mean/stddev are order-independent.
     pub fn sort_samples(&mut self) {
         self.samples.sort_unstable();
     }
 
+    /// Nearest-rank percentile (µs).
     pub fn percentile_us(&self, percentile: f64) -> Option<f64> {
         if self.samples.is_empty() {
             return None;
@@ -36,8 +36,75 @@ impl Timing {
             ((self.samples.len() - 1) as f64 * percentile.clamp(0.0, 1.0)).round() as usize;
         Some(self.samples[position].as_secs_f64() * 1_000_000.0)
     }
+
+    pub fn min_us(&self) -> Option<f64> {
+        self.samples
+            .iter()
+            .map(|d| d.as_secs_f64() * 1_000_000.0)
+            .min_by(f64::total_cmp)
+    }
+
+    pub fn max_us(&self) -> Option<f64> {
+        self.samples
+            .iter()
+            .map(|d| d.as_secs_f64() * 1_000_000.0)
+            .max_by(f64::total_cmp)
+    }
+
+    /// Arithmetic mean (µs).
+    pub fn mean_us(&self) -> Option<f64> {
+        if self.samples.is_empty() {
+            return None;
+        }
+        let sum: f64 = self.samples.iter().map(|d| d.as_secs_f64()).sum();
+        Some(sum / self.samples.len() as f64 * 1_000_000.0)
+    }
+
+    /// Population stddev (µs); quantifies tail jitter.
+    pub fn stddev_us(&self) -> Option<f64> {
+        let mean = self.mean_us()?;
+        let variance = self
+            .samples
+            .iter()
+            .map(|d| {
+                let v = d.as_secs_f64() * 1_000_000.0 - mean;
+                v * v
+            })
+            .sum::<f64>()
+            / self.samples.len() as f64;
+        Some(variance.sqrt())
+    }
+
+    /// P99/P50: tail factor. ≈1 tight; >3 flags a trackable tail anomaly.
+    pub fn tail_ratio(&self) -> Option<f64> {
+        let p50 = self.percentile_us(0.50)?;
+        let p99 = self.percentile_us(0.99)?;
+        (p50 > 0.0).then(|| p99 / p50)
+    }
 }
 
+/// Format an optional µs value (2 decimals) or `na`.
+pub fn metric(value: Option<f64>) -> String {
+    value
+        .map(|v| format!("{v:.2}"))
+        .unwrap_or_else(|| "na".to_owned())
+}
+
+/// Shared deep-stats fields appended to RESULT rows: min/mean/max/stddev/P99.9/tail-ratio.
+/// All suites reuse one format; the report script parses by name.
+pub fn stats_fields(timing: &Timing) -> String {
+    format!(
+        "min_us={}|mean_us={}|max_us={}|stddev_us={}|p999_us={}|tail_ratio={}",
+        metric(timing.min_us()),
+        metric(timing.mean_us()),
+        metric(timing.max_us()),
+        metric(timing.stddev_us()),
+        metric(timing.percentile_us(0.999)),
+        metric(timing.tail_ratio()),
+    )
+}
+
+/// Uniform-stride downsample plan so samples still represent the whole run.
 fn sample_plan(requests: usize, max_samples: usize) -> (usize, usize) {
     let sample_count = requests.min(max_samples.max(1));
     let stride = if sample_count == 0 {
@@ -48,7 +115,7 @@ fn sample_plan(requests: usize, max_samples: usize) -> (usize, usize) {
     (sample_count, stride)
 }
 
-/// Measure sequential work after all sample storage has been allocated.
+/// Sequential timing (single worker).
 pub fn run_sequential<Work>(requests: usize, max_samples: usize, mut work: Work) -> Timing
 where
     Work: FnMut(),
@@ -73,7 +140,8 @@ where
     }
 }
 
-/// Measure work distributed across independent worker closures.
+/// Concurrent timing: barrier-aligned start, requests split across workers,
+/// per-worker capped sampling merged back; global cap stays worker-independent.
 pub fn run_concurrent<MakeWorker>(
     requests: usize,
     workers: usize,

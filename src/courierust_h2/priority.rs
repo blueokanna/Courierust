@@ -76,7 +76,6 @@ impl Priority {
 }
 
 impl core::fmt::Display for Priority {
-    /// Serialize as a priority field value (e.g. `u=0, i`).
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         core::write!(f, "u={}", self.urgency)?;
         if self.incremental {

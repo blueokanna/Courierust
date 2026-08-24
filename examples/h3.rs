@@ -30,7 +30,6 @@ const CERT_DER: &[u8] = include_bytes!("../tests/certs/server_cert.der");
 const KEY_DER: &[u8] = include_bytes!("../tests/certs/server_key.der");
 
 fn main() -> courierust::Result<()> {
-    // --- HTTP/3 (QUIC) server ----------------------------------------
     let identity = courierust::courierust_tls::Identity {
         cert_chain: vec![CERT_DER.to_vec()],
         private_key: KEY_DER.to_vec(),
@@ -47,8 +46,6 @@ fn main() -> courierust::Result<()> {
     let server = Server::bind_with_config("127.0.0.1:0", server_cfg)?;
     let addr = server.local_addr()?;
     let _handle = server.serve_background(|req: Request<Body>| -> Response<Body> {
-        // `/big` returns a 256 KiB body (exercises flow control); every
-        // other path echoes the request body, or the path when empty.
         if req.uri.as_str() == "/big" {
             return Response::<Body>::with_status(200.into())
                 .with_body(Body::Bytes(Bytes::from(vec![b'x'; 256 * 1024])));
@@ -63,7 +60,6 @@ fn main() -> courierust::Result<()> {
     })?;
     println!("HTTP/3 server listening on {addr} (QUIC v1 + TLS 1.3, ALPN h3)");
 
-    // --- HTTP/3 (QUIC) client ----------------------------------------
     let mut roots = courierust::courierust_tls::RootStore::new();
     roots.add_der(CERT_DER.to_vec());
     let now = std::time::SystemTime::now()
@@ -85,7 +81,6 @@ fn main() -> courierust::Result<()> {
     let client = Client::with_config(client_cfg);
     let base = format!("https://{addr}");
 
-    // 1. Cold connect: the first request pays the whole handshake.
     let t = Instant::now();
     let resp = client.get(&format!("{base}/cold"))?;
     println!(
@@ -95,7 +90,6 @@ fn main() -> courierust::Result<()> {
     );
     assert_eq!(resp.body.collect()?.to_str()?, "/cold");
 
-    // 2. Warm reuse: the pooled connection is reused, ~1 RTT per request.
     for i in 0..5 {
         let t = Instant::now();
         let resp = client.get(&format!("{base}/warm/{i}"))?;
@@ -107,14 +101,12 @@ fn main() -> courierust::Result<()> {
         assert_eq!(resp.body.collect()?.to_str()?, format!("/warm/{i}"));
     }
 
-    // 3. Request body over QUIC (POST).
     let payload = b"hello over QUIC".to_vec();
     let resp = client.post(&format!("{base}/echo"), payload.clone())?;
     let echoed = resp.body.collect()?;
     assert_eq!(&echoed[..], &payload[..]);
     println!("POST /echo  -> {} bytes echoed", echoed.len());
 
-    // 4. Large response: flow control streams it in ACK-paced chunks.
     let t = Instant::now();
     let resp = client.get(&format!("{base}/big"))?;
     let big = resp.body.collect()?;
@@ -125,7 +117,6 @@ fn main() -> courierust::Result<()> {
         t.elapsed().as_secs_f64() * 1000.0
     );
 
-    // 5. Concurrent multiplexing over the single pooled connection.
     let handles: Vec<_> = (0..8)
         .map(|i| {
             let client = client.clone();
@@ -144,8 +135,6 @@ fn main() -> courierust::Result<()> {
     }
     println!("8 concurrent requests multiplexed over the pooled connection");
 
-    // 6. Certificate verification: an untrusted peer must be rejected at
-    //    the handshake (the client trusts nothing here).
     let untrusted = Client::with_config(ClientConfig {
         http3: true,
         read_timeout: Some(Duration::from_secs(5)),

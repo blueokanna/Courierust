@@ -1,26 +1,14 @@
 #!/usr/bin/env bash
-# Real external TLS-stack interop for Courierust.
+# External TLS-stack interop for Courierust (TLS 1.2 + 1.3 matrix).
 #
-# The self-interop suite (benches/src/interop.rs) only proves that
-# Courierust's TLS client and server agree with each other. This script
-# proves the TLS layer against a *mainstream, independently implemented*
-# stack, in both directions:
+# Self-interop only proves Courierust agrees with itself. Here the TLS layer
+# is checked against mainstream independent stacks, both directions:
+#   A. Courierust client  -> OpenSSL s_server      (TLS 1.3 / 1.2, h1)
+#   B. Courierust server  <- curl / s_client       (TLS 1.3 / 1.2, h1+h2, ALPN)
+#   C. Courierust h2 client -> nginx               (TLS 1.3 / 1.2, when present)
+# Throwaway CA + leaf generated locally; no network, no long-lived servers.
 #
-#   A. Courierust client  ->  OpenSSL s_server (TLS 1.3, HTTP/1.1)
-#   B. Courierust server  <-  curl / OpenSSL s_client (independent stack
-#                             validates our server: cert, ALPN, h1, h2)
-#   C. Courierust h2 client -> nginx (TLS + HTTP/2 via ALPN), when nginx
-#                             is installed
-#
-# Everything is generated locally (a throwaway CA + leaf) so the job
-# needs no network and no long-lived test servers.
-#
-# Usage: scripts/tls_interop.sh [bench-target-dir]
-#   bench-target-dir  where the built `tls_interop` and `network` bench
-#                     binaries live (default: benches/target/release)
-#
-# Results are printed as `TLSINTEROP|...` lines (and appended to
-# tls_interop.log when a logfile path is given as the second argument).
+# Usage: scripts/tls_interop.sh [bench-target-dir] [logfile]
 set -euo pipefail
 
 BENCH_DIR="${1:-benches/target/release}"
@@ -49,36 +37,11 @@ if [[ -n "${OPENSSL_CONF:-}" && ! -f "$OPENSSL_CONF" ]]; then
 fi
 : > "$LOGFILE"
 
-# Locate a bench binary: prefer `$BENCH_DIR/<name>`, else the newest
-# *executable* `$BENCH_DIR/deps/<name>-*` (the output location of
-# `cargo bench --no-run`, whose artifact names carry a hash). Only
-# regular executable files count: `cargo` also writes a `<name>-<hash>.d`
-# dep-info file alongside the binary, and running that text file would
-# silently kill the spawned server (the `no_listen` failures this script
-# originally produced).
-find_bin() {
-  local name="$1" f
-  if [[ -x "$BENCH_DIR/$name" ]]; then
-    printf '%s\n' "$BENCH_DIR/$name"
-    return 0
-  fi
-  while IFS= read -r f; do
-    # Skip build-metadata artifacts that `cargo` writes next to the
-    # binary (dep-info, PDB debug info, rlib/rmeta/so/object files): on
-    # Windows the filesystem reports them as executable, so `-x` alone is
-    # not enough.
-    case "$f" in
-      *.d|*.pdb|*.rlib|*.rmeta|*.so|*.dll|*.dylib|*.o) continue ;;
-    esac
-    if [[ -f "$f" && -x "$f" ]]; then
-      printf '%s\n' "$f"
-      return 0
-    fi
-  done < <(ls -t "$BENCH_DIR"/deps/${name}-* 2>/dev/null)
-  return 1
-}
-TLS_INTEROP_BIN="$(find_bin tls_interop || true)"
-NETWORK_BIN="$(find_bin network || true)"
+# Bench artifacts carry a hash under `deps/`; the shared locator handles
+# both layouts (see scripts/find_bench_bin.sh).
+source "$(dirname "${BASH_SOURCE[0]}")/find_bench_bin.sh"
+TLS_INTEROP_BIN="$(find_bench_bin "$BENCH_DIR" tls_interop || true)"
+NETWORK_BIN="$(find_bench_bin "$BENCH_DIR" network || true)"
 if [[ -z "$TLS_INTEROP_BIN" || -z "$NETWORK_BIN" ]]; then
   echo "error: built tls_interop/network bench binaries not found under $BENCH_DIR" >&2
   echo "searched: $BENCH_DIR/<name> and $BENCH_DIR/deps/<name>-*" >&2
@@ -86,9 +49,8 @@ if [[ -z "$TLS_INTEROP_BIN" || -z "$NETWORK_BIN" ]]; then
   ls -la "$BENCH_DIR/deps/" 2>/dev/null | grep -E 'tls_interop|network' || true
   exit 1
 fi
-# Re-verify at *use* time and log what was picked, so a wrong artifact
-# (or one that vanished after a cache prune) is visible in CI instead of
-# a bare "No such file or directory".
+# Re-verify at use time and log the pick, so a stale/pruned artifact is
+# visible in CI instead of a bare "No such file or directory".
 require_bin() {
   local path="$1" role="$2"
   if [[ ! -f "$path" || ! -x "$path" ]]; then
@@ -126,15 +88,10 @@ wait_port() {
   return 1
 }
 
-# ---------------------------------------------------------------------
-# 0. Throwaway Ed25519 identity.
-#    A single self-signed Ed25519 cert doubles as the server identity AND
-#    the trust root (SAN localhost + 127.0.0.1, serverAuth EKU, CA:TRUE)
-#    — byte-for-byte the same shape as the certificate the integration
-#    tests use, so the certificate chain / signature / EKU paths this
-#    script exercises are exactly the ones already covered by `cargo
-#    test`. (The previous RSA CA+leaf form worked with OpenSSL/curl, but
-#    exercised an untested RSA-cert path in the crate.)
+# --- 0. Throwaway Ed25519 identity: one self-signed cert doubles as server
+# identity AND trust root (SAN localhost+127.0.0.1, serverAuth, CA:TRUE) —
+# the same shape the integration tests use, so the exercised cert paths
+# match those covered by `cargo test`.
 "$OPENSSL_BIN" req -x509 -newkey ed25519 -keyout server.key -out server.pem \
   -days 2 -nodes -subj "/CN=localhost" \
   -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
@@ -145,38 +102,74 @@ cp server.pem ca.pem
 "$OPENSSL_BIN" x509 -in server.pem -outform DER -out server_cert.der
 "$OPENSSL_BIN" pkcs8 -topk8 -nocrypt -in server.key -outform DER -out server_key.der
 
-# ---------------------------------------------------------------------
-# A. Courierust client -> OpenSSL s_server (TLS 1.3, HTTP/1.1, -www).
-# ---------------------------------------------------------------------
-PORT_A=$((30000 + RANDOM % 20000))
-"$OPENSSL_BIN" s_server -accept "127.0.0.1:$PORT_A" -cert server.pem -key server.key \
-  -tls1_3 -www -quiet > s_server.log 2>&1 &
-SS_PID=$!
-if wait_port "$PORT_A"; then
-  if COURIERUST_TLS_URL="https://localhost:$PORT_A/" \
-     COURIERUST_TLS_ROOT="$WORK/ca.der" \
-     COURIERUST_TLS_PROTO="h1" \
-     "$TLS_INTEROP_BIN" > tls_s_server.log 2>&1; then
-    cat tls_s_server.log
-    record "TLSINTEROP|role=client|peer=openssl_s_server|protocol=h1|status=ok"
+# --- A. Courierust client -> OpenSSL s_server, one run per TLS version ---
+client_vs_s_server() {
+  local version="$1" flag="$2"
+  local port=$((30000 + RANDOM % 20000))
+  "$OPENSSL_BIN" s_server -accept "127.0.0.1:$port" -cert server.pem -key server.key \
+    "$flag" -www -quiet > s_server.log 2>&1 &
+  local pid=$!
+  if wait_port "$port"; then
+    if COURIERUST_TLS_URL="https://localhost:$port/" \
+       COURIERUST_TLS_ROOT="$WORK/ca.der" \
+       COURIERUST_TLS_PROTO="h1" \
+       "$TLS_INTEROP_BIN" > tls_s_server.log 2>&1; then
+      cat tls_s_server.log
+      record "TLSINTEROP|role=client|peer=openssl_s_server|tls=$version|protocol=h1|status=ok"
+    else
+      echo "--- s_server client log ---"
+      cat tls_s_server.log 2>/dev/null || true
+      record "TLSINTEROP|role=client|peer=openssl_s_server|tls=$version|protocol=h1|status=failed"
+      mark_fail
+    fi
   else
-    echo "--- openssl s_server client log ---"
-    cat tls_s_server.log 2>/dev/null || true
-    record "TLSINTEROP|role=client|peer=openssl_s_server|protocol=h1|status=failed"
+    echo "--- s_server did not listen; log ---"
+    cat s_server.log 2>/dev/null || true
+    record "TLSINTEROP|role=client|peer=openssl_s_server|tls=$version|protocol=h1|status=no_listen"
     mark_fail
   fi
-else
-  echo "--- openssl s_server did not listen; log ---"
-  cat s_server.log 2>/dev/null || true
-  record "TLSINTEROP|role=client|peer=openssl_s_server|protocol=h1|status=no_listen"
-  mark_fail
-fi
-kill "$SS_PID" 2>/dev/null || true
-wait "$SS_PID" 2>/dev/null || true
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+client_vs_s_server "TLSv1.3" -tls1_3
+client_vs_s_server "TLSv1.2" -tls1_2
 
-# ---------------------------------------------------------------------
-# B. Courierust TLS server (h1 + h2) <- curl and OpenSSL s_client.
-# ---------------------------------------------------------------------
+# --- B. Courierust TLS server <- curl / s_client, one run per TLS version ---
+curl_vs_server() {
+  local version="$1" flag="$2" http2="$3"
+  local proto="h1" extra=()
+  [[ "$http2" == 1 ]] && { proto="h2"; extra+=(--http2); }
+  local http
+  http=$("$CURL_BIN" -sS --cacert ca.pem --max-time 15 "${extra[@]}" "$flag" \
+    -o curl_body.txt -w '%{http_code}' "https://127.0.0.1:$PORT_B/bench" 2>curl_err.txt || true)
+  if [[ "$http" == "200" ]]; then
+    record "TLSINTEROP|role=server|peer=curl|tls=$version|protocol=$proto|status=ok|http=200"
+  else
+    echo "--- curl $proto error ---"
+    cat curl_err.txt 2>/dev/null || true
+    record "TLSINTEROP|role=server|peer=curl|tls=$version|protocol=$proto|status=failed|http=${http:-none}"
+    mark_fail
+  fi
+}
+
+s_client_alpn() {
+  local version="$1" flag="$2"
+  local output alpn protocol
+  # One handshake, two facts: the ALPN we advertise must be picked, and the
+  # protocol line must match the TLS version the caller asked for — proving
+  # the server negotiated the exact requested version.
+  output=$("$OPENSSL_BIN" s_client -connect "127.0.0.1:$PORT_B" -CAfile ca.pem \
+    "$flag" -alpn h2 -servername localhost </dev/null 2>/dev/null || true)
+  alpn=$(printf '%s\n' "$output" | grep -i 'ALPN protocol' | tail -1 || true)
+  protocol=$(printf '%s\n' "$output" | grep -iE '^Protocol[[:space:]]*:' | tail -1 || true)
+  if [[ "$alpn" == *h2* ]]; then
+    record "TLSINTEROP|role=server|peer=openssl_s_client|tls=$version|protocol=alpn|status=ok|negotiated=h2|saw=$protocol"
+  else
+    record "TLSINTEROP|role=server|peer=openssl_s_client|tls=$version|protocol=alpn|status=failed|negotiated=${alpn:-none}"
+    mark_fail
+  fi
+}
+
 PORT_B=$((30000 + RANDOM % 20000))
 COURIERUST_NETWORK_ROLE=server \
 COURIERUST_NETWORK_BIND="127.0.0.1:$PORT_B" \
@@ -189,38 +182,12 @@ COURIERUST_NETWORK_PAYLOAD=64 \
 SRV_PID=$!
 
 if wait_port "$PORT_B"; then
-  # B1. curl (independent TLS stack) over HTTP/1.1.
-  HTTP=$("$CURL_BIN" -sS --cacert ca.pem --max-time 15 -o curl_body.txt -w '%{http_code}' \
-    "https://127.0.0.1:$PORT_B/bench" 2>curl_err.txt || true)
-  if [[ "$HTTP" == "200" ]]; then
-    record "TLSINTEROP|role=server|peer=curl|protocol=h1|status=ok|http=200"
-  else
-    echo "--- curl h1 error ---"
-    cat curl_err.txt 2>/dev/null || true
-    record "TLSINTEROP|role=server|peer=curl|protocol=h1|status=failed|http=${HTTP:-none}"
-    mark_fail
-  fi
-  # B2. curl over HTTP/2 (ALPN h2) when the build supports it.
-  HTTP2=$("$CURL_BIN" -sS --http2 --cacert ca.pem --max-time 15 -o curl2_body.txt -w '%{http_code}' \
-    "https://127.0.0.1:$PORT_B/bench" 2>curl2_err.txt || true)
-  if [[ "$HTTP2" == "200" ]]; then
-    record "TLSINTEROP|role=server|peer=curl_http2|protocol=h2|status=ok|http=200"
-  else
-    echo "--- curl h2 error ---"
-    cat curl2_err.txt 2>/dev/null || true
-    record "TLSINTEROP|role=server|peer=curl_http2|protocol=h2|status=failed|http=${HTTP2:-none}"
-    mark_fail
-  fi
-  # B3. OpenSSL s_client: independent stack must complete a handshake
-  #     and see our ALPN offer (h2 first).
-  ALPN=$("$OPENSSL_BIN" s_client -connect "127.0.0.1:$PORT_B" -CAfile ca.pem \
-    -alpn h2 -servername localhost </dev/null 2>/dev/null | grep -i 'ALPN protocol' | tail -1 || true)
-  if [[ "$ALPN" == *h2* ]]; then
-    record "TLSINTEROP|role=server|peer=openssl_s_client|protocol=alpn|status=ok|negotiated=h2"
-  else
-    record "TLSINTEROP|role=server|peer=openssl_s_client|protocol=alpn|status=failed|negotiated=${ALPN:-none}"
-    mark_fail
-  fi
+  curl_vs_server "TLSv1.3" --tlsv1.3 0
+  curl_vs_server "TLSv1.2" --tlsv1.2 0
+  curl_vs_server "TLSv1.3" --tlsv1.3 1
+  curl_vs_server "TLSv1.2" --tlsv1.2 1
+  s_client_alpn "TLSv1.3" -tls1_3
+  s_client_alpn "TLSv1.2" -tls1_2
 else
   echo "--- courierust network server did not listen; log ---"
   cat tls_server.log 2>/dev/null || true
@@ -231,12 +198,12 @@ fi
 kill "$SRV_PID" 2>/dev/null || true
 wait "$SRV_PID" 2>/dev/null || true
 
-# ---------------------------------------------------------------------
-# C. Courierust h2 client -> nginx (TLS + HTTP/2), when nginx exists.
-# ---------------------------------------------------------------------
+# --- C. Courierust h2 client -> nginx (ALPN h2), one run per TLS version ---
 if command -v "$NGINX_BIN" >/dev/null 2>&1; then
-  PORT_C=$((30000 + RANDOM % 20000))
-  cat > nginx.conf <<EOF
+  client_vs_nginx() {
+    local version="$1"
+    local port=$((30000 + RANDOM % 20000))
+    cat > nginx.conf <<EOF
 worker_processes 1;
 pid $WORK/nginx.pid;
 error_log $WORK/nginx_error.log;
@@ -244,39 +211,42 @@ events { worker_connections 64; }
 http {
   access_log off;
   server {
-    listen 127.0.0.1:$PORT_C ssl http2;
+    listen 127.0.0.1:$port ssl http2;
     server_name localhost;
     ssl_certificate $WORK/server.pem;
     ssl_certificate_key $WORK/server.key;
-    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_protocols $version;
     location / { return 200 'ok'; add_header Content-Type text/plain; }
   }
 }
 EOF
-  "$NGINX_BIN" -p "$WORK" -c "$WORK/nginx.conf" > nginx_start.log 2>&1 &
-  NGX_PID=$!
-  if wait_port "$PORT_C"; then
-    if COURIERUST_TLS_URL="https://localhost:$PORT_C/" \
-       COURIERUST_TLS_ROOT="$WORK/ca.der" \
-       COURIERUST_TLS_PROTO="h2" \
-       "$TLS_INTEROP_BIN" > tls_nginx.log 2>&1; then
-      cat tls_nginx.log
-      record "TLSINTEROP|role=client|peer=nginx|protocol=h2|status=ok"
+    "$NGINX_BIN" -p "$WORK" -c "$WORK/nginx.conf" > nginx_start.log 2>&1 &
+    local pid=$!
+    if wait_port "$port"; then
+      if COURIERUST_TLS_URL="https://localhost:$port/" \
+         COURIERUST_TLS_ROOT="$WORK/ca.der" \
+         COURIERUST_TLS_PROTO="h2" \
+         "$TLS_INTEROP_BIN" > tls_nginx.log 2>&1; then
+        cat tls_nginx.log
+        record "TLSINTEROP|role=client|peer=nginx|tls=$version|protocol=h2|status=ok"
+      else
+        echo "--- courierust client vs nginx log ---"
+        cat tls_nginx.log 2>/dev/null || true
+        record "TLSINTEROP|role=client|peer=nginx|tls=$version|protocol=h2|status=failed"
+        mark_fail
+      fi
     else
-      echo "--- courierust client vs nginx log ---"
-      cat tls_nginx.log 2>/dev/null || true
-      record "TLSINTEROP|role=client|peer=nginx|protocol=h2|status=failed"
+      echo "--- nginx did not listen; log ---"
+      cat nginx_start.log nginx_error.log 2>/dev/null || true
+      record "TLSINTEROP|role=client|peer=nginx|tls=$version|protocol=h2|status=no_listen"
       mark_fail
     fi
-  else
-    echo "--- nginx did not listen; log ---"
-    cat nginx_start.log nginx_error.log 2>/dev/null || true
-    record "TLSINTEROP|role=client|peer=nginx|protocol=h2|status=no_listen"
-    mark_fail
-  fi
-  "$NGINX_BIN" -p "$WORK" -c "$WORK/nginx.conf" -s stop >/dev/null 2>&1 || \
-    kill "$NGX_PID" 2>/dev/null || true
-  wait "$NGX_PID" 2>/dev/null || true
+    "$NGINX_BIN" -p "$WORK" -c "$WORK/nginx.conf" -s stop >/dev/null 2>&1 || \
+      kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  }
+  client_vs_nginx "TLSv1.3"
+  client_vs_nginx "TLSv1.2"
 else
   record "TLSINTEROP|role=client|peer=nginx|protocol=h2|status=skipped(nginx_not_found)"
 fi

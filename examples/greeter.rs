@@ -5,9 +5,6 @@ use courierust::courierust_bytes::Bytes;
 use courierust::courierust_grpc::{GrpcClient, GrpcServer};
 
 fn main() -> courierust::Result<()> {
-    // --- server ---
-    // The service is a plain function (method, request bytes) -> Result.
-    // A real deployment would route methods to protobuf handlers.
     let server = GrpcServer::bind("127.0.0.1:0", |method: &str, req: Bytes| match method {
         "/greeter.Greeter/SayHello" => {
             let name = if req.is_empty() {

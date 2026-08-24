@@ -1,14 +1,10 @@
 name: TLS interop (OpenSSL / nginx)
 
-# Validates the Courierust TLS layer against mainstream, independently
-# implemented TLS stacks — the counterweight to the self-interop suite:
-#
-#   A. Courierust client  ->  OpenSSL s_server (TLS 1.3, HTTP/1.1)
-#   B. Courierust server  <-  curl / OpenSSL s_client (h1, h2 ALPN)
-#   C. Courierust h2 client -> nginx (TLS + HTTP/2), when nginx exists
-#
-# The script (`scripts/tls_interop.sh`) generates a throwaway CA + leaf,
-# so no long-lived test servers or network are needed.
+# Courierust TLS vs mainstream independent stacks (TLS 1.2 + 1.3 matrix):
+#   A. Courierust client  -> OpenSSL s_server (TLS 1.3 / 1.2, h1)
+#   B. Courierust server  <- curl / s_client  (TLS 1.3 / 1.2, h1+h2, ALPN)
+#   C. Courierust h2 client -> nginx          (TLS 1.3 / 1.2)
+# scripts/tls_interop.sh generates a throwaway CA + leaf — no network needed.
 
 on:
   push:
@@ -55,10 +51,9 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq nginx
           nginx -v
-      # Build-only: `cargo bench` without `--no-run` would *execute* the
-      # benches, and the `network` bench's client mode panics without a
-      # target URL. The binaries land in target/release/deps/<name>-<hash>;
-      # scripts/tls_interop.sh locates them automatically.
+      # Build-only: executing the benches would run `network` client mode,
+      # which panics without a target URL. Binaries land in
+      # target/release/deps/<name>-<hash>; the script locates them.
       - name: Build the interop binaries (release)
         run: cargo bench --manifest-path benches/Cargo.toml --locked --bench tls_interop --bench network --no-run
       - name: Run TLS interop (OpenSSL s_server, curl, s_client, nginx)
@@ -74,9 +69,36 @@ jobs:
         if: always()
         shell: bash
         run: |
-          if [[ -f tls_interop.log ]]; then
-            cat tls_interop.log >> "$GITHUB_STEP_SUMMARY"
+          if [[ ! -f tls_interop.log ]]; then
+            exit 0
           fi
+          {
+            echo "## TLS Interop Matrix (TLS 1.2 + 1.3)"
+            echo
+            echo '| Direction | Peer | TLS | Protocol | Status | Detail |'
+            echo '| --- | --- | --- | --- | --- | --- |'
+            awk -F'|' '/^TLSINTEROP\|role=/ {
+              role=peer=tls=proto=status=detail="-"
+              for (i=2; i<=NF; i++) {
+                split($i, kv, "=")
+                if (kv[1]=="role") role=kv[2]
+                else if (kv[1]=="peer") peer=kv[2]
+                else if (kv[1]=="tls") tls=kv[2]
+                else if (kv[1]=="protocol") proto=kv[2]
+                else if (kv[1]=="status") status=kv[2]
+                else if (kv[1]=="http") detail="http=" kv[2]
+                else if (kv[1]=="negotiated") detail="negotiated=" kv[2]
+                else if (kv[1]=="saw") detail=$i
+              }
+              gsub(/\|/, "\\|", detail)
+              printf "| %s | %s | %s | %s | %s | %s |\n", role, peer, tls, proto, status, detail
+            }' tls_interop.log
+            echo
+            echo "### Raw TLSINTEROP log"
+            echo '~~~text'
+            cat tls_interop.log
+            echo '~~~'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload TLS interop log
         if: always()
         uses: actions/upload-artifact@v4

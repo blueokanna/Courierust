@@ -12,8 +12,11 @@ use courierust::courierust_h3::qpack::{
     decode_field_line, decode_integer, decode_string, encode_field_line, encode_integer,
     encode_string, static_index, DynamicTable,
 };
+use courierust::courierust_hpack::huffman::HuffmanDecoder;
 
 fn main() -> courierust::Result<()> {
+    // One decoder, reused across every literal (the production pattern).
+    let huff = HuffmanDecoder::new();
     // --- 1. Static table (RFC 9204 Appendix A) -----------------------
     println!(
         "static \":method\" \"GET\" -> index {:?}",
@@ -46,7 +49,7 @@ fn main() -> courierust::Result<()> {
     let mut out = Vec::new();
     encode_string(b"www.example.com", 8, 0x00, &mut out);
     let mut pos = 0;
-    let string = decode_string(&out, 8, &mut pos)?;
+    let string = decode_string(&out, 8, &mut pos, &huff)?;
     assert_eq!(string, b"www.example.com");
     println!("huffman string -> {out:02x?}");
 
@@ -57,7 +60,7 @@ fn main() -> courierust::Result<()> {
     let mut out = Vec::new();
     encode_field_line(":method", b"GET", &empty, 0, &mut out);
     let mut pos = 0;
-    let line = decode_field_line(&out, &mut pos, &empty, 0)?;
+    let line = decode_field_line(&out, &mut pos, &empty, 0, &huff)?;
     assert_eq!(
         (line.name.as_str(), line.value.as_slice()),
         (":method", b"GET".as_slice())
@@ -68,7 +71,7 @@ fn main() -> courierust::Result<()> {
     let mut out = Vec::new();
     encode_field_line("user-agent", b"courierust/1.0", &empty, 0, &mut out);
     let mut pos = 0;
-    let line = decode_field_line(&out, &mut pos, &empty, 0)?;
+    let line = decode_field_line(&out, &mut pos, &empty, 0, &huff)?;
     assert_eq!(
         (line.name.as_str(), line.value.as_slice()),
         ("user-agent", b"courierust/1.0".as_slice())
@@ -89,7 +92,7 @@ fn main() -> courierust::Result<()> {
     let mut out = Vec::new();
     encode_field_line("x-custom-header", b"value-1", &table, 0, &mut out);
     let mut pos = 0;
-    let line = decode_field_line(&out, &mut pos, &table, 0)?;
+    let line = decode_field_line(&out, &mut pos, &table, 0, &huff)?;
     assert_eq!(
         (line.name.as_str(), line.value.as_slice()),
         ("x-custom-header", b"value-1".as_slice())

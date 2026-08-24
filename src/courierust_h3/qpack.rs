@@ -27,6 +27,7 @@
 //! here are individually complete and RFC-example-tested.
 
 use crate::courierust_error::{Error, Result};
+use crate::courierust_hpack::huffman::HuffmanDecoder;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
@@ -238,8 +239,15 @@ pub fn encode_string(value: &[u8], prefix_bits: u8, first_byte: u8, out: &mut Ve
 }
 
 /// Decode an N-bit-prefix string literal. Returns the raw bytes
-/// (Huffman-decoded when the flag was set).
-pub fn decode_string(buf: &[u8], prefix_bits: u8, pos: &mut usize) -> Result<Vec<u8>> {
+/// (Huffman-decoded when the flag was set). `huff` is the connection's
+/// reused decoder — building the four-level Huffman tables per string is
+/// measurable overhead on the H3 hot path.
+pub fn decode_string(
+    buf: &[u8],
+    prefix_bits: u8,
+    pos: &mut usize,
+    huff: &HuffmanDecoder,
+) -> Result<Vec<u8>> {
     debug_assert!((2..=8).contains(&prefix_bits));
     let first = *buf.get(*pos).ok_or_else(Error::eof)?;
     let huffman = first & (1u8 << (prefix_bits - 1)) != 0;
@@ -254,8 +262,11 @@ pub fn decode_string(buf: &[u8], prefix_bits: u8, pos: &mut usize) -> Result<Vec
     let raw = &buf[*pos..end];
     *pos = end;
     if huffman {
+        // RFC 7541 Huffman expands by at most ~1.6×, so 2× bounds any
+        // valid decode; the downstream max-header-list check re-bounds
+        // the whole field section.
         let mut out = Vec::new();
-        crate::courierust_hpack::huffman::decode(raw, &mut out)
+        huff.decode(raw, &mut out, raw.len().saturating_mul(2).max(1024))
             .map_err(|_| Error::protocol("QPACK Huffman decode failed"))?;
         Ok(out)
     } else {
@@ -550,12 +561,14 @@ pub fn encode_field_line(
 
 /// Decode one field line. `base` is the Base of the enclosing field
 /// section. The dynamic table must already hold the referenced entries
-/// (connection-state responsibility).
+/// (connection-state responsibility). `huff` is the reused Huffman
+/// decoder.
 pub fn decode_field_line(
     buf: &[u8],
     pos: &mut usize,
     dyn_table: &DynamicTable,
     base: u64,
+    huff: &HuffmanDecoder,
 ) -> Result<FieldLine> {
     let first = *buf.get(*pos).ok_or_else(Error::eof)?;
     if first & 0x80 != 0 {
@@ -611,7 +624,7 @@ pub fn decode_field_line(
                 .name
                 .clone()
         };
-        let value = decode_string(buf, 8, pos)?;
+        let value = decode_string(buf, 8, pos, huff)?;
         Ok(FieldLine {
             name,
             value,
@@ -620,10 +633,10 @@ pub fn decode_field_line(
     } else if first & 0xe0 == 0x20 {
         // Literal Field Line with Literal Name: `001` + N + H + 3-bit.
         let never_indexed = first & 0x10 != 0;
-        let name_raw = decode_string(buf, 4, pos)?;
+        let name_raw = decode_string(buf, 4, pos, huff)?;
         let name = String::from_utf8(name_raw)
             .map_err(|_| Error::protocol("QPACK field name is not UTF-8"))?;
-        let value = decode_string(buf, 8, pos)?;
+        let value = decode_string(buf, 8, pos, huff)?;
         Ok(FieldLine {
             name,
             value,
@@ -656,7 +669,7 @@ pub fn decode_field_line(
             .ok_or_else(|| Error::protocol("QPACK post-base name index out of range"))?
             .name
             .clone();
-        let value = decode_string(buf, 8, pos)?;
+        let value = decode_string(buf, 8, pos, huff)?;
         Ok(FieldLine {
             name,
             value,
@@ -684,20 +697,22 @@ fn static_entry(index: u64) -> Result<(String, String)> {
 /// the table's current insert count (for resolving dynamic relative
 /// indices). `advertised_capacity` is the decoder's advertised
 /// `SETTINGS_QPACK_MAX_TABLE_CAPACITY`: a Set Capacity instruction above
-/// it is a QPACK_ENCODER_STREAM_ERROR (RFC 9204 §4.3.1).
+/// it is a QPACK_ENCODER_STREAM_ERROR (RFC 9204 §4.3.1). `huff` is the
+/// reused Huffman decoder.
 pub fn decode_encoder_instruction(
     buf: &[u8],
     pos: &mut usize,
     dyn_table: &mut DynamicTable,
     insert_count: u64,
     advertised_capacity: Option<u64>,
+    huff: &HuffmanDecoder,
 ) -> Result<()> {
     let first = *buf.get(*pos).ok_or_else(Error::eof)?;
     if first & 0x80 != 0 {
         // Insert with Name Reference: `1` + T + 6-bit.
         let static_ref = first & 0x40 != 0;
         let index = decode_integer(buf, 6, pos)?;
-        let value = decode_string(buf, 8, pos)?;
+        let value = decode_string(buf, 8, pos, huff)?;
         let value_str =
             String::from_utf8(value).map_err(|_| Error::protocol("QPACK value is not UTF-8"))?;
         let name = if static_ref {
@@ -726,10 +741,10 @@ pub fn decode_encoder_instruction(
     if first & 0xc0 == 0x40 {
         // Insert with Literal Name: `01` + H + 5-bit (6-bit-prefix
         // string), then 8-bit-prefix value string.
-        let name_raw = decode_string(buf, 6, pos)?;
+        let name_raw = decode_string(buf, 6, pos, huff)?;
         let name = String::from_utf8(name_raw)
             .map_err(|_| Error::protocol("QPACK field name is not UTF-8"))?;
-        let value = decode_string(buf, 8, pos)?;
+        let value = decode_string(buf, 8, pos, huff)?;
         let value_str =
             String::from_utf8(value).map_err(|_| Error::protocol("QPACK value is not UTF-8"))?;
         dyn_table.insert(&name, &value_str);
@@ -863,6 +878,12 @@ pub fn decode_decoder_instruction(buf: &[u8], pos: &mut usize) -> Result<Decoder
 mod tests {
     use super::*;
 
+    /// Throwaway decoder for unit tests (production reuses one per
+    /// connection; tests must not share state).
+    fn test_huff() -> HuffmanDecoder {
+        HuffmanDecoder::new()
+    }
+
     #[test]
     fn static_table_matches_appendix_a() {
         assert_eq!(STATIC_TABLE.len(), 99);
@@ -896,7 +917,10 @@ mod tests {
                 let mut out = Vec::new();
                 encode_string(value, prefix, 0, &mut out);
                 let mut pos = 0;
-                assert_eq!(decode_string(&out, prefix, &mut pos).unwrap(), value);
+                assert_eq!(
+                    decode_string(&out, prefix, &mut pos, &test_huff()).unwrap(),
+                    value
+                );
                 assert_eq!(pos, out.len());
             }
         }
@@ -918,7 +942,8 @@ mod tests {
         let mut pos = 0;
         let (required, base) = decode_field_section_prefix(&wire, &mut pos, 0, 0).unwrap();
         assert_eq!((required, base), (0, 0));
-        let line = decode_field_line(&wire, &mut pos, &DynamicTable::new(0), base).unwrap();
+        let line =
+            decode_field_line(&wire, &mut pos, &DynamicTable::new(0), base, &test_huff()).unwrap();
         assert_eq!(line.name, ":path");
         assert_eq!(line.value, b"/index.html");
         assert_eq!(pos, wire.len());
@@ -942,8 +967,15 @@ mod tests {
         let mut pos = 0;
         while pos < enc.len() {
             let insert_count = table.insert_count();
-            decode_encoder_instruction(&enc, &mut pos, &mut table, insert_count, Some(220))
-                .unwrap();
+            decode_encoder_instruction(
+                &enc,
+                &mut pos,
+                &mut table,
+                insert_count,
+                Some(220),
+                &test_huff(),
+            )
+            .unwrap();
         }
         assert_eq!(table.insert_count(), 2);
         assert_eq!(table.get(0).unwrap().name, ":authority");
@@ -962,12 +994,12 @@ mod tests {
             decode_field_section_prefix(&section, &mut pos, table.insert_count(), 220).unwrap();
         assert_eq!(required, 2, "RFC 9204 B.2 Required Insert Count");
         assert_eq!(base, 0, "RFC 9204 B.2 Base");
-        let l1 = decode_field_line(&section, &mut pos, &table, base).unwrap();
+        let l1 = decode_field_line(&section, &mut pos, &table, base, &test_huff()).unwrap();
         assert_eq!(
             (l1.name.as_str(), l1.value.as_slice()),
             (":authority", b"www.example.com".as_slice())
         );
-        let l2 = decode_field_line(&section, &mut pos, &table, base).unwrap();
+        let l2 = decode_field_line(&section, &mut pos, &table, base, &test_huff()).unwrap();
         assert_eq!(
             (l2.name.as_str(), l2.value.as_slice()),
             (":path", b"/sample/path".as_slice())
@@ -985,7 +1017,7 @@ mod tests {
         encode_string(b"custom-value", 8, 0x00, &mut enc);
         let mut table = DynamicTable::new(1000);
         let mut pos = 0;
-        decode_encoder_instruction(&enc, &mut pos, &mut table, 0, Some(220)).unwrap();
+        decode_encoder_instruction(&enc, &mut pos, &mut table, 0, Some(220), &test_huff()).unwrap();
         assert_eq!(pos, enc.len());
         assert_eq!(table.insert_count(), 1);
         assert_eq!(table.get(0).unwrap().name, "custom-key");
@@ -1010,7 +1042,15 @@ mod tests {
         // Duplicate (relative index 2) = `02` → abs = 3 - 1 - 2 = 0.
         let mut pos = 0;
         let insert_count = table.insert_count();
-        decode_encoder_instruction(&[0x02], &mut pos, &mut table, insert_count, Some(220)).unwrap();
+        decode_encoder_instruction(
+            &[0x02],
+            &mut pos,
+            &mut table,
+            insert_count,
+            Some(220),
+            &test_huff(),
+        )
+        .unwrap();
         assert_eq!(table.insert_count(), 4);
         assert_eq!(table.get(3).unwrap().name, ":authority");
 
@@ -1023,17 +1063,17 @@ mod tests {
         let (required, base) =
             decode_field_section_prefix(&section, &mut pos, table.insert_count(), 220).unwrap();
         assert_eq!((required, base), (4, 4));
-        let l1 = decode_field_line(&section, &mut pos, &table, base).unwrap();
+        let l1 = decode_field_line(&section, &mut pos, &table, base, &test_huff()).unwrap();
         assert_eq!(
             (l1.name.as_str(), l1.value.as_slice()),
             (":authority", b"www.example.com".as_slice())
         );
-        let l2 = decode_field_line(&section, &mut pos, &table, base).unwrap();
+        let l2 = decode_field_line(&section, &mut pos, &table, base, &test_huff()).unwrap();
         assert_eq!(
             (l2.name.as_str(), l2.value.as_slice()),
             (":path", b"/".as_slice())
         );
-        let l3 = decode_field_line(&section, &mut pos, &table, base).unwrap();
+        let l3 = decode_field_line(&section, &mut pos, &table, base, &test_huff()).unwrap();
         assert_eq!(
             (l3.name.as_str(), l3.value.as_slice()),
             ("custom-key", b"custom-value".as_slice())

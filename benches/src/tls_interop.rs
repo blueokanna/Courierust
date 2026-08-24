@@ -1,15 +1,11 @@
-//! Real-TLS-stack interop client, driven by `scripts/tls_interop.sh`.
+//! Courierust side of the TLS interop matrix (driven by `scripts/tls_interop.sh`).
 //!
-//! This binary is the *courierust* side of an interop test against a
-//! mainstream TLS implementation (OpenSSL `s_server`, nginx). It connects
-//! to whatever `COURIERUST_TLS_URL` points at, validates the certificate
-//! against the given root, and reports the HTTP outcome. It deliberately
-//! does not assert a body length — external servers' responses are not
-//! ours to pin.
-//!
-//! The mirror direction (a courierust TLS server validated by `curl` /
-//! `openssl s_client`, which is an independent TLS stack) is driven by
-//! the same script reusing the `network` server mode.
+//! Connects to `COURIERUST_TLS_URL`, validates the cert against
+//! `COURIERUST_TLS_ROOT`, reports the HTTP outcome. Body length is not
+//! asserted — external servers' responses are not ours to pin. The TLS
+//! version is forced by the peer (s_server / nginx) and proven by a
+//! successful request. The mirror direction (a Courierust TLS server
+//! validated by curl / openssl s_client) reuses the `network` server mode.
 
 use courierust::courierust_client::{Client, ClientConfig, TlsSettings};
 use courierust::courierust_http::method::Method;

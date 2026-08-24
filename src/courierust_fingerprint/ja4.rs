@@ -20,7 +20,6 @@ use alloc::vec::Vec;
 pub fn ja4(p: &TlsProfile) -> String {
     let mut out = String::with_capacity(80);
 
-    // a-part
     out.push(if p.protocol == 'q' {
         'q'
     } else if p.protocol == 'd' {
@@ -48,7 +47,6 @@ pub fn ja4(p: &TlsProfile) -> String {
     out.push_str(&ja4_alpn(&p.alpn));
     out.push('_');
 
-    // b-part: hash of sorted cipher hex list
     if ciphers.is_empty() {
         out.push_str("000000000000");
     } else {
@@ -59,8 +57,6 @@ pub fn ja4(p: &TlsProfile) -> String {
     }
     out.push('_');
 
-    // c-part: sorted extensions minus SNI(0) and ALPN(16), then sigalgs
-    // in original order.
     let mut exts2: Vec<u16> = exts
         .iter()
         .copied()
@@ -155,8 +151,6 @@ mod tests {
 
     #[test]
     fn matches_official_spec_example() {
-        // The JA4 spec's worked example (which is Chrome's ClientHello):
-        //   t13d1516h2_8daaf6152771_e5627efa2ab1
         let p = chrome_tls_profile();
         assert_eq!(ja4(&p), "t13d1516h2_8daaf6152771_e5627efa2ab1");
     }

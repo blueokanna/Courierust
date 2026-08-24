@@ -10,6 +10,7 @@ if [[ $# -eq 4 ]]; then
     network_log=''
     fuzz_log=''
     h3_log=''
+    tls_interop_log=''
 elif [[ $# -eq 7 ]]; then
     throughput_log=$1
     compare_log=$2
@@ -19,6 +20,7 @@ elif [[ $# -eq 7 ]]; then
     fuzz_log=$6
     output=$7
     h3_log=''
+    tls_interop_log=''
 elif [[ $# -eq 8 ]]; then
     throughput_log=$1
     compare_log=$2
@@ -28,8 +30,19 @@ elif [[ $# -eq 8 ]]; then
     fuzz_log=$6
     h3_log=$7
     output=$8
+    tls_interop_log=''
+elif [[ $# -eq 9 ]]; then
+    throughput_log=$1
+    compare_log=$2
+    concurrency_log=$3
+    interop_log=$4
+    network_log=$5
+    fuzz_log=$6
+    h3_log=$7
+    tls_interop_log=$8
+    output=$9
 else
-    printf 'usage: %s THROUGHPUT_LOG COMPARE_LOG [CONCURRENCY_LOG] INTEROP_LOG [NETWORK_LOG] [FUZZ_LOG] [H3_LOG] OUTPUT\n' "$0" >&2
+    printf 'usage: %s THROUGHPUT_LOG COMPARE_LOG [CONCURRENCY_LOG] INTEROP_LOG [NETWORK_LOG] [FUZZ_LOG] [H3_LOG] [TLS_INTEROP_LOG] OUTPUT\n' "$0" >&2
     exit 2
 fi
 
@@ -63,15 +76,15 @@ write_throughput_table() {
     local line
 
     if [[ -z "$lines" ]]; then
-        printf '| _No benchmark result captured_ | | | | | | | | | | | | | | |\n'
+        printf '| _No benchmark result captured_ | | | | | | | | | | | | | | | | | | | | |\n'
         return
     fi
 
-    printf '| Case | Protocol | Mode | Payload | Workers | Server threads | Requests | RPS | Resp MB/s | P50 us | P75 us | P90 us | P95 us | P99 us | Samples |\n'
-    printf '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n'
+    printf '| Case | Protocol | Mode | Payload | Workers | Server threads | Requests | RPS | Resp MB/s | P50 us | P75 us | P90 us | P95 us | P99 us | Min us | Mean us | Max us | Stddev us | P99.9 us | Tail | Samples |\n'
+    printf '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n'
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
-        printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
+        printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
             "$(result_field "$line" case)" \
             "$(result_field "$line" protocol)" \
             "$(result_field "$line" mode)" \
@@ -86,6 +99,12 @@ write_throughput_table() {
             "$(result_field "$line" p90_us)" \
             "$(result_field "$line" p95_us)" \
             "$(result_field "$line" p99_us)" \
+            "$(result_field "$line" min_us)" \
+            "$(result_field "$line" mean_us)" \
+            "$(result_field "$line" max_us)" \
+            "$(result_field "$line" stddev_us)" \
+            "$(result_field "$line" p999_us)" \
+            "$(result_field "$line" tail_ratio)" \
             "$(result_field "$line" samples)"
     done <<< "$lines"
 }
@@ -95,15 +114,15 @@ write_compare_table() {
     local line
 
     if [[ -z "$lines" ]]; then
-        printf '| _No benchmark result captured_ | | | | | | | | | | | | | | | | | | | |\n'
+        printf '| _No benchmark result captured_ | | | | | | | | | | | | | | | | | | | | | | | | | | | |\n'
         return
     fi
 
-    printf '| Case | Layer | Protocol | Client | Server | Payload | Workers | Server threads | Pool policy | Pool value | Reps | Status | Reason | Requests | RPS | Resp MB/s | P50 us | P75 us | P90 us | P95 us | P99 us | Samples |\n'
-    printf '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n'
+    printf '| Case | Layer | Protocol | Client | Server | Payload | Workers | Server threads | Pool policy | Pool value | Reps | Status | Reason | Requests | RPS | Resp MB/s | P50 us | P75 us | P90 us | P95 us | P99 us | Min us | Mean us | Max us | Stddev us | P99.9 us | Tail | Samples |\n'
+    printf '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n'
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
-        printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
+        printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
             "$(result_field "$line" case)" \
             "$(result_field "$line" layer)" \
             "$(result_field "$line" protocol)" \
@@ -125,6 +144,12 @@ write_compare_table() {
             "$(result_field "$line" p90_us)" \
             "$(result_field "$line" p95_us)" \
             "$(result_field "$line" p99_us)" \
+            "$(result_field "$line" min_us)" \
+            "$(result_field "$line" mean_us)" \
+            "$(result_field "$line" max_us)" \
+            "$(result_field "$line" stddev_us)" \
+            "$(result_field "$line" p999_us)" \
+            "$(result_field "$line" tail_ratio)" \
             "$(result_field "$line" samples)"
     done <<< "$lines"
 }
@@ -201,15 +226,15 @@ write_network_table() {
     local line
 
     if [[ -z "$lines" ]]; then
-        printf '| _No cross-machine result captured_ | | | | | | | | | | | | | |\n'
+        printf '| _No cross-machine result captured_ | | | | | | | | | | | | | | | | | | | | |\n'
         return
     fi
 
-    printf '| Role | Status | Scope | Protocol | Workers | Max connections | Requests | Bytes | RPS | Resp MB/s | P50 us | P95 us | P99 us | Samples | Reason |\n'
-    printf '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n'
+    printf '| Role | Status | Scope | Protocol | Workers | Max connections | Requests | Bytes | RPS | Resp MB/s | P50 us | P95 us | P99 us | Min us | Mean us | Max us | Stddev us | P99.9 us | Tail | Samples | Reason |\n'
+    printf '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n'
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
-        printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
+        printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
             "$(result_field "$line" role)" \
             "$(result_field "$line" status)" \
             "$(result_field "$line" target_scope)" \
@@ -223,6 +248,12 @@ write_network_table() {
             "$(result_field "$line" p50_us)" \
             "$(result_field "$line" p95_us)" \
             "$(result_field "$line" p99_us)" \
+            "$(result_field "$line" min_us)" \
+            "$(result_field "$line" mean_us)" \
+            "$(result_field "$line" max_us)" \
+            "$(result_field "$line" stddev_us)" \
+            "$(result_field "$line" p999_us)" \
+            "$(result_field "$line" tail_ratio)" \
             "$(result_field "$line" samples)" \
             "$(result_field "$line" reason)"
     done <<< "$lines"
@@ -256,15 +287,15 @@ write_h3_table() {
     local line
 
     if [[ -z "$lines" ]]; then
-        printf '| _No HTTP/3 result captured_ | | | | | | | | | | | |\n'
+        printf '| _No HTTP/3 result captured_ | | | | | | | | | | | | | | | | | |\n'
         return
     fi
 
-    printf '| Case | Mode | Workers | Requests | Elapsed ms | Connect ms | RPS | P50 us | P75 us | P90 us | P99 us | Samples |\n'
-    printf '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n'
+    printf '| Case | Mode | Workers | Requests | Elapsed ms | Connect ms | RPS | P50 us | P75 us | P90 us | P99 us | Min us | Mean us | Max us | Stddev us | P99.9 us | Tail | Samples |\n'
+    printf '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n'
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
-        printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
+        printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
             "$(result_field "$line" case)" \
             "$(result_field "$line" mode)" \
             "$(result_field "$line" workers)" \
@@ -276,6 +307,12 @@ write_h3_table() {
             "$(result_field "$line" p75_us)" \
             "$(result_field "$line" p90_us)" \
             "$(result_field "$line" p99_us)" \
+            "$(result_field "$line" min_us)" \
+            "$(result_field "$line" mean_us)" \
+            "$(result_field "$line" max_us)" \
+            "$(result_field "$line" stddev_us)" \
+            "$(result_field "$line" p999_us)" \
+            "$(result_field "$line" tail_ratio)" \
             "$(result_field "$line" samples)"
     done <<< "$lines"
 }
@@ -351,6 +388,47 @@ write_interop_table() {
     done <<< "$lines"
 }
 
+write_tlsinterop_table() {
+    local lines=$1
+    local line
+    local role peer tls proto status detail
+
+    if [[ -z "$lines" ]]; then
+        printf '| _No TLS interop evidence captured_ | | | | | |\n'
+        return
+    fi
+
+    printf '| Direction | Peer | TLS | Protocol | Status | Detail |\n'
+    printf '| --- | --- | --- | --- | --- | --- |\n'
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        # Only run rows carry a status; binary/suite markers are skipped.
+        [[ "$line" != *'status='* ]] && continue
+        role=$(result_field "$line" role)
+        peer=$(result_field "$line" peer)
+        tls=$(result_field "$line" tls)
+        proto=$(result_field "$line" protocol)
+        status=$(result_field "$line" status)
+        detail=$(result_field "$line" http)
+        if [[ "$detail" != "-" ]]; then
+            detail="http=$detail"
+        else
+            detail=$(result_field "$line" negotiated)
+            if [[ "$detail" != "-" ]]; then
+                detail="negotiated=$detail"
+            else
+                detail=$(result_field "$line" saw)
+                if [[ "$detail" != "-" ]]; then
+                    detail=${detail//|/\\|}
+                else
+                    detail="-"
+                fi
+            fi
+        fi
+        printf '| %s | %s | %s | %s | %s | %s |\n' "$role" "$peer" "$tls" "$proto" "$status" "$detail"
+    done <<< "$lines"
+}
+
 write_raw_block() {
     local file=$1
     local pattern=$2
@@ -383,6 +461,7 @@ network_results=$(extract_lines '^NETWORK\|' "$network_log")
 fuzz_results=$(extract_lines '^FUZZ\|' "$fuzz_log")
 h3_results=$(extract_lines '^RESULT\|suite=h3' "$h3_log")
 stats_results=$(extract_lines '^STATS\|' "$throughput_log")
+tlsinterop_results=$(extract_lines '^TLSINTEROP\|' "$tls_interop_log")
 
 {
     printf '# GitHub Action Benchmark\n\n'
@@ -413,6 +492,13 @@ stats_results=$(extract_lines '^STATS\|' "$throughput_log")
     printf '%s\n' '- Fuzz status is evidence only for the recorded target, run count, and duration; an unconfigured target is not a pass.'
     printf '%s\n' '- The `STATS` table is the reactor/connection/stream/syscall evidence behind the throughput rows (especially the h2 multi-worker scaling).'
 
+    printf '\n%s\n\n' '## Reading the numbers (correct interpretation)'
+    printf '%s\n' '- RPS and median latency are comparable only within a paired row (same client, server, payload, concurrency). Never divide across rows, clients or protocols to claim "N× faster".'
+    printf '%s\n' '- reqwest pays for a general async runtime, rich extensions (proxies, cookies, encodings, swappable connector/TLS backends) and a different pool policy: `pool_max_idle_per_host=N` caps idle *pooled* connections, not live ones — equivalent to Courierust `max_connections_per_host=N` only under sequential load.'
+    printf '%s\n' '- An H3 concurrent row whose P99/P99.9/tail_ratio sits far above its median (e.g. P99 jumping from ~200 µs to ms) is a signal to track, not noise. Candidates: UDP reactor, packet queue, congestion-window/ACK timers, QPACK/control flow, worker→reactor handoff, CI-runner scheduling. One run cannot localize the root cause, but it proves the H3 tail is not yet as tight as H2.'
+    printf '%s\n' '- The H1 server is built for event-driven protection (incomplete headers, idle keep-alive, slow senders); hyper is a mature async architecture. A short-request microbenchmark cannot dismiss the scheduling value — the concurrency/slow-connection rows measure production usability and resource isolation.'
+    printf '%s\n' '- H3 connection reuse plus cross-implementation interop (quinn+h3 → Courierust server) is stronger evidence than Courierust-to-Courierust.'
+
     printf '\n%s\n\n' '## Throughput'
     write_throughput_table "$throughput_results"
     printf '\n%s\n\n' '## TLS Verification Evidence'
@@ -420,6 +506,7 @@ stats_results=$(extract_lines '^STATS\|' "$throughput_log")
     printf '\n%s\n\n' '## Cross-Library Comparison'
     write_compare_table "$compare_results"
     printf '\n%s\n\n' '## Concurrency and Slow Connections'
+    printf '%s\n' '- These rows measure production usability and resource isolation: an event-driven scheduler must keep idle/partial/slow (Slowloris-style) connections off the worker pool while a fast probe still completes. The `pool` row is the diagnostic counter-model.'
     write_concurrency_table "$concurrency_results"
     printf '\n%s\n\n' '## HTTP/3 (QUIC)'
     printf '%s\n' '- `h3_connect` is a cold request: QUIC handshake + TLS 1.3 + server Retry address validation on a fresh connection.'
@@ -433,6 +520,8 @@ stats_results=$(extract_lines '^STATS\|' "$throughput_log")
     write_fuzz_table "$fuzz_results"
     printf '\n%s\n\n' '## Interop Validation'
     write_interop_table "$interop_results"
+    printf '\n%s\n\n' '## TLS Interop Matrix'
+    write_tlsinterop_table "$tlsinterop_results"
 
     printf '\n%s\n\n' '## Captured Benchmark Output'
     printf '%s\n' '### Throughput'
@@ -466,6 +555,10 @@ stats_results=$(extract_lines '^STATS\|' "$throughput_log")
     printf '%s\n' '### Interop Validation'
     printf '%s\n' '~~~text'
     write_raw_block "$interop_log" '^(courierust vs mainstream|INTEROP\|)'
+    printf '%s\n' '~~~'
+    printf '%s\n' '### TLS Interop'
+    printf '%s\n' '~~~text'
+    write_raw_block "$tls_interop_log" '^(TLSINTEROP\|)'
     printf '%s\n' '~~~'
 } > "$output"
 

@@ -63,50 +63,74 @@ jobs:
           PAYLOAD: ${{ inputs.payload || '4096' }}
         run: |
           set -euo pipefail
+          source "$PWD/scripts/find_bench_bin.sh"
           DIR="$PWD/benches/target/release"
+          NET="$(find_bench_bin "$DIR" network)"
+          if [[ -z "$NET" ]]; then
+            echo "::error::network bench binary not found under $DIR (\$DIR/network or \$DIR/deps/network-*)" >&2
+            exit 1
+          fi
+          wait_port() {
+            local port="$1" tries="${2:-100}"
+            for _ in $(seq 1 "$tries"); do
+              if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+                exec 3>&- 3<&- 2>/dev/null || true
+                return 0
+              fi
+              sleep 0.1
+            done
+            return 1
+          }
           COURIERUST_NETWORK_ROLE=server COURIERUST_NETWORK_BIND=127.0.0.1:18090 \
-            COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" "$DIR/network" > loop_h1.log 2>&1 &
+            COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" "$NET" > loop_h1.log 2>&1 &
           H1=$!
           COURIERUST_NETWORK_ROLE=server COURIERUST_NETWORK_BIND=127.0.0.1:18091 \
-            COURIERUST_NETWORK_HTTP2=1 COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" "$DIR/network" > loop_h2.log 2>&1 &
+            COURIERUST_NETWORK_HTTP2=1 COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" "$NET" > loop_h2.log 2>&1 &
           H2=$!
           # HTTPS server using the committed self-signed test identity.
           COURIERUST_NETWORK_ROLE=server COURIERUST_NETWORK_BIND=127.0.0.1:18092 \
             COURIERUST_NETWORK_HTTP2=1 COURIERUST_NETWORK_TLS=1 \
             COURIERUST_NETWORK_CERT_DER="$PWD/tests/certs/server_cert.der" \
             COURIERUST_NETWORK_KEY_DER="$PWD/tests/certs/server_key.der" \
-            COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" "$DIR/network" > loop_https.log 2>&1 &
+            COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" "$NET" > loop_https.log 2>&1 &
           HTTPS=$!
           # Rate-limited server: 1 Mbit/s response cap + 40 ms per-request
           # latency, simulating a constrained WAN link in-process.
           COURIERUST_NETWORK_ROLE=server COURIERUST_NETWORK_BIND=127.0.0.1:18093 \
             COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" \
             COURIERUST_NETWORK_THROTTLE_BPS=125000 COURIERUST_NETWORK_LATENCY_MS=40 \
-            "$DIR/network" > loop_throttle.log 2>&1 &
+            "$NET" > loop_throttle.log 2>&1 &
           THROTTLE=$!
-          sleep 1
+          # Wait until every server actually listens: the old fixed 1 s
+          # sleep raced a cold runner and failed the first client burst.
+          for port in 18090 18091 18092 18093; do
+            if ! wait_port "$port"; then
+              echo "::error::loopback server did not listen on 127.0.0.1:$port" >&2
+              exit 1
+            fi
+          done
           echo "=== LOOPBACK h1 ==="
           COURIERUST_NETWORK_URL=http://127.0.0.1:18090/ COURIERUST_NETWORK_PROTOCOL=h1 \
             COURIERUST_NETWORK_WORKERS=8 COURIERUST_NETWORK_MAX_CONNECTIONS=8 \
             COURIERUST_NETWORK_REQUESTS="$REQS" COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" \
-            "$DIR/network"
+            "$NET"
           echo "=== LOOPBACK h2 ==="
           COURIERUST_NETWORK_URL=http://127.0.0.1:18091/ COURIERUST_NETWORK_PROTOCOL=h2 \
             COURIERUST_NETWORK_WORKERS=8 COURIERUST_NETWORK_MAX_CONNECTIONS=1 \
             COURIERUST_NETWORK_REQUESTS="$REQS" COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" \
-            "$DIR/network"
+            "$NET"
           echo "=== LOOPBACK HTTPS+h2 (TLS 1.3) ==="
           COURIERUST_NETWORK_URL=https://127.0.0.1:18092/ COURIERUST_NETWORK_PROTOCOL=https-h2 \
             COURIERUST_NETWORK_WORKERS=4 COURIERUST_NETWORK_MAX_CONNECTIONS=1 \
             COURIERUST_NETWORK_ROOT_DER="$PWD/tests/certs/server_cert.der" \
             COURIERUST_NETWORK_REQUESTS="$REQS" COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" \
-            "$DIR/network"
+            "$NET"
           echo "=== LOOPBACK h1 THROTTLED (1 Mbit/s cap, 40 ms RTT) ==="
           COURIERUST_NETWORK_URL=http://127.0.0.1:18093/ COURIERUST_NETWORK_PROTOCOL=h1 \
             COURIERUST_NETWORK_WORKERS=1 COURIERUST_NETWORK_MAX_CONNECTIONS=1 \
             COURIERUST_NETWORK_REQUESTS=500 COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" \
             COURIERUST_NETWORK_TAG=throttled-1mbit-40ms \
-            "$DIR/network"
+            "$NET"
           kill "$H1" "$H2" "$HTTPS" "$THROTTLE" 2>/dev/null || true
           wait "$H1" 2>/dev/null || true
           wait "$H2" 2>/dev/null || true
@@ -129,23 +153,29 @@ jobs:
           PAYLOAD: ${{ inputs.payload || '4096' }}
         run: |
           set -euo pipefail
+          source "$PWD/scripts/find_bench_bin.sh"
           DIR="$PWD/benches/target/release"
+          NET="$(find_bench_bin "$DIR" network)"
+          if [[ -z "$NET" ]]; then
+            echo "::error::network bench binary not found under $DIR (\$DIR/network or \$DIR/deps/network-*)" >&2
+            exit 1
+          fi
           COURIERUST_NETWORK_ROLE=server COURIERUST_NETWORK_BIND=0.0.0.0:18080 \
-            COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" "$DIR/network" > cross_h1.log 2>&1 &
+            COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" "$NET" > cross_h1.log 2>&1 &
           H1=$!
           COURIERUST_NETWORK_ROLE=server COURIERUST_NETWORK_BIND=0.0.0.0:18081 \
-            COURIERUST_NETWORK_HTTP2=1 COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" "$DIR/network" > cross_h2.log 2>&1 &
+            COURIERUST_NETWORK_HTTP2=1 COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" "$NET" > cross_h2.log 2>&1 &
           H2=$!
           COURIERUST_NETWORK_ROLE=server COURIERUST_NETWORK_BIND=0.0.0.0:18082 \
             COURIERUST_NETWORK_HTTP2=1 COURIERUST_NETWORK_TLS=1 \
             COURIERUST_NETWORK_CERT_DER="$PWD/tests/certs/server_cert.der" \
             COURIERUST_NETWORK_KEY_DER="$PWD/tests/certs/server_key.der" \
-            COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" "$DIR/network" > cross_https.log 2>&1 &
+            COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" "$NET" > cross_https.log 2>&1 &
           HTTPS=$!
           COURIERUST_NETWORK_ROLE=server COURIERUST_NETWORK_BIND=0.0.0.0:18083 \
             COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" \
             COURIERUST_NETWORK_THROTTLE_BPS=125000 COURIERUST_NETWORK_LATENCY_MS=40 \
-            "$DIR/network" > cross_throttle.log 2>&1 &
+            "$NET" > cross_throttle.log 2>&1 &
           THROTTLE=$!
           echo "cross-machine servers listening on 18080 (h1), 18081 (h2), 18082 (https+h2), 18083 (throttled h1)"
           # Keep serving while the client job benchmarks against us.
@@ -176,7 +206,13 @@ jobs:
           PAYLOAD: ${{ inputs.payload || '4096' }}
         run: |
           set -euo pipefail
+          source "$PWD/scripts/find_bench_bin.sh"
           DIR="$PWD/benches/target/release"
+          NET="$(find_bench_bin "$DIR" network)"
+          if [[ -z "$NET" ]]; then
+            echo "::error::network bench binary not found under $DIR (\$DIR/network or \$DIR/deps/network-*)" >&2
+            exit 1
+          fi
           HOST="${SERVER_HOST%%:*}"
           # Wait for the remote servers to come up (the server job starts
           # in parallel with this one).
@@ -199,24 +235,24 @@ jobs:
           COURIERUST_NETWORK_URL="http://$HOST:18080/" COURIERUST_NETWORK_PROTOCOL=h1 \
             COURIERUST_NETWORK_WORKERS=8 COURIERUST_NETWORK_MAX_CONNECTIONS=8 \
             COURIERUST_NETWORK_REQUESTS="$REQS" COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" \
-            "$DIR/network"
+            "$NET"
           echo "=== CROSS-MACHINE h2 ==="
           COURIERUST_NETWORK_URL="http://$HOST:18081/" COURIERUST_NETWORK_PROTOCOL=h2 \
             COURIERUST_NETWORK_WORKERS=8 COURIERUST_NETWORK_MAX_CONNECTIONS=1 \
             COURIERUST_NETWORK_REQUESTS="$REQS" COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" \
-            "$DIR/network"
+            "$NET"
           echo "=== CROSS-MACHINE HTTPS+h2 (TLS 1.3) ==="
           COURIERUST_NETWORK_URL="https://$HOST:18082/" COURIERUST_NETWORK_PROTOCOL=https-h2 \
             COURIERUST_NETWORK_WORKERS=4 COURIERUST_NETWORK_MAX_CONNECTIONS=1 \
             COURIERUST_NETWORK_ROOT_DER="$PWD/tests/certs/server_cert.der" \
             COURIERUST_NETWORK_REQUESTS="$REQS" COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" \
-            "$DIR/network"
+            "$NET"
           echo "=== CROSS-MACHINE h1 THROTTLED (1 Mbit/s cap, 40 ms RTT) ==="
           COURIERUST_NETWORK_URL="http://$HOST:18083/" COURIERUST_NETWORK_PROTOCOL=h1 \
             COURIERUST_NETWORK_WORKERS=1 COURIERUST_NETWORK_MAX_CONNECTIONS=1 \
             COURIERUST_NETWORK_REQUESTS=500 COURIERUST_NETWORK_PAYLOAD="$PAYLOAD" \
             COURIERUST_NETWORK_TAG=throttled-1mbit-40ms \
-            "$DIR/network"
+            "$NET"
 
   publish-summary:
     name: Publish cross-machine summary

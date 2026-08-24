@@ -19,6 +19,7 @@
 
 use super::qpack::{self, DecoderInstruction, DynamicTable, EncoderInstruction, FieldLine};
 use crate::courierust_error::{Error, ErrorKind, Result};
+use crate::courierust_hpack::huffman::HuffmanDecoder;
 use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -78,6 +79,10 @@ pub(crate) struct QpackConnection {
     decoder_out: Vec<u8>,
     /// Blocked field sections: (stream id, encoded section).
     blocked: VecDeque<(u64, Vec<u8>)>,
+    /// Shared RFC 7541 Huffman decoder (four-level tables built once, not
+    /// per string literal — the H3 hot path decodes many literals per
+    /// connection).
+    huff: HuffmanDecoder,
 }
 
 impl QpackConnection {
@@ -94,6 +99,7 @@ impl QpackConnection {
             encoder_out: Vec::new(),
             decoder_out: Vec::new(),
             blocked: VecDeque::new(),
+            huff: HuffmanDecoder::new(),
         }
     }
 
@@ -298,6 +304,7 @@ impl QpackConnection {
                 &mut self.decoder,
                 insert_count,
                 Some(self.capacity),
+                &self.huff,
             ) {
                 Ok(()) => {}
                 Err(error) if error.kind == ErrorKind::UnexpectedEof => {
@@ -434,7 +441,7 @@ impl QpackConnection {
         let mut fields = Vec::new();
         let mut total = 0usize;
         while pos < block.len() {
-            let field = qpack::decode_field_line(block, &mut pos, &self.decoder, base)?;
+            let field = qpack::decode_field_line(block, &mut pos, &self.decoder, base, &self.huff)?;
             total = total
                 .checked_add(field.name.len())
                 .and_then(|t| t.checked_add(field.value.len()))
