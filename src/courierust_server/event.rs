@@ -616,8 +616,7 @@ fn build_response(
         HeaderValue::from_static(if keep_alive { "keep-alive" } else { "close" }),
     );
 
-    let mut out = out;
-    courierust_h1::write_response_head(&mut out, resp.status, Version::HTTP_11, &out_headers)?;
+    courierust_h1::write_response_head(out, resp.status, Version::HTTP_11, &out_headers)?;
     match resp.body {
         Body::Empty => {}
         Body::Bytes(b) => out.extend_from_slice(&b),

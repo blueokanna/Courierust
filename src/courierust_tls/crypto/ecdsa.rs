@@ -1128,7 +1128,13 @@ mod tests {
     }
 
     fn to_hex(v: &[u8]) -> String {
-        v.iter().map(|b| format!("{:02x}", b)).collect()
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut s = String::with_capacity(v.len() * 2);
+        for &b in v {
+            s.push(HEX[(b >> 4) as usize] as char);
+            s.push(HEX[(b & 0x0f) as usize] as char);
+        }
+        s
     }
 
     fn sha256(data: &[u8]) -> Vec<u8> {
@@ -1257,16 +1263,8 @@ mod tests {
             BigInt::from_le_limbs(&raw).cmp(&BigInt::from_le_limbs(&expected_mont)),
             core::cmp::Ordering::Equal,
             "mul(ma,mb) != to_mont(ab): raw {} expected_mont {}",
-            BigInt::from_le_limbs(&raw)
-                .to_be_bytes_padded(16)
-                .iter()
-                .map(|b| format!("{:02x}", b))
-                .collect::<String>(),
-            BigInt::from_le_limbs(&expected_mont)
-                .to_be_bytes_padded(16)
-                .iter()
-                .map(|b| format!("{:02x}", b))
-                .collect::<String>()
+            to_hex(&BigInt::from_le_limbs(&raw).to_be_bytes_padded(16)),
+            to_hex(&BigInt::from_le_limbs(&expected_mont).to_be_bytes_padded(16))
         );
         let c = f.from_mont(&raw);
         let expected_mul = a_big.mul(&b_big).rem(&m_big);
@@ -1274,16 +1272,8 @@ mod tests {
             BigInt::from_le_limbs(&c).cmp(&expected_mul),
             core::cmp::Ordering::Equal,
             "mont_mul wrong: got {} expected {}",
-            BigInt::from_le_limbs(&c)
-                .to_be_bytes_padded(16)
-                .iter()
-                .map(|b| format!("{:02x}", b))
-                .collect::<String>(),
-            expected_mul
-                .to_be_bytes_padded(16)
-                .iter()
-                .map(|b| format!("{:02x}", b))
-                .collect::<String>()
+            to_hex(&BigInt::from_le_limbs(&c).to_be_bytes_padded(16)),
+            to_hex(&expected_mul.to_be_bytes_padded(16))
         );
     }
 
@@ -1355,16 +1345,8 @@ mod tests {
             BigInt::from_le_limbs(&via_be).cmp(&BigInt::from_le_limbs(&expected_tomont)),
             core::cmp::Ordering::Equal,
             "from_be != to_mont: via_be={} expected={}",
-            BigInt::from_le_limbs(&via_be)
-                .to_be_bytes_padded(66)
-                .iter()
-                .map(|b| format!("{:02x}", b))
-                .collect::<String>(),
-            BigInt::from_le_limbs(&expected_tomont)
-                .to_be_bytes_padded(66)
-                .iter()
-                .map(|b| format!("{:02x}", b))
-                .collect::<String>()
+            to_hex(&BigInt::from_le_limbs(&via_be).to_be_bytes_padded(66)),
+            to_hex(&BigInt::from_le_limbs(&expected_tomont).to_be_bytes_padded(66))
         );
         // Cross-check the full multiply on the crosscheck's seed-0 values:
         // a*b mod p must match, both in mont domain and after from_mont.
@@ -1389,16 +1371,8 @@ mod tests {
             BigInt::from_le_limbs(&prod_mont).cmp(&BigInt::from_le_limbs(&expect_mont)),
             core::cmp::Ordering::Equal,
             "mont-domain mul wrong: got={} expected={}",
-            BigInt::from_le_limbs(&prod_mont)
-                .to_be_bytes_padded(66)
-                .iter()
-                .map(|b| format!("{:02x}", b))
-                .collect::<String>(),
-            BigInt::from_le_limbs(&expect_mont)
-                .to_be_bytes_padded(66)
-                .iter()
-                .map(|b| format!("{:02x}", b))
-                .collect::<String>()
+            to_hex(&BigInt::from_le_limbs(&prod_mont).to_be_bytes_padded(66)),
+            to_hex(&BigInt::from_le_limbs(&expect_mont).to_be_bytes_padded(66))
         );
         let prod_plain = f.from_mont(&prod_mont);
         assert_eq!(
@@ -1433,26 +1407,13 @@ mod tests {
                 eprintln!(
                     "seed={} a={} b={} got={} expected={}",
                     seed,
-                    BigInt::from_be_bytes(&a_be)
-                        .to_be_bytes_padded(spec.coord_len)
-                        .iter()
-                        .map(|b| format!("{:02x}", b))
-                        .collect::<String>(),
-                    BigInt::from_be_bytes(&b_be)
-                        .to_be_bytes_padded(spec.coord_len)
-                        .iter()
-                        .map(|b| format!("{:02x}", b))
-                        .collect::<String>(),
-                    BigInt::from_be_bytes(&le_limbs_to_be(&c, spec.coord_len))
-                        .to_be_bytes_padded(spec.coord_len)
-                        .iter()
-                        .map(|b| format!("{:02x}", b))
-                        .collect::<String>(),
-                    expected
-                        .to_be_bytes_padded(spec.coord_len)
-                        .iter()
-                        .map(|b| format!("{:02x}", b))
-                        .collect::<String>(),
+                    to_hex(&BigInt::from_be_bytes(&a_be).to_be_bytes_padded(spec.coord_len)),
+                    to_hex(&BigInt::from_be_bytes(&b_be).to_be_bytes_padded(spec.coord_len)),
+                    to_hex(
+                        &BigInt::from_be_bytes(&le_limbs_to_be(&c, spec.coord_len))
+                            .to_be_bytes_padded(spec.coord_len)
+                    ),
+                    to_hex(&expected.to_be_bytes_padded(spec.coord_len)),
                 );
             }
             assert_eq!(

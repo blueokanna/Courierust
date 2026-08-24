@@ -126,9 +126,13 @@ fn ja4_alpn(alpn: &[String]) -> String {
     if first_alnum && last_alnum {
         format!("{}{}", b[0] as char, b[b.len() - 1] as char)
     } else {
-        let hex: String = b.iter().map(|x| format!("{:02x}", x)).collect();
-        let chars: Vec<char> = hex.chars().collect();
-        format!("{}{}", chars[0], chars[chars.len() - 1])
+        // Only the first and last hex characters are inspected, so encode
+        // just those two nibbles instead of materializing the whole hex
+        // string (avoids clippy::format_collect and per-byte format!).
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let first = HEX[(b[0] >> 4) as usize] as char;
+        let last = HEX[(b[b.len() - 1] & 0x0f) as usize] as char;
+        format!("{first}{last}")
     }
 }
 

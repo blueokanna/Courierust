@@ -994,10 +994,13 @@ fn run_server(
                 let wake = wake_writer.clone();
                 let received_at = request.received_at;
                 pool.spawn(move || {
-                    let response = match panic::catch_unwind(AssertUnwindSafe(|| {
+                    // clippy::blocks_in_conditions: bind the catch_unwind
+                    // result before matching on it.
+                    let caught = panic::catch_unwind(AssertUnwindSafe(|| {
                         let response = handler.handle(request.request);
                         materialize_response(response, max_body)
-                    })) {
+                    }));
+                    let response = match caught {
                         Ok(response) => response,
                         Err(_) => Err(protocol("HTTP/3 request handler panicked")),
                     };
@@ -2380,7 +2383,7 @@ impl ServerConnection {
                                 .on_client_hello(&self.initial_tls)
                                 .map_err(tls_error)?;
                             self.initial_tls.clear();
-                            self.peer_transport = flight.peer_transport.clone();
+                            self.peer_transport.clone_from(&flight.peer_transport);
                             if let Some(parameters) = self.peer_transport.as_ref() {
                                 self.transport.set_peer_transport(parameters);
                             }
@@ -4238,7 +4241,7 @@ impl QuicTransport {
             return Err(protocol("invalid QUIC Retry connection ID or token"));
         }
         let (client_initial, server_initial) = protection::initial_pair(&retry_dcid)?;
-        self.initial_dcid = retry_dcid.clone();
+        self.initial_dcid.clone_from(&retry_dcid);
         self.remote_cid = retry_dcid;
         self.initial_send = client_initial;
         self.initial_recv = server_initial;
@@ -4289,7 +4292,7 @@ impl QuicTransport {
     fn peer_stream_send_limit(&self, id: u64) -> u64 {
         let default_limit = if stream_id::is_unidirectional(id) {
             self.peer_max_stream_data_uni
-        } else if stream_id::is_client_initiated(id) == !self.server {
+        } else if stream_id::is_client_initiated(id) != self.server {
             self.peer_max_stream_data_bidi_remote
         } else {
             self.peer_max_stream_data_bidi_local
@@ -4324,7 +4327,7 @@ impl QuicTransport {
             .ok_or_else(|| protocol("QUIC stream receive offset overflow"))?;
         let default_limit = if stream_id::is_unidirectional(id) {
             self.local_max_stream_data_uni
-        } else if stream_id::is_client_initiated(id) == !self.server {
+        } else if stream_id::is_client_initiated(id) != self.server {
             self.local_max_stream_data_bidi_local
         } else {
             self.local_max_stream_data_bidi_remote
@@ -5013,7 +5016,7 @@ impl QuicTransport {
         for (&id, &received) in &self.received_stream_data {
             let default_limit = if stream_id::is_unidirectional(id) {
                 self.local_max_stream_data_uni
-            } else if stream_id::is_client_initiated(id) == !self.server {
+            } else if stream_id::is_client_initiated(id) != self.server {
                 self.local_max_stream_data_bidi_local
             } else {
                 self.local_max_stream_data_bidi_remote

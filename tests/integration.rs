@@ -1256,7 +1256,7 @@ fn tls_server_rejects_tls12_client_hello() {
     let base = spawn_tls_server(https_server_config(false), echo_handler);
     let addr = base.trim_start_matches("https://").to_string();
 
-    let mut stream = std::net::TcpStream::connect(&addr).unwrap();
+    let mut stream = std::net::TcpStream::connect(addr).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -1521,7 +1521,7 @@ fn event_keepalive_sequential_requests_do_not_stall() {
         resp
     });
     let addr = base.trim_start_matches("http://").to_string();
-    let mut c = RawConn::new(TcpStream::connect(&addr).unwrap());
+    let mut c = RawConn::new(TcpStream::connect(addr).unwrap());
     let t0 = std::time::Instant::now();
     for _ in 0..200 {
         c.stream()
@@ -1566,7 +1566,7 @@ fn event_idle_timeout_reaps_slowloris() {
     });
     let addr = base.trim_start_matches("http://").to_string();
 
-    let mut s = TcpStream::connect(&addr).unwrap();
+    let mut s = TcpStream::connect(addr).unwrap();
     s.write_all(b"GET /loris HTTP/1.1\r\nHost: x\r\n").unwrap();
     let t0 = std::time::Instant::now();
     let mut buf = [0u8; 16];
@@ -1690,7 +1690,7 @@ fn event_slow_sender_resumes_partial_request() {
     });
     let addr = base.trim_start_matches("http://").to_string();
 
-    let mut c = RawConn::new(TcpStream::connect(&addr).unwrap());
+    let mut c = RawConn::new(TcpStream::connect(addr).unwrap());
     // Send a partial request, then stall well beyond any poll timeout.
     c.stream()
         .write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\n")
@@ -1735,7 +1735,7 @@ fn event_pipelining() {
     });
     let addr = base.trim_start_matches("http://").to_string();
 
-    let mut c = RawConn::new(TcpStream::connect(&addr).unwrap());
+    let mut c = RawConn::new(TcpStream::connect(addr).unwrap());
     c.stream()
         .write_all(b"GET /one HTTP/1.1\r\nHost: x\r\n\r\nGET /two HTTP/1.1\r\nHost: x\r\n\r\n")
         .unwrap();

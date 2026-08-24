@@ -624,7 +624,7 @@ pub fn validate_chain(
         let leaf = &certs[0];
         if usage_present(&leaf.key_usage) {
             let rsa = leaf.spki.oid == der::OID_RSA_ENCRYPTION;
-            if !leaf.key_usage.digital_signature && !(rsa && leaf.key_usage.key_encipherment) {
+            if !(leaf.key_usage.digital_signature || (rsa && leaf.key_usage.key_encipherment)) {
                 return Err(TlsError::Certificate(
                     "leaf certificate key usage forbids server authentication".into(),
                 ));

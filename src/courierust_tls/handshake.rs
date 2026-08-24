@@ -95,7 +95,7 @@ pub(crate) struct HsMessage<'a> {
 }
 
 /// Parse a single handshake message (4-byte header + body).
-pub(crate) fn parse_hs<'a>(buf: &'a [u8]) -> Option<HsMessage<'a>> {
+pub(crate) fn parse_hs(buf: &[u8]) -> Option<HsMessage<'_>> {
     if buf.len() < 4 {
         return None;
     }
@@ -110,7 +110,7 @@ pub(crate) fn parse_hs<'a>(buf: &'a [u8]) -> Option<HsMessage<'a>> {
 }
 
 /// If `buf` starts with a complete handshake message, return it.
-pub(crate) fn peek_complete_hs<'a>(buf: &'a [u8]) -> Option<HsMessage<'a>> {
+pub(crate) fn peek_complete_hs(buf: &[u8]) -> Option<HsMessage<'_>> {
     parse_hs(buf).filter(|m| 4 + m.body.len() <= buf.len())
 }
 

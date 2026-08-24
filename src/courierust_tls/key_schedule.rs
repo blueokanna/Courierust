@@ -480,6 +480,12 @@ mod tests {
     }
 
     fn hex_str(v: &[u8]) -> String {
-        v.iter().map(|b| format!("{:02x}", b)).collect()
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut s = String::with_capacity(v.len() * 2);
+        for &b in v {
+            s.push(HEX[(b >> 4) as usize] as char);
+            s.push(HEX[(b & 0x0f) as usize] as char);
+        }
+        s
     }
 }

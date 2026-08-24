@@ -976,7 +976,7 @@ impl Client {
                             String::from_utf8_lossy(&alpn)
                         )));
                     }
-                    None if !self.inner.config.tls.is_none() => {
+                    None if self.inner.config.tls.is_some() => {
                         return Err(Error::protocol(
                             "server did not negotiate any ALPN protocol; \
                              HTTP/2 over TLS requires ALPN h2",

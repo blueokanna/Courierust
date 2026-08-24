@@ -170,12 +170,16 @@ impl<'a> ActiveH2Streams<'a> {
             self.current = value;
             return;
         };
-        if value > self.current {
-            stats
-                .h2_streams_active
-                .fetch_add(value - self.current, Ordering::Relaxed);
-        } else if self.current > value {
-            Stats::decrement(&stats.h2_streams_active, self.current - value);
+        match value.cmp(&self.current) {
+            core::cmp::Ordering::Greater => {
+                stats
+                    .h2_streams_active
+                    .fetch_add(value - self.current, Ordering::Relaxed);
+            }
+            core::cmp::Ordering::Less => {
+                Stats::decrement(&stats.h2_streams_active, self.current - value);
+            }
+            core::cmp::Ordering::Equal => {}
         }
         self.current = value;
         Stats::bump_peak(&stats.h2_streams_active_peak, value);

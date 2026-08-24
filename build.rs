@@ -46,7 +46,7 @@ fn main() {
         }
     }
     let out_path = Path::new(&out_dir).join("courierust_generated.rs");
-    fs::write(&out_path, &generated).expect("write generated code");
+    fs::write(out_path, &generated).expect("write generated code");
 }
 
 // ---------------------------------------------------------------------

@@ -676,6 +676,16 @@ mod tests {
             .collect()
     }
 
+    fn to_hex(v: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut s = String::with_capacity(v.len() * 2);
+        for &b in v {
+            s.push(HEX[(b >> 4) as usize] as char);
+            s.push(HEX[(b & 0x0f) as usize] as char);
+        }
+        s
+    }
+
     #[test]
     fn base_point_sanity() {
         let b = base_point();
@@ -750,7 +760,7 @@ mod tests {
         let mut h = Sha512::new();
         h.update(b"abc");
         let digest = h.finalize();
-        let hex_digest: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        let hex_digest: String = to_hex(&digest);
         assert_eq!(
             hex_digest,
             "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
@@ -793,7 +803,7 @@ mod tests {
             let mut h = Sha512::new();
             h.update(&source[..len]);
             let digest = h.finalize();
-            let hex_digest: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+            let hex_digest: String = to_hex(&digest);
             assert_eq!(
                 hex_digest, expected,
                 "SHA-512 mismatch at message length {len}"
