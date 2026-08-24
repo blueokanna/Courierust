@@ -81,6 +81,79 @@ impl Timing {
         let p99 = self.percentile_us(0.99)?;
         (p50 > 0.0).then(|| p99 / p50)
     }
+
+    /// Intra-run coefficient of variation (stddev / mean): jitter within
+    /// one run, complementary to the cross-run CV in [`report_repetitions`].
+    pub fn cv(&self) -> Option<f64> {
+        let mean = self.mean_us()?;
+        let stddev = self.stddev_us()?;
+        (mean > 0.0).then(|| stddev / mean)
+    }
+}
+
+/// Coefficient of variation (stddev / mean) of a set of values; `None`
+/// for fewer than two samples or a zero mean. Cross-run stability metric
+/// for repeatability reporting (P3).
+pub fn coefficient_of_variation(values: &[f64]) -> Option<f64> {
+    if values.len() < 2 {
+        return None;
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    if mean == 0.0 {
+        return None;
+    }
+    let variance = values
+        .iter()
+        .map(|v| (v - mean) * (v - mean))
+        .sum::<f64>()
+        / values.len() as f64;
+    Some(variance.sqrt() / mean)
+}
+
+/// One repetition's headline metrics, for cross-run repeatability.
+#[derive(Clone, Copy)]
+pub struct RunMetrics {
+    pub rps: f64,
+    pub p50_us: f64,
+    pub p99_us: f64,
+    pub p999_us: f64,
+}
+
+impl RunMetrics {
+    /// Extract the headline metrics from a finished run.
+    pub fn from_timing(timing: &Timing) -> Self {
+        Self {
+            rps: timing.requests_per_second(),
+            p50_us: timing.percentile_us(0.50).unwrap_or(0.0),
+            p99_us: timing.percentile_us(0.99).unwrap_or(0.0),
+            p999_us: timing.percentile_us(0.999).unwrap_or(0.0),
+        }
+    }
+}
+
+/// Report a repeatability summary across independent runs (P3): for each
+/// headline metric, the cross-run mean / min / max and the coefficient of
+/// variation. One `REPSUM` row per metric; a CI job can assert a CV
+/// ceiling on a key case.
+pub fn report_repetitions(label: &str, runs: &[RunMetrics]) {
+    fn summarize(label: &str, name: &str, values: &[f64]) {
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        println!(
+            "REPSUM|suite={label}|metric={name}|runs={}|mean={mean:.3}|min={min:.3}|max={max:.3}|cv={}",
+            values.len(),
+            metric(coefficient_of_variation(values)),
+        );
+    }
+    let rps: Vec<f64> = runs.iter().map(|r| r.rps).collect();
+    let p50: Vec<f64> = runs.iter().map(|r| r.p50_us).collect();
+    let p99: Vec<f64> = runs.iter().map(|r| r.p99_us).collect();
+    let p999: Vec<f64> = runs.iter().map(|r| r.p999_us).collect();
+    summarize(label, "rps", &rps);
+    summarize(label, "p50_us", &p50);
+    summarize(label, "p99_us", &p99);
+    summarize(label, "p999_us", &p999);
 }
 
 /// Format an optional µs value (2 decimals) or `na`.
@@ -94,13 +167,14 @@ pub fn metric(value: Option<f64>) -> String {
 /// All suites reuse one format; the report script parses by name.
 pub fn stats_fields(timing: &Timing) -> String {
     format!(
-        "min_us={}|mean_us={}|max_us={}|stddev_us={}|p999_us={}|tail_ratio={}",
+        "min_us={}|mean_us={}|max_us={}|stddev_us={}|p999_us={}|tail_ratio={}|cv={}",
         metric(timing.min_us()),
         metric(timing.mean_us()),
         metric(timing.max_us()),
         metric(timing.stddev_us()),
         metric(timing.percentile_us(0.999)),
         metric(timing.tail_ratio()),
+        metric(timing.cv()),
     )
 }
 

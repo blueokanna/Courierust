@@ -22,12 +22,24 @@
 //! The poller raises the Windows timer to 1 ms (`timeBeginPeriod`), which
 //! removed ~1 ms periodic `select()` wakeup stalls (p99 10.7 ms → ~0.3 ms).
 
+use courierust::courierust_body::Body;
+use courierust::courierust_bytes::Bytes;
 use courierust::courierust_client::{Client, ClientConfig, TlsSettings as ClientTls};
 use courierust::courierust_http::request::Request;
 use courierust::courierust_http::response::Response;
 use courierust::courierust_server::{Server, ServerConfig, TlsSettings as ServerTls};
-use courierust_benchmark::metrics::{run_concurrent, run_sequential, stats_fields, Timing, MAX_SAMPLES};
+use courierust_benchmark::metrics::{
+    run_concurrent, run_sequential, stats_fields, report_repetitions, RunMetrics, Timing, MAX_SAMPLES,
+};
 use std::time::Instant;
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
 
 const CERT_DER: &[u8] = include_bytes!("../../tests/certs/server_cert.der");
 const KEY_DER: &[u8] = include_bytes!("../../tests/certs/server_key.der");
@@ -48,14 +60,71 @@ fn report(label: &str, workers: usize, timing: &Timing) {
 }
 
 fn main() {
-    let requests = std::env::var("BENCH_REQUESTS")
+    // P1 parameter matrix: the parent spawns one child process per cell
+    // (workers × ack-delay × cwnd). A fresh process per cell is required
+    // because the runtime caches the env-derived knobs once per process
+    // (they are read on the packet path).
+    if std::env::var_os("H3_SWEEP").is_some() && std::env::var_os("H3_SWEEP_CHILD").is_none() {
+        sweep_matrix();
+        return;
+    }
+    run_suite();
+}
+
+/// Spawn one child bench process per matrix cell. The child inherits
+/// stdout, so its `META` + `RESULT` rows (labelled with the cell's env)
+/// stream straight into the matrix output.
+fn sweep_matrix() {
+    use std::process::Command;
+    let exe = std::env::current_exe().expect("bench executable path");
+    // ACK-delay is a latency/throughput knob; cwnd controls how many
+    // ACK-paced rounds a large body takes; workers is the concurrency
+    // axis — exactly the P1 matrix dimensions.
+    let workers = [1usize, 2, 4, 8, 16];
+    let ack_delay_ms = [0u64, 2, 5, 10];
+    let cwnds = [2_400usize, 12_000, 48_000];
+    let cells = workers.len() * ack_delay_ms.len() * cwnds.len();
+    println!(
+        "META|suite=h3|sweep=workers_ack_delay_cwnd|cells={cells}|note=one child process per cell"
+    );
+    for &workers in &workers {
+        for &ack_delay_ms in &ack_delay_ms {
+            for &cwnd in &cwnds {
+                let status = Command::new(&exe)
+                    .env("H3_WORKERS", workers.to_string())
+                    .env("COURIERUST_H3_ACK_DELAY_MS", ack_delay_ms.to_string())
+                    .env("COURIERUST_H3_MIN_ACK_DELAY_MS", ack_delay_ms.to_string())
+                    .env("COURIERUST_H3_CWND", cwnd.to_string())
+                    .env("H3_SWEEP_CHILD", "1")
+                    .status()
+                    .expect("spawn sweep child");
+                assert!(
+                    status.success(),
+                    "sweep child failed: workers={workers} ack_delay_ms={ack_delay_ms} cwnd={cwnd}"
+                );
+            }
+        }
+    }
+}
+
+/// One config cell: cold connect + warm sequential/parallel (+ 64 KiB
+/// upload when `BENCH_BODY_BYTES` is set), optionally repeated
+/// `BENCH_RUNS` times for cross-run repeatability (P3).
+fn run_suite() {
+    let requests = env_usize("BENCH_REQUESTS", 1000);
+    let workers = env_usize("H3_WORKERS", 8);
+    let runs = env_usize("BENCH_RUNS", 1);
+    let body_bytes = env_usize("BENCH_BODY_BYTES", 0);
+
+    let ack_delay_ms = std::env::var("COURIERUST_H3_ACK_DELAY_MS")
         .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1000);
-    let workers = std::env::var("H3_WORKERS")
+        .unwrap_or_else(|| "2".to_string());
+    let cwnd = std::env::var("COURIERUST_H3_CWND")
         .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(8);
+        .unwrap_or_else(|| "12000".to_string());
+    println!(
+        "META|suite=h3|requests={requests}|workers={workers}|runs={runs}|body_bytes={body_bytes}|ack_delay_ms={ack_delay_ms}|cwnd={cwnd}"
+    );
 
     let identity = courierust::courierust_tls::Identity {
         cert_chain: vec![CERT_DER.to_vec()],
@@ -74,9 +143,7 @@ fn main() {
     let server = Server::bind_with_config("127.0.0.1:0", server_cfg).unwrap();
     let addr = server.local_addr().unwrap();
     let _handle = server
-        .serve_background(|_req: Request<courierust::courierust_body::Body>| {
-            Response::with_status(200.into())
-        })
+        .serve_background(|_req: Request<Body>| Response::with_status(200.into()))
         .unwrap();
 
     let mut roots = courierust::courierust_tls::RootStore::new();
@@ -126,7 +193,27 @@ fn main() {
     seq.sort_samples();
     report("h3_sequential", 1, &seq);
 
-    // 3. Warm concurrent: workers share the pooled connection(s) and
+    // 3. P0: large request-body upload (64 KiB by default when
+    //    `BENCH_BODY_BYTES` is set) — the cwnd/ACK-paced transfer the
+    //    `COURIERUST_H3_TRACE` packet events dissect. Capped so a slow
+    //    cell does not make the matrix take forever.
+    if body_bytes > 0 {
+        // `Bytes` is an Arc-backed cheap clone; the per-request body is
+        // re-wrapped from the same buffer so upload cost is the QUIC
+        // transfer, not a per-request allocation.
+        let upload_payload = Bytes::from(vec![b'x'; body_bytes]);
+        let upload_client = client.clone();
+        let upload_url = url.clone();
+        let upload_requests = requests.min(200);
+        let mut up = run_sequential(upload_requests, MAX_SAMPLES, || {
+            let req = Request::post("/upload").with_body(Body::Bytes(upload_payload.clone()));
+            let _ = upload_client.execute(&upload_url, req);
+        });
+        up.sort_samples();
+        report("h3_upload", 1, &up);
+    }
+
+    // 4. Warm concurrent: workers share the pooled connection(s) and
     //    multiplex request streams over QUIC.
     let mut conc = run_concurrent(requests, workers, MAX_SAMPLES, |_| {
         let client = client.clone();
@@ -137,4 +224,30 @@ fn main() {
     });
     conc.sort_samples();
     report("h3_parallel", workers, &conc);
+
+    // P3 cross-run repeatability: re-run sequential + parallel `runs`
+    // times and report per-metric mean/min/max/CV (`REPSUM` rows).
+    if runs > 1 {
+        let mut seq_metrics = Vec::with_capacity(runs);
+        let mut conc_metrics = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            let mut s = run_sequential(requests, MAX_SAMPLES, || {
+                let _ = client.get(&url);
+            });
+            s.sort_samples();
+            seq_metrics.push(RunMetrics::from_timing(&s));
+
+            let mut c = run_concurrent(requests, workers, MAX_SAMPLES, |_| {
+                let client = client.clone();
+                let url = url.clone();
+                Box::new(move || {
+                    let _ = client.get(&url);
+                })
+            });
+            c.sort_samples();
+            conc_metrics.push(RunMetrics::from_timing(&c));
+        }
+        report_repetitions("h3_sequential", &seq_metrics);
+        report_repetitions("h3_parallel", &conc_metrics);
+    }
 }

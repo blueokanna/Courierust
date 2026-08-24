@@ -72,6 +72,65 @@ const ACK_DELAY: Duration = Duration::from_millis(2);
 /// same-burst cluster on loopback/DC, small enough not to add a visible
 /// round to a single-request flow.
 const MIN_ACK_DELAY: Duration = Duration::from_micros(250);
+
+/// `COURIERUST_H3_ACK_DELAY_MS` override for the interactive ACK batch
+/// window (production default [`ACK_DELAY`]). Read once: the ACK path
+/// runs per batch, so the env probe must not repeat per packet.
+fn ack_delay() -> Duration {
+    static DELAY: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *DELAY.get_or_init(|| {
+        std::env::var("COURIERUST_H3_ACK_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(ACK_DELAY)
+    })
+}
+
+/// `COURIERUST_H3_MIN_ACK_DELAY_MS` override (production default
+/// [`MIN_ACK_DELAY`]).
+fn min_ack_delay() -> Duration {
+    static DELAY: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *DELAY.get_or_init(|| {
+        std::env::var("COURIERUST_H3_MIN_ACK_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(MIN_ACK_DELAY)
+    })
+}
+
+/// `COURIERUST_H3_CWND` override for the initial congestion window in
+/// bytes (production default 12 000). A larger value admits a large
+/// request body in fewer ACK-paced rounds; clamped to a sane range so a
+/// typo cannot disable flow control.
+fn initial_congestion_window() -> usize {
+    static CWND: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CWND.get_or_init(|| {
+        std::env::var("COURIERUST_H3_CWND")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(12_000)
+            .clamp(1_200, 1 << 20)
+    })
+}
+
+/// Cached `COURIERUST_H3_TRACE` presence. The packet-level event trace
+/// (send / ACK / credit) runs on the hot path, so the env probe is
+/// evaluated once per process instead of once per packet.
+fn h3_packet_trace() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("COURIERUST_H3_TRACE").is_some())
+}
+
+/// Role tag used by the packet event trace.
+fn h3_role(server: bool) -> &'static str {
+    if server {
+        "server"
+    } else {
+        "client"
+    }
+}
 /// RFC 9000 §9.3.3: PATH_CHALLENGE probe timeout — after this long without
 /// a matching PATH_RESPONSE the probe is retried once, then the pending
 /// path is abandoned (the validated path remains authoritative).
@@ -4157,7 +4216,7 @@ impl QuicTransport {
             ],
             crypto_send_offsets: [0; 3],
             queued_streams: VecDeque::new(),
-            congestion_window: 12_000,
+            congestion_window: initial_congestion_window(),
             slow_start_threshold: usize::MAX,
             smoothed_rtt: None,
             rtt_variance: Duration::from_millis(0),
@@ -4516,7 +4575,7 @@ impl QuicTransport {
             // A duplicate packet: the peer likely missed our ACK. Re-arm
             // the batch deadline so it is acknowledged promptly.
             space.ack_pending = true;
-            space.ack_deadline = Some(Instant::now() + ACK_DELAY);
+            space.ack_deadline = Some(Instant::now() + ack_delay());
             return Ok(Some((level, pn, Vec::new(), meta.packet_end)));
         }
         if space.received.len() > 8192 {
@@ -4559,6 +4618,14 @@ impl QuicTransport {
             }
             match frame {
                 QFrame::MaxData(max) => {
+                    if h3_packet_trace() {
+                        eprintln!(
+                            "H3TRACE|{}|credit max_data={max} sent_data={} cwnd={}",
+                            h3_role(self.server),
+                            self.sent_data,
+                            self.congestion_window
+                        );
+                    }
                     self.peer_max_data = self.peer_max_data.max(*max);
                 }
                 QFrame::MaxStreams {
@@ -4572,6 +4639,12 @@ impl QuicTransport {
                     }
                 }
                 QFrame::MaxStreamData { stream_id, max } => {
+                    if h3_packet_trace() {
+                        eprintln!(
+                            "H3TRACE|{}|credit stream={stream_id} max={max}",
+                            h3_role(self.server)
+                        );
+                    }
                     let limit = self.peer_stream_limits.entry(*stream_id).or_insert(0);
                     *limit = (*limit).max(*max);
                 }
@@ -4580,7 +4653,7 @@ impl QuicTransport {
         }
         if ack_eliciting {
             space.ack_pending = true;
-            space.ack_deadline = Some(Instant::now() + ACK_DELAY);
+            space.ack_deadline = Some(Instant::now() + ack_delay());
         }
         if acknowledged_bytes != 0 {
             self.on_acknowledgement(acknowledged_bytes, rtt_sample, level);
@@ -4623,6 +4696,17 @@ impl QuicTransport {
                 .min(16 * 1024 * 1024);
         }
         let _ = self.detect_lost_packets(level, Instant::now());
+        if h3_packet_trace() {
+            // ACK event: newly-acknowledged bytes and the cwnd after
+            // growth — the release valve for a cwnd-paced upload.
+            let rtt_us = self.latest_rtt.map_or(0, |d| d.as_micros() as u64);
+            eprintln!(
+                "H3TRACE|{}|ack acked_bytes={bytes} cwnd={} unacked={} rtt_us={rtt_us}",
+                h3_role(self.server),
+                self.congestion_window,
+                self.unacknowledged_bytes()
+            );
+        }
     }
 
     /// RFC 9002 §6.1.1 time threshold: `9/8 * max(latest_rtt,
@@ -4644,7 +4728,7 @@ impl QuicTransport {
         // advertised `max_ack_delay`; our own ACK batching is the same
         // magnitude, so both directions are absorbed before declaring
         // loss.
-        (scaled + ACK_DELAY).max(LOSS_TIMEOUT_FLOOR)
+        (scaled + ack_delay()).max(LOSS_TIMEOUT_FLOOR)
     }
 
     /// RFC 9002 §6.2.1: PTO = smoothed_rtt + max(4·rttvar, granularity) +
@@ -4656,7 +4740,7 @@ impl QuicTransport {
             return Duration::from_millis(1000);
         };
         let variance = (self.rtt_variance * 4).max(Duration::from_millis(1));
-        (smoothed + variance + ACK_DELAY).max(LOSS_TIMEOUT_FLOOR)
+        (smoothed + variance + ack_delay()).max(LOSS_TIMEOUT_FLOOR)
     }
 
     /// Declare ack-eliciting packets in `level` lost once they are older
@@ -4908,10 +4992,10 @@ impl QuicTransport {
     /// constant 2 ms while WAN flows keep a bounded batch for bursts.
     fn current_ack_delay(&self) -> Duration {
         let Some(smoothed) = self.smoothed_rtt else {
-            return ACK_DELAY;
+            return ack_delay();
         };
         let window = smoothed.saturating_mul(2);
-        window.clamp(MIN_ACK_DELAY, ACK_DELAY)
+        window.clamp(min_ack_delay(), ack_delay())
     }
 
     fn ack(&mut self, level: LevelIndex) {
@@ -5460,6 +5544,29 @@ impl QuicTransport {
             && self.unacknowledged_bytes().saturating_add(wire.len()) > self.congestion_window
         {
             return Err(Error::new(ErrorKind::WouldBlock));
+        }
+        if h3_packet_trace() {
+            // Per-packet event stream: which stream data this datagram
+            // carried and the cwnd/unacked state, so a slow large upload
+            // is attributable to a specific cwnd batch and its ACK round.
+            let mut stream_bytes = 0usize;
+            let mut first_stream = None;
+            for frame in frames {
+                if let QFrame::Stream {
+                    stream_id, data, ..
+                } = frame
+                {
+                    stream_bytes = stream_bytes.saturating_add(data.len());
+                    first_stream = Some(*stream_id);
+                }
+            }
+            eprintln!(
+                "H3TRACE|{}|send pn={pn} level={level} wire={} ack_eliciting={ack_eliciting} stream={first_stream:?} stream_bytes={stream_bytes} cwnd={} unacked={}",
+                h3_role(self.server),
+                wire.len(),
+                self.congestion_window,
+                self.unacknowledged_bytes()
+            );
         }
         self.send_wire(socket, &wire, dest)?;
         if level == APPLICATION {

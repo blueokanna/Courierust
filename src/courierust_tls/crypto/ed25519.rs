@@ -192,9 +192,6 @@ fn point_compress(p: Point) -> [u8; 32] {
     let x = fe_mul(p.x, z_inv);
     let y = fe_mul(p.y, z_inv);
     let mut out = fe_tobytes(y);
-    // The sign bit is the parity of the *canonical* x. The donna field
-    // elements are bounded but not canonical (a value ≡ 0 mod p may
-    // have an odd raw limb), so canonicalize x before reading bit 0.
     let x_bytes = fe_tobytes(x);
     out[31] |= (x_bytes[0] & 1) << 7;
     out
@@ -627,10 +624,6 @@ impl Digest for Sha512 {
         for i in 0..block_count {
             let mut b = [0u8; 128];
             if i == 0 {
-                // Only the first padding block carries the message tail and
-                // the 0x80 marker; the length block must be zeros (RFC
-                // 6234 §7.4). Re-copying `self.buf` here corrupts digests
-                // whose final block holds 112..=127 message bytes.
                 b[..self.buf_len].copy_from_slice(&self.buf[..self.buf_len]);
                 b[self.buf_len] = 0x80;
             }

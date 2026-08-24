@@ -59,6 +59,7 @@ fn main() {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
                         .as_secs() as i64,
+                    ..Default::default()
                 }),
                 ..Default::default()
             },

@@ -49,6 +49,32 @@ const MAX_HEADER_BLOCK: usize = 1024 * 1024;
 /// burst of ready connections cannot serialize one send/recv per id.
 const DISPATCH_BATCH: usize = 16;
 
+/// Cached `COURIERUST_H1_TRACE` presence. The per-request segment timing
+/// reads it at connection construction and per segment, so it is cached
+/// once per process instead of per request.
+fn h1_trace() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("COURIERUST_H1_TRACE").is_some())
+}
+
+/// Start a timed segment when tracing is enabled; `None` otherwise.
+#[inline]
+fn seg_start(enabled: bool) -> Option<Instant> {
+    if enabled {
+        Some(Instant::now())
+    } else {
+        None
+    }
+}
+
+/// Fold an elapsed segment into `acc` (µs). No-op when tracing is off.
+#[inline]
+fn seg_end(acc: &mut u64, start: Option<Instant>) {
+    if let Some(start) = start {
+        *acc = acc.saturating_add(start.elapsed().as_micros() as u64);
+    }
+}
+
 /// Control messages sent to the event loop.
 enum EventMsg {
     NewConn { id: usize, stream: TcpStream },
@@ -477,6 +503,18 @@ struct EventConn {
     reads: Option<Arc<AtomicUsize>>,
     /// Transport write-call counter (h1 syscall evidence), when attached.
     writes: Option<Arc<AtomicUsize>>,
+    // Per-request segment timing (`COURIERUST_H1_TRACE`); all zero and
+    // unused when tracing is off, so the steady-state hot path pays no
+    // `Instant::now()` calls.
+    trace: bool,
+    parse_us: u64,
+    handler_us: u64,
+    build_us: u64,
+    write_us: u64,
+    trace_requests: u64,
+    /// When this connection was last parked on the reactor, for the
+    /// worker → reactor → worker handoff measurement.
+    parked_at: Option<Instant>,
 }
 
 impl EventConn {
@@ -496,6 +534,13 @@ impl EventConn {
             keep_alive: true,
             reads,
             writes,
+            trace: h1_trace(),
+            parse_us: 0,
+            handler_us: 0,
+            build_us: 0,
+            write_us: 0,
+            trace_requests: 0,
+            parked_at: None,
         }
     }
 
@@ -503,22 +548,35 @@ impl EventConn {
     /// pipelined requests as are fully buffered, then returns how to
     /// continue.
     fn step(&mut self, handler: &dyn Handler, config: &ServerConfig) -> Result<StepOutcome> {
+        let trace = self.trace;
         loop {
             if self.out_pos < self.out.len() {
                 return self.write_more();
             }
+            let parse = seg_start(trace);
             match self
                 .reader
                 .next_request(&self.socket, self.reads.as_deref())?
             {
                 Some(req) => {
+                    seg_end(&mut self.parse_us, parse);
                     let request_close = courierust_h1::wants_close(&req.headers);
+                    let handle = seg_start(trace);
                     let resp = handler.handle(req);
+                    seg_end(&mut self.handler_us, handle);
                     self.out.clear();
+                    let build = seg_start(trace);
                     let keep_alive = build_response(resp, config, request_close, &mut self.out)?;
+                    seg_end(&mut self.build_us, build);
                     self.out_pos = 0;
                     self.keep_alive = keep_alive;
-                    match self.write_more()? {
+                    let write = seg_start(trace);
+                    let outcome = self.write_more()?;
+                    seg_end(&mut self.write_us, write);
+                    if trace {
+                        self.trace_requests = self.trace_requests.saturating_add(1);
+                    }
+                    match outcome {
                         StepOutcome::Idle => {
                             // Response fully written. Loop to serve any
                             // pipelined request already buffered; when
@@ -529,7 +587,10 @@ impl EventConn {
                         other => return Ok(other),
                     }
                 }
-                None => return Ok(StepOutcome::Idle),
+                None => {
+                    seg_end(&mut self.parse_us, parse);
+                    return Ok(StepOutcome::Idle);
+                }
             }
         }
     }
@@ -1117,6 +1178,29 @@ fn event_worker(
                 Some(c) => c,
                 None => continue,
             };
+            // Handoff measurement: how long the connection sat parked on
+            // the reactor between this worker's last release and this
+            // dispatch pickup (worker → reactor → worker round trip).
+            let handoff_us = conn
+                .parked_at
+                .take()
+                .map(|at| at.elapsed().as_micros() as u64)
+                .unwrap_or(0);
+            if conn.trace && conn.trace_requests > 0 {
+                eprintln!(
+                    "H1SEG|id={id}|reqs={}|parse_us={}|handler_us={}|build_us={}|write_us={}|handoff_us={handoff_us}",
+                    conn.trace_requests,
+                    conn.parse_us,
+                    conn.handler_us,
+                    conn.build_us,
+                    conn.write_us,
+                );
+            }
+            conn.trace_requests = 0;
+            conn.parse_us = 0;
+            conn.handler_us = 0;
+            conn.build_us = 0;
+            conn.write_us = 0;
             let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 conn.step(handler, config)
             }));
@@ -1128,6 +1212,7 @@ fn event_worker(
                 StepOutcome::Idle | StepOutcome::NeedWrite => {
                     let fd = fd_of(&conn.socket);
                     let want_write = matches!(outcome, StepOutcome::NeedWrite);
+                    conn.parked_at = Some(Instant::now());
                     registry.lock().unwrap().insert(id, conn);
                     let _ = msg_tx.send(EventMsg::Register { id, fd, want_write });
                     wake_nudge(wake_writer);

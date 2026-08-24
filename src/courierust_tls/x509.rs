@@ -234,8 +234,6 @@ fn ip_matches_constraint(ip: &[u8], constraint: &[u8]) -> Option<bool> {
     let (addr, mask) = constraint.split_at(half);
     let mut seen_zero = false;
     for (&a, (&b, &m)) in ip.iter().zip(addr.iter().zip(mask.iter())) {
-        // A valid mask byte is a run of ones followed by a run of zeros;
-        // once a zero bit appears, no later byte may contain a one bit.
         let ones = m.leading_ones();
         let zeros = m.trailing_zeros();
         if ones + zeros != 8 || (seen_zero && m != 0) {
@@ -479,11 +477,9 @@ pub fn hostname_matches(name: &str, dns_names: &[String], ip_names: &[Vec<u8>]) 
 
 /// RFC 6125 DNS-ID comparison with a single `*` in the left-most label.
 fn dns_match(name: &str, pattern: &str) -> bool {
-    // Exact match.
     if name == pattern {
         return true;
     }
-    // Only a bare `*.` wildcard is accepted (matches exactly one label).
     if !pattern.starts_with("*.") {
         return false;
     }
@@ -491,8 +487,6 @@ fn dns_match(name: &str, pattern: &str) -> bool {
     if suffix.contains('*') {
         return false;
     }
-    // The name must end with the suffix, and the wildcard must replace
-    // exactly one non-empty label (no further dots in that label).
     let Some(stripped) = name.strip_suffix(suffix) else {
         return false;
     };
@@ -559,8 +553,6 @@ pub fn validate_chain(
         }
     }
 
-    // 2. RFC 5280 §4.2: a certificate carrying an extension marked
-    //    critical that we do not understand must be rejected.
     for (i, c) in certs.iter().enumerate() {
         if c.unknown_critical {
             return Err(TlsError::Certificate(format!(
@@ -569,7 +561,6 @@ pub fn validate_chain(
         }
     }
 
-    // 3. Name chaining and signature verification for every link.
     for i in 0..certs.len() - 1 {
         let child = &certs[i];
         let parent = &certs[i + 1];
@@ -583,9 +574,6 @@ pub fn validate_chain(
         }
     }
 
-    // 4. Every certificate that issues another in the path must be a CA
-    //    and (when the key usage extension is present) assert keyCertSign
-    //    (RFC 5280 §4.2.1.3 / §4.2.1.9).
     for ca in certs.iter().skip(1) {
         if ca.is_ca != Some(true) {
             return Err(TlsError::Certificate("chain issuer is not a CA".into()));
@@ -595,10 +583,6 @@ pub fn validate_chain(
         }
     }
 
-    // 5. pathLenConstraint (RFC 5280 §4.2.1.9): the number of
-    //    intermediate CA certificates below an intermediate (closer to
-    //    the end entity, excluding the leaf and the trust anchor) must
-    //    not exceed its pathLen.
     for (i, ca) in certs
         .iter()
         .enumerate()
@@ -615,11 +599,6 @@ pub fn validate_chain(
         }
     }
 
-    // 6. Leaf (end-entity) usage. The TLS profile here only performs
-    //    ECDHE key exchange, so a key-usage extension must permit
-    //    digitalSignature; RSA keyEncipherment alone is tolerated for
-    //    compatibility with RSA-key-exchange chains even though they
-    //    cannot be negotiated.
     {
         let leaf = &certs[0];
         if usage_present(&leaf.key_usage) {
@@ -632,9 +611,8 @@ pub fn validate_chain(
         }
     }
 
-    // 7. Trust anchor.
     let last = certs.last().unwrap();
-    let anchored = {
+    let anchored: bool = {
         let mut found = false;
         for root in roots.roots() {
             if root.der == last.der {
@@ -645,9 +623,6 @@ pub fn validate_chain(
         found
     };
     if !anchored {
-        // The last presented cert must be signed by a root; the root
-        // must itself be a CA (and keyCertSign when it carries a key
-        // usage extension).
         let mut verified = false;
         for root in roots.roots() {
             let Ok(root_cert) = der::parse_certificate(&root.der) else {
@@ -662,36 +637,24 @@ pub fn validate_chain(
             if usage_present(&root_cert.key_usage) && !root_cert.key_usage.key_cert_sign {
                 continue;
             }
-            if verify_cert_signature(last, &root_cert.spki) {
-                // The root must be self-signed / its own issuer.
-                if root_cert.issuer_der == root_cert.subject_der {
-                    verified = true;
-                    break;
-                }
+            if verify_cert_signature(last, &root_cert.spki)
+                && root_cert.issuer_der == root_cert.subject_der
+            {
+                verified = true;
+                break;
             }
         }
         if !verified {
             return Err(TlsError::Certificate("no trusted root found".into()));
         }
-    } else if last.issuer_der != last.subject_der {
-        // A presented trust anchor must be self-issued.
-        if !verify_cert_signature(last, &last.spki) {
-            return Err(TlsError::Certificate("root is not self-signed".into()));
-        }
+    } else if last.issuer_der != last.subject_der && !verify_cert_signature(last, &last.spki) {
+        return Err(TlsError::Certificate("root is not self-signed".into()));
     }
 
-    // 8. The leaf must not be a CA unless it is the sole presented
-    //    trust anchor (a directly trusted self-signed end entity).
     if certs[0].is_ca == Some(true) && !(certs.len() == 1 && anchored) {
         return Err(TlsError::Certificate("leaf certificate is a CA".into()));
     }
 
-    // 9. Name constraints (RFC 5280 §4.2.1.10): every CA in the path
-    //    restricts the names its subordinates may carry. The trust
-    //    anchor's own constraints are not enforced (the anchor is trusted
-    //    as-is), matching rustls-webpki. The chain is leaf-first, so
-    //    certs[i] issues certs[0..i]; its constraints apply to those
-    //    subordinates.
     for (i, ca) in certs.iter().enumerate().skip(1) {
         let Some(nc) = &ca.name_constraints else {
             continue;
@@ -700,7 +663,6 @@ pub fn validate_chain(
             continue;
         }
         if i == certs.len() - 1 && anchored {
-            // The final presented certificate is the trust anchor.
             continue;
         }
         for subordinate in certs.iter().take(i) {
@@ -785,9 +747,6 @@ fn verify_cert_signature(cert: &Certificate, issuer: &Spki) -> bool {
             if issuer.oid != OID_EC_PUBLIC_KEY {
                 return false;
             }
-            // Strict curve↔hash mapping (identical to rustls/webpki):
-            // ecdsa-with-SHA256 requires P-256, ecdsa-with-SHA384
-            // requires P-384, ecdsa-with-SHA512 requires P-521.
             let curve = match cert.sig_alg {
                 SigAlg::EcdsaSha256 => Curve::P256,
                 SigAlg::EcdsaSha384 => Curve::P384,
@@ -796,8 +755,6 @@ fn verify_cert_signature(cert: &Certificate, issuer: &Spki) -> bool {
             if issuer.ec_curve != Some(curve) {
                 return false;
             }
-            // Uncompressed point: 0x04 || X || Y with the curve's
-            // coordinate size.
             let clen = curve.coord_len();
             if issuer.key.len() != 1 + 2 * clen || issuer.key[0] != 0x04 {
                 return false;
