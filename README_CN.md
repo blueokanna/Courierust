@@ -287,7 +287,9 @@ Workflow 还记录跨机 endpoint（含 TLS 与进程内限速场景）、reacto
 
 **连接池语义两个客户端不同，不可混为一谈：** Courierust 的 `max_connections_per_host` 限制的是每个 authority 的*存活*连接数；reqwest 的 `pool_max_idle_per_host` 限制的是*空闲池化*连接数。两者设为相同的 N 只在顺序负载下等价——并发时 reqwest 可能建立超过 N 条存活连接。
 
-**worker 数建议（由 `STATS` 行实测支持）：** HTTP/2 多路复用把所有流都放在一条连接、由一个 driver 线程串行处理。`max_connections_per_host = 1` 时吞吐在 4–8 worker 后随 worker 数**回退**：32 个 worker 争抢共享池锁与单一 driver 命令通道的速度超过 driver 的消化速度。`STATS` 行显示 `h2_connections=1` 且 `workers` 个并发流——这就是串行化点。每条 h2 连接建议 4–8 个客户端 worker，再往上应加连接而不是加 worker。
+**worker 数建议（由 `STATS` 行实测支持）：** HTTP/2 多路复用把所有流都放在一条连接、由一个 driver 线程串行处理。`max_connections_per_host = 1` 时吞吐在 4–8 worker 后随 worker 数**回退**：32 个 worker 争抢共享池锁与单一 driver 命令通道的速度超过 driver 的消化速度。`STATS` 行显示 `h2_connections=1` 且 `workers` 个并发流——这就是串行化点。每条 h2 连接建议 4–8 个客户端 worker，再往上应加连接而不是加 worker。当 per-authority 连接 cap 逼你选择时，池按**加权负载**选连接——活跃流数加在途请求体字节（64 KiB 单位）加封顶的 EWMA 服务时间项——一条拖着 1 MiB 上传的连接不再被当成只拖着一个 header-only RPC 来选（见 `courierust_client` README）。
+
+**HTTP/3 延迟长尾（实测，`benches/src/h3.rs`）：** reactor 是 poller 驱动的事件循环，poll timeout 是*绝对协议 deadline* 而非固定节拍，ACK 路径是交互式的——每个 burst 的第一个包立即回 ACK，其余包合并进同一个 ACK。这很关键，因为固定 poll tick 曾经门控每个 cwnd-limited round：每个 ACK 都被压在 `ack_delay()` *再加*下一次 poll 唤醒后面，环回上 64 KiB 流每轮约 5 ms。改成即时 ACK + deadline 折叠后，`h3_sequential` 是 p50 ~115 µs / max ~0.2 ms，`h3_parallel`×4 是 p50 ~180 µs / p99 ~0.35 ms，64 KiB 上传 p50 ~1.15 ms，64 KiB 下载 p99 ~0.74 ms（cwnd 长起来后单 burst 完成）。`Stats` 里的 `h3_ack_deferred` / `h3_credit_stalls` 可以证明到底是批次窗口还是拥塞窗口在给一条流限速。这些是单台 runner 的 loopback 数字——对比请在相同 runner 上进行，就像 `network` bench 跨主机做的那样。
 
 ```bash
 cargo bench --manifest-path benches/Cargo.toml --bench throughput
@@ -310,11 +312,11 @@ cargo fuzz run h2_frame --fuzz-dir fuzz -- -runs=10000
 
 该套件在每个 PR 的 CI（`benchmark.yml`）中运行，真实互操作回归会让流水线失败。主流 crate 仅是 bench 工作区的 dev 依赖；`courierust` 库本身保持零依赖。
 
-`compare` bench 还跑一个 **HTTP/3 对比**，对端是业界标准的 **quinn + h3 crate**：两个客户端都复用同一条池化 QUIC 连接、面向同一个 Courierust H3 服务端，测量热路径每请求延迟（1 KiB / 64 KiB）。quinn 行目前报告 `not_available`：独立的 quinn/rustls QUIC/TLS 握手无法与 Courierust 服务端完成——这是真实的跨实现互操作缺口，如实上报而非造假。补齐它是开放项，与其它独立互操作工作并列。
+`compare` bench 还跑一个 **HTTP/3 对比**，对端是业界标准的 **quinn + h3 crate**：两个客户端都复用同一条池化 QUIC 连接、面向同一个 Courierust H3 服务端，测量热路径每请求延迟（1 KiB / 64 KiB）。quinn 行只在独立的 quinn/rustls QUIC/TLS 握手真正与 Courierust 服务端完成时才报告——完成时两行都带实测 p50/p99；不能完成时（真实的跨实现互操作缺口）quinn 行如实报告 `not_available` 并附失败原因，绝不造假。在握手能完成的 runner 上，quinn 的 1 KiB p99 约 0.3 ms、64 KiB p99 约 1.2 ms，这就是 Courierust 行对照的基准。
 
 ## 测试
 
-- 单元测试 253 个：覆盖 HPACK 全部 RFC 向量（C.2/C.3/C.4/C.6）、Huffman 编解码（含解码输出上限）、帧编解码、状态机、流控、WUCS 调度、JA3/JA4 公开记录比对、指纹解析、TLS 1.3 握手与 RFC 8448 密钥调度、TLS 1.2 握手（ECDHE-RSA/ECDSA AEAD 套件、PRF、RFC 5746 重协商回显、Ed25519 ServerKeyExchange 签名/验证）、X.25519/Ed25519/ECDSA/RSA 原语、DEFLATE/gzip 编解码（往返、CRC-32 向量、损坏拒绝、输出上限、与 Python zlib 输出交叉验证），以及轮询器 self-pipe（唤醒描述符）语义。
+- 单元测试 260 个：覆盖 HPACK 全部 RFC 向量（C.2/C.3/C.4/C.6）、Huffman 编解码（含解码输出上限）、帧编解码、状态机、流控、WUCS 调度、JA3/JA4 公开记录比对、指纹解析、TLS 1.3 握手与 RFC 8448 密钥调度、TLS 1.2 握手（ECDHE-RSA/ECDSA AEAD 套件、PRF、RFC 5746 重协商回显、Ed25519 ServerKeyExchange 签名/验证）、X.25519/Ed25519/ECDSA/RSA 原语、DEFLATE/gzip 编解码（往返、CRC-32 向量、损坏拒绝、输出上限、与 Python zlib 输出交叉验证），以及轮询器 self-pipe（唤醒描述符）语义与 h2 池的加权负载记账。
 - 集成测试 63 个：真实 TCP 环回上的 h1/h2/HTTPS 请求往返、keep-alive 复用、chunked、重定向、h2 并发多路复用、流式响应、大体积流控往返、gRPC unary/服务端流/客户端流/双向流与错误状态/trailers/deadline 执行、gzip 往返、`grpc.health.v1.Health` `Check` + `Watch`、RFC 7540 §3.2 `h2c` Upgrade、**TLS 策略/加固**（信任拒绝、过期证书、不可信签发链、自签名但显式信任、主机名不匹配、ALPN 一致、TLS 1.2 与 TLS 1.3 分别用 RSA / P-384 / Ed25519 身份的完整往返、纯 TLS 1.3 客户端拒绝 TLS 1.2 服务器——绝不静默降级——与 RFC 8446 降级哨兵、握手中断失败、畸形 TLS 输入存活、`verify:false`）、并发证明（慢流不阻塞同连接其他流；大量空闲流按连接而非按流占 worker；空闲连接羊群不阻塞新请求；事件调度器回收 slow-loris 并执行 `max_connections`；服务端流式响应按短节奏冲刷；单条 h2 连接并发突发不饥饿），以及 **13 个 HTTP/3 集成测试**（QUIC v1 + TLS 1.3 真实 UDP 套接字、走公共 `Client`/`Server`）：GET/POST 往返、池化连接复用、双向 256 KiB 请求/响应流控、并发多路复用、每请求 deadline 执行、双向 key update，以及 H3 TLS 安全（不信任 / 过期 / 错误证书链 / 主机名不匹配证书均在握手阶段拒绝）。
 - 加固测试 30 个：恶意帧输入（超长帧、畸形 SETTINGS/PING/WINDOW_UPDATE、流控窗口溢出、HPACK 头表与 Huffman 炸弹、截断/EOS Huffman、伪头顺序、`content-length` 不一致、非法 `transfer-encoding`/`connection` 系头、两端 `SETTINGS_MAX_CONCURRENT_STREAMS` 强制、`h2c` 存活检测：SETTINGS_TIMEOUT 与 keepalive 死对端检测）。
 

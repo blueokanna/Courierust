@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Client-side TLS settings for `https://` URLs.
 ///
@@ -508,11 +508,26 @@ impl Client {
         req: Request<Body>,
         priority: Priority,
     ) -> Result<crate::courierust_client::h2::H2Response> {
-        let conn = self.get_h2_conn(authority, addr, tls.as_ref(), &url.host)?;
+        // Body bytes feed the weighted connection-selection load: a
+        // connection carrying a large upload is more expensive on the wire
+        // than one carrying several header-only RPCs, so the pool weights
+        // by size, not just by stream count. Unknown (streaming) bodies
+        // weigh 0 — an honest "don't know", not a guess.
+        let body_bytes = req.body.len().unwrap_or(0);
+        let conn = self.get_h2_conn(authority, addr, tls.as_ref(), &url.host, body_bytes)?;
         let fields = h2::request_fields(&req, &url.scheme, authority);
         let (tx, rx) = std::sync::mpsc::channel();
         let cmd = build_h2_cmd(fields, req.body, priority, tx);
-        self.send_h2_cmd(conn, authority, addr, tls.as_ref(), &url.host, cmd, rx)
+        self.send_h2_cmd(
+            conn,
+            authority,
+            addr,
+            tls.as_ref(),
+            &url.host,
+            cmd,
+            rx,
+            body_bytes,
+        )
     }
 
     /// Perform a request over a pooled h3 (QUIC) connection. The first
@@ -684,8 +699,9 @@ impl Client {
                 // The driver is gone; open a fresh connection and retry.
                 conn.accepting.store(false, Ordering::Release);
                 conn.release();
+                // `get_h3_conn` already reserves for the retried request;
+                // a second `reserve` here would leak one unit per retry.
                 let fresh = self.get_h3_conn(authority, addr, hostname, &options)?;
-                fresh.reserve();
                 let (tx2, rx2) = std::sync::mpsc::channel();
                 let cmd2 = match cmd {
                     H3Cmd::Request { request, .. } => H3Cmd::Request {
@@ -719,18 +735,27 @@ impl Client {
         addr: SocketAddr,
         req: Request<Body>,
     ) -> Result<Response<Body>> {
+        let body_bytes = req.body.len().unwrap_or(0);
         let pooled = {
             let mut pools = self.inner.h2_pool.lock().unwrap();
             pools.get_mut(authority).and_then(|list| {
                 list.retain(|c| c.accepting.load(Ordering::Acquire));
                 let max_connections = self.inner.config.max_connections_per_host.max(1);
-                let conn = list
+                // Idle-first (see `get_h2_conn`): a free connection is
+                // reused regardless of its EWMA history.
+                let idle = list
                     .iter()
                     .filter(|c| c.accepting.load(Ordering::Acquire))
-                    .min_by_key(|c| c.reservations())
-                    .cloned()?;
-                if conn.reservations() == 0 || list.len() >= max_connections {
-                    conn.reserve();
+                    .find(|c| c.is_idle())
+                    .cloned();
+                let conn = idle.or_else(|| {
+                    list.iter()
+                        .filter(|c| c.accepting.load(Ordering::Acquire))
+                        .min_by_key(|c| c.load())
+                        .cloned()
+                })?;
+                if conn.is_idle() || list.len() >= max_connections {
+                    conn.reserve(body_bytes);
                     Some(conn)
                 } else {
                     None
@@ -742,7 +767,7 @@ impl Client {
             let (tx, rx) = std::sync::mpsc::channel();
             let cmd = build_h2_cmd(fields, req.body, Priority::default(), tx);
             return self
-                .send_h2_cmd(conn, authority, addr, None, &url.host, cmd, rx)
+                .send_h2_cmd(conn, authority, addr, None, &url.host, cmd, rx, body_bytes)
                 .map(|raw| Response {
                     status: raw.head.status,
                     version: raw.head.version,
@@ -766,7 +791,7 @@ impl Client {
                 let cs = crate::courierust_net::ConnStream::plain(stream);
                 let (tx, rx) = std::sync::mpsc::channel();
                 let conn = h2::start_upgraded(cs, &self.inner.config, seed, tx)?;
-                conn.reserve();
+                conn.reserve(body_bytes);
                 {
                     let mut pools = self.inner.h2_pool.lock().unwrap();
                     let list = pools.entry(authority.to_string()).or_default();
@@ -779,7 +804,7 @@ impl Client {
                     .recv()
                     .map_err(|_| Error::canceled("h2 driver closed the channel"))
                     .and_then(|result| result);
-                conn.release();
+                conn.release(body_bytes);
                 let raw = raw?;
                 Ok(Response {
                     status: raw.head.status,
@@ -807,7 +832,9 @@ impl Client {
     }
 
     /// Send a driver command, retrying once on a fresh connection if the
-    /// driver is gone, then wait for the reply.
+    /// driver is gone, then wait for the reply. `body_bytes` is the same
+    /// value the pool reserved with, so the weighted reservation is
+    /// released exactly once on every path.
     //
     // The `authority`/`addr`/`tls`/`hostname` bundle is deliberately kept
     // flat here (and in `get_h2_conn`) so the retry path
@@ -822,23 +849,28 @@ impl Client {
         hostname: &str,
         cmd: H2Cmd,
         rx: std::sync::mpsc::Receiver<Result<crate::courierust_client::h2::H2Response>>,
+        body_bytes: usize,
     ) -> Result<crate::courierust_client::h2::H2Response> {
         match conn.tx.send(cmd) {
             Ok(()) => {
+                let started = Instant::now();
                 let result = rx
                     .recv()
                     .map_err(|_| Error::canceled("h2 driver closed the channel"))
                     .and_then(|result| result);
-                conn.release();
+                conn.note_service_us(started.elapsed().as_micros() as u64);
+                conn.release(body_bytes);
                 result
             }
             Err(std::sync::mpsc::SendError(cmd)) => {
                 conn.accepting.store(false, Ordering::Release);
-                conn.release();
-                let fresh = self.get_h2_conn(authority, addr, tls, hostname)?;
-                fresh.reserve();
+                conn.release(body_bytes);
+                // `get_h2_conn` already reserves for the retried request;
+                // a second `reserve` here would leak one unit per retry.
+                let fresh = self.get_h2_conn(authority, addr, tls, hostname, body_bytes)?;
                 let (tx2, rx2) = std::sync::mpsc::channel();
                 let cmd2 = retarget_reply(cmd, tx2);
+                let started = Instant::now();
                 let result = match fresh.tx.send(cmd2) {
                     Ok(()) => rx2
                         .recv()
@@ -846,7 +878,8 @@ impl Client {
                         .and_then(|result| result),
                     Err(_) => Err(Error::canceled("h2 driver is gone")),
                 };
-                fresh.release();
+                fresh.note_service_us(started.elapsed().as_micros() as u64);
+                fresh.release(body_bytes);
                 result
             }
         }
@@ -858,6 +891,7 @@ impl Client {
         addr: SocketAddr,
         tls: Option<&crate::courierust_tls::TlsConnector>,
         hostname: &str,
+        body_bytes: usize,
     ) -> Result<H2Conn> {
         let max_connections = self.inner.config.max_connections_per_host.max(1);
         // Opening a connection (TCP connect + optional TLS handshake +
@@ -877,15 +911,31 @@ impl Client {
                 let mut pending = self.inner.pending_h2_opens.lock().unwrap();
                 let list = pools.entry(authority.to_string()).or_default();
                 list.retain(|c| c.accepting.load(Ordering::Acquire));
+                // An idle connection is free regardless of its latency
+                // history: prefer it outright, so a stale EWMA sample can
+                // never block keep-alive reuse (an idle connection's EWMA
+                // only decays on new samples, so a weighted-min pick that
+                // considered it would skip it forever).
+                if let Some(conn) = list
+                    .iter()
+                    .filter(|c| c.accepting.load(Ordering::Acquire))
+                    .find(|c| c.is_idle())
+                    .cloned()
+                {
+                    conn.reserve(body_bytes);
+                    return Ok(conn);
+                }
+                // All busy. At the per-authority cap pick the least
+                // weighted load (streams + body bytes + EWMA); under the
+                // cap open a fresh connection for wire parallelism.
                 let least_loaded = list
                     .iter()
                     .filter(|c| c.accepting.load(Ordering::Acquire))
-                    .min_by_key(|c| c.reservations())
+                    .min_by_key(|c| c.load())
                     .cloned();
-
                 if let Some(conn) = least_loaded {
-                    if conn.reservations() == 0 || list.len() >= max_connections {
-                        conn.reserve();
+                    if list.len() >= max_connections {
+                        conn.reserve(body_bytes);
                         return Ok(conn);
                     }
                 }
@@ -929,7 +979,7 @@ impl Client {
             })();
             match opened {
                 Ok(conn) => {
-                    conn.reserve();
+                    conn.reserve(body_bytes);
                     return Ok(conn);
                 }
                 Err(e) => {
@@ -947,10 +997,10 @@ impl Client {
         let conn = list
             .iter()
             .filter(|c| c.accepting.load(Ordering::Acquire))
-            .min_by_key(|c| c.reservations())
+            .min_by_key(|c| c.load())
             .cloned()
             .ok_or_else(|| Error::canceled("no accepting h2 connection"))?;
-        conn.reserve();
+        conn.reserve(body_bytes);
         Ok(conn)
     }
 

@@ -79,6 +79,12 @@ pub struct Stats {
     pub h3_udp_recv_syscalls: Arc<AtomicUsize>,
     /// UDP send calls made by the HTTP/3 reactor/client.
     pub h3_udp_send_syscalls: Arc<AtomicUsize>,
+    /// Times an ACK was held back by an un-expired batch deadline (a
+    /// straggler / duplicate arm).
+    pub h3_ack_deferred: Arc<AtomicUsize>,
+    /// Times a send was blocked by a full congestion window. Each
+    /// increment is one flow-control round that had to wait for an ACK
+    pub h3_credit_stalls: Arc<AtomicUsize>,
 }
 
 impl Stats {
@@ -120,6 +126,8 @@ impl Stats {
             h3_queue_depth_peak: self.h3_queue_depth_peak.load(Ordering::Relaxed),
             h3_udp_recv_syscalls: self.h3_udp_recv_syscalls.load(Ordering::Relaxed),
             h3_udp_send_syscalls: self.h3_udp_send_syscalls.load(Ordering::Relaxed),
+            h3_ack_deferred: self.h3_ack_deferred.load(Ordering::Relaxed),
+            h3_credit_stalls: self.h3_credit_stalls.load(Ordering::Relaxed),
         }
     }
 
@@ -143,9 +151,6 @@ impl Stats {
         if amount == 0 {
             return;
         }
-        // `fetch_update` (Rust 1.45) retries the CAS so the decrement is
-        // always applied; `try_update` (Rust 1.95) is above our MSRV and
-        // can be lost under contention, overstating the live counter.
         let _ = target.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(current.saturating_sub(amount))
         });
@@ -252,13 +257,17 @@ pub struct StatsSnapshot {
     pub h3_udp_recv_syscalls: usize,
     /// HTTP/3 UDP send calls.
     pub h3_udp_send_syscalls: usize,
+    /// HTTP/3 ACKs held back by an un-expired batch deadline.
+    pub h3_ack_deferred: usize,
+    /// HTTP/3 sends blocked by a full congestion window.
+    pub h3_credit_stalls: usize,
 }
 
 impl StatsSnapshot {
     /// Machine-readable `|`-separated field block for benchmark output.
     pub fn render(&self) -> String {
         format!(
-            "connections_accepted={}|connections_active={}|event_poll_syscalls={}|event_wakeups={}|event_queue_depth_peak={}|h1_connections={}|h1_read_syscalls={}|h1_write_syscalls={}|h2_connections={}|h2_connections_active={}|h2_streams_total={}|h2_streams_timed_out={}|h2_streams_active={}|h2_streams_active_peak={}|h2_streams_per_connection_peak={}|h2_read_syscalls={}|h2_write_syscalls={}|h3_connections={}|h3_connections_active={}|h3_streams_total={}|h3_streams_active={}|h3_streams_active_peak={}|h3_streams_per_connection_peak={}|h3_queue_depth_peak={}|h3_udp_recv_syscalls={}|h3_udp_send_syscalls={}",
+            "connections_accepted={}|connections_active={}|event_poll_syscalls={}|event_wakeups={}|event_queue_depth_peak={}|h1_connections={}|h1_read_syscalls={}|h1_write_syscalls={}|h2_connections={}|h2_connections_active={}|h2_streams_total={}|h2_streams_timed_out={}|h2_streams_active={}|h2_streams_active_peak={}|h2_streams_per_connection_peak={}|h2_read_syscalls={}|h2_write_syscalls={}|h3_connections={}|h3_connections_active={}|h3_streams_total={}|h3_streams_active={}|h3_streams_active_peak={}|h3_streams_per_connection_peak={}|h3_queue_depth_peak={}|h3_udp_recv_syscalls={}|h3_udp_send_syscalls={}|h3_ack_deferred={}|h3_credit_stalls={}",
             self.connections_accepted,
             self.connections_active,
             self.event_poll_syscalls,
@@ -285,6 +294,8 @@ impl StatsSnapshot {
             self.h3_queue_depth_peak,
             self.h3_udp_recv_syscalls,
             self.h3_udp_send_syscalls,
+            self.h3_ack_deferred,
+            self.h3_credit_stalls,
         )
     }
 }

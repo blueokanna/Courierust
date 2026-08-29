@@ -32,6 +32,16 @@ The benchmark profile uses thin LTO and one code-generation unit. Each suite exi
 
 Each result records RPS, response throughput, P50/P75/P90/P95/P99 request latency, and the actual server thread count. `BENCH_REQUESTS` and `BENCH_SERVER_THREADS` can override the default request count and server worker count. HTTP/1.1 parallel cases raise the effective server thread count to at least the client worker count because the Linux blocking server model reserves one worker per idle keep-alive connection.
 
+## HTTP/3 (`h3` bench)
+
+The `h3` bench (`cargo bench --manifest-path benches/Cargo.toml --bench h3`) measures the pooled HTTP/3 path: a cold connect, warm sequential requests, a 64 KiB upload, a 64 KiB response download, and parallel workers over one QUIC connection. `BENCH_REQUESTS`, `H3_WORKERS`, `BENCH_BODY_BYTES`, and `BENCH_RESPONSE_BYTES` tune the load; `H3_SCENARIOS=1` runs the full body-size × direction × worker matrix and `H3_SWEEP=1` sweeps workers × ACK-delay × cwnd in child processes.
+
+The reactor's latency model is deadline-driven, not cadence-driven. The poll timeout is `max(0, next protocol deadline − now)` — the earliest pending ACK batch, loss/PTO timer, path validation, or request timeout — and the first ack-eliciting packet of every burst is acknowledged immediately (later packets coalesce into that ACK). A fixed poll tick used to gate every cwnd-limited round: each ACK waited a full `ack_delay()` plus the next poll wake, which put a multi-millisecond step into the latency tail on loopback. With immediate ACKs and deadline-folded polls, `h3_sequential` is p50 ~115 µs / max ~0.2 ms, `h3_parallel`×4 is p50 ~180 µs / p99 ~0.35 ms, and a 64 KiB upload is p50 ~1.15 ms. The `h3_ack_deferred` / `h3_credit_stalls` counters in `courierust_net::Stats` distinguish a flow paced by the ACK batch window from one paced by the congestion window.
+
+`COURIERUST_H3_ACK_DELAY_MS`, `COURIERUST_H3_MIN_ACK_DELAY_MS`, `COURIERUST_H3_CWND`, `COURIERUST_H3_SERVER_POLL_MS`, and `COURIERUST_H3_CLIENT_*_POLL_MS` override the corresponding knobs. `COURIERUST_H3_TRACE` enables a per-packet event stream (slow under load — don't leave it on for timing), and `COURIERUST_H3_TRACE_MS` enables only the per-request phase split (`total_us|send_us|wait_headers_us|recv_body_us`) so a slow path is attributable to a phase without the per-packet overhead.
+
+Loopback H3 numbers are one-runner evidence: they depend on CPU allocation, kernel scheduling, and background load. The `network` bench is the cross-host measurement, and it is reported `not_configured` when no `COURIERUST_NETWORK_URL` is supplied — never invented.
+
 ## Cross-library comparison
 
 `compare` keeps the peer fixed while measuring one implementation at a time:

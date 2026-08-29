@@ -31,6 +31,24 @@ accept 线程 ──> 事件循环（poller + 分类）──> event worker（�
 - 长时间阻塞的同步 handler 会占住一个 worker（事件驱动与否都一样）——任何同步服务器的通病。流式请用 channel body。
 - 同时服务 h2c 前导知识和 `h2c` Upgrade。
 
+## H1 每请求阶段计时
+
+`COURIERUST_H1_TRACE=1` 开启每请求分段计时，输出 `H1SEG|...` 行——一条连接建立行（`event=newconn|accept_us`），以及每个已服务请求批一条行，覆盖 1 KiB keep-alive 请求的完整九段分解：
+
+```
+accept_us    accept → 注册进 poller                      （连接建立）
+fresh_wait_us 注册 → 首次 worker 拾取                    （仅首请求）
+handoff_us   release → 下次拾取（keep-alive 往返         = last_write_to_reregistered
+             + poll_ready_to_worker_dispatch）
+dispatch_us  worker 拾取 → 读到第一个字节
+parse_us     第一个字节 → 请求完整
+handler_us   头完整 → 响应就绪
+build_us     响应 → 首次写入（序列化）
+write_us     首次写入 → 全部写完
+```
+
+输出刻意保持裸 `key=value`，方便脚本/基准分桶。环回上主导项是 `handoff_us` 和 `write_us`——reactor 往返和 socket 写入——而 `parse_us` / `handler_us` 是个位微秒。这直接回答"时间到底花在 parser 还是 handoff"。全部由环境变量门控；不设置时热路径不付任何 `Instant::now()` 成本。
+
 ## 用法
 
 ```rust

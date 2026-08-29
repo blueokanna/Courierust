@@ -18,7 +18,7 @@ use crate::courierust_net::stats::{ActiveH2Streams, Counting, Stats};
 use crate::courierust_net::ConnStream;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -82,26 +82,101 @@ pub struct H2Conn {
     pub accepting: Arc<std::sync::atomic::AtomicBool>,
     /// Number of requests currently reserved for dispatch on this driver.
     reservations: Arc<AtomicUsize>,
+    /// Request-body bytes in flight, in [`H2_BODY_UNIT`] units. A
+    /// connection carrying one 1 MiB upload is far more expensive on the
+    /// wire than one carrying four header-only RPCs, so pool selection
+    /// must see body weight, not just stream count.
+    body_load: Arc<AtomicUsize>,
+    /// EWMA of per-request service time (µs), updated by the pool after
+    /// each completed request; 0 until the first sample. Entered into
+    /// [`H2Conn::load`] with a small divisor so a genuinely slow
+    /// connection is gently de-weighted without ever dominating stream /
+    /// body load (which would make selection oscillate).
+    ewma_service_us: Arc<AtomicU64>,
+}
+
+/// One body-load unit per 64 KiB of in-flight request body: the unit at
+/// which a body starts to dominate a connection's wire usage.
+const H2_BODY_UNIT: usize = 64 * 1024;
+/// Clamp for a single request's body weight, so a multi-GiB body cannot
+/// saturate the load counter (its wire cost is bounded by the stream in
+/// any case).
+const H2_BODY_WEIGHT_CAP: usize = 256;
+/// Divisor (µs → load units) for the EWMA service-time term: 1 ms of
+/// observed service time adds one unit, comparable to one active stream.
+const H2_EWMA_DIVISOR: u64 = 1000;
+/// Upper bound for the EWMA service-time term, so one pathological sample
+/// cannot pin a connection as permanently slow.
+const H2_EWMA_CAP_US: u64 = 10_000;
+
+/// Body weight of `bytes` in [`H2_BODY_UNIT`] units, clamped.
+fn body_weight(bytes: usize) -> usize {
+    bytes.div_ceil(H2_BODY_UNIT).min(H2_BODY_WEIGHT_CAP)
 }
 
 impl H2Conn {
-    pub(crate) fn reserve(&self) {
+    pub(crate) fn reserve(&self, body_bytes: usize) {
         self.reservations.fetch_add(1, Ordering::AcqRel);
+        self.body_load
+            .fetch_add(body_weight(body_bytes), Ordering::AcqRel);
     }
 
-    pub(crate) fn release(&self) {
-        // `fetch_update` (Rust 1.45) retries the CAS, so a release under
-        // contention is never dropped; `try_update` (Rust 1.95) is both
-        // above our MSRV and can return `Err`, leaking a reservation.
+    pub(crate) fn release(&self, body_bytes: usize) {
         let _ = self
             .reservations
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                 Some(value.saturating_sub(1))
             });
+        let _ = self
+            .body_load
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                Some(value.saturating_sub(body_weight(body_bytes)))
+            });
     }
 
-    pub(crate) fn reservations(&self) -> usize {
-        self.reservations.load(Ordering::Acquire)
+    pub(crate) fn is_idle(&self) -> bool {
+        self.reservations.load(Ordering::Acquire) == 0
+    }
+
+    /// The pool's selection load: active streams plus body weight plus a
+    /// bounded EWMA service-time term. Lower is less loaded. Picking the
+    /// minimum at the per-authority connection cap spreads work onto the
+    /// connection that is cheapest on the wire, not merely the one with
+    /// the fewest concurrent streams.
+    pub(crate) fn load(&self) -> usize {
+        let streams = self.reservations.load(Ordering::Acquire);
+        let body = self.body_load.load(Ordering::Acquire);
+        let ewma = self
+            .ewma_service_us
+            .load(Ordering::Acquire)
+            .min(H2_EWMA_CAP_US);
+        streams
+            .saturating_add(body)
+            .saturating_add((ewma / H2_EWMA_DIVISOR) as usize)
+    }
+
+    /// Fold one completed request's service time into the EWMA. The
+    /// sample is the wall time from command dispatch to response delivery
+    /// (channel wait + wire + peer), so a genuinely slow peer raises the
+    /// term and the connection is de-weighted at the selection cap.
+    pub(crate) fn note_service_us(&self, sample_us: u64) {
+        let mut current = self.ewma_service_us.load(Ordering::Relaxed);
+        loop {
+            let next = if current == 0 {
+                sample_us.min(H2_EWMA_CAP_US)
+            } else {
+                ((current * 7 + sample_us) / 8).min(H2_EWMA_CAP_US)
+            };
+            match self.ewma_service_us.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
     }
 }
 
@@ -184,9 +259,8 @@ fn start_inner(
     let accepting = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let accepting2 = accepting.clone();
     let reservations = Arc::new(AtomicUsize::new(0));
-    // Transport call counters: real ones when stats are attached, inert
-    // dummies otherwise (a relaxed atomic per read/write is far below
-    // the syscall cost it labels).
+    let body_load = Arc::new(AtomicUsize::new(0));
+    let ewma_service_us = Arc::new(AtomicU64::new(0));
     let (reads, writes) = match cfg.stats.as_deref() {
         Some(s) => (s.h2_read_syscalls.clone(), s.h2_write_syscalls.clone()),
         None => (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
@@ -216,6 +290,8 @@ fn start_inner(
         peer,
         accepting,
         reservations,
+        body_load,
+        ewma_service_us,
     })
 }
 
@@ -249,7 +325,6 @@ fn driver(
 ) {
     let _ = stream.configure(Some(DRIVER_READ_TIMEOUT));
     let stats = stats.as_deref();
-    // Decrement the live-connection counter on every exit path (RAII).
     let _active_guard = stats.map(|s| ActiveGuard(s.h2_connections_active.clone()));
     let mut conn = if seed.is_empty() {
         Connection::new(
@@ -299,8 +374,6 @@ fn driver(
     let _ = conn.poll();
 
     loop {
-        // 1. Drain commands (deferred first: they only wait because a
-        // stream slot was unavailable, and a slot may have just freed).
         if !retry_deferred(
             &mut conn,
             &mut pending,
@@ -331,9 +404,6 @@ fn driver(
             }
         }
 
-        // Use the protocol stream table rather than the application pending
-        // map: a response body can already be delivered while its stream is
-        // still open and consuming flow-control credit.
         stream_stats.set(conn.open_stream_count());
 
         let has_work =
@@ -1224,4 +1294,98 @@ fn _field(name: &str, value: &str) -> HeaderField {
         HeaderName::from_hpack_bytes(name.as_bytes()).unwrap(),
         HeaderValue::from_bytes(value.as_bytes()).unwrap(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bare `H2Conn` with inert shared state, for accounting tests that
+    /// never touch the driver thread.
+    fn test_conn() -> H2Conn {
+        let (tx, _rx) = channel::<H2Cmd>();
+        H2Conn {
+            tx,
+            peer: "127.0.0.1:1".parse().unwrap(),
+            accepting: Arc::new(AtomicBool::new(true)),
+            reservations: Arc::new(AtomicUsize::new(0)),
+            body_load: Arc::new(AtomicUsize::new(0)),
+            ewma_service_us: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    #[test]
+    fn reserve_release_balances_to_idle() {
+        let conn = test_conn();
+        assert!(conn.is_idle(), "fresh connection must be idle");
+        // A header-only request and a 1 MiB body request.
+        conn.reserve(0);
+        conn.reserve(1 << 20);
+        assert!(!conn.is_idle());
+        conn.release(0);
+        conn.release(1 << 20);
+        assert!(
+            conn.is_idle(),
+            "balanced reserve/release must return to idle"
+        );
+        assert_eq!(conn.load(), 0);
+    }
+
+    #[test]
+    fn load_weights_bodies_over_stream_count() {
+        let conn = test_conn();
+        // One connection: a single 1 MiB upload (1 stream, ~16 body units).
+        conn.reserve(1 << 20);
+        let big_upload_load = conn.load();
+        // Another connection: four header-only requests (4 streams, 0 body).
+        conn.release(1 << 20);
+        for _ in 0..4 {
+            conn.reserve(0);
+        }
+        let four_small_load = conn.load();
+        assert!(
+            big_upload_load > four_small_load,
+            "one 1 MiB upload must outweigh four header-only RPCs: {big_upload_load} vs {four_small_load}"
+        );
+        // And a header-only request is cheaper than a 64 KiB body request.
+        conn.release(0);
+        conn.release(0);
+        conn.release(0);
+        conn.release(0);
+        conn.reserve(64 * 1024);
+        assert_eq!(conn.load(), 2, "one stream + one 64 KiB body unit");
+    }
+
+    #[test]
+    fn ewma_updates_and_caps() {
+        let conn = test_conn();
+        assert_eq!(conn.load(), 0, "no samples yet -> no latency term");
+        conn.note_service_us(1_000); // first sample seeds the EWMA
+        conn.note_service_us(1_000);
+        conn.note_service_us(1_000);
+        assert_eq!(conn.load(), 1, "1 ms of service time adds one unit");
+        // A pathological sample is capped, so load stays bounded.
+        conn.note_service_us(60_000_000);
+        assert!(conn.load() <= 10 + 1, "EWMA term must stay within its cap");
+    }
+
+    #[test]
+    fn idle_wins_over_stale_ewma() {
+        let conn = test_conn();
+        // One pathological request leaves a high EWMA term…
+        conn.note_service_us(60_000_000);
+        // …but once released the connection is idle again. The pool must
+        // prefer it on that basis (a free connection is free regardless of
+        // latency history); `load` alone would skip it forever because an
+        // idle connection's EWMA only decays on new samples.
+        assert!(conn.is_idle(), "released connection must be idle");
+        assert!(
+            conn.load() > 0,
+            "the EWMA term still shows in load, which is why idle-first matters"
+        );
+        conn.reserve(0);
+        assert!(!conn.is_idle());
+        conn.release(0);
+        assert!(conn.is_idle());
+    }
 }

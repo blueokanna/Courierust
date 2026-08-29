@@ -766,6 +766,14 @@ fn run_client_driver(
             let remaining = deadline.saturating_duration_since(now);
             wait_ms = wait_ms.min(remaining.as_millis().min(i64::MAX as u128) as i64);
         }
+        // Fold QUIC protocol deadlines (pending ACK batch, loss/PTO
+        // timers, path validation) into the poll: a deferred ACK or a
+        // loss timer must fire at its absolute deadline, not on the next
+        // fixed 5 ms tick — that tick is the H3 loopback tail.
+        if let Some(deadline) = conn.transport.earliest_deadline() {
+            let remaining = deadline.saturating_duration_since(now);
+            wait_ms = wait_ms.min(remaining.as_millis().min(i64::MAX as u128) as i64);
+        }
         let wait_started = Instant::now();
         if h3_packet_trace() {
             eprintln!(
@@ -955,11 +963,28 @@ fn run_server(
         // promptly. A lost self-pipe wake would otherwise park it for a
         // full poll timeout; poll tightly with work outstanding (the wake
         // still wins the moment it fires).
-        let poll_ms = if active_tasks.load(Ordering::Acquire) > 0 {
+        let mut poll_ms = if active_tasks.load(Ordering::Acquire) > 0 {
             server_poll_ms().min(1)
         } else {
             server_poll_ms()
         };
+        // Fold the earliest QUIC protocol deadline (pending ACK batch,
+        // loss/PTO timer, path validation) into the poll timeout: a
+        // deferred ACK or loss timer must fire at its absolute deadline,
+        // not on the next fixed tick. Without this, a cwnd-limited
+        // upload/response round sleeps the full idle poll (5 ms) instead
+        // of waking at the ACK deadline — the loopback quantum.
+        let deadline_now = Instant::now();
+        let mut protocol_deadline: Option<Instant> = None;
+        for connection in state.connections.values() {
+            if let Some(deadline) = connection.transport.earliest_deadline() {
+                protocol_deadline = Some(protocol_deadline.map_or(deadline, |e| e.min(deadline)));
+            }
+        }
+        if let Some(deadline) = protocol_deadline {
+            let remaining = deadline.saturating_duration_since(deadline_now);
+            poll_ms = poll_ms.min(remaining.as_millis().min(i32::MAX as u128) as i32);
+        }
         let ready = poller
             .wait(poll_ms, Some(wake_fd))
             .map_err(|e| io_error(e.to_string()))?;
@@ -1289,10 +1314,17 @@ impl Drop for H3ActiveGuard {
     }
 }
 
-/// Slow-request trace threshold in µs. `None` disables tracing. Gated by
-/// `COURIERUST_H3_TRACE` (enable) and `COURIERUST_H3_TRACE_MS` (default 2).
+/// Slow-request trace threshold in µs. `None` disables tracing. Enabled by
+/// `COURIERUST_H3_TRACE_MS` (default 2), optionally combined with
+/// `COURIERUST_H3_TRACE` — the per-request phase trace alone does NOT
+/// enable the (expensive) per-packet `H3TRACE` stream, so a phase split
+/// can be measured without the eprintln overhead distorting timing.
 fn h3_trace_threshold_us() -> Option<u64> {
-    std::env::var_os("COURIERUST_H3_TRACE")?;
+    if std::env::var_os("COURIERUST_H3_TRACE").is_none()
+        && std::env::var_os("COURIERUST_H3_TRACE_MS").is_none()
+    {
+        return None;
+    }
     let ms = std::env::var("COURIERUST_H3_TRACE_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -1552,11 +1584,9 @@ impl ClientConnection {
             {
                 self.transport.initiate_path_validation(socket, source)?;
             }
-            let mut ack = false;
             for frame in frames {
                 match frame {
                     QFrame::Crypto { offset, data } if level == INITIAL => {
-                        ack = true;
                         let ready = self.initial_crypto.insert(offset, &data)?;
                         if !ready.is_empty() {
                             if self.tls_server_hello {
@@ -1586,7 +1616,6 @@ impl ClientConnection {
                         }
                     }
                     QFrame::Crypto { offset, data } if level == HANDSHAKE => {
-                        ack = true;
                         let ready = self.handshake_crypto.insert(offset, &data)?;
                         if !ready.is_empty() {
                             if self.handshake_complete {
@@ -1623,7 +1652,6 @@ impl ClientConnection {
                             }
                         }
                         self.receive_stream(stream_id, offset.unwrap_or(0), &data, fin)?;
-                        ack = true;
                     }
                     QFrame::ConnectionClose { .. } => {
                         self.peer_closed = true;
@@ -1631,9 +1659,6 @@ impl ClientConnection {
                     }
                     _ => {}
                 }
-            }
-            if ack {
-                self.transport.ack(level);
             }
         }
         if self.handshake_complete && self.control_received {
@@ -2413,11 +2438,9 @@ impl ServerConnection {
             {
                 self.transport.initiate_path_validation(socket, source)?;
             }
-            let mut ack = false;
             for frame in frames {
                 match frame {
                     QFrame::Crypto { offset, data } if level == INITIAL => {
-                        ack = true;
                         let ready = self.initial_crypto.insert(offset, &data)?;
                         if !ready.is_empty() {
                             if self.tls_ready {
@@ -2461,7 +2484,6 @@ impl ServerConnection {
                         }
                     }
                     QFrame::Crypto { offset, data } if level == HANDSHAKE => {
-                        ack = true;
                         let ready = self.handshake_crypto.insert(offset, &data)?;
                         if !ready.is_empty() {
                             if !self.tls_ready || self.handshake_complete {
@@ -2509,7 +2531,6 @@ impl ServerConnection {
                             return Err(protocol("HTTP/3 stream before TLS handshake completion"));
                         }
                         self.receive_stream(stream_id, offset.unwrap_or(0), &data, fin)?;
-                        ack = true;
                     }
                     QFrame::ConnectionClose { .. } => {
                         self.peer_closed = true;
@@ -2517,9 +2538,6 @@ impl ServerConnection {
                     }
                     _ => {}
                 }
-            }
-            if ack {
-                self.transport.ack(level);
             }
         }
         Ok(())
@@ -3975,9 +3993,6 @@ fn version_negotiation_versions(buf: &[u8]) -> Result<Option<VersionNegotiationP
         return Ok(None);
     }
     let versions = &buf[identity.payload_offset..];
-    // `% 4 != 0` is total (usize remainder never overflows; constant
-    // non-zero divisor cannot panic), and guarantees `chunks_exact(4)`
-    // below yields only full 4-byte chunks.
     if versions.is_empty() || versions.len() % 4 != 0 {
         return Err(protocol("malformed QUIC Version Negotiation packet"));
     }
@@ -4267,8 +4282,6 @@ impl QuicTransport {
         self.peer_max_streams_uni = parameters.initial_max_streams_uni;
         self.peer_stateless_reset_token = parameters.stateless_reset_token;
         self.peer_disable_active_migration = parameters.disable_active_migration;
-        // PMTUD: never send above the peer's advertised receive ceiling
-        // (RFC 9000 §14.1) and never above the UDP hard limit.
         let peer_cap = usize::try_from(parameters.max_udp_payload_size).unwrap_or(MAX_DATAGRAM);
         self.max_packet_size = peer_cap.clamp(1200, MAX_DATAGRAM);
     }
@@ -4280,7 +4293,6 @@ impl QuicTransport {
         let Some(token) = &self.peer_stateless_reset_token else {
             return false;
         };
-        // Short header (0x40..=0x7f); at least 1 header + 16 token bytes.
         if datagram.is_empty() || datagram[0] & 0x80 != 0 || datagram[0] & 0x40 == 0 {
             return false;
         }
@@ -4364,9 +4376,6 @@ impl QuicTransport {
         if length == 0 {
             return Ok(());
         }
-        // RFC 9000 §4.6 stream-count limit: the peer may only open streams
-        // below the cumulative limit we last advertised. Track the highest
-        // peer-initiated stream index so MAX_STREAMS can be replenished.
         if stream_id::is_client_initiated(id) == self.server {
             let (limit, counter) = if stream_id::is_unidirectional(id) {
                 (self.local_max_streams_uni, &mut self.received_streams_uni)
@@ -4389,9 +4398,6 @@ impl QuicTransport {
         } else {
             self.local_max_stream_data_bidi_remote
         };
-        // The peer may use the *last advertised* limit for this stream
-        // (raised by `MAX_STREAM_DATA` replenishment), not merely the
-        // initial transport parameter.
         let advertised = self
             .local_stream_limits
             .get(&id)
@@ -4414,15 +4420,10 @@ impl QuicTransport {
 
     fn open(&mut self, datagram: &mut [u8]) -> Result<Option<OpenPacket>> {
         if datagram.len() < 21 || datagram.len() > MAX_DATAGRAM {
-            // RFC 9000 §5.2: an endpoint may drop a packet it cannot
-            // process (a short or oversized tail in a coalesced datagram).
             return Ok(None);
         }
         let meta = match PacketMeta::parse(datagram, self.local_cid.len()) {
             Ok(meta) => meta,
-            // RFC 9000 §5.2: malformed/unparseable packets are dropped,
-            // never treated as a connection error (the header is not
-            // authenticated).
             Err(_) => return Ok(None),
         };
         let (level, key) = if meta.long_type == Some(LongType::Initial) {
@@ -4454,8 +4455,6 @@ impl QuicTransport {
             .largest_received
             .map(|pn| pn.saturating_add(1))
             .unwrap_or(0);
-        // Common case: current key with a single copy. The key-update path
-        // is only exercised when the current key fails.
         let current_phase = if level == APPLICATION {
             Some(self.application_recv_phase)
         } else {
@@ -4526,23 +4525,11 @@ impl QuicTransport {
                     meta.token.len()
                 );
             }
-            // RFC 9000 §10.3.3: an endpoint MUST NOT close a connection
-            // because a packet fails to authenticate. The packet may be
-            // stale (a late duplicate from before a key update), forged,
-            // or corrupted in transit — in every case it is dropped, and
-            // the connection survives. A validated stateless reset is
-            // detected by the caller from this same drop path.
             return Ok(None);
         };
         if level == APPLICATION && next_phase {
             self.application_recv = Some(candidate);
             self.application_recv_phase = !self.application_recv_phase;
-            // RFC 9001 §6.2: on detecting a peer key update, the receiver
-            // MUST respond by updating its own send keys to the new phase
-            // (the key phase is shared between both directions) before it
-            // may initiate further updates. If we had already initiated an
-            // update of our own, the peer's new-phase packet confirms it,
-            // so the one-update-at-a-time guard clears here.
             if self.application_send_phase != self.application_recv_phase {
                 if let Some(next_send) = self
                     .application_send
@@ -4568,12 +4555,11 @@ impl QuicTransport {
                 );
             }
         }
+        let adaptive_delay = self.current_ack_delay();
         let space = &mut self.spaces[level];
         if !space.received.insert(pn) {
-            // A duplicate packet: the peer likely missed our ACK. Re-arm
-            // the batch deadline so it is acknowledged promptly.
             space.ack_pending = true;
-            space.ack_deadline = Some(Instant::now() + ack_delay());
+            space.ack_deadline = Some(Instant::now() + adaptive_delay);
             return Ok(Some((level, pn, Vec::new(), meta.packet_end)));
         }
         if space.received.len() > 8192 {
@@ -4650,8 +4636,14 @@ impl QuicTransport {
             }
         }
         if ack_eliciting {
-            space.ack_pending = true;
-            space.ack_deadline = Some(Instant::now() + ack_delay());
+            if !space.ack_pending {
+                space.ack_pending = true;
+                space.ack_deadline = None;
+            } else if let Some(deadline) = space.ack_deadline {
+                if deadline > Instant::now() {
+                    space.ack_deadline = Some(Instant::now() + adaptive_delay);
+                }
+            }
         }
         if acknowledged_bytes != 0 {
             self.on_acknowledgement(acknowledged_bytes, rtt_sample, level);
@@ -4666,8 +4658,6 @@ impl QuicTransport {
                 self.smoothed_rtt = Some(sample);
                 self.rtt_variance = sample / 2;
             } else if let Some(smoothed) = self.smoothed_rtt {
-                // `Duration::abs_diff` is only stable from Rust 1.85; this
-                // branch keeps MSRV 1.78 (both operands are `Duration`).
                 let difference = if smoothed >= sample {
                     smoothed - sample
                 } else {
@@ -4722,10 +4712,6 @@ impl QuicTransport {
             .checked_mul(TIME_THRESHOLD_NUM)
             .map(|v| v / TIME_THRESHOLD_DEN)
             .unwrap_or(rtt);
-        // RFC 9002 §6.1.2: the peer may delay its ACK by up to its
-        // advertised `max_ack_delay`; our own ACK batching is the same
-        // magnitude, so both directions are absorbed before declaring
-        // loss.
         (scaled + ack_delay()).max(LOSS_TIMEOUT_FLOOR)
     }
 
@@ -5002,35 +4988,17 @@ impl QuicTransport {
         window.clamp(min_ack_delay(), ack_delay())
     }
 
-    fn ack(&mut self, level: LevelIndex) {
-        let delay = self.current_ack_delay();
-        let space = &mut self.spaces[level];
-        if !space.ack_pending {
-            // RFC 9002 §6.2.2 interactive fast path: acknowledge the first
-            // ack-eliciting packet of a batch immediately (deadline None).
-            // Parking every ACK behind a fixed window is precisely the H3
-            // loopback tail — each cwnd-limited round waited a full
-            // ACK_DELAY. Stragglers of the same burst still coalesce.
-            space.ack_pending = true;
-            space.ack_deadline = None;
-        } else if space.ack_deadline.is_some() {
-            // A burst is coalescing: re-arm the adaptive window so late
-            // arrivals join the pending ACK instead of forcing a second.
-            space.ack_deadline = Some(Instant::now() + delay);
-        }
-    }
-
     fn flush_ack(&mut self, socket: &UdpSocket, level: LevelIndex) -> Result<()> {
         if !self.spaces[level].ack_pending {
             return Ok(());
         }
-        // Batch ACKs (RFC 9002 §6.2.2): hold the ACK until its window
-        // passes so a burst yields one ACK instead of one per datagram.
-        // `ack_deadline == None` is the interactive fast path — due now.
         if self.spaces[level]
             .ack_deadline
             .is_some_and(|deadline| deadline > Instant::now())
         {
+            if let Some(stats) = self.stats.as_deref() {
+                stats.h3_ack_deferred.fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(());
         }
         let Some(largest) = self.spaces[level].largest_received else {
@@ -5049,10 +5017,6 @@ impl QuicTransport {
                 self.spaces[level].ack_deadline = None;
                 Ok(())
             }
-            // A full send buffer defers the ACK: `ack_pending` stays set,
-            // the peer's retransmission (or the next datagram) retries it.
-            // Treating this as fatal would tear the connection down over
-            // transient backpressure.
             Err(error) if error.kind == ErrorKind::WouldBlock => Ok(()),
             Err(error) => Err(error),
         }
@@ -5224,14 +5188,6 @@ impl QuicTransport {
     /// recovery (`expected = largest_received + 1`) valid across phases.
     fn maybe_key_update(&mut self) {
         let threshold = key_update_threshold();
-        // RFC 9001 §6.2 one-at-a-time rule: an endpoint that has initiated
-        // a key update MUST NOT initiate another until the peer has
-        // confirmed the new phase by sending a packet protected with the
-        // new keys (the receiver's key-update path clears this flag).
-        // Without the guard, two endpoints that independently reach their
-        // packet counters drift apart by a whole generation and become
-        // undecryptable: the phase bit only toggles per generation, so a
-        // two-generation drift is indistinguishable from the old phase.
         if self.send_update_pending
             || self.application_send.is_none()
             || self.key_phase_packets < threshold
@@ -5277,11 +5233,6 @@ impl QuicTransport {
                     if !packet.ack_eliciting {
                         continue;
                     }
-                    // A retransmit previously blocked by the congestion
-                    // window is retried on the next tick (it does not
-                    // count as a fresh loss); only a fresh time-threshold
-                    // expiry increments the retransmit budget and halves
-                    // the window.
                     let pending = packet.pending_resend;
                     let aged_out = now.duration_since(packet.sent_at) >= lost_threshold;
                     if pending || aged_out {
@@ -5322,11 +5273,6 @@ impl QuicTransport {
                     space.sent.remove(pn);
                 }
             }
-            // RFC 9002 §6.2.1 PTO: if nothing was declared lost but an
-            // ack-eliciting packet has been in flight longer than the
-            // PTO, send a single probe. The probe is a retransmission
-            // that does NOT collapse the congestion window — only
-            // time-threshold loss does.
             if expired.is_empty() && !probe_armed {
                 if let Some((pn, sent_at)) = earliest_ack_eliciting {
                     if now.duration_since(sent_at) >= pto {
@@ -5368,11 +5314,6 @@ impl QuicTransport {
                 retransmits,
             ) {
                 Ok(()) => {}
-                // Congestion window full: keep the retransmit in `sent`
-                // flagged for an immediate retry on the next tick, so the
-                // moment ACKs free credit it goes out without waiting a
-                // full loss timeout. Never tear the connection down over
-                // transient congestion.
                 Err(error) if error.kind == ErrorKind::WouldBlock => {
                     let previous = self.spaces[level].sent.insert(
                         pn,
@@ -5437,11 +5378,6 @@ impl QuicTransport {
         retransmits: u8,
         dest: Option<SocketAddr>,
     ) -> Result<()> {
-        // Piggyback a due ACK onto any outgoing datagram (RFC 9002
-        // §6.2.2): acknowledging on a packet we are already sending costs
-        // nothing and collapses the standalone ACK round that otherwise
-        // paces every cwnd-limited transfer. `flush_ack`'s own pure-ACK
-        // packet already carries one, so skip when `frames` has an ACK.
         let due_ack = !frames
             .iter()
             .any(|frame| matches!(frame, QFrame::Ack { .. }))
@@ -5449,8 +5385,6 @@ impl QuicTransport {
             && self.spaces[level]
                 .ack_deadline
                 .map_or(true, |deadline| deadline <= Instant::now());
-        // Owned scratch outlives `frames` below so the piggybacked ACK
-        // slice stays valid for the whole packet build.
         let mut piggyback = Vec::new();
         let frames = if due_ack {
             if let Some(largest) = self.spaces[level].largest_received {
@@ -5554,12 +5488,12 @@ impl QuicTransport {
         if ack_eliciting
             && self.unacknowledged_bytes().saturating_add(wire.len()) > self.congestion_window
         {
+            if let Some(stats) = self.stats.as_deref() {
+                stats.h3_credit_stalls.fetch_add(1, Ordering::Relaxed);
+            }
             return Err(Error::new(ErrorKind::WouldBlock));
         }
         if h3_packet_trace() {
-            // Per-packet event stream: which stream data this datagram
-            // carried and the cwnd/unacked state, so a slow large upload
-            // is attributable to a specific cwnd batch and its ACK round.
             let mut stream_bytes = 0usize;
             let mut first_stream = None;
             for frame in frames {
@@ -5606,6 +5540,46 @@ impl QuicTransport {
             .flat_map(|space| space.sent.values())
             .map(|packet| packet.size)
             .fold(0usize, usize::saturating_add)
+    }
+
+    /// The earliest instant at which a protocol timer fires: a pending
+    /// ACK batch deadline, the path-validation timeout, or the
+    /// loss/PTO timer of the oldest ack-eliciting packet in flight. The
+    /// reactor folds this into its poll timeout so every protocol event
+    /// is handled on time even when no datagram wakes it — without it, a
+    /// deferred ACK or loss timer waits for the next fixed poll tick,
+    /// which is the multi-millisecond H3 loopback tail.
+    fn earliest_deadline(&self) -> Option<Instant> {
+        let now = Instant::now();
+        let mut earliest: Option<Instant> = None;
+        let loss = self.loss_detection_threshold();
+        let pto = self.pto_timeout();
+        for space in &self.spaces {
+            if let Some(deadline) = space.ack_deadline {
+                earliest = Some(earliest.map_or(deadline, |e| e.min(deadline)));
+            }
+            // Loss detection / PTO: the oldest ack-eliciting packet in
+            // flight sets the timer, and the earlier of the two applies.
+            // `pending_resend` packets have no timer (they are retried on
+            // datagram wakes / the fixed poll), so they are excluded.
+            let oldest = space
+                .sent
+                .values()
+                .filter(|packet| packet.ack_eliciting && !packet.pending_resend)
+                .map(|packet| packet.sent_at)
+                .min();
+            if let Some(oldest) = oldest {
+                let deadline = oldest + loss.min(pto);
+                earliest = Some(earliest.map_or(deadline, |e| e.min(deadline)));
+            }
+        }
+        if let Some(sent) = self.path_challenge_sent {
+            let deadline = sent + PATH_VALIDATION_TIMEOUT;
+            earliest = Some(earliest.map_or(deadline, |e| e.min(deadline)));
+        }
+        // A deadline already in the past is "due now"; the caller treats
+        // that as an immediate poll return.
+        earliest.filter(|deadline| *deadline > now)
     }
 
     /// Whether any packet is in flight awaiting an ACK (drives the

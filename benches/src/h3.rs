@@ -9,18 +9,28 @@
 //!
 //! Env: `BENCH_REQUESTS` (default 1000), `H3_WORKERS` (default 8).
 //!
-//! Baseline (Windows 11, loopback, release, 2026-08-22):
-//! - `h3_connect`:      ~6-8 ms (cold)
-//! - `h3_sequential`:   ~3.5-5.4k rps, p50 ~170-260 µs, p99 ~0.3-0.6 ms
-//! - `h3_parallel`×8:   ~9-12k rps, p50 ~0.5-0.9 ms
+//! Baseline (Windows 11, loopback, release, 2026-08-29, quiet runner):
+//! - `h3_connect`:      ~4-6 ms (cold)
+//! - `h3_sequential`:   ~8.5k rps, p50 ~115 µs, p99 ~160-190 µs, max ~0.2 ms
+//! - `h3_upload` 64KiB: p50 ~1.15 ms, p99 ~1.4 ms (cwnd-paced upload)
+//! - `h3_response` 64KiB: p50 ~0.4 ms, p99 ~0.74 ms (single-burst download
+//!   once the connection's cwnd has grown)
+//! - `h3_parallel`×4:   ~20k rps, p50 ~180 µs, p99 ~0.35 ms
 //!
-//! Tail note: `h3_parallel` p99 can jump (µs→ms) on shared runners. The
-//! emitted p999/tail_ratio/stddev exist to track that — a single run is a
-//! signal, not a root cause (UDP reactor, packet queue, cwnd/ACK timers,
-//! QPACK/control flow, worker→reactor handoff, CI scheduling all shape it).
+//! The 2026-08-29 latency pass removed the fixed multi-ms tail: every
+//! ACK used to be parked behind `ack_delay()` and the reactor's fixed
+//! poll tick (`open()` armed a future deadline and the "interactive fast
+//! path" in `ack()` was dead code), so each cwnd-limited round absorbed
+//! up to the full 5 ms poll — the loopback quantum. ACKs are now sent
+//! immediately for the first packet of each burst (`ack_deadline = None`),
+//! and the poll timeout folds the absolute protocol deadlines (ACK batch,
+//! loss/PTO, path validation), so a deferred ACK or loss timer fires on
+//! time instead of on the next fixed tick.
 //!
-//! The poller raises the Windows timer to 1 ms (`timeBeginPeriod`), which
-//! removed ~1 ms periodic `select()` wakeup stalls (p99 10.7 ms → ~0.3 ms).
+//! Tail note: loopback results remain sensitive to CPU allocation,
+//! kernel scheduling and background load — compare only on the same
+//! runner under identical load. The emitted p999/tail_ratio/stddev exist
+//! to track that; a single run is a signal, not a root cause.
 
 use courierust::courierust_body::Body;
 use courierust::courierust_bytes::Bytes;

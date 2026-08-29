@@ -31,6 +31,33 @@ The whole thing is held together by a **self-pipe** — a loopback socket pair w
 - A long-blocking synchronous handler occupies a worker (event-driven or not) — any synchronous server's disease. Use channel bodies for streaming.
 - Both h2c prior knowledge and `h2c` Upgrade are served.
 
+## H1 per-request stage timing
+
+`COURIERUST_H1_TRACE=1` turns on per-request segment timing, emitted as
+`H1SEG|...` lines — a connection-setup line (`event=newconn|accept_us`) and
+one line per served request batch with the full nine-stage decomposition
+of a 1 KiB keep-alive request:
+
+```
+accept_us    accept → registered with the poller            (connection setup)
+fresh_wait_us registered → first worker pickup              (first request only)
+handoff_us   release → next pickup (keep-alive round trip   = last_write_to_reregistered
+             + poll_ready_to_worker_dispatch)
+dispatch_us  worker pickup → first byte read
+parse_us     first byte read → request complete
+handler_us   headers complete → response ready
+build_us     response → first write (serialization)
+write_us     first write → all written
+```
+
+The output is deliberately raw `key=value` pairs so a benchmark or shell
+can bucket them. On loopback the dominant terms are `handoff_us` and
+`write_us` — the reactor round trip and the socket write — while
+`parse_us` / `handler_us` are single-digit microseconds, which is exactly
+the answer to "is the time in the parser or in the handoff". Everything
+is gated behind the env var; with it unset the hot path pays no
+`Instant::now()` at all.
+
 ## Usage
 
 ```rust

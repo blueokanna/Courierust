@@ -77,9 +77,22 @@ fn seg_end(acc: &mut u64, start: Option<Instant>) {
 
 /// Control messages sent to the event loop.
 enum EventMsg {
-    NewConn { id: usize, stream: TcpStream },
-    Register { id: usize, fd: Fd, want_write: bool },
-    Closed { id: usize },
+    NewConn {
+        id: usize,
+        stream: TcpStream,
+        /// Accept → registration timing (`COURIERUST_H1_TRACE`); `None`
+        /// when tracing is off, so the message carries no timestamp
+        /// overhead in the steady state.
+        accepted_at: Option<Instant>,
+    },
+    Register {
+        id: usize,
+        fd: Fd,
+        want_write: bool,
+    },
+    Closed {
+        id: usize,
+    },
 }
 
 /// How a worker wants the connection handled next.
@@ -188,10 +201,17 @@ struct IncrRequest {
     header_bytes: usize,
     phase: Phase,
     body_limit: usize,
+    /// `COURIERUST_H1_TRACE` gate; when off, `first_read_at` stays `None`
+    /// and the hot path pays no `Instant::now()`.
+    trace: bool,
+    /// When the first byte of this request batch was read from the
+    /// socket, splitting the worker dispatch (pickup → first read) from
+    /// the parse (first read → request complete).
+    first_read_at: Option<Instant>,
 }
 
 impl IncrRequest {
-    fn new(body_limit: usize) -> Self {
+    fn new(body_limit: usize, trace: bool) -> Self {
         Self {
             buf: Vec::with_capacity(8192),
             pos: 0,
@@ -203,6 +223,8 @@ impl IncrRequest {
             header_bytes: 0,
             phase: Phase::RequestLine,
             body_limit,
+            trace,
+            first_read_at: None,
         }
     }
 
@@ -223,6 +245,9 @@ impl IncrRequest {
                 Ok(n) => {
                     got = true;
                     self.buf.extend_from_slice(&tmp[..n]);
+                    if self.trace && self.first_read_at.is_none() {
+                        self.first_read_at = Some(Instant::now());
+                    }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(got),
                 Err(e) => return Err(Error::io(e.to_string())),
@@ -511,10 +536,20 @@ struct EventConn {
     handler_us: u64,
     build_us: u64,
     write_us: u64,
+    /// Worker pickup → first byte read (the worker side of the dispatch
+    /// handoff, separate from parse so a slow first read is not blamed
+    /// on the parser).
+    dispatch_us: u64,
     trace_requests: u64,
     /// When this connection was last parked on the reactor, for the
     /// worker → reactor → worker handoff measurement.
     parked_at: Option<Instant>,
+    /// When this connection was created (classified as h1), for the
+    /// first-request dispatch-wait measurement.
+    registered_at: Option<Instant>,
+    /// When the worker picked this connection up, for the
+    /// pickup → first-read split.
+    pickup_at: Option<Instant>,
 }
 
 impl EventConn {
@@ -526,21 +561,25 @@ impl EventConn {
             ),
             None => (None, None),
         };
+        let trace = h1_trace();
         Self {
             socket: Arc::new(socket),
-            reader: IncrRequest::new(body_limit),
+            reader: IncrRequest::new(body_limit, trace),
             out: Vec::new(),
             out_pos: 0,
             keep_alive: true,
             reads,
             writes,
-            trace: h1_trace(),
+            trace,
             parse_us: 0,
             handler_us: 0,
             build_us: 0,
             write_us: 0,
+            dispatch_us: 0,
             trace_requests: 0,
             parked_at: None,
+            registered_at: trace.then(Instant::now),
+            pickup_at: None,
         }
     }
 
@@ -559,7 +598,35 @@ impl EventConn {
                 .next_request(&self.socket, self.reads.as_deref())?
             {
                 Some(req) => {
-                    seg_end(&mut self.parse_us, parse);
+                    // Stage split: `dispatch_us` is worker pickup → first
+                    // byte read; `parse_us` is first byte read → request
+                    // complete. For a request fully buffered in one read
+                    // they are two halves of the same `next_request` call;
+                    // for a partial request the first read lands inside it
+                    // and the parse accumulates across parks (the parked
+                    // interval is charged to `handoff_us`, never to parse).
+                    if trace {
+                        if let Some(first_read) = self.reader.first_read_at.take() {
+                            let done = Instant::now();
+                            if let Some(pickup) = self.pickup_at.take() {
+                                if first_read >= pickup {
+                                    self.dispatch_us = self.dispatch_us.saturating_add(
+                                        first_read.duration_since(pickup).as_micros() as u64,
+                                    );
+                                }
+                            }
+                            self.parse_us = self
+                                .parse_us
+                                .saturating_add(done.duration_since(first_read).as_micros() as u64);
+                        } else {
+                            // Defensive: no read observed (should not
+                            // happen for a completed request); fall back
+                            // to charging the whole span to parse.
+                            seg_end(&mut self.parse_us, parse);
+                        }
+                    } else {
+                        seg_end(&mut self.parse_us, parse);
+                    }
                     let request_close = courierust_h1::wants_close(&req.headers);
                     let handle = seg_start(trace);
                     let resp = handler.handle(req);
@@ -589,6 +656,13 @@ impl EventConn {
                 }
                 None => {
                     seg_end(&mut self.parse_us, parse);
+                    if trace {
+                        // A partial request parks: drop the first-read
+                        // marker so the resumed pickup measures its own
+                        // dispatch/parse split instead of inheriting the
+                        // parked interval (which belongs to `handoff_us`).
+                        self.reader.first_read_at = None;
+                    }
                     return Ok(StepOutcome::Idle);
                 }
             }
@@ -853,7 +927,11 @@ fn handle_msg(
     stats: Option<&Stats>,
 ) {
     match msg {
-        EventMsg::NewConn { id, stream } => {
+        EventMsg::NewConn {
+            id,
+            stream,
+            accepted_at,
+        } => {
             // Connection cap: beyond it, the new socket is closed
             // immediately (its fd is never registered, so the idle
             // timeout does not even have to reap it). The accept thread
@@ -880,6 +958,15 @@ fn handle_msg(
             pending.insert(id, stream);
             activity.insert(id, Instant::now());
             poller.register(id, fd, false);
+            // Trace-only: accept → registered with the poller (the
+            // connection-setup stage). Emitted as its own event line so
+            // the per-request `H1SEG` rows stay warm-path measurements.
+            if let Some(accepted_at) = accepted_at {
+                eprintln!(
+                    "H1SEG|id={id}|event=newconn|accept_us={}",
+                    accepted_at.elapsed().as_micros()
+                );
+            }
         }
         EventMsg::Register { id, fd, want_write } => {
             activity.insert(id, Instant::now());
@@ -1169,6 +1256,32 @@ fn event_loop(
     }
 }
 
+/// Emit and reset the per-request trace accumulators of one connection.
+/// Called on every dispatch pickup (reporting the previous batch) and on
+/// close (reporting the final batch, which would otherwise never be
+/// printed — a single-request connection would lose its only row).
+fn emit_trace(conn: &mut EventConn, id: usize, handoff_us: u64, fresh_wait_us: u64) {
+    if conn.trace && conn.trace_requests > 0 {
+        eprintln!(
+            "H1SEG|id={id}|reqs={}|fresh_wait_us={fresh_wait_us}|handoff_us={handoff_us}|dispatch_us={}|parse_us={}|handler_us={}|build_us={}|write_us={}",
+            conn.trace_requests,
+            conn.dispatch_us,
+            conn.parse_us,
+            conn.handler_us,
+            conn.build_us,
+            conn.write_us,
+        );
+    }
+    if conn.trace {
+        conn.trace_requests = 0;
+        conn.dispatch_us = 0;
+        conn.parse_us = 0;
+        conn.handler_us = 0;
+        conn.build_us = 0;
+        conn.write_us = 0;
+    }
+}
+
 /// One event worker: processes a *batch* of ready connections and
 /// re-registers the survivors. Each processed connection is followed by a
 /// wake byte, so the event loop re-registers it without waiting for a
@@ -1192,34 +1305,31 @@ fn event_worker(
                 None => continue,
             };
             // Handoff measurement (trace-only): how long the connection
-            // sat parked on the reactor between this worker's last release
-            // and this dispatch pickup. Kept behind `conn.trace` so the
-            // steady-state path pays no `Instant::now()` at all.
-            let handoff_us = if conn.trace {
-                conn.parked_at
+            // sat away from a worker. For a keep-alive connection this is
+            // the release → next pickup round trip (the sum of
+            // last_write_to_reregistered and
+            // poll_ready_to_worker_dispatch); for a fresh connection it
+            // is the registered → first pickup wait. Kept behind
+            // `conn.trace` so the steady-state path pays no
+            // `Instant::now()` at all.
+            let (handoff_us, fresh_wait_us) = if conn.trace {
+                let pickup_at = Instant::now();
+                let handoff = conn
+                    .parked_at
                     .take()
                     .map(|at| at.elapsed().as_micros() as u64)
-                    .unwrap_or(0)
+                    .unwrap_or(0);
+                let fresh = conn
+                    .registered_at
+                    .take()
+                    .map(|at| pickup_at.duration_since(at).as_micros() as u64)
+                    .unwrap_or(0);
+                conn.pickup_at = Some(pickup_at);
+                (handoff, fresh)
             } else {
-                0
+                (0, 0)
             };
-            if conn.trace && conn.trace_requests > 0 {
-                eprintln!(
-                    "H1SEG|id={id}|reqs={}|parse_us={}|handler_us={}|build_us={}|write_us={}|handoff_us={handoff_us}",
-                    conn.trace_requests,
-                    conn.parse_us,
-                    conn.handler_us,
-                    conn.build_us,
-                    conn.write_us,
-                );
-            }
-            if conn.trace {
-                conn.trace_requests = 0;
-                conn.parse_us = 0;
-                conn.handler_us = 0;
-                conn.build_us = 0;
-                conn.write_us = 0;
-            }
+            emit_trace(&mut conn, id, handoff_us, fresh_wait_us);
             let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 conn.step(handler, config)
             }));
@@ -1239,6 +1349,9 @@ fn event_worker(
                     wake_nudge(wake_writer);
                 }
                 StepOutcome::Close => {
+                    // Report the final request batch before the
+                    // connection leaves the reactor.
+                    emit_trace(&mut conn, id, 0, 0);
                     let _ = msg_tx.send(EventMsg::Closed { id });
                     wake_nudge(wake_writer);
                 }
@@ -1266,7 +1379,16 @@ fn accept_loop(
         }
         let id = next_id;
         next_id += 1;
-        let _ = msg_tx.send(EventMsg::NewConn { id, stream });
+        let accepted_at = if h1_trace() {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        let _ = msg_tx.send(EventMsg::NewConn {
+            id,
+            stream,
+            accepted_at,
+        });
         wake_nudge(wake_writer);
     }
 }

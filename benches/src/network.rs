@@ -128,8 +128,12 @@ fn server() -> std::io::Result<()> {
 }
 
 fn client() {
-    let url = std::env::var("COURIERUST_NETWORK_URL")
-        .expect("COURIERUST_NETWORK_URL is required for client mode");
+    let Some(url) = std::env::var("COURIERUST_NETWORK_URL").ok() else {
+        println!(
+            "NETWORK|role=client|status=not_configured|target_scope=remote|reason=COURIERUST_NETWORK_URL_not_set|requests=0|rps=0|response_mbps=0|p50_us=na|p75_us=na|p90_us=na|p95_us=na|p99_us=na|samples=0"
+        );
+        return;
+    };
     let protocol =
         std::env::var("COURIERUST_NETWORK_PROTOCOL").unwrap_or_else(|_| "h1".to_string());
     let http2 = matches!(protocol.as_str(), "h2c" | "https-h2" | "h2");
