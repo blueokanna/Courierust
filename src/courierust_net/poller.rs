@@ -265,13 +265,27 @@ impl Poller {
             tv_usec: 0,
         };
         let mut ready = Vec::new();
+        // When a wake descriptor is present it is inserted into every
+        // batch's read set, so each batch must leave a slot for it:
+        // with a full batch of FD_SETSIZE sockets plus the wake fd the
+        // last socket would be silently dropped (FdSet::insert ignores
+        // overflow) and its readiness delayed by a whole poll tick.
+        let batch_cap = if wake.is_some() {
+            FD_SETSIZE - 1
+        } else {
+            FD_SETSIZE
+        };
         // At least one batch always runs — when no connection fds are
         // registered, a single batch holding just the wake descriptor is
         // still polled, so the wake pipe alone can interrupt the wait.
-        let batches = self.fds.len().div_ceil(FD_SETSIZE).max(1);
+        let batches = if self.fds.is_empty() {
+            1
+        } else {
+            self.fds.len().div_ceil(batch_cap).max(1)
+        };
         for b in 0..batches {
-            let start = b * FD_SETSIZE;
-            let end = core::cmp::min(start + FD_SETSIZE, self.fds.len());
+            let start = b * batch_cap;
+            let end = core::cmp::min(start + batch_cap, self.fds.len());
             let mut readset = FdSet::new();
             let mut writeset = FdSet::new();
             if let Some(w) = wake {

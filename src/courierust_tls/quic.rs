@@ -422,11 +422,6 @@ impl QuicClient {
     pub(crate) fn on_initial(&mut self, bytes: &[u8]) -> TlsResult<()> {
         append_bounded(&mut self.initial_in, bytes, MAX_CRYPTO_BUFFER)?;
         let message = parse_single_message(&self.initial_in, HS_SERVER_HELLO)?;
-        // A HelloRetryRequest would require re-issuing the Initial packet
-        // with a fresh SCID (RFC 9000 §17.2.5). This client always sends
-        // an X25519 share and the configured server always accepts it, so
-        // an HRR here means a misbehaving peer: fail closed rather than
-        // mis-parse the HRR as a ServerHello.
         if super::handshake::is_hello_retry_request(&message[4..]) {
             return Err(TlsError::Protocol(
                 "QUIC peer sent HelloRetryRequest for an offered group".into(),
@@ -442,6 +437,7 @@ impl QuicClient {
         transcript.update(&self.client_hello);
         transcript.update(&message);
         let shared = x25519::x25519(&self.private_key, &sh.key_share);
+        super::handshake::validate_shared_secret(&shared)?;
         let th = transcript.current_hash();
         self.key_schedule = Some(KeySchedule::handshake(sh.suite, &shared, &th));
         self.transcript = Some(transcript);
@@ -731,6 +727,7 @@ impl QuicServer {
         super::handshake::fill_entropy(&mut s_priv)?;
         let s_pub = x25519::x25519(&s_priv, &x25519::BASE_POINT);
         let shared = x25519::x25519(&s_priv, &ch_share);
+        super::handshake::validate_shared_secret(&shared)?;
         let mut random = [0u8; 32];
         super::handshake::fill_entropy(&mut random)?;
         let params = self.server_transport.encode(&self.server_source_cid)?;

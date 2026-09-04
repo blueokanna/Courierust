@@ -11,8 +11,12 @@ pub fn hmac(d: &mut dyn Digest, key: &[u8], data: &[u8]) -> Vec<u8> {
     let block = d.block_len();
     let mut k = key.to_vec();
     if k.len() > block {
-        k = d.finalize();
-        d.update(&k);
+        // RFC 2104 §2: keys longer than the block size are hashed first
+        // (K = H(key)) before zero-padding. The previous code hashed the
+        // *empty* digest state instead of the key itself, silently
+        // computing H(H("")) — wrong, though unreachable while every
+        // caller's key is shorter than the block size.
+        d.update(key);
         k = d.finalize();
     }
     while k.len() < block {
@@ -101,6 +105,21 @@ mod tests {
         assert_eq!(
             hex(&mac),
             "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn hmac_sha256_rfc4231_long_key() {
+        // RFC 4231 Test Case 6: key longer than the SHA-256 block size
+        // (64 bytes) must be hashed first (K = H(key)). Exercises the
+        // previously-broken >block branch.
+        let key = [0xaau8; 131];
+        let data = b"Test Using Larger Than Block-Size Key - Hash Key First";
+        let mut d = Sha256::new();
+        let mac = hmac(&mut d, &key, data);
+        assert_eq!(
+            hex(&mac),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
         );
     }
 

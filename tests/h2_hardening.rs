@@ -1049,3 +1049,142 @@ fn h2_client_rejects_content_length_mismatch_response() {
     }
     // An `Err` surfaced at the head is also acceptable.
 }
+
+#[test]
+fn h2_client_handles_interim_1xx_then_final_response() {
+    // RFC 9110 §15.2: a server may send informational (1xx) responses —
+    // e.g. 103 Early Hints — before the final response. The client must
+    // not treat a 1xx HEADERS as the final response (which would make
+    // the real response look like trailers and tear the stream down).
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (sock, _) = listener.accept().unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut peer = RawH2Peer { stream: sock };
+        assert!(peer.read_preface());
+        let _ = peer.read_frame(); // client SETTINGS
+        loop {
+            match peer.read_frame() {
+                Some((0x1, _, 1, _)) => break,
+                Some((0x4, _, 0, _)) => continue,
+                Some(_) => continue,
+                None => panic!("client closed before request"),
+            }
+        }
+        // Interim 103 Early Hints (informational, no END_STREAM).
+        let interim = hpack(&[
+            hdr(":status", "103"),
+            hdr("link", "</style.css>; rel=preload"),
+        ]);
+        peer.send_frame(0x1, 0x4, 1, &interim);
+        // Final 200 response with a body.
+        let final_head = hpack(&[hdr(":status", "200"), hdr("content-length", "2")]);
+        peer.send_frame(0x1, 0x4, 1, &final_head);
+        peer.send_frame(0x0, 0x1, 1, b"ok");
+        // Drain until the client closes or goes idle.
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(3) {
+            if peer.read_frame().is_none() {
+                break;
+            }
+        }
+    });
+
+    let cfg = ClientConfig {
+        http2: true,
+        connect_timeout: Some(Duration::from_secs(5)),
+        read_timeout: Some(Duration::from_secs(5)),
+        h2_settings_timeout: Some(Duration::from_secs(5)),
+        h2_ping_interval: None,
+        h2_ping_timeout: None,
+        h2_idle_timeout: Some(Duration::from_secs(1)),
+        ..Default::default()
+    };
+    let client = Client::with_config(cfg);
+    let resp = client.get(&format!("http://{addr}/")).expect("response");
+    assert_eq!(
+        resp.status.as_u16(),
+        200,
+        "final response must be delivered"
+    );
+    let body = resp.body.collect().unwrap();
+    assert_eq!(
+        &body[..],
+        b"ok",
+        "response body must be intact after a 1xx interim"
+    );
+}
+
+#[test]
+fn h2_rejects_duplicate_request_pseudo_header() {
+    // RFC 9113 §8.1.2.3: a request pseudo-header must not appear more
+    // than once; duplicates are a malformed (connection error) input.
+    let addr = spawn_h2_server(1 << 20);
+    let mut peer = RawH2Peer::connect(addr).unwrap();
+    peer.send_preface_and_settings();
+    let block = hpack(&[
+        hdr(":method", "GET"),
+        hdr(":scheme", "http"),
+        hdr(":path", "/one"),
+        hdr(":path", "/two"),
+    ]);
+    peer.send_frame(0x1, 0x4, 1, &block);
+    let code = peer.wait_goaway(Duration::from_secs(5));
+    assert_eq!(
+        code,
+        Some(0x1),
+        "expected PROTOCOL_ERROR GOAWAY for duplicate :path"
+    );
+}
+
+#[test]
+fn h2_data_on_just_closed_stream_is_stream_error_not_connection_error() {
+    // RFC 9113 §5.1: DATA racing our RST_STREAM on a stream we just
+    // closed is a *stream* error (STREAM_CLOSED), not a connection
+    // error. Killing the whole multiplex here would fail every unrelated
+    // in-flight request because one stream was reset.
+    let addr = spawn_h2_server(1 << 20);
+    let mut peer = RawH2Peer::connect(addr).unwrap();
+    peer.send_preface_and_settings();
+    // Open stream 1 with a complete GET request and read its response,
+    // so the exchange is fully finished before the reset.
+    peer.send_frame(0x1, 0x5, 1, &get_block()); // END_HEADERS | END_STREAM
+    let mut saw_response_1 = false;
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        match peer.read_frame() {
+            Some((0x1, _, 1, _)) | Some((0x0, _, 1, _)) => {
+                saw_response_1 = true;
+                break;
+            }
+            Some((0x4, _, 0, _)) => continue, // SETTINGS ACK
+            Some(_) => continue,
+            None => break,
+        }
+    }
+    assert!(saw_response_1, "no response on stream 1");
+    // Reset stream 1, then deliver in-flight DATA that races the reset.
+    peer.send_frame(0x3, 0, 1, &8u32.to_be_bytes()); // RST_STREAM CANCEL
+    peer.send_frame(0x0, 0x1, 1, b"late");
+    // A fresh request on stream 3 must still be answered: the connection
+    // survived the closed-stream DATA.
+    peer.send_frame(0x1, 0x5, 3, &get_block());
+    let mut saw_response = false;
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        match peer.read_frame() {
+            Some((0x1, _, 3, _)) | Some((0x0, _, 3, _)) => {
+                saw_response = true;
+                break;
+            }
+            Some((0x7, _, _, _)) => panic!("GOAWAY: closed-stream DATA killed the connection"),
+            Some(_) => continue,
+            None => break,
+        }
+    }
+    assert!(
+        saw_response,
+        "connection must survive DATA on a closed stream"
+    );
+}

@@ -424,6 +424,7 @@ fn driver(
                 &mut goaway,
                 &accepting,
                 cfg.max_body,
+                cfg.read_timeout,
             );
             drain_stream_bodies(&mut conn, &mut stream_bodies);
             check_timeouts(&mut conn, &mut pending, stats);
@@ -488,6 +489,7 @@ fn driver(
                         &mut goaway,
                         &accepting,
                         cfg.max_body,
+                        cfg.read_timeout,
                     );
                     drain_stream_bodies(&mut conn, &mut stream_bodies);
                     check_timeouts(&mut conn, &mut pending, stats);
@@ -886,6 +888,7 @@ fn drain_events(
     goaway: &mut bool,
     accepting: &Arc<AtomicBool>,
     max_body: usize,
+    timeout: Option<Duration>,
 ) {
     while let Some(ev) = conn.next_event() {
         match ev {
@@ -923,6 +926,18 @@ fn drain_events(
                                 // Keep the pending entry so `body_tx`
                                 // stays alive for the DATA frames that
                                 // follow the response head.
+                                //
+                                // The per-request deadline is a
+                                // no-progress guard, not an absolute
+                                // request limit: an active long-lived
+                                // stream (gRPC server-streaming, long
+                                // downloads) must not be killed merely
+                                // because it outlives `read_timeout`.
+                                // Refresh it now that the head arrived;
+                                // DATA keeps it rolling below.
+                                if let Some(t) = timeout {
+                                    p.deadline = Some(std::time::Instant::now() + t);
+                                }
                             }
                         }
                         Err(e) => {
@@ -948,6 +963,12 @@ fn drain_events(
                         continue;
                     }
                     let _ = p.body_tx.as_ref().map(|tx| tx.send(Ok(data)));
+                    // Roll the no-progress deadline: receiving body data
+                    // proves the peer is alive and the stream is making
+                    // progress.
+                    if let Some(t) = timeout {
+                        p.deadline = Some(std::time::Instant::now() + t);
+                    }
                     if end_stream {
                         pending.remove(&stream_id);
                     }
@@ -968,9 +989,14 @@ fn drain_events(
                 error_code,
             } => {
                 if let Some(p) = pending.remove(&stream_id) {
-                    let _ = p.reply.map(|r| {
-                        r.send(Err(Error::h2(error_code.as_u32(), "stream reset by peer")))
-                    });
+                    let err = Error::h2(error_code.as_u32(), "stream reset by peer");
+                    // A mid-stream reset must also reach callers that
+                    // already consumed the response head and are reading
+                    // the streaming body: silently dropping `body_tx`
+                    // would look like a clean end-of-stream and a gRPC
+                    // caller would report a truncated response as OK.
+                    let _ = p.body_tx.map(|tx| tx.send(Err(err.clone())));
+                    let _ = p.reply.map(|r| r.send(Err(err)));
                 }
             }
             Event::StreamError {
@@ -1004,9 +1030,9 @@ fn drain_events(
                     .collect();
                 for sid in dead {
                     if let Some(p) = pending.remove(&sid) {
-                        let _ = p.reply.map(|r| {
-                            r.send(Err(Error::h2(error_code.as_u32(), "peer sent GOAWAY")))
-                        });
+                        let err = Error::h2(error_code.as_u32(), "peer sent GOAWAY");
+                        let _ = p.body_tx.map(|tx| tx.send(Err(err.clone())));
+                        let _ = p.reply.map(|r| r.send(Err(err)));
                     }
                 }
             }
@@ -1255,6 +1281,10 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 fn fail_all(pending: &mut HashMap<u32, Pending>, err: Error) {
     for (_, p) in pending.drain() {
+        // Notify both channels: streams whose response head was already
+        // delivered (so `reply` is gone) are still listening on the body
+        // channel and must not see the transport death as a clean EOF.
+        let _ = p.body_tx.map(|tx| tx.send(Err(err.clone())));
         let _ = p.reply.map(|r| r.send(Err(err.clone())));
     }
 }

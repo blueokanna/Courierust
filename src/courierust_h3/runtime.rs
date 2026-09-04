@@ -133,10 +133,16 @@ fn h3_role(server: bool) -> &'static str {
 }
 
 /// `COURIERUST_H3_RETRY=0` disables the server's Retry address
-/// validation (benchmark knob; default Retry is on). Without Retry the
-/// per-connection anti-amplification limit still applies, so the 3x
-/// amplification bound is preserved — only the extra address-validation
-/// round trip is removed.
+/// validation (benchmark knob; default Retry is on).
+///
+/// NOTE: with Retry disabled the server sends its Initial+Handshake
+/// flight (certificate chain, usually several KB) to a *spoofable*
+/// source address with no RFC 9000 §8.1 anti-amplification accounting —
+/// a single 1200-byte forged Initial can direct that flight at a victim.
+/// Unlike the Retry/token path, no per-connection 3× byte budget is
+/// enforced here. Public-facing servers must keep Retry enabled (the
+/// default); `COURIERUST_H3_RETRY=0` is for trusted, loopback-only
+/// benchmarking.
 fn h3_retry_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("COURIERUST_H3_RETRY").ok().as_deref() != Some("0"))
@@ -2985,26 +2991,69 @@ impl StreamReassembly {
             let data = &data[skip..];
             return self.insert(self.next, data, fin, max);
         }
-        if self.chunks.len() >= MAX_STREAM_CHUNKS && !self.chunks.contains_key(&offset) {
-            return Err(protocol("too many out-of-order QUIC stream chunks"));
-        }
-        if let Some(previous) = self.chunks.get(&offset) {
-            if previous.as_slice() != data {
-                return Err(protocol("conflicting QUIC stream retransmission"));
-            }
-        } else {
-            if let Some((&start, previous)) = self.chunks.range(..=offset).next_back() {
-                let previous_end = start.saturating_add(previous.len() as u64);
-                if previous_end > offset {
-                    return Err(protocol("overlapping QUIC stream ranges"));
-                }
-            }
-            if let Some((&start, _)) = self.chunks.range(offset..).next() {
-                if end > start {
-                    return Err(protocol("overlapping QUIC stream ranges"));
-                }
+        // Out-of-order buffering with content-verified merging. RFC 9000
+        // §2.2: STREAM frame boundaries are not preserved across
+        // retransmission — a peer may legitimately re-send the same data
+        // split differently — so an incoming range that *overlaps* a
+        // buffered chunk is legal as long as every overlapped offset
+        // carries identical bytes. The previous code rejected any
+        // retransmission whose segmentation differed from the buffered
+        // chunk, tearing the connection down on perfectly correct peers
+        // (e.g. quinn) under loss + reordering.
+        let affected: Vec<(u64, Vec<u8>)> = self
+            .chunks
+            .range(..end)
+            .filter(|(s, c)| s.saturating_add(c.len() as u64) > offset)
+            .map(|(s, c)| (*s, c.clone()))
+            .collect();
+        if affected.is_empty() {
+            if self.chunks.len() >= MAX_STREAM_CHUNKS {
+                return Err(protocol("too many out-of-order QUIC stream chunks"));
             }
             self.chunks.insert(offset, data.to_vec());
+        } else {
+            let merged_start = core::cmp::min(offset, affected[0].0);
+            let last_end = affected
+                .last()
+                .map(|(s, c)| s.saturating_add(c.len() as u64))
+                .unwrap_or(end);
+            let merged_end = core::cmp::max(end, last_end);
+            // Verify every overlapped region carries identical bytes.
+            for (s, c) in &affected {
+                let a_start = core::cmp::max(*s, offset);
+                let a_end = core::cmp::min(s.saturating_add(c.len() as u64), end);
+                if a_start >= a_end {
+                    continue;
+                }
+                let in_new = usize::try_from(a_start - offset)
+                    .map_err(|_| protocol("QUIC stream overlap does not fit usize"))?;
+                let len = usize::try_from(a_end - a_start)
+                    .map_err(|_| protocol("QUIC stream overlap does not fit usize"))?;
+                let in_old = usize::try_from(a_start - *s)
+                    .map_err(|_| protocol("QUIC stream overlap does not fit usize"))?;
+                if c[in_old..in_old + len] != data[in_new..in_new + len] {
+                    return Err(protocol("conflicting QUIC stream retransmission"));
+                }
+            }
+            let total = usize::try_from(merged_end - merged_start)
+                .map_err(|_| protocol("QUIC stream merge does not fit usize"))?;
+            if total > max {
+                return Err(protocol("QUIC stream flow-control limit exceeded"));
+            }
+            let mut combined = vec![0u8; total];
+            let base = merged_start;
+            for (s, c) in &affected {
+                let idx = usize::try_from(*s - base)
+                    .map_err(|_| protocol("QUIC stream merge does not fit usize"))?;
+                combined[idx..idx + c.len()].copy_from_slice(c);
+            }
+            let new_idx = usize::try_from(offset - base)
+                .map_err(|_| protocol("QUIC stream merge does not fit usize"))?;
+            combined[new_idx..new_idx + data.len()].copy_from_slice(data);
+            for (s, _) in &affected {
+                self.chunks.remove(s);
+            }
+            self.chunks.insert(merged_start, combined);
         }
         self.take_ready()
     }
@@ -3068,23 +3117,66 @@ impl CryptoReassembly {
         let end = offset
             .checked_add(data.len() as u64)
             .ok_or_else(|| protocol("QUIC CRYPTO offset overflow"))?;
-        if let Some((&start, previous)) = self.chunks.range(..=offset).next_back() {
-            let previous_end = start
-                .checked_add(previous.len() as u64)
-                .ok_or_else(|| protocol("QUIC CRYPTO range overflow"))?;
-            if previous_end > offset {
-                return Err(protocol("overlapping QUIC CRYPTO ranges"));
+        // Content-verified merging (mirrors `StreamReassembly::insert`):
+        // a peer may retransmit CRYPTO data with different segmentation,
+        // so an overlapping range is legal when the overlapped bytes are
+        // identical. The previous boundary check rejected every
+        // re-segmented retransmission and tore the connection down on
+        // correct peers under loss.
+        let affected: Vec<(u64, Vec<u8>)> = self
+            .chunks
+            .range(..end)
+            .filter(|(s, c)| s.saturating_add(c.len() as u64) > offset)
+            .map(|(s, c)| (*s, c.clone()))
+            .collect();
+        if affected.is_empty() {
+            if self.chunks.len() >= MAX_STREAM_CHUNKS {
+                return Err(protocol("too many out-of-order QUIC CRYPTO chunks"));
             }
-        }
-        if let Some((&start, _)) = self.chunks.range(offset..).next() {
-            if end > start {
-                return Err(protocol("overlapping QUIC CRYPTO ranges"));
+            self.chunks.insert(offset, data.to_vec());
+        } else {
+            let merged_start = core::cmp::min(offset, affected[0].0);
+            let last_end = affected
+                .last()
+                .map(|(s, c)| s.saturating_add(c.len() as u64))
+                .unwrap_or(end);
+            let merged_end = core::cmp::max(end, last_end);
+            for (s, c) in &affected {
+                let a_start = core::cmp::max(*s, offset);
+                let a_end = core::cmp::min(s.saturating_add(c.len() as u64), end);
+                if a_start >= a_end {
+                    continue;
+                }
+                let in_new = usize::try_from(a_start - offset)
+                    .map_err(|_| protocol("QUIC CRYPTO overlap does not fit usize"))?;
+                let len = usize::try_from(a_end - a_start)
+                    .map_err(|_| protocol("QUIC CRYPTO overlap does not fit usize"))?;
+                let in_old = usize::try_from(a_start - *s)
+                    .map_err(|_| protocol("QUIC CRYPTO overlap does not fit usize"))?;
+                if c[in_old..in_old + len] != data[in_new..in_new + len] {
+                    return Err(protocol("conflicting QUIC CRYPTO retransmission"));
+                }
             }
+            let total = usize::try_from(merged_end - merged_start)
+                .map_err(|_| protocol("QUIC CRYPTO merge does not fit usize"))?;
+            if total > MAX_CRYPTO_BUFFER {
+                return Err(protocol("QUIC CRYPTO stream limit exceeded"));
+            }
+            let mut combined = vec![0u8; total];
+            let base = merged_start;
+            for (s, c) in &affected {
+                let idx = usize::try_from(*s - base)
+                    .map_err(|_| protocol("QUIC CRYPTO merge does not fit usize"))?;
+                combined[idx..idx + c.len()].copy_from_slice(c);
+            }
+            let new_idx = usize::try_from(offset - base)
+                .map_err(|_| protocol("QUIC CRYPTO merge does not fit usize"))?;
+            combined[new_idx..new_idx + data.len()].copy_from_slice(data);
+            for (s, _) in &affected {
+                self.chunks.remove(s);
+            }
+            self.chunks.insert(merged_start, combined);
         }
-        if self.chunks.len() >= MAX_STREAM_CHUNKS {
-            return Err(protocol("too many out-of-order QUIC CRYPTO chunks"));
-        }
-        self.chunks.insert(offset, data.to_vec());
         self.take_ready()
     }
 
@@ -3453,6 +3545,25 @@ fn drain_response_frames(
                 match qpack.decode(stream.id, &block, max_header_list)? {
                     Some(fields) => {
                         if stream.headers.is_none() {
+                            // A first header block whose `:status` is
+                            // informational (100..=199) is an interim
+                            // response (RFC 9110 §15.2, e.g. 103 Early
+                            // Hints). It must not become the stream's
+                            // final headers: the real response arrives
+                            // in a later HEADERS block and would
+                            // otherwise be misread as trailers. Interim
+                            // responses carry no body, so the block is
+                            // simply skipped and the stream keeps
+                            // awaiting the final response.
+                            let interim = fields.iter().any(|f| {
+                                f.name == ":status"
+                                    && f.value.len() == 3
+                                    && f.value.iter().all(u8::is_ascii_digit)
+                                    && f.value[0] == b'1'
+                            });
+                            if interim {
+                                continue;
+                            }
                             stream.headers = Some(fields);
                         } else {
                             if stream.trailers.is_some() {
@@ -4844,12 +4955,21 @@ impl QuicTransport {
                 .checked_add(bytes.len() as u64)
                 .ok_or_else(|| protocol("QUIC stream send offset overflow"))?;
             if end > self.peer_stream_send_limit(id) {
-                return Err(protocol("QUIC peer stream flow-control limit exceeded"));
+                // No stream-level credit yet: block (and let the caller
+                // requeue) instead of killing the whole connection. RFC
+                // 9000 §4.1: exceeding the limit is the *receiver's*
+                // FLOW_CONTROL_ERROR to report; the sender simply waits
+                // for MAX_STREAM_DATA. Previously this was a fatal
+                // protocol error that tore down the connection — and with
+                // it every unrelated in-flight request — whenever a large
+                // upload briefly exhausted the peer's window.
+                return Err(Error::new(ErrorKind::WouldBlock));
             }
             let previous = self.sent_stream_data.get(&id).copied().unwrap_or(0);
             let newly_sent = end.saturating_sub(previous);
             if self.sent_data.saturating_add(newly_sent) > self.peer_max_data {
-                return Err(protocol("QUIC peer connection flow-control limit exceeded"));
+                // Same for the connection-level window: wait for MAX_DATA.
+                return Err(Error::new(ErrorKind::WouldBlock));
             }
             self.sent_data = self.sent_data.saturating_add(newly_sent);
             self.sent_stream_data.insert(id, previous.max(end));
@@ -5757,6 +5877,16 @@ fn ack_ranges(received: &BTreeSet<u64>, largest: u64) -> Vec<(u64, u64)> {
         low = *packet_number;
     }
     ranges.push((pending_gap.unwrap_or(0), high.saturating_sub(low)));
+    // RFC 9000 §13.2.3: an ACK frame is expected to fit within a single
+    // packet; older ranges are omitted when it cannot carry them all.
+    // Without a bound, a lossy/reordering peer producing thousands of
+    // fragmented ranges would make the ACK exceed our own
+    // `max_udp_payload_size` and tear the connection down with a
+    // self-inflicted protocol error. 60 ranges is comfortably below the
+    // 1200-byte minimum datagram even with worst-case 8-byte varints;
+    // omitted ranges are re-acknowledged by later ACKs.
+    const MAX_ACK_RANGES: usize = 60;
+    ranges.truncate(MAX_ACK_RANGES);
     ranges
 }
 
@@ -6339,6 +6469,63 @@ mod tests {
         assert_eq!(stream.insert(0, b"ab", false, 16).unwrap(), b"abcd");
         assert!(stream.insert(1, b"b", false, 16).unwrap().is_empty());
         assert!(stream.insert(1, b"x", false, 16).is_err());
+    }
+
+    /// RFC 9000 §2.2: STREAM frame boundaries are not preserved across
+    /// retransmission. A peer may re-send data that overlaps a buffered
+    /// (out-of-order) chunk with different segmentation; this is legal as
+    /// long as every overlapped offset carries identical bytes.
+    #[test]
+    fn stream_reassembly_merges_resegmented_retransmission() {
+        let mut stream = StreamReassembly::default();
+        // Gap at 0..5; buffer 5..10, then a re-segmented retransmission
+        // spanning 3..9 (overlapping 5..9, same bytes).
+        assert!(stream.insert(5, b"fghij", false, 64).unwrap().is_empty());
+        assert!(stream.insert(3, b"defghi", false, 64).unwrap().is_empty());
+        // Filling the remaining gap yields the full in-order payload.
+        assert_eq!(stream.insert(0, b"abc", false, 64).unwrap(), b"abcdefghij");
+    }
+
+    #[test]
+    fn stream_reassembly_merges_overlap_that_extends_both_sides() {
+        let mut stream = StreamReassembly::default();
+        // Buffered 10..12 and 20..22; a retransmission 8..24 overlaps both
+        // (identical bytes) and fills the middle.
+        assert!(stream.insert(10, b"kl", false, 64).unwrap().is_empty());
+        assert!(stream.insert(20, b"uv", false, 64).unwrap().is_empty());
+        // payload covers offsets 8..24 = "ijklmnopqrstuvwx":
+        //   idx 2..4  -> offsets 10..12 == "kl" (matches buffered)
+        //   idx 12..14 -> offsets 20..22 == "uv" (matches buffered)
+        let payload = b"ijklmnopqrstuvwx";
+        assert!(stream.insert(8, payload, false, 64).unwrap().is_empty());
+        // Fill the head (offsets 0..8) and read the whole stream in order.
+        assert_eq!(
+            stream.insert(0, b"abcdefgh", false, 64).unwrap(),
+            b"abcdefghijklmnopqrstuvwx"
+        );
+    }
+
+    #[test]
+    fn stream_reassembly_rejects_conflicting_overlap_content() {
+        let mut stream = StreamReassembly::default();
+        assert!(stream.insert(5, b"fghij", false, 64).unwrap().is_empty());
+        // Overlaps 5..9 but with different bytes at offset 6.
+        assert!(stream.insert(3, b"defXhi", false, 64).is_err());
+    }
+
+    #[test]
+    fn crypto_reassembly_merges_resegmented_retransmission() {
+        let mut crypto = CryptoReassembly::default();
+        // Gap 0..5; buffer 5..10, then a re-segmented retransmission
+        // 3..9 overlapping 5..9 with identical bytes.
+        assert!(crypto.insert(5, b"fghij").unwrap().is_empty());
+        assert!(crypto.insert(3, b"defghi").unwrap().is_empty());
+        // Fill the head: the full payload is delivered in order.
+        assert_eq!(crypto.insert(0, b"abc").unwrap(), b"abcdefghij");
+        // Conflicting overlap against buffered data is still rejected.
+        let mut crypto2 = CryptoReassembly::default();
+        assert!(crypto2.insert(5, b"fghij").unwrap().is_empty());
+        assert!(crypto2.insert(3, b"deXghi").is_err());
     }
 
     #[test]

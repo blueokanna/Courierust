@@ -8,9 +8,10 @@
 use crate::courierust_body::Body;
 use crate::courierust_bytes::Bytes;
 use crate::courierust_client::ClientConfig;
-use crate::courierust_error::{Error, Result};
+use crate::courierust_error::{Error, ErrorKind, Result};
 use crate::courierust_h1;
 use crate::courierust_http::header::{HeaderMap, HeaderName, HeaderValue};
+use crate::courierust_http::method::Method;
 use crate::courierust_http::request::Request;
 use crate::courierust_http::response::{Response, ResponseHead};
 use crate::courierust_http::status::StatusCode;
@@ -155,10 +156,10 @@ impl H1Connection {
         }
         self.writer.flush()?;
 
-        self.read_response(cfg)
+        self.read_response(cfg, req.method.clone())
     }
 
-    fn read_response(&mut self, cfg: &ClientConfig) -> Result<Response<Body>> {
+    fn read_response(&mut self, cfg: &ClientConfig, method: Method) -> Result<Response<Body>> {
         let (reader, scratch) = (&mut self.reader, &mut self.scratch);
         let status_line = scratch.line();
         reader.read_until_into(b'\n', 16 * 1024, status_line)?;
@@ -178,24 +179,27 @@ impl H1Connection {
             version,
             headers,
         };
-        self.finish_response(cfg, head)
+        self.finish_response(cfg, &method, head)
     }
 
     /// Read a response body given an already-parsed response head (used
     /// by the `h2c` Upgrade fallback, where the head was consumed by the
-    /// handshake).
+    /// handshake). `method` is the request method, which decides whether
+    /// a response to a HEAD request may carry a body (RFC 9112 §6.3).
     pub fn finish_response(
         &mut self,
         cfg: &ClientConfig,
+        method: &Method,
         head: ResponseHead,
     ) -> Result<Response<Body>> {
         let status = head.status;
         let version = head.version;
         let (reader, scratch) = (&mut self.reader, &mut self.scratch);
         let mut close_delimited = false;
-        let body = match courierust_h1::body_length(&head.headers, None, Some(status))? {
+        let body = match courierust_h1::body_length(&head.headers, Some(method), Some(status))? {
             courierust_h1::BodyLen::None => {
-                if status == StatusCode::NO_CONTENT
+                if *method == Method::HEAD
+                    || status == StatusCode::NO_CONTENT
                     || status == StatusCode::NOT_MODIFIED
                     || status.is_informational()
                     || status.is_redirection()
@@ -223,6 +227,12 @@ impl H1Connection {
 
 /// Read a body delimited by connection close into the scratch body
 /// buffer.
+///
+/// Only a clean EOF (or a WouldBlock on a non-blocking transport) ends
+/// the body. Timeouts and transport resets mid-body are propagated as
+/// errors — previously every read error was treated as EOF, silently
+/// returning a truncated body as a successful response when a server
+/// reset/aborted mid-stream.
 fn read_until_eof_scratch(
     reader: &mut BufReader<Arc<ConnStream>>,
     max: usize,
@@ -233,7 +243,11 @@ fn read_until_eof_scratch(
         let b = match reader.fill_buf() {
             Ok([]) => break,
             Ok(b) => b,
-            Err(_) => break,
+            Err(e) => match e.kind {
+                ErrorKind::UnexpectedEof => break, // clean close ends the body
+                ErrorKind::WouldBlock => break,    // never on a blocking socket
+                _ => return Err(e),
+            },
         };
         let n = b.len();
         if out.len() + n > max {

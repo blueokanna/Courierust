@@ -349,7 +349,12 @@ impl Client {
                 };
                 let mut new_req = Request::new(method, next.path_and_query.clone());
                 let mut headers = orig_headers;
-                if next.authority() != url.authority() {
+                // Strip credentials on any cross-origin hop — either an
+                // authority change OR a scheme downgrade (https→http even
+                // on the same port, e.g. https://host:8443 →
+                // http://host:8443). Reusing the same port keeps the
+                // authority equal, so authority alone is not sufficient.
+                if next.authority() != url.authority() || next.scheme != url.scheme {
                     for name in ["authorization", "proxy-authorization", "cookie"] {
                         headers.remove(name);
                     }
@@ -454,9 +459,14 @@ impl Client {
         tls: Option<crate::courierust_tls::TlsConnector>,
         req: Request<Body>,
     ) -> Result<Response<Body>> {
+        // Pool key includes the scheme: `http://host:8443` (plain) and
+        // `https://host:8443` (TLS) share an authority but must never
+        // reuse each other's connections — reusing the plaintext one for
+        // an https URL would silently downgrade the request.
+        let key = format!("{}://{authority}", url.scheme);
         let conn = {
             let mut pool = self.inner.h1_pool.lock().unwrap();
-            let entry = pool.entry(authority.to_string()).or_default();
+            let entry = pool.entry(key.clone()).or_default();
             entry
                 .iter()
                 .position(|(a, _)| *a == addr)
@@ -472,7 +482,7 @@ impl Client {
             Ok(resp) => {
                 if owned.is_reusable() {
                     let mut pool = self.inner.h1_pool.lock().unwrap();
-                    let entry = pool.entry(authority.to_string()).or_default();
+                    let entry = pool.entry(key).or_default();
                     if entry.len() < self.inner.config.max_connections_per_host {
                         entry.push((addr, owned));
                     }
@@ -735,6 +745,7 @@ impl Client {
         addr: SocketAddr,
         req: Request<Body>,
     ) -> Result<Response<Body>> {
+        let req_method = req.method.clone();
         let body_bytes = req.body.len().unwrap_or(0);
         let pooled = {
             let mut pools = self.inner.h2_pool.lock().unwrap();
@@ -818,7 +829,7 @@ impl Client {
                 let cs = crate::courierust_net::ConnStream::plain(stream);
                 let mut owned =
                     H1Connection::from_stream_seeded(cs, &self.inner.config, &leftover)?;
-                let resp = owned.finish_response(&self.inner.config, head)?;
+                let resp = owned.finish_response(&self.inner.config, &req_method, head)?;
                 if owned.is_reusable() {
                     let mut pool = self.inner.h1_pool.lock().unwrap();
                     let entry = pool.entry(authority.to_string()).or_default();

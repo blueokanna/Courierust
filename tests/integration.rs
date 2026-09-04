@@ -2104,3 +2104,82 @@ fn grpc_timeout_header_formats() {
         "2H"
     );
 }
+
+/// RFC 9112 §6.3: a response to a HEAD request never carries a body even
+/// when the server sends a Content-Length. The client must return the
+/// (empty) response immediately instead of waiting for N bytes that will
+/// never arrive (and, on a pooled connection, must not desync the next
+/// request).
+#[test]
+fn h1_client_head_response_with_content_length_has_no_body() {
+    use std::io::{BufRead, BufReader, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        // Read the request head (method line + headers + blank line).
+        let mut head = String::new();
+        loop {
+            let mut l = String::new();
+            if reader.read_line(&mut l).unwrap_or(0) == 0 {
+                break;
+            }
+            head.push_str(&l);
+            if l == "\r\n" {
+                break;
+            }
+        }
+        assert!(head.starts_with("HEAD "), "unexpected request: {head}");
+        // A standard HEAD response: 200 with Content-Length but no body.
+        let mut w = stream;
+        w.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+            .unwrap();
+        // A subsequent GET on the same keep-alive connection must not be
+        // poisoned by the "missing" HEAD body: answer it normally.
+        let mut l = String::new();
+        if reader.read_line(&mut l).unwrap_or(0) > 0 {
+            let mut got_head = false;
+            loop {
+                let mut h = String::new();
+                if reader.read_line(&mut h).unwrap_or(0) == 0 {
+                    break;
+                }
+                if h == "\r\n" {
+                    got_head = true;
+                    break;
+                }
+            }
+            if got_head && l.starts_with("GET ") {
+                w.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc")
+                    .unwrap();
+            }
+        }
+    });
+
+    let client = Client::with_config(ClientConfig {
+        connect_timeout: Some(std::time::Duration::from_secs(5)),
+        read_timeout: Some(std::time::Duration::from_secs(5)),
+        ..Default::default()
+    });
+    let mut req = Request::new(Method::HEAD, "/");
+    req.body = Body::Empty;
+    let resp = client
+        .execute(&format!("http://{addr}/"), req)
+        .expect("HEAD response must complete without waiting for the body");
+    assert_eq!(resp.status.as_u16(), 200);
+    assert!(
+        resp.body.collect().unwrap().is_empty(),
+        "a HEAD response has no body"
+    );
+    // Reuse the same pooled connection for a GET; if the HEAD body were
+    // mis-framed the connection would desync and this would fail/hang.
+    let resp = client
+        .get(&format!("http://{addr}/"))
+        .expect("GET after HEAD");
+    assert_eq!(resp.body.collect().unwrap().to_str().unwrap(), "abc");
+}

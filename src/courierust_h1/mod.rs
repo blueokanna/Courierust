@@ -200,6 +200,21 @@ pub fn body_length(
     method: Option<&Method>,
     status: Option<StatusCode>,
 ) -> Result<BodyLen> {
+    // RFC 9112 §6.3: a response to a HEAD request, or any response with
+    // a 1xx/204/304 status, never carries a body regardless of the
+    // framing header fields present. These checks MUST precede
+    // Content-Length/Transfer-Encoding parsing: otherwise a
+    // "204/304 + Content-Length: N" or a "HEAD + Content-Length: N"
+    // response would be mis-framed and a client would wait for bytes
+    // that never arrive (and, behind a proxy, the mismatch becomes a
+    // response-queue-poisoning / smuggling vector).
+    let head_response = method == Some(&Method::HEAD);
+    let bodyless_status = status.is_some_and(|s| {
+        s.is_informational() || s == StatusCode::NO_CONTENT || s == StatusCode::NOT_MODIFIED
+    });
+    if status.is_some() && (head_response || bodyless_status) {
+        return Ok(BodyLen::None);
+    }
     let mut te_count = 0usize;
     let mut chunked_pos: Option<usize> = None;
     let mut any_te = false;
@@ -681,6 +696,55 @@ mod tests {
     fn transfer_encoding_repeated_chunked_rejected() {
         let h = headers(&[("transfer-encoding", "chunked, chunked")]);
         assert!(body_length(&h, Some(&Method::POST), None).is_err());
+    }
+
+    /// RFC 9112 §6.3: a response to a HEAD request never carries a body,
+    /// even when Content-Length is present (a "200-to-HEAD +
+    /// Content-Length: N" would otherwise hang the client waiting for N
+    /// bytes that never arrive).
+    #[test]
+    fn head_response_with_content_length_has_no_body() {
+        let h = headers(&[("content-length", "100")]);
+        assert_eq!(
+            body_length(&h, Some(&Method::HEAD), Some(StatusCode::OK)).unwrap(),
+            BodyLen::None
+        );
+        // Same framing on a plain GET response does carry the body.
+        assert_eq!(
+            body_length(&h, Some(&Method::GET), Some(StatusCode::OK)).unwrap(),
+            BodyLen::Length(100)
+        );
+    }
+
+    /// RFC 9112 §6.3: 204/304 responses never carry a body regardless of
+    /// Content-Length/Transfer-Encoding (a caching proxy that emits
+    /// "304 + Content-Length" for the cached entity is standard).
+    #[test]
+    fn no_content_and_not_modified_have_no_body() {
+        let cl = headers(&[("content-length", "100")]);
+        assert_eq!(
+            body_length(&cl, Some(&Method::GET), Some(StatusCode::NO_CONTENT)).unwrap(),
+            BodyLen::None
+        );
+        assert_eq!(
+            body_length(&cl, Some(&Method::GET), Some(StatusCode::NOT_MODIFIED)).unwrap(),
+            BodyLen::None
+        );
+        let te = headers(&[("transfer-encoding", "chunked")]);
+        assert_eq!(
+            body_length(&te, Some(&Method::GET), Some(StatusCode::NO_CONTENT)).unwrap(),
+            BodyLen::None
+        );
+    }
+
+    /// A 1xx informational response never carries a body.
+    #[test]
+    fn informational_response_has_no_body() {
+        let h = headers(&[("content-length", "100")]);
+        assert_eq!(
+            body_length(&h, Some(&Method::GET), Some(StatusCode::CONTINUE)).unwrap(),
+            BodyLen::None
+        );
     }
 
     /// Multiple TE fields are combined as one codeword list.

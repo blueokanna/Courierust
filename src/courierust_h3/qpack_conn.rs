@@ -197,6 +197,23 @@ impl QpackConnection {
             {
                 return Err(Error::protocol("invalid HTTP/3 header field"));
             }
+            // QPACK field *values* are opaque octets (RFC 9204), but
+            // dynamic-table entries and encoder-stream inserts are
+            // UTF-8 strings: our decoder (and the peer's) rejects a
+            // non-UTF-8 insert with a protocol error, and a non-UTF-8
+            // value can never match a static/dynamic entry, so it must
+            // not be offered to the table machinery at all. Send it as
+            // an uncompressed literal carrying the raw bytes instead.
+            if core::str::from_utf8(value).is_err() {
+                if let Some(index) = qpack::static_name_index(name) {
+                    qpack::encode_integer(index, 4, 0x50, &mut body);
+                    qpack::encode_string(value, 8, 0x00, &mut body);
+                } else {
+                    qpack::encode_string(name.as_bytes(), 4, 0x20, &mut body);
+                    qpack::encode_string(value, 8, 0x00, &mut body);
+                }
+                continue;
+            }
             let value_str = core::str::from_utf8(value).unwrap_or("");
             // 1. Exact static match → indexed field line.
             if let Some(index) = qpack::static_index(name, value_str) {

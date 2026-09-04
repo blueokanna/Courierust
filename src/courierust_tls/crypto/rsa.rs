@@ -447,6 +447,16 @@ impl RsaPublicKey {
             return None;
         }
         let e = BigInt::from_be_bytes(&self.e);
+        // Reject degenerate public exponents (BoringSSL does the same):
+        // with e = 1 any integer s trivially verifies (s^1 = s), and an
+        // even e cannot be coprime to phi(n), marking a malformed or
+        // hostile key.
+        if e.is_zero()
+            || (e.limbs[0] & 1) == 0
+            || e.cmp(&BigInt::from_u64(2)) != core::cmp::Ordering::Greater
+        {
+            return None;
+        }
         let m = s.mod_pow(&e, &n);
         Some(m.to_be_bytes_padded(self.n.len()))
     }

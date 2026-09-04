@@ -232,6 +232,13 @@ pub struct Connection<R, W> {
     // Events
     events: VecDeque<Event>,
 
+    // Recently closed stream ids (bounded). RFC 9113 §5.1: frames that
+    // arrive for a stream we already closed (e.g. DATA that raced our
+    // RST_STREAM) are a stream error of type STREAM_CLOSED — not a
+    // connection error that would tear down unrelated streams. This ring
+    // lets us distinguish those from truly idle/never-opened streams.
+    recently_closed: VecDeque<u32>,
+
     // Lifecycle
     goaway_sent: bool,
     goaway_received: bool,
@@ -278,6 +285,7 @@ impl<R: Read, W: Write> Connection<R, W> {
             conn_recv_window: FlowWindow::new(conn_window, MAX_FLOW_WINDOW),
             conn_pending_release: 0,
             events: VecDeque::new(),
+            recently_closed: VecDeque::new(),
             goaway_sent: false,
             goaway_received: false,
             peer_last_stream: 0,
@@ -1227,6 +1235,16 @@ impl<R: Read, W: Write> Connection<R, W> {
             self.validate_header_block(&fields, !self.config.client, false)?;
 
             if self.config.client {
+                if self.recently_closed.iter().any(|&c| c == sid) {
+                    // The stream was closed (typically by our RST_STREAM)
+                    // and this HEADERS raced it: stream error, not a
+                    // connection error.
+                    self.pending_frames.push_back(Frame::RstStream {
+                        stream_id: sid,
+                        error_code: ErrorCode::StreamClosed,
+                    });
+                    return Ok(());
+                }
                 return self.conn_error(ErrorCode::ProtocolError, "response on unknown stream");
             }
             if !self.streams.accept_peer_id(sid) {
@@ -1338,6 +1356,32 @@ impl<R: Read, W: Write> Connection<R, W> {
             .and_then(|f| f.value.to_str().ok())
             .and_then(|s| s.parse::<u16>().ok())
             .unwrap_or(200);
+        if (100..=199).contains(&status) && self.config.client {
+            // RFC 9110 §15.2 / RFC 9113 §8.1: interim (1xx) responses.
+            // The stream stays open awaiting the final response; the
+            // interim block must NOT mark the headers as delivered, or
+            // the real response arriving next would be misread as
+            // trailers (and rejected for carrying `:status`). Interim
+            // responses carry no body, so the block is simply dropped.
+            if p.end_stream {
+                // The peer terminated the exchange with only an interim
+                // response; no final response will follow.
+                self.pending_frames.push_back(Frame::RstStream {
+                    stream_id: sid,
+                    error_code: ErrorCode::Cancel,
+                });
+                self.events.push_back(Event::StreamError {
+                    stream_id: sid,
+                    error_code: ErrorCode::Cancel,
+                    message: alloc::string::String::from(
+                        "peer sent only an informational response",
+                    ),
+                });
+                self.close_stream(sid);
+                return Ok(());
+            }
+            return Ok(());
+        }
         let status_expects_body = !(100..=199).contains(&status) && status != 204 && status != 304;
         let priority;
         {
@@ -1416,6 +1460,12 @@ impl<R: Read, W: Write> Connection<R, W> {
         let mut path: Option<&str> = None;
         let mut has_authority = false;
         let mut has_status = false;
+        // RFC 9113 §8.1.2.3: request pseudo-headers must not appear more
+        // than once (each occurrence after the first is malformed).
+        let mut saw_method = false;
+        let mut saw_scheme = false;
+        let mut saw_path = false;
+        let mut saw_authority = false;
 
         for f in fields.iter() {
             if !f.name.is_pseudo() {
@@ -1460,24 +1510,40 @@ impl<R: Read, W: Write> Connection<R, W> {
                     if !is_request {
                         return self.conn_error(ErrorCode::ProtocolError, ":method in response");
                     }
+                    if saw_method {
+                        return self.conn_error(ErrorCode::ProtocolError, "duplicate :method");
+                    }
+                    saw_method = true;
                     method = f.value.to_str().ok();
                 }
                 ":scheme" => {
                     if !is_request {
                         return self.conn_error(ErrorCode::ProtocolError, ":scheme in response");
                     }
+                    if saw_scheme {
+                        return self.conn_error(ErrorCode::ProtocolError, "duplicate :scheme");
+                    }
+                    saw_scheme = true;
                     has_scheme = true;
                 }
                 ":path" => {
                     if !is_request {
                         return self.conn_error(ErrorCode::ProtocolError, ":path in response");
                     }
+                    if saw_path {
+                        return self.conn_error(ErrorCode::ProtocolError, "duplicate :path");
+                    }
+                    saw_path = true;
                     path = f.value.to_str().ok();
                 }
                 ":authority" => {
                     if !is_request {
                         return self.conn_error(ErrorCode::ProtocolError, ":authority in response");
                     }
+                    if saw_authority {
+                        return self.conn_error(ErrorCode::ProtocolError, "duplicate :authority");
+                    }
+                    saw_authority = true;
                     has_authority = true;
                 }
                 ":status" => {
@@ -1545,6 +1611,19 @@ impl<R: Read, W: Write> Connection<R, W> {
 
     fn on_data(&mut self, stream_id: u32, data: Bytes, end_stream: bool) -> Result<()> {
         if !self.streams.contains(&stream_id) {
+            if self.recently_closed.iter().any(|&c| c == stream_id) {
+                // The stream was open and has since closed — most commonly
+                // in-flight DATA racing the RST_STREAM we just sent. RFC
+                // 9113 §5.1 makes this a *stream* error (STREAM_CLOSED),
+                // not a connection error: killing the whole multiplex here
+                // would fail every unrelated in-flight request because one
+                // peer kept sending on a stream we already reset.
+                self.pending_frames.push_back(Frame::RstStream {
+                    stream_id,
+                    error_code: ErrorCode::StreamClosed,
+                });
+                return Ok(());
+            }
             return self.conn_error(ErrorCode::ProtocolError, "DATA on unknown stream");
         }
         let len = data.len() as i64;
@@ -1825,6 +1904,13 @@ impl<R: Read, W: Write> Connection<R, W> {
         self.send_queue.remove(&stream_id);
         self.pending_priority.remove(&stream_id);
         self.streams.remove(&stream_id);
+        // Remember the id so late frames on it are treated as stream
+        // errors (STREAM_CLOSED) rather than connection errors.
+        self.recently_closed.push_back(stream_id);
+        const CLOSED_TRACK: usize = 2048;
+        if self.recently_closed.len() > CLOSED_TRACK {
+            self.recently_closed.pop_front();
+        }
     }
 }
 

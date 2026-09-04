@@ -858,6 +858,19 @@ pub(crate) fn fill_entropy(buf: &mut [u8]) -> TlsResult<()> {
     }
 }
 
+/// RFC 7748 §6.1: an X25519 peer share that is a low-order point (such
+/// as u = 0) yields an all-zero shared secret. Reject it instead of
+/// silently keying the connection with a predictable all-zero value.
+/// rustls/BoringSSL abort the handshake on this condition.
+pub(crate) fn validate_shared_secret(shared: &[u8; 32]) -> TlsResult<()> {
+    if shared.iter().all(|&b| b == 0) {
+        return Err(TlsError::Protocol(
+            "peer X25519 share produced an all-zero shared secret".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) struct ClientHandshake {
     pub(crate) server_name: Option<String>,
     pub(crate) verify: bool,
@@ -911,6 +924,7 @@ impl ClientHandshake {
 
         // 3. ECDHE + key schedule
         let shared = x25519::x25519(priv_key, &sh.key_share);
+        validate_shared_secret(&shared)?;
         let th = transcript.current_hash();
         let mut ks = if sh.resumed {
             // The server accepted our resumption PSK (RFC 8446 §4.2.11);
@@ -1197,6 +1211,7 @@ impl ServerHandshake {
         fill_entropy(&mut s_priv)?;
         let s_pub = x25519::x25519(&s_priv, &x25519::BASE_POINT);
         let shared = x25519::x25519(&s_priv, &ch_share);
+        validate_shared_secret(&shared)?;
         let mut random = [0u8; 32];
         fill_entropy(&mut random)?;
         let sh = if resumed {

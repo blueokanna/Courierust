@@ -533,10 +533,8 @@ impl MessageStream {
     }
 
     fn finish(&self) -> Result<()> {
-        let code = self
-            .trailers
-            .lock()
-            .unwrap()
+        let trailers = self.trailers.lock().unwrap();
+        let code = trailers
             .as_ref()
             .and_then(|t| t.get("grpc-status"))
             .and_then(|v| v.to_str().ok())
@@ -546,13 +544,22 @@ impl MessageStream {
                     .get("grpc-status")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<u32>().ok())
-            })
-            .unwrap_or(status::OK);
+            });
+        // A gRPC exchange always terminates with a `grpc-status` (in
+        // trailers, or in the head for trailer-only responses). A stream
+        // ending without one means the transport died mid-stream, the
+        // peer reset the stream, or the peer is not actually gRPC — in
+        // every case reporting OK would silently turn a truncated
+        // response into a valid one (RFC 9110 / gRPC spec: missing
+        // status is UNKNOWN).
+        let Some(code) = code else {
+            return Err(Error::grpc(
+                status::UNKNOWN,
+                "stream ended without a grpc-status",
+            ));
+        };
         if code != status::OK {
-            let msg = self
-                .trailers
-                .lock()
-                .unwrap()
+            let msg = trailers
                 .as_ref()
                 .and_then(|t| t.get("grpc-message"))
                 .or_else(|| self.head_headers.get("grpc-message"))
