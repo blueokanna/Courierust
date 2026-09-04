@@ -507,10 +507,16 @@ tlsinterop_results=$(extract_lines '^TLSINTEROP\|' "$tls_interop_log")
     write_compare_table "$compare_results"
     printf '\n%s\n\n' '## Concurrency and Slow Connections'
     printf '%s\n' '- These rows measure production usability and resource isolation: an event-driven scheduler must keep idle/partial/slow (Slowloris-style) connections off the worker pool while a fast probe still completes. The `pool` row is the diagnostic counter-model.'
+    # Blank line between the list and the table: a GFM table directly
+    # after a list item (no blank line) is parsed as lazy continuation of
+    # the list paragraph and rendered as folded text instead of a table.
+    printf '\n'
     write_concurrency_table "$concurrency_results"
     printf '\n%s\n\n' '## HTTP/3 (QUIC)'
     printf '%s\n' '- `h3_connect` is a cold request: QUIC handshake + TLS 1.3 + server Retry address validation on a fresh connection.'
     printf '%s\n' '- `h3_sequential` and `h3_parallel` reuse the pooled per-authority QUIC connection (`mode=reuse`), so they measure the warm per-request cost of connection reuse.'
+    # Blank line between the list and the table (see above).
+    printf '\n'
     write_h3_table "$h3_results"
     printf '\n%s\n\n' '## Reactor / Connection / Stream Evidence'
     write_stats_table "$stats_results"
