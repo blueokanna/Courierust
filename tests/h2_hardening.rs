@@ -812,8 +812,15 @@ fn h2_rejects_window_update_overflow() {
 fn h2_rejects_data_exceeding_flow_window() {
     // Sending DATA beyond the advertised flow-control window is a
     // FLOW_CONTROL_ERROR (RFC 9113 §6.9). The server must not auto-release
-    // receive credit here, otherwise the 5 × 16 KiB would legitimately be
+    // receive credit here, otherwise the 4 x 16 KiB would legitimately be
     // granted and no violation would occur.
+    //
+    // Exactly four 16 KiB frames (64 KiB > 65535 conn window) are sent so
+    // the violating frame is the last on the wire: the server must fully
+    // read it before judging the violation, leaving nothing unread in its
+    // TCP receive buffer when it closes after GOAWAY. A fifth frame would
+    // linger there; closing a Windows socket with unread receive data
+    // sends RST, which can swallow the just-written GOAWAY (CI flake).
     let server = Server::bind_with_config(
         "127.0.0.1:0",
         ServerConfig {
@@ -842,8 +849,8 @@ fn h2_rejects_data_exceeding_flow_window() {
     peer.send_preface_and_settings();
     peer.send_frame(0x1, 0x4, 1, &get_block()); // open stream 1
     let chunk = vec![b'x'; 16384];
-    for _ in 0..5 {
-        peer.send_frame(0x0, 0x0, 1, &chunk); // 5 × 16 KiB > 64 KiB conn window
+    for _ in 0..4 {
+        peer.send_frame(0x0, 0x0, 1, &chunk); // 4 x 16 KiB > 64 KiB conn window
     }
     let code = peer.wait_goaway(Duration::from_secs(5));
     assert_eq!(code, Some(0x3), "expected FLOW_CONTROL_ERROR GOAWAY");
