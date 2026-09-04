@@ -158,10 +158,6 @@ fn dns_name_matches_constraint(presented: &str, constraint: &str, is_excluded: b
         a.eq_ignore_ascii_case(b)
     }
     fn subdomain(name: &[u8], constraint: &[u8]) -> bool {
-        // `name` is a strict subdomain of `constraint` iff it ends with
-        // ".constraint" (whole labels only). A constraint with a leading
-        // dot supplies its own boundary, so the plain `ends_with` check
-        // is used there; otherwise the byte before the suffix must be '.'.
         if name.len() <= constraint.len() {
             return false;
         }
@@ -178,35 +174,25 @@ fn dns_name_matches_constraint(presented: &str, constraint: &str, is_excluded: b
         // An empty constraint permits/forbids every name.
         return true;
     }
-    // Wildcard SANs expand for excluded subtrees: `*.X` can match `X` and
-    // any `Y.X` (Y a single label). It intersects the excluded subtree C
-    // iff (1) X is within C's subtree, or (2) C is X with exactly one
-    // label prepended (the wildcard can expand to C itself), or (3) C is
-    // a leading-dot constraint whose base is X (then `Y.X` falls inside).
+
     if is_excluded && p.starts_with(b"*.") {
         let x = &p[2..];
-        // (1) X within C's subtree.
         if !c.starts_with(b".") && eq(x, c) {
             return true;
         }
         if subdomain(x, c) {
             return true;
         }
-        // (2) C == "Y." + X for a single-label Y.
         let pre = c.len().saturating_sub(x.len());
         if pre > 1 && c.ends_with(x) && c[pre - 1] == b'.' && !c[..pre - 1].contains(&b'.') {
             return true;
         }
-        // (3) Leading-dot constraint whose base equals X.
         if c.starts_with(b".") && eq(x, &c[1..]) {
             return true;
         }
         return false;
     }
-    // Literal matching (permitted subtrees and all non-wildcard names).
     if c[0] == b'.' {
-        // Leading dot: strict subdomain — the presented name must be a
-        // strict subdomain of the constraint's base.
         return subdomain(p, c);
     }
     if eq(p, c) {
@@ -225,10 +211,7 @@ fn ip_matches_constraint(ip: &[u8], constraint: &[u8]) -> Option<bool> {
     let half = constraint.len() / 2;
     match (ip.len(), constraint.len()) {
         (4, 8) | (16, 32) => {}
-        // An IPv4 address never matches an IPv6 constraint and vice
-        // versa (rustls-webpki returns Ok(false) for these).
         (4, 32) | (16, 8) => return Some(false),
-        // Any other length is malformed.
         _ => return None,
     }
     let (addr, mask) = constraint.split_at(half);
@@ -237,7 +220,7 @@ fn ip_matches_constraint(ip: &[u8], constraint: &[u8]) -> Option<bool> {
         let ones = m.leading_ones();
         let zeros = m.trailing_zeros();
         if ones + zeros != 8 || (seen_zero && m != 0) {
-            return None; // non-contiguous mask: malformed constraint
+            return None;
         }
         if m != 0xff {
             seen_zero = true;
@@ -590,7 +573,11 @@ pub fn validate_chain(
         .take(certs.len().saturating_sub(2))
     {
         if let Some(p) = ca.path_len {
-            let below = (i + 1..certs.len() - 1).count();
+            let below = (1..i)
+                .filter(|&j| {
+                    certs[j].is_ca == Some(true) && certs[j].issuer_der != certs[j].subject_der
+                })
+                .count();
             if below > p as usize {
                 return Err(TlsError::Certificate(format!(
                     "certificate {i} exceeds its pathLenConstraint"

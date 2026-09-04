@@ -1,6 +1,6 @@
 [package]
 name = "courierust"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2021"
 rust-version = "1.78"
 license = "Apache-2.0"
