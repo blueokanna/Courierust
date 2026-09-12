@@ -27,6 +27,10 @@ pub struct Stats {
     pub event_poll_syscalls: Arc<AtomicUsize>,
     /// Event-loop wake-ups via the self-pipe (control messages queued).
     pub event_wakeups: Arc<AtomicUsize>,
+    /// Event-loop waits that failed and had to be recovered from (a
+    /// descriptor in the wait set was closed behind the reactor's back).
+    /// Any non-zero value after a run is a defect report, not noise.
+    pub event_wait_errors: Arc<AtomicUsize>,
     /// Highest number of control messages seen queued at once.
     pub event_queue_depth_peak: Arc<AtomicUsize>,
     /// HTTP/1.1 connections fully served by the event workers.
@@ -100,6 +104,7 @@ impl Stats {
             connections_active: self.connections_active.load(Ordering::Relaxed),
             event_poll_syscalls: self.event_poll_syscalls.load(Ordering::Relaxed),
             event_wakeups: self.event_wakeups.load(Ordering::Relaxed),
+            event_wait_errors: self.event_wait_errors.load(Ordering::Relaxed),
             event_queue_depth_peak: self.event_queue_depth_peak.load(Ordering::Relaxed),
             h1_connections: self.h1_connections.load(Ordering::Relaxed),
             h1_read_syscalls: self.h1_read_syscalls.load(Ordering::Relaxed),
@@ -211,6 +216,8 @@ pub struct StatsSnapshot {
     pub event_poll_syscalls: usize,
     /// Event-loop wake-ups via the self-pipe.
     pub event_wakeups: usize,
+    /// Event-loop waits that failed and had to be recovered from.
+    pub event_wait_errors: usize,
     /// Highest control-message queue depth observed.
     pub event_queue_depth_peak: usize,
     /// HTTP/1.1 connections served by the event workers.
@@ -267,11 +274,12 @@ impl StatsSnapshot {
     /// Machine-readable `|`-separated field block for benchmark output.
     pub fn render(&self) -> String {
         format!(
-            "connections_accepted={}|connections_active={}|event_poll_syscalls={}|event_wakeups={}|event_queue_depth_peak={}|h1_connections={}|h1_read_syscalls={}|h1_write_syscalls={}|h2_connections={}|h2_connections_active={}|h2_streams_total={}|h2_streams_timed_out={}|h2_streams_active={}|h2_streams_active_peak={}|h2_streams_per_connection_peak={}|h2_read_syscalls={}|h2_write_syscalls={}|h3_connections={}|h3_connections_active={}|h3_streams_total={}|h3_streams_active={}|h3_streams_active_peak={}|h3_streams_per_connection_peak={}|h3_queue_depth_peak={}|h3_udp_recv_syscalls={}|h3_udp_send_syscalls={}|h3_ack_deferred={}|h3_credit_stalls={}",
+            "connections_accepted={}|connections_active={}|event_poll_syscalls={}|event_wakeups={}|event_wait_errors={}|event_queue_depth_peak={}|h1_connections={}|h1_read_syscalls={}|h1_write_syscalls={}|h2_connections={}|h2_connections_active={}|h2_streams_total={}|h2_streams_timed_out={}|h2_streams_active={}|h2_streams_active_peak={}|h2_streams_per_connection_peak={}|h2_read_syscalls={}|h2_write_syscalls={}|h3_connections={}|h3_connections_active={}|h3_streams_total={}|h3_streams_active={}|h3_streams_active_peak={}|h3_streams_per_connection_peak={}|h3_queue_depth_peak={}|h3_udp_recv_syscalls={}|h3_udp_send_syscalls={}|h3_ack_deferred={}|h3_credit_stalls={}",
             self.connections_accepted,
             self.connections_active,
             self.event_poll_syscalls,
             self.event_wakeups,
+            self.event_wait_errors,
             self.event_queue_depth_peak,
             self.h1_connections,
             self.h1_read_syscalls,

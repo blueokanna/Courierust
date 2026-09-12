@@ -92,7 +92,38 @@ enum EventMsg {
     },
     Closed {
         id: usize,
+        /// A handle the reactor keeps alive until it has stopped
+        /// watching the descriptor.
+        ///
+        /// The alternative — letting the worker drop the last handle —
+        /// closes the descriptor while the reactor may be blocked in a
+        /// wait that still names it, and a wait set naming a closed
+        /// descriptor fails as a whole on Winsock. Holding one handle
+        /// across the handover makes "stop watching" strictly happen
+        /// before "close", so the failure cannot be reached at all.
+        socket: Option<Arc<TcpStream>>,
     },
+}
+
+/// The connection tables the reactor and its workers share.
+///
+/// A plain HTTP/1.1 connection (and a WebSocket whose upgrade has not
+/// completed) lives in `h1`; a connection whose upgrade has completed
+/// lives in `ws`. A connection never moves between the two: what changes
+/// at the upgrade is the policy that drives it, not its identity.
+#[derive(Clone)]
+struct Registries {
+    h1: Arc<std::sync::Mutex<HashMap<usize, EventConn>>>,
+    ws: Arc<std::sync::Mutex<HashMap<usize, crate::courierust_server::ws::WsEventConn>>>,
+}
+
+impl Registries {
+    fn new() -> Self {
+        Self {
+            h1: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            ws: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
 }
 
 /// How a worker wants the connection handled next.
@@ -591,6 +622,15 @@ impl EventConn {
         }
     }
 
+    /// Whether a response (or a `101` head) still has bytes to write.
+    ///
+    /// Used by the reactor when it rebuilds its wait set after a failed
+    /// wait: the parked-direction of a connection is not stored in the
+    /// registries, it is derived from this fact.
+    fn has_pending_output(&self) -> bool {
+        self.out_pos < self.out.len()
+    }
+
     /// Process the connection one step (non-blocking). Serves as many
     /// pipelined requests as are fully buffered, then returns how to
     /// continue.
@@ -914,11 +954,7 @@ pub(crate) fn serve_event(
     let (msg_tx, msg_rx) = channel::<EventMsg>();
     let (ready_tx, ready_rx): (Sender<Vec<usize>>, Receiver<Vec<usize>>) = channel();
     let ready_rx = Arc::new(std::sync::Mutex::new(ready_rx));
-    let registry: Arc<std::sync::Mutex<HashMap<usize, EventConn>>> =
-        Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let ws_registry: Arc<
-        std::sync::Mutex<HashMap<usize, crate::courierust_server::ws::WsEventConn>>,
-    > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let registries = Registries::new();
     let (wake_reader, wake_writer) = wakeup_pair()?;
     let wake_writer = Arc::new(wake_writer);
 
@@ -926,7 +962,7 @@ pub(crate) fn serve_event(
     let loop_handler = handler.clone();
     let loop_config = config.clone();
     let loop_pool = pool.clone();
-    let loop_registry = registry.clone();
+    let loop_registries = registries.clone();
     let event_thread = thread::Builder::new()
         .name("courierust-event".into())
         .spawn(move || {
@@ -936,7 +972,7 @@ pub(crate) fn serve_event(
                 loop_handler,
                 loop_config,
                 loop_pool,
-                loop_registry,
+                loop_registries,
                 wake_reader,
             );
         })?;
@@ -951,8 +987,7 @@ pub(crate) fn serve_event(
     };
     let mut worker_handles = Vec::new();
     for _ in 0..workers {
-        let w_registry = registry.clone();
-        let w_ws_registry = ws_registry.clone();
+        let w_registries = registries.clone();
         let w_handler = handler.clone();
         let w_config = config.clone();
         let w_ready_rx = ready_rx.clone();
@@ -964,8 +999,7 @@ pub(crate) fn serve_event(
                 .spawn(move || {
                     event_worker(
                         w_ready_rx,
-                        w_registry,
-                        w_ws_registry,
+                        w_registries,
                         &*w_handler,
                         &w_config,
                         &w_msg_tx,
@@ -1025,6 +1059,35 @@ pub(crate) fn drain_wake(r: &TcpStream) {
     }
 }
 
+/// Rebuild the reactor's wait set from the live connections.
+///
+/// The registries are the source of truth: sockets still being
+/// classified (`pending`, readable), parked HTTP/1.1 connections
+/// (readable again unless a response is still in flight) and parked
+/// WebSocket connections (writable exactly while frames are queued). An
+/// id no registry knows is left out of the rebuilt set — which is what
+/// removes the entry that made the wait fail in the first place.
+///
+/// This runs only after a wait failed, so it may walk every connection:
+/// the cost of rebuilding is paid once, in exchange for a reactor that
+/// keeps its guarantees instead of spinning on a broken descriptor set.
+fn rebuild_wait_set(
+    poller: &mut Poller,
+    pending: &HashMap<usize, TcpStream>,
+    registries: &Registries,
+) {
+    poller.clear();
+    for (id, stream) in pending.iter() {
+        poller.register(*id, fd_of(stream), false);
+    }
+    for (id, conn) in registries.h1.lock().unwrap().iter() {
+        poller.register(*id, fd_of(&conn.socket), conn.has_pending_output());
+    }
+    for (id, conn) in registries.ws.lock().unwrap().iter() {
+        poller.register(*id, fd_of(conn.socket()), conn.has_queued_output());
+    }
+}
+
 /// Apply one control message to the poller / pending / activity state.
 /// Used by both the message-drain path and the block-on-channel path, so
 /// a message consumed from the channel is never dropped.
@@ -1068,25 +1131,38 @@ fn handle_msg(
             activity.insert(id, Instant::now());
             poller.register(id, fd, want_write);
         }
-        EventMsg::Closed { id } => {
+        EventMsg::Closed { id, socket } => {
+            // The reactor stops watching the descriptor *here*, and only
+            // afterwards drops the handle the worker handed over — so
+            // the descriptor is still open while a concurrent wait may
+            // name it, and closed once it is no longer named. A wait set
+            // that names a closed descriptor is not a harmless stale
+            // entry either: POSIX `poll` reports `POLLNVAL` for that one
+            // entry, but Winsock's `select` fails the whole call with
+            // `WSAENOTSOCK`, which used to leave the loop spinning in
+            // its error path with every other connection parked until
+            // its peer gave up.
+            poller.unregister(id);
+            pending.remove(&id);
             if activity.remove(&id).is_some() {
                 if let Some(s) = stats {
                     Stats::decrement(&s.connections_active, 1);
                 }
             }
+            drop(socket);
         }
     }
 }
 
 /// The event loop: polls sockets, classifies new connections, and
-/// dispatches ready HTTP/1.1 connections to workers.
+/// dispatches ready HTTP/1.1 and WebSocket connections to workers.
 fn event_loop(
     msg_rx: Receiver<EventMsg>,
     ready_tx: Sender<Vec<usize>>,
     handler: Arc<dyn Handler>,
     config: ServerConfig,
     pool: Arc<crate::courierust_pool::ThreadPool>,
-    registry: Arc<std::sync::Mutex<HashMap<usize, EventConn>>>,
+    registries: Registries,
     wake_reader: TcpStream,
 ) {
     let mut poller = Poller::new();
@@ -1094,6 +1170,9 @@ fn event_loop(
     let mut activity: HashMap<usize, Instant> = HashMap::new();
     let stats = config.stats.clone();
     let stats = stats.as_deref();
+    // Consecutive failed waits; reset by every successful one. A healthy
+    // reactor never sees a non-zero value.
+    let mut wait_errors = 0usize;
 
     let wake_fd = fd_of(&wake_reader);
     let poll_timeout = config.event_poll_timeout_ms.clamp(1, 1000) as i32;
@@ -1155,8 +1234,28 @@ fn event_loop(
             None => poll_timeout,
         };
         let ready = match poller.wait(wait_ms, Some(wake_fd)) {
-            Ok(r) => r,
-            Err(_) => continue,
+            Ok(r) => {
+                wait_errors = 0;
+                r
+            }
+            Err(_) => {
+                // Recovering beats spinning. A wait fails as a whole when
+                // one descriptor in its set is no longer usable, so the
+                // set is rebuilt from the live connections (the
+                // registries are the source of truth) and waits resume
+                // immediately. If the rebuilt set still cannot be waited
+                // on, the loop backs off instead of burning a core — a
+                // broken wait must cost latency, never the process.
+                wait_errors += 1;
+                if let Some(s) = stats {
+                    s.event_wait_errors.fetch_add(1, Ordering::Relaxed);
+                }
+                rebuild_wait_set(&mut poller, &pending, &registries);
+                if wait_errors >= 64 {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                continue;
+            }
         };
         if let Some(s) = stats {
             s.event_poll_syscalls.fetch_add(1, Ordering::Relaxed);
@@ -1265,7 +1364,7 @@ fn event_loop(
                         if let Some(s) = stats {
                             s.h1_connections.fetch_add(1, Ordering::Relaxed);
                         }
-                        registry.lock().unwrap().insert(id, conn);
+                        registries.h1.lock().unwrap().insert(id, conn);
                         to_dispatch.push(id);
                     }
                     Class::NeedMore => {
@@ -1297,7 +1396,8 @@ fn event_loop(
             if near_idle {
                 let now = Instant::now();
                 let mut expired = Vec::new();
-                let registered: HashSet<usize> = registry.lock().unwrap().keys().copied().collect();
+                let registered: HashSet<usize> =
+                    registries.h1.lock().unwrap().keys().copied().collect();
                 for (&id, &at) in &activity {
                     if now.duration_since(at) < t {
                         continue;
@@ -1309,7 +1409,7 @@ fn event_loop(
                 for id in expired {
                     poller.unregister(id);
                     pending.remove(&id);
-                    registry.lock().unwrap().remove(&id);
+                    registries.h1.lock().unwrap().remove(&id);
                     if activity.remove(&id).is_some() {
                         if let Some(s) = stats {
                             Stats::decrement(&s.connections_active, 1);
@@ -1424,8 +1524,7 @@ fn emit_trace(conn: &mut EventConn, id: usize, handoff_us: u64, fresh_wait_us: u
 /// poll tick.
 fn event_worker(
     ready_rx: Arc<std::sync::Mutex<Receiver<Vec<usize>>>>,
-    registry: Arc<std::sync::Mutex<HashMap<usize, EventConn>>>,
-    ws_registry: Arc<std::sync::Mutex<HashMap<usize, crate::courierust_server::ws::WsEventConn>>>,
+    registries: Registries,
     handler: &dyn Handler,
     config: &ServerConfig,
     msg_tx: &Sender<EventMsg>,
@@ -1438,7 +1537,7 @@ fn event_worker(
         };
         for id in ids {
             // ---- WebSocket connections stay in the reactor ----------
-            let ws_conn = ws_registry.lock().unwrap().remove(&id);
+            let ws_conn = registries.ws.lock().unwrap().remove(&id);
             if let Some(mut ws_conn) = ws_conn {
                 let step =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ws_conn.step()));
@@ -1452,18 +1551,24 @@ fn event_worker(
                         let fd = fd_of(ws_conn.socket());
                         let want_write =
                             matches!(outcome, crate::courierust_server::ws::WsStep::NeedWrite);
-                        ws_registry.lock().unwrap().insert(id, ws_conn);
+                        registries.ws.lock().unwrap().insert(id, ws_conn);
                         let _ = msg_tx.send(EventMsg::Register { id, fd, want_write });
                         wake_nudge(wake_writer);
                     }
                     crate::courierust_server::ws::WsStep::Close => {
-                        let _ = msg_tx.send(EventMsg::Closed { id });
+                        // Hand the handle over: the reactor must stop
+                        // watching the descriptor before it is closed.
+                        let socket = ws_conn.socket().clone();
+                        let _ = msg_tx.send(EventMsg::Closed {
+                            id,
+                            socket: Some(socket),
+                        });
                         wake_nudge(wake_writer);
                     }
                 }
                 continue;
             }
-            let mut conn = match registry.lock().unwrap().remove(&id) {
+            let mut conn = match registries.h1.lock().unwrap().remove(&id) {
                 Some(c) => c,
                 None => continue,
             };
@@ -1511,13 +1616,19 @@ fn event_worker(
                     if conn.trace {
                         conn.parked_at = Some(Instant::now());
                     }
-                    registry.lock().unwrap().insert(id, conn);
+                    registries.h1.lock().unwrap().insert(id, conn);
                     let _ = msg_tx.send(EventMsg::Register { id, fd, want_write });
                     wake_nudge(wake_writer);
                 }
                 StepOutcome::Close => {
                     emit_trace(&mut conn, id, 0, 0);
-                    let _ = msg_tx.send(EventMsg::Closed { id });
+                    // Hand the handle over: the reactor must stop
+                    // watching the descriptor before it is closed.
+                    let socket = conn.socket.clone();
+                    let _ = msg_tx.send(EventMsg::Closed {
+                        id,
+                        socket: Some(socket),
+                    });
                     wake_nudge(wake_writer);
                 }
                 StepOutcome::Upgrade(upgraded) => {
@@ -1544,12 +1655,18 @@ fn event_worker(
                         | crate::courierust_server::ws::WsStep::NeedWrite => {
                             let want_write =
                                 matches!(outcome, crate::courierust_server::ws::WsStep::NeedWrite);
-                            ws_registry.lock().unwrap().insert(id, ws_conn);
+                            registries.ws.lock().unwrap().insert(id, ws_conn);
                             let _ = msg_tx.send(EventMsg::Register { id, fd, want_write });
                             wake_nudge(wake_writer);
                         }
                         crate::courierust_server::ws::WsStep::Close => {
-                            let _ = msg_tx.send(EventMsg::Closed { id });
+                            // Hand the handle over: the reactor must stop
+                            // watching the descriptor before it is closed.
+                            let socket = ws_conn.socket().clone();
+                            let _ = msg_tx.send(EventMsg::Closed {
+                                id,
+                                socket: Some(socket),
+                            });
                             wake_nudge(wake_writer);
                         }
                     }

@@ -223,6 +223,20 @@ impl Poller {
         }
     }
 
+    /// Forget every registration, leaving the poller empty and ready for
+    /// a fresh registration pass.
+    ///
+    /// This is recovery, not steady state: the caller rebuilds the set
+    /// from its own live-connection tables, so an entry whose descriptor
+    /// was closed behind the poller's back cannot poison every later
+    /// wait. `poll` reports such a descriptor as `POLLNVAL` for that one
+    /// entry, but Winsock's `select` fails the *whole* call, which turns
+    /// a stale entry into a reactor that never waits successfully again.
+    pub(crate) fn clear(&mut self) {
+        self.fds.clear();
+        self.index.clear();
+    }
+
     /// Wait up to `timeout_ms` for readiness. `wake` is an optional
     /// descriptor (the event loop's self-pipe) watched for readability in
     /// every batch; when it fires, [`WAKE_ID`] is included in the result.
@@ -430,6 +444,46 @@ mod tests {
         client.write_all(b"hi").unwrap();
         let ready = p.wait(100, None).unwrap();
         assert!(ready.is_empty(), "unregistered socket reported: {ready:?}");
+    }
+
+    /// A descriptor closed behind the poller's back must never wedge a
+    /// wait; it has to be reported *somehow* so the reactor can react.
+    ///
+    /// The platforms disagree about the shape of the report, and both
+    /// shapes are handled: Winsock fails the whole wait with
+    /// `WSAENOTSOCK` (the caller rebuilds the set from its registries),
+    /// while POSIX `poll` returns `POLLNVAL` for that one entry, which
+    /// this module reports as ready so the caller drops it. What must not
+    /// exist is a third shape — a wait that never returns — because the
+    /// reactor's recovery path would never run.
+    #[test]
+    fn a_closed_descriptor_cannot_wedge_a_wait() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        let mut p = Poller::new();
+        let fd = fd_of(&server);
+        p.register(7, fd, false);
+        drop(server);
+
+        let started = std::time::Instant::now();
+        let outcome = p.wait(200, None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the wait did not return: a closed descriptor wedged it"
+        );
+        match outcome {
+            // Winsock: the whole wait fails, so the caller must rebuild.
+            Err(_) => {}
+            // POSIX: the closed descriptor is reported as ready.
+            Ok(ids) => assert!(
+                ids.contains(&7),
+                "a closed descriptor must be reported, got {ids:?}"
+            ),
+        }
+        drop(client);
     }
 
     #[test]

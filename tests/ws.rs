@@ -15,6 +15,7 @@ use courierust::courierust_http::header::{HeaderName, HeaderValue};
 use courierust::courierust_http::request::Request;
 use courierust::courierust_http::response::Response;
 use courierust::courierust_http::status::StatusCode;
+use courierust::courierust_net::stats::Stats;
 use courierust::courierust_server::ws::{
     WsConfig, WsConn, WsData, WsSender, WsService, WsUpgradeReply,
 };
@@ -134,6 +135,17 @@ fn wait_for<F: Fn() -> bool>(what: &str, f: F) {
 
 fn connect(addr: SocketAddr, path: &str) -> WebSocket {
     let cfg = ClientConfig::default();
+    WebSocket::connect(&format!("ws://{addr}{path}"), &cfg).expect("handshake")
+}
+
+/// Connect with a short read deadline, so a stalled server fails a test
+/// in seconds and with an error that names the cause instead of hiding
+/// behind the default minute-long timeout.
+fn connect_within(addr: SocketAddr, path: &str, read_timeout: Duration) -> WebSocket {
+    let cfg = ClientConfig {
+        read_timeout: Some(read_timeout),
+        ..ClientConfig::default()
+    };
     WebSocket::connect(&format!("ws://{addr}{path}"), &cfg).expect("handshake")
 }
 
@@ -728,6 +740,80 @@ fn many_connections_echo_concurrently() {
     for h in handles {
         h.join().expect("worker thread");
     }
+}
+
+/// Regression: a connection that ends must leave the reactor's wait set.
+///
+/// The descriptor of a closed connection used to stay registered, so the
+/// reactor kept waiting on a socket nobody owned any more. Where the
+/// platform rejects a whole wait set for one bad descriptor (Winsock's
+/// `select` fails with `WSAENOTSOCK`), the reactor then failed every
+/// wait from that moment on — every other connection stayed parked until
+/// its peer gave up, which is exactly what a busy server must never do.
+///
+/// The test does not merely check that the closed connection is gone; it
+/// proves the *survivors* keep talking.
+#[test]
+fn a_closed_connection_does_not_stop_the_reactor() {
+    let service = Arc::new(EchoService::default());
+    let observed = service.clone();
+    // The reactor's own evidence: a healthy run never pays a failed wait.
+    let stats = Stats::new();
+    let addr = spawn_ws_server(
+        ServerConfig {
+            stats: Some(stats.clone()),
+            ..event_config()
+        },
+        "/echo",
+        service,
+    );
+    let deadline = Duration::from_secs(5);
+    let mut leaving = connect_within(addr, "/echo", deadline);
+    let mut staying = connect_within(addr, "/echo", deadline);
+
+    // Both connections are live on the same reactor before one leaves.
+    leaving.send_text("leaving").unwrap();
+    staying.send_text("staying").unwrap();
+    assert_eq!(
+        leaving.read_message().unwrap(),
+        Event::Text(String::from("leaving"))
+    );
+    assert_eq!(
+        staying.read_message().unwrap(),
+        Event::Text(String::from("staying"))
+    );
+
+    // Close one of them and wait until the server has seen it end, so the
+    // close is really processed while the other connection is parked.
+    leaving.close(1000, "bye").unwrap();
+    drop(leaving);
+    wait_for("the server to observe the close", || {
+        !observed.closed.lock().unwrap().is_empty()
+    });
+
+    for round in 0..4 {
+        let text = format!("still here {round}");
+        staying.send_text(&text).unwrap();
+        assert_eq!(
+            staying.read_message().unwrap(),
+            Event::Text(text),
+            "the reactor must keep serving the connections that are still open"
+        );
+    }
+    staying.close(1000, "done").unwrap();
+
+    // The invariant behind that: every close unregisters the descriptor
+    // *before* it is closed, so no wait ever names a closed one and the
+    // reactor never has to recover at all.
+    let snapshot = stats.snapshot();
+    assert_eq!(
+        snapshot.event_wait_errors, 0,
+        "a healthy reactor never pays a failed wait"
+    );
+    assert!(
+        snapshot.event_poll_syscalls > 0,
+        "the reactor must have waited at least once"
+    );
 }
 
 #[test]

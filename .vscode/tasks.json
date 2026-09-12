@@ -2,546 +2,58 @@
 	"version": "2.0.0",
 	"tasks": [
 		{
-			"label": "run-integration-stability",
+			"label": "ci: fmt",
 			"type": "shell",
-			"command": "for /L %i in (1,1,5) do (cargo test --test integration > tmp_stab_task_run.txt 2>&1 & findstr /C:\"test result: ok. 26 passed\" tmp_stab_task_run.txt >nul && echo run=%i PASS >> tmp_stab_task.txt || echo run=%i FAILED >> tmp_stab_task.txt)",
+			"command": "cargo +1.78.0 fmt --all -- --check",
 			"problemMatcher": [],
 			"group": "test"
 		},
 		{
-			"label": "verify-grease-fix",
+			"label": "ci: clippy",
 			"type": "shell",
-			"command": "cargo bench --manifest-path benches/Cargo.toml --bench tmp_repro > tmp_verify_task.txt 2>&1",
-			"group": "test"
-		},
-		{
-			"label": "verify-grease-fix2",
-			"type": "shell",
-			"command": "cargo bench --manifest-path benches/Cargo.toml --bench tmp_repro > tmp_verify_task2.txt 2>&1; Get-Content tmp_verify_task2.txt -Raw | Select-String -Pattern \"QUINN-H3 repro outcome|COURIERUST-CLIENT phase|QUINN phase\" | ForEach-Object { $_.Line }",
-			"group": "test"
-		},
-		{
-			"label": "task-marker-test",
-			"type": "shell",
-			"command": "Set-Content -Path task_test_marker.txt -Value \"hello-from-task\"; Write-Output marker-written",
-			"group": "test"
-		},
-		{
-			"label": "ws-bench",
-			"type": "shell",
-			"command": "cargo bench --manifest-path benches/Cargo.toml --bench ws",
-			"args": [],
+			"command": "cargo +1.78.0 clippy --all-targets -- -D warnings",
 			"problemMatcher": [],
 			"group": "test"
 		},
 		{
-			"label": "ws-lib-tests",
+			"label": "ci: clippy (no default features)",
 			"type": "shell",
-			"command": "cargo test --lib courierust_ws",
+			"command": "cargo +1.78.0 clippy --no-default-features --lib -- -D warnings",
 			"problemMatcher": [],
 			"group": "test"
 		},
 		{
-			"label": "ws-bench",
+			"label": "ci: test all targets",
 			"type": "shell",
-			"command": "cargo bench --manifest-path benches/Cargo.toml --bench ws",
+			"command": "cargo +1.78.0 test --all-targets",
 			"problemMatcher": [],
 			"group": "test"
 		},
 		{
-			"label": "kill-stale-bench",
+			"label": "ci: doc",
 			"type": "shell",
-			"command": "Get-Process | Where-Object { $_.ProcessName -like 'ws-*' } | Select-Object Id,ProcessName,StartTime | Format-Table -AutoSize | Out-String; Get-Process | Where-Object { $_.ProcessName -like 'ws-*' } | Stop-Process -Force; Write-Output 'stale bench processes stopped'",
+			"command": "cargo +1.78.0 doc --no-deps",
 			"problemMatcher": [],
 			"group": "test"
 		},
 		{
-			"label": "ws-bench",
+			"label": "test: websocket end-to-end",
+			"type": "shell",
+			"command": "cargo +1.78.0 test --test ws",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "test: websocket under 2 CPUs (CI runner shape)",
+			"type": "shell",
+			"command": "powershell -NoProfile -Command \"(Get-Process -Id $PID).ProcessorAffinity = 3; cargo +1.78.0 test --test ws\"",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "bench: websocket vs tungstenite/tokio-tungstenite",
 			"type": "shell",
 			"command": "cargo bench --manifest-path benches/Cargo.toml --bench ws",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ws-bench",
-			"type": "shell",
-			"command": "cargo bench --manifest-path benches/Cargo.toml --bench ws",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ws-lib-tests",
-			"type": "shell",
-			"command": "cargo test --lib courierust_ws 2>&1 | Select-String -Pattern 'error|warning:|test result|FAILED|panicked' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ws-bench-echo",
-			"type": "shell",
-			"command": "cargo bench --manifest-path benches/Cargo.toml --bench ws 2>&1 | Select-String -Pattern 'message |courierust /|tungstenite /|tokio-tungstenite /|courierust client|tungstenite client|raw TCP|ratios|deflate' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ws-bench-echo",
-			"type": "shell",
-			"command": "cargo bench --manifest-path benches/Cargo.toml --bench ws 2>&1 | Select-String -Pattern 'message 262144|buffer |courierust /|tungstenite /|tokio-tungstenite /|courierust client|tungstenite client|raw TCP|ratios' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ws-bench-file",
-			"type": "shell",
-			"command": "cargo bench --manifest-path benches/Cargo.toml --bench ws > tmp_ws_bench.txt 2>&1",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ws-bench-full",
-			"type": "shell",
-			"command": "cargo bench --manifest-path benches/Cargo.toml --bench ws",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ws-bench-full",
-			"type": "shell",
-			"command": "cargo bench --manifest-path benches/Cargo.toml --bench ws",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ws-bench-full",
-			"type": "shell",
-			"command": "cargo bench --manifest-path benches/Cargo.toml --bench ws",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ws-bench-file",
-			"type": "shell",
-			"command": "cargo bench --manifest-path benches/Cargo.toml --bench ws > tmp_ws_bench.txt 2>&1; exit 0",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ws-bench-file",
-			"type": "shell",
-			"command": "cargo bench --manifest-path benches/Cargo.toml --bench ws > tmp_ws_bench.txt 2>&1; exit 0",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ws-bench-file",
-			"type": "shell",
-			"command": "cargo bench --manifest-path benches/Cargo.toml --bench ws > tmp_ws_bench.txt 2>&1; exit 0",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "push-only-bench",
-			"type": "shell",
-			"command": "$env:WS_BENCH_SECTION='push'; cargo bench --manifest-path benches/Cargo.toml --bench ws > tmp_push1.txt 2>&1; exit 0",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "push-only-bench",
-			"type": "shell",
-			"command": "$env:WS_BENCH_SECTION='push'; cargo bench --manifest-path benches/Cargo.toml --bench ws > tmp_push2.txt 2>&1; exit 0",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "push-trace-bench",
-			"type": "shell",
-			"command": "$env:WS_BENCH_SECTION='push'; $env:WS_BENCH_TRACE='1'; cargo bench --manifest-path benches/Cargo.toml --bench ws > tmp_push3.txt 2>&1; exit 0",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "push-control-bench",
-			"type": "shell",
-			"command": "$env:WS_BENCH_SECTION='push'; cargo bench --manifest-path benches/Cargo.toml --bench ws > tmp_push4.txt 2>&1; exit 0",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "push-deadline-bench",
-			"type": "shell",
-			"command": "$env:WS_BENCH_SECTION='push'; cargo bench --manifest-path benches/Cargo.toml --bench ws > tmp_push5.txt 2>&1; exit 0",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ws-tests-after-deadline-change",
-			"type": "shell",
-			"command": "cargo test --lib courierust_ws 2>&1 | Select-String -Pattern 'error|test result|FAILED' | ForEach-Object { $_.Line }; cargo test --test ws 2>&1 | Select-String -Pattern 'error|test result|FAILED' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ws-bench-full2",
-			"type": "shell",
-			"command": "cargo bench --manifest-path benches/Cargo.toml --bench ws > tmp_ws_bench2.txt 2>&1; exit 0",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "echo-only-bench",
-			"type": "shell",
-			"command": "$env:WS_BENCH_SECTION='echo'; cargo bench --manifest-path benches/Cargo.toml --bench ws > tmp_echo1.txt 2>&1; cargo bench --manifest-path benches/Cargo.toml --bench ws > tmp_echo2.txt 2>&1; exit 0",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "build-examples",
-			"type": "shell",
-			"command": "cargo build --examples 2>&1 | Select-String -Pattern '^error|^warning: unused|-->' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "build"
-		},
-		{
-			"label": "build-examples2",
-			"type": "shell",
-			"command": "cargo build --examples 2>&1 | Select-String -Pattern '^error|^warning: unused|-->' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "build"
-		},
-		{
-			"label": "build-examples3",
-			"type": "shell",
-			"command": "cargo build --examples 2>&1 | Select-String -Pattern '^error|^warning: unused|-->' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "build"
-		},
-		{
-			"label": "build-examples4",
-			"type": "shell",
-			"command": "cargo build --examples 2>&1 | Select-String -Pattern '^error|^warning|-->' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "build"
-		},
-		{
-			"label": "run-ws-echo-example",
-			"type": "shell",
-			"command": "cargo run --example ws_echo 2>&1 | Select-Object -Last 20",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "full-test-suite",
-			"type": "shell",
-			"command": "cargo test --lib 2>&1 | Select-String -Pattern '^error|test result|panicked' | ForEach-Object { $_.Line }; cargo test --test ws 2>&1 | Select-String -Pattern '^error|test result|panicked' | ForEach-Object { $_.Line }; cargo test --test integration 2>&1 | Select-String -Pattern '^error|test result|panicked' | ForEach-Object { $_.Line }; cargo test --doc 2>&1 | Select-String -Pattern '^error|test result|panicked' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ws-bench-final",
-			"type": "shell",
-			"command": "cargo bench --manifest-path benches/Cargo.toml --bench ws > tmp_final.txt 2>&1; exit 0",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "crypto-ws-tests",
-			"type": "shell",
-			"command": "cargo test --lib courierust_crypto 2>&1 | Select-String -Pattern '^error|test result|panicked|-->' | ForEach-Object { $_.Line }; cargo test --lib courierust_ws::handshake 2>&1 | Select-String -Pattern '^error|test result|panicked' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "crypto-tests",
-			"type": "shell",
-			"command": "cargo test --lib courierust_crypto 2>&1 | Select-String -Pattern '^error|test result|panicked|-->' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ws-after-review",
-			"type": "shell",
-			"command": "cargo test --lib courierust_ws 2>&1 | Select-String -Pattern '^error|test result|panicked|-->' | ForEach-Object { $_.Line }; cargo build --lib 2>&1 | Select-String -Pattern '^error|warning:|-->' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "lib-after-review",
-			"type": "shell",
-			"command": "cargo test --lib 2>&1 | Select-String -Pattern '^error|test result|panicked|-->' | ForEach-Object { $_.Line }; cargo test --lib 2>&1 | Select-String -Pattern 'warning:' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ws-tests-close-guard",
-			"type": "shell",
-			"command": "cargo test --lib courierust_ws 2>&1 | Select-String -Pattern '^error|test result|panicked|-->' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "after-close-flag",
-			"type": "shell",
-			"command": "cargo test --lib 2>&1 | Select-String -Pattern '^error|test result|panicked|warning:|-->' | ForEach-Object { $_.Line }; cargo test --test ws 2>&1 | Select-String -Pattern '^error|test result|panicked|-->' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "after-close-flag2",
-			"type": "shell",
-			"command": "cargo test --lib 2>&1 | Select-String -Pattern '^error|test result|panicked|warning:|-->' | ForEach-Object { $_.Line }; cargo test --test ws 2>&1 | Select-String -Pattern '^error|test result|panicked|-->' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ws-tests-close2",
-			"type": "shell",
-			"command": "cargo test --lib courierust_ws 2>&1 | Select-String -Pattern '^error|test result|panicked|FAILED|-->|warning:' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "lib-after-violation-split",
-			"type": "shell",
-			"command": "cargo test --lib 2>&1 | Select-String -Pattern '^error|test result|panicked|FAILED|-->|warning:' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "session-tests-new",
-			"type": "shell",
-			"command": "cargo test --lib courierust_ws::session 2>&1 | Select-String -Pattern '^error|test result|panicked|FAILED|-->|warning:' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "server-ws-tests",
-			"type": "shell",
-			"command": "cargo test --lib courierust_server::ws 2>&1 | Select-String -Pattern '^error|test result|panicked|FAILED|-->|warning:|^  ' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "server-ws-tests2",
-			"type": "shell",
-			"command": "cargo test --lib courierust_server::ws 2>&1 | Select-String -Pattern '^error|test result|panicked|FAILED|-->|warning:|^  ' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "server-ws-tests3",
-			"type": "shell",
-			"command": "cargo test --lib courierust_server::ws 2>&1 | Select-String -Pattern '^error|test result|panicked|FAILED|-->|warning:|^  ' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "full-after-hardening",
-			"type": "shell",
-			"command": "cargo test --lib 2>&1 | Select-String -Pattern '^error|test result|panicked|FAILED|-->|warning:' | ForEach-Object { $_.Line }; cargo test --test ws 2>&1 | Select-String -Pattern '^error|test result|panicked|FAILED|-->' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "after-host-enforcement",
-			"type": "shell",
-			"command": "cargo test --lib 2>&1 | Select-String -Pattern '^error|test result|panicked|FAILED|-->|warning:' | ForEach-Object { $_.Line }; cargo test --test ws 2>&1 | Select-String -Pattern '^error|test result|panicked|FAILED|-->|assert' | ForEach-Object { $_.Line }; cargo test --test integration 2>&1 | Select-String -Pattern '^error|test result|panicked|FAILED' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "after-host-enforcement2",
-			"type": "shell",
-			"command": "cargo test --lib 2>&1 | Select-String -Pattern '^error|test result|panicked|FAILED|-->|warning:' | ForEach-Object { $_.Line }; cargo test --test ws 2>&1 | Select-String -Pattern '^error|test result|panicked|FAILED|-->' | ForEach-Object { $_.Line }; cargo test --test integration 2>&1 | Select-String -Pattern '^error|test result|panicked|FAILED' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "host-test",
-			"type": "shell",
-			"command": "cargo test --test integration http11_requires 2>&1 | Select-String -Pattern '^error|test result|panicked|FAILED|-->|got ' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "host-test2",
-			"type": "shell",
-			"command": "cargo test --test integration http11_requires 2>&1 | Select-String -Pattern '^error|test result|panicked|FAILED|-->|got ' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "whole-suite-after-hardening",
-			"type": "shell",
-			"command": "cargo test --lib 2>&1 | Select-String -Pattern '^error|test result|FAILED|warning:' | ForEach-Object { $_.Line }; cargo test --test ws 2>&1 | Select-String -Pattern '^error|test result|FAILED' | ForEach-Object { $_.Line }; cargo test --test integration 2>&1 | Select-String -Pattern '^error|test result|FAILED' | ForEach-Object { $_.Line }; cargo test --test h2_hardening 2>&1 | Select-String -Pattern '^error|test result|FAILED' | ForEach-Object { $_.Line }; cargo test --test h3 2>&1 | Select-String -Pattern '^error|test result|FAILED' | ForEach-Object { $_.Line }; cargo test --test h3_key_update 2>&1 | Select-String -Pattern '^error|test result|FAILED' | ForEach-Object { $_.Line }; cargo test --doc 2>&1 | Select-String -Pattern '^error|test result|FAILED' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "origin-edges-test",
-			"type": "shell",
-			"command": "cargo test --lib courierust_ws::handshake 2>&1 | Select-String -Pattern '^error|test result|panicked|FAILED|-->|assert' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "final-verification",
-			"type": "shell",
-			"command": "cargo test --lib 2>&1 | Select-String -Pattern '^error|test result|FAILED|warning:' | ForEach-Object { $_.Line }; cargo test --test ws 2>&1 | Select-String -Pattern '^error|test result|FAILED' | ForEach-Object { $_.Line }; cargo test --test integration 2>&1 | Select-String -Pattern '^error|test result|FAILED' | ForEach-Object { $_.Line }; cargo test --doc 2>&1 | Select-String -Pattern '^error|test result|FAILED' | ForEach-Object { $_.Line }; cargo build --examples --tests 2>&1 | Select-String -Pattern '^error|warning:' | ForEach-Object { $_.Line }; Remove-Item tmp_host.txt -ErrorAction SilentlyContinue; 'all-done'",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "integration-clean",
-			"type": "shell",
-			"command": "cargo test --test integration 2>&1 | Select-String -Pattern '^error|test result|FAILED|warning:' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ci-build-178",
-			"type": "shell",
-			"command": "$env:RUSTFLAGS='-D warnings'; cargo +1.78.0 build --all-targets > tmp_ci_build.txt 2>&1; Write-Output \"EXIT=$LASTEXITCODE\"",
-			"problemMatcher": [],
-			"group": "build"
-		},
-		{
-			"label": "ci-build-log",
-			"type": "shell",
-			"command": "Get-Content tmp_ci_build.txt -Tail 50",
-			"problemMatcher": [],
-			"group": "build"
-		},
-		{
-			"label": "ci-clippy-178",
-			"type": "shell",
-			"command": "$env:RUSTFLAGS=''; cargo +1.78.0 clippy --all-targets -- -D warnings > tmp_ci_clippy.txt 2>&1; Write-Output \"CLIPPY_EXIT=$LASTEXITCODE\"; cargo +1.78.0 clippy --no-default-features --lib -- -D warnings > tmp_ci_clippy_nostd.txt 2>&1; Write-Output \"CLIPPY_NOSTD_EXIT=$LASTEXITCODE\"; cargo +1.78.0 build --no-default-features --lib > tmp_ci_nostd.txt 2>&1; Write-Output \"NOSTD_BUILD_EXIT=$LASTEXITCODE\"",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ci-logs",
-			"type": "shell",
-			"command": "Write-Output '=== clippy (std) ==='; Select-String -Path tmp_ci_clippy.txt -Pattern '^error|^warning|-->' | Select-Object -First 40 | ForEach-Object { $_.Line }; Write-Output '=== clippy (no_std) ==='; Select-String -Path tmp_ci_clippy_nostd.txt -Pattern '^error|^warning|-->' | Select-Object -First 30 | ForEach-Object { $_.Line }; Write-Output '=== no_std build ==='; Select-String -Path tmp_ci_nostd.txt -Pattern '^error|^warning|-->' | Select-Object -First 30 | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "clippy-detail",
-			"type": "shell",
-			"command": "$c = Get-Content tmp_ci_clippy.txt; $idx = ($c | Select-String -Pattern '^error' | Select-Object -First 10).LineNumber; foreach ($i in $idx) { $c[($i-1)..([Math]::Min($i+14, $c.Count-1))]; '-----' }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ci-clippy-again",
-			"type": "shell",
-			"command": "$env:RUSTFLAGS=''; cargo +1.78.0 clippy --all-targets -- -D warnings > tmp_ci_clippy.txt 2>&1; Write-Output \"CLIPPY_EXIT=$LASTEXITCODE\"; cargo +1.78.0 build --no-default-features --lib > tmp_ci_nostd.txt 2>&1; Write-Output \"NOSTD_EXIT=$LASTEXITCODE\"; cargo +1.78.0 clippy --no-default-features --lib -- -D warnings > tmp_ci_clippy_nostd.txt 2>&1; Write-Output \"CLIPPY_NOSTD_EXIT=$LASTEXITCODE\"",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ci-logs2",
-			"type": "shell",
-			"command": "Write-Output '=== clippy std ==='; $c = Get-Content tmp_ci_clippy.txt; $idx = ($c | Select-String -Pattern '^error' | Select-Object -First 8).LineNumber; foreach ($i in $idx) { $c[($i-1)..([Math]::Min($i+8, $c.Count-1))]; '---' }; Write-Output '=== no_std ==='; Select-String -Path tmp_ci_nostd.txt -Pattern '^error|-->' | Select-Object -First 25 | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ci-clippy-3",
-			"type": "shell",
-			"command": "$env:RUSTFLAGS=''; cargo +1.78.0 clippy --all-targets -- -D warnings > tmp_ci_clippy.txt 2>&1; Write-Output \"CLIPPY_EXIT=$LASTEXITCODE\"; cargo +1.78.0 build --no-default-features --lib > tmp_ci_nostd.txt 2>&1; Write-Output \"NOSTD_EXIT=$LASTEXITCODE\"; cargo +1.78.0 clippy --no-default-features --lib -- -D warnings > tmp_ci_clippy_nostd.txt 2>&1; Write-Output \"CLIPPY_NOSTD_EXIT=$LASTEXITCODE\"; cargo +1.78.0 fmt --all -- --check > tmp_fmt78.txt 2>&1; Write-Output \"FMT_EXIT=$LASTEXITCODE\"",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ci-doc-test-178",
-			"type": "shell",
-			"command": "$env:RUSTFLAGS='-D warnings'; $env:RUSTDOCFLAGS='-D warnings'; cargo +1.78.0 doc --no-deps > tmp_ci_doc.txt 2>&1; Write-Output \"DOC_EXIT=$LASTEXITCODE\"; $env:RUSTFLAGS=''; cargo +1.78.0 test --all-targets > tmp_ci_test.txt 2>&1; Write-Output \"TEST_EXIT=$LASTEXITCODE\"; cargo +1.78.0 test --doc > tmp_ci_doctest.txt 2>&1; Write-Output \"DOCTEST_EXIT=$LASTEXITCODE\"",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "doc-log",
-			"type": "shell",
-			"command": "$c = Get-Content tmp_ci_doc.txt; $idx = ($c | Select-String -Pattern '^error|^warning' | Select-Object -First 6).LineNumber; foreach ($i in $idx) { $c[($i-1)..([Math]::Min($i+12, $c.Count-1))]; '---' }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ci-doc-2",
-			"type": "shell",
-			"command": "$env:RUSTFLAGS='-D warnings'; $env:RUSTDOCFLAGS='-D warnings'; cargo +1.78.0 doc --no-deps > tmp_ci_doc.txt 2>&1; Write-Output \"DOC_EXIT=$LASTEXITCODE\"; $c = Get-Content tmp_ci_doc.txt; $idx = ($c | Select-String -Pattern '^error' | Select-Object -First 8).LineNumber; foreach ($i in $idx) { $c[($i-1)..([Math]::Min($i+6, $c.Count-1))]; '---' }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "test-summary-178",
-			"type": "shell",
-			"command": "Select-String -Path tmp_ci_test.txt -Pattern 'test result:|running \\d+ tests|^error|FAILED' | ForEach-Object { $_.Line }; Write-Output '--- doc tests ---'; Select-String -Path tmp_ci_doctest.txt -Pattern 'test result:|^error' | ForEach-Object { $_.Line }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ci-strict-final",
-			"type": "shell",
-			"command": "$env:RUSTFLAGS='-D warnings'; $env:RUSTDOCFLAGS='-D warnings'; cargo +1.78.0 test --all-targets > tmp_ci_test2.txt 2>&1; Write-Output \"TEST_STRICT_EXIT=$LASTEXITCODE\"; cargo +1.78.0 test --doc > tmp_ci_doctest2.txt 2>&1; Write-Output \"DOCTEST_STRICT_EXIT=$LASTEXITCODE\"; cargo +1.78.0 build --no-default-features --lib > tmp_ci_nostd2.txt 2>&1; Write-Output \"NOSTD_STRICT_EXIT=$LASTEXITCODE\"; rustfmt --edition 2021 benches/src/ws.rs; Write-Output \"RUSTFMT_BENCH_EXIT=$LASTEXITCODE\"; cargo +1.78.0 fmt --all -- --check; Write-Output \"FMT_EXIT=$LASTEXITCODE\"",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "build-after-linger",
-			"type": "shell",
-			"command": "$env:RUSTFLAGS='-D warnings'; cargo +1.78.0 build --all-targets > tmp_ci_build2.txt 2>&1; Write-Output \"BUILD_EXIT=$LASTEXITCODE\"; $c = Get-Content tmp_ci_build2.txt; $idx = ($c | Select-String -Pattern '^error' | Select-Object -First 6).LineNumber; foreach ($i in $idx) { $c[($i-1)..([Math]::Min($i+8, $c.Count-1))]; '---' }",
-			"problemMatcher": [],
-			"group": "build"
-		},
-		{
-			"label": "build-after-refactor",
-			"type": "shell",
-			"command": "$env:RUSTFLAGS='-D warnings'; cargo +1.78.0 build --all-targets > tmp_ci_build3.txt 2>&1; Write-Output \"BUILD_EXIT=$LASTEXITCODE\"; $c = Get-Content tmp_ci_build3.txt; $idx = ($c | Select-String -Pattern '^error' | Select-Object -First 6).LineNumber; foreach ($i in $idx) { $c[($i-1)..([Math]::Min($i+8, $c.Count-1))]; '---' }",
-			"problemMatcher": [],
-			"group": "build"
-		},
-		{
-			"label": "build-after-fix",
-			"type": "shell",
-			"command": "$env:RUSTFLAGS='-D warnings'; cargo +1.78.0 build --all-targets > tmp_ci_build4.txt 2>&1; Write-Output \"BUILD_EXIT=$LASTEXITCODE\"; $c = Get-Content tmp_ci_build4.txt; $idx = ($c | Select-String -Pattern '^error' | Select-Object -First 6).LineNumber; foreach ($i in $idx) { $c[($i-1)..([Math]::Min($i+8, $c.Count-1))]; '---' }",
-			"problemMatcher": [],
-			"group": "build"
-		},
-		{
-			"label": "malformed-test",
-			"type": "shell",
-			"command": "$env:RUSTFLAGS='-D warnings'; cargo +1.78.0 test --test integration http11_requires > tmp_host_test.txt 2>&1; Write-Output \"EXIT=$LASTEXITCODE\"; $c = Get-Content tmp_host_test.txt; $idx = ($c | Select-String -Pattern 'panicked|test result|no response|got ' | Select-Object -First 6).LineNumber; foreach ($i in $idx) { $c[($i-1)..([Math]::Min($i+4, $c.Count-1))]; '---' }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ci-full-final",
-			"type": "shell",
-			"command": "$R = [ordered]@{}; cargo +1.78.0 fmt --all -- --check; $R['fmt']=$LASTEXITCODE; $env:RUSTFLAGS='-D warnings'; $env:RUSTDOCFLAGS='-D warnings'; cargo +1.78.0 clippy --all-targets -- -D warnings > tmp_v_clippy.txt 2>&1; $R['clippy']=$LASTEXITCODE; cargo +1.78.0 clippy --no-default-features --lib -- -D warnings > tmp_v_clippy_nostd.txt 2>&1; $R['clippy_nostd']=$LASTEXITCODE; cargo +1.78.0 build --all-targets > tmp_v_build.txt 2>&1; $R['build_all']=$LASTEXITCODE; cargo +1.78.0 build --no-default-features --lib > tmp_v_nostd.txt 2>&1; $R['build_nostd']=$LASTEXITCODE; cargo +1.78.0 test --all-targets > tmp_v_test.txt 2>&1; $R['test']=$LASTEXITCODE; cargo +1.78.0 test --doc > tmp_v_doctest.txt 2>&1; $R['doctest']=$LASTEXITCODE; cargo +1.78.0 doc --no-deps > tmp_v_doc.txt 2>&1; $R['doc']=$LASTEXITCODE; $R.GetEnumerator() | ForEach-Object { \"$($_.Key)=$($_.Value)\" }",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ci-final-a",
-			"type": "shell",
-			"command": "$env:RUSTFLAGS='-D warnings'; $env:RUSTDOCFLAGS='-D warnings'; cargo +1.78.0 fmt --all -- --check; Write-Output ('fmt=' + $LASTEXITCODE); cargo +1.78.0 clippy --all-targets -- -D warnings; Write-Output ('clippy=' + $LASTEXITCODE); cargo +1.78.0 clippy --no-default-features --lib -- -D warnings; Write-Output ('clippy_nostd=' + $LASTEXITCODE)",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "ci-final-b",
-			"type": "shell",
-			"command": "$env:RUSTFLAGS='-D warnings'; $env:RUSTDOCFLAGS='-D warnings'; cargo +1.78.0 build --all-targets; Write-Output ('build_all=' + $LASTEXITCODE); cargo +1.78.0 build --no-default-features --lib; Write-Output ('build_nostd=' + $LASTEXITCODE); cargo +1.78.0 test --all-targets > tmp_v_test.txt 2>&1; Write-Output ('test=' + $LASTEXITCODE); cargo +1.78.0 test --doc; Write-Output ('doctest=' + $LASTEXITCODE); cargo +1.78.0 doc --no-deps; Write-Output ('doc=' + $LASTEXITCODE)",
-			"problemMatcher": [],
-			"group": "test"
-		},
-		{
-			"label": "final-summary-cleanup",
-			"type": "shell",
-			"command": "Select-String -Path tmp_v_test.txt -Pattern 'test result:' | ForEach-Object { $_.Line }; Write-Output '--- tasks.json ---'; (Get-Content .vscode/tasks.json -Raw).Length; Write-Output '--- cleanup ---'; Remove-Item tmp_*.txt -ErrorAction SilentlyContinue; (Get-ChildItem tmp_* -ErrorAction SilentlyContinue | Measure-Object).Count",
 			"problemMatcher": [],
 			"group": "test"
 		}

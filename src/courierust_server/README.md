@@ -17,6 +17,14 @@ accept thread ──> event loop (poller + classify) ──> event workers (batc
 
 The whole thing is held together by a **self-pipe** — a loopback socket pair whose read end is registered in the poller, so a queued control message interrupts a blocking poll *the instant* it's queued. Poll timeout never sits in the request-latency path. The full story, with the 5 ms P99 spike that motivated it, is in `blogs/03-self-pipe-event-scheduler.md`.
 
+## The close-ordering invariant (why one connection ending cannot park the rest)
+
+A closed descriptor sitting in a wait set is not a harmless stale entry: POSIX `poll` reports `POLLNVAL` for that one entry, but Winsock's `select` fails the **whole** wait with `WSAENOTSOCK`. So:
+
+- When a connection ends, the worker hands its socket handle to the event loop (`EventMsg::Closed { id, socket }`). The event loop unregisters the id from the poller **first** and drops the handle **after** — the descriptor is still open for as long as it can be named, so *"stop watching" strictly precedes "close"*.
+- Every close that happens inside the event loop itself (idle reap, failed classification, dropped dispatch) unregisters before it closes, in the same order.
+- A wait can still fail (a reused descriptor, a close from elsewhere). The event loop then **rebuilds** the whole wait set from its registries (`pending` / h1 / WebSocket), which drops whatever no longer exists, and backs off instead of spinning if the rebuilt set still cannot be waited on. Recoveries are counted in `Stats::event_wait_errors`; a healthy run leaves it at zero.
+
 ## The protection, before workers are involved
 
 - An incomplete request parks on the poller (zero workers).

@@ -17,6 +17,14 @@ accept 线程 ──> 事件循环（poller + 分类）──> event worker（�
 
 整个架构靠一个 **self-pipe** 串起来——一对回环 socket，读端注册进 poller，让入队的控制消息*入队的瞬间*就打断阻塞的 poll。poll 超时永远不会进请求延迟路径。完整故事，连同催生它的 5ms P99 尖峰，在 `blogs/03-self-pipe-event-scheduler.md`。
 
+## 关闭顺序不变量（为什么不会因为一个连接结束而全体停摆）
+
+等待集合里出现一个已关闭的描述符不是”无害的过期项“：POSIX `poll` 只为该项返回 `POLLNVAL`，但 Winsock 的 `select` 会让**整个等待**以 `WSAENOTSOCK` 失败。因此：
+
+- 连接结束时，worker 把 socket 句柄交给事件循环（`EventMsg::Closed { id, socket }`）。事件循环**先**从 poller 注销该 id，**然后**才放下句柄——描述符在被等待时永远仍然有效，*“停止监视”严格早于“关闭”*。
+- 所有在事件循环内部关闭的连接（idle 回收、分类失败、派发失败的丢弃）都先 `unregister` 再 drop，顺序相同。
+- 即使如此，等待仍然可能失败（fd 被复用、外部关闭等等）。此时事件循环不会空转：它按注册表（`pending` / h1 注册表 / WS 注册表）**重建**整个等待集合，让 fd 已死的项彻底消失；若重建后仍连续失败，则退避 1ms 一次，并计入 `Stats::event_wait_errors`——该计数在健康运行中永远为 0。
+
 ## worker 介入之前的防护
 
 - 不完整的请求挂在 poller 上（零 worker）。
