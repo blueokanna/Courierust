@@ -29,6 +29,10 @@
 //! Everything here is safe code: no `unsafe`, no third-party crates.
 
 use crate::courierust_error::{Error, Result};
+// Only the tests still build `Vec`s with the `vec!` macro: the decoder's
+// tables and code-length arrays are fixed arrays now precisely so that a
+// message costs no allocation.
+#[cfg(test)]
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -238,6 +242,7 @@ impl<'a> BitReader<'a> {
 
 /// Bit writer (LSB-first), with byte alignment and a sync-flush marker
 /// for RFC 7692.
+#[derive(Default)]
 struct BitWriter {
     out: Vec<u8>,
     acc: u32,
@@ -246,11 +251,7 @@ struct BitWriter {
 
 impl BitWriter {
     fn new() -> Self {
-        Self {
-            out: Vec::new(),
-            acc: 0,
-            nbits: 0,
-        }
+        Self::default()
     }
 
     /// Append the low `n` bits of `value` (DEFLATE integer format).
@@ -291,10 +292,25 @@ impl BitWriter {
         self.out
     }
 
+    /// Reset for another message, keeping the allocated buffer.
+    fn reset(&mut self) {
+        self.out.clear();
+        self.acc = 0;
+        self.nbits = 0;
+    }
+
+    /// The encoded bytes so far.
+    fn encoded(&self) -> &[u8] {
+        &self.out
+    }
+
     /// Emit a DEFLATE sync flush and strip the RFC 7692 §7.2.1 tail: an
     /// empty stored block (`00 00 FF FF` after the header byte) whose
     /// final four octets are removed because the peer re-adds them.
-    fn finish_permessage(mut self) -> Vec<u8> {
+    ///
+    /// Unlike [`BitWriter::finish_permessage`] this keeps the buffer, so
+    /// a `Deflater` that owns its writer never allocates per message.
+    fn sync_flush(&mut self) {
         // Empty stored block: BFINAL=0, BTYPE=00, then align and write
         // LEN=0, NLEN=0xFFFF.
         self.write_bits(0, 3);
@@ -306,6 +322,11 @@ impl BitWriter {
         // RFC 7692 §7.2.1: remove the trailing 00 00 FF FF.
         self.out.truncate(self.out.len() - 4);
         self.align_byte();
+    }
+
+    /// [`BitWriter::sync_flush`] and hand the buffer back.
+    fn finish_permessage(mut self) -> Vec<u8> {
+        self.sync_flush();
         self.out
     }
 }
@@ -329,7 +350,13 @@ struct DecodeTable {
     symbol: [u16; 288],
     /// `fast[low FAST_BITS bits] = (len << 16) | symbol`, or 0 when the
     /// code is longer than `FAST_BITS` and needs the fallback walk.
-    fast: Vec<u32>,
+    ///
+    /// A fixed array rather than a `Vec`: the size is a compile-time
+    /// constant, a dynamic block builds two of these per message, and a
+    /// `Vec` here means two heap allocations *per message* on the inflate
+    /// path — which is exactly the space cost the complexity benchmark
+    /// exists to expose. 2 KiB in the frame is cheaper than a malloc.
+    fast: [u32; FAST_SIZE],
 }
 
 impl DecodeTable {
@@ -340,7 +367,7 @@ impl DecodeTable {
             count: [0; 16],
             offset: [0; 16],
             symbol: [0; 288],
-            fast: vec![0u32; FAST_SIZE],
+            fast: [0u32; FAST_SIZE],
         };
         for &l in lens {
             if l == 0 {
@@ -595,6 +622,10 @@ fn inflate_huffman(
     }
 }
 
+/// Largest legal `hlit + hdist` in a dynamic block header (RFC 1951
+/// §3.2.7: 286 literal/length codes and 30 distance codes).
+const MAX_CODE_LENGTHS: usize = 286 + 30;
+
 /// Dynamic Huffman block header (BTYPE=10), then its data.
 fn inflate_dynamic(
     br: &mut BitReader,
@@ -620,37 +651,49 @@ fn inflate_dynamic(
         return Err(Error::protocol("deflate: empty code-length table"));
     }
     let total = hlit + hdist;
-    let mut lens: Vec<u8> = Vec::with_capacity(total);
-    while lens.len() < total {
+    // `hlit + hdist` ≤ 286 + 30, so a fixed array describes every legal
+    // dynamic block without a heap allocation: a dynamic block used to
+    // cost a `Vec` on top of the two decode tables, i.e. one malloc per
+    // message on the RFC 7692 inflate path.
+    let mut lens = [0u8; MAX_CODE_LENGTHS];
+    let mut len_count = 0usize;
+    while len_count < total {
         let sym = decode_symbol(br, &clen_table)?;
         match sym {
-            0..=15 => lens.push(sym as u8),
+            0..=15 => {
+                lens[len_count] = sym as u8;
+                len_count += 1;
+            }
             16 => {
-                let prev = match lens.last() {
-                    Some(&p) => p,
-                    None => return Err(Error::protocol("deflate: repeat with no previous")),
-                };
+                if len_count == 0 {
+                    return Err(Error::protocol("deflate: repeat with no previous"));
+                }
+                let prev = lens[len_count - 1];
                 let rep = 3 + br.take(2)? as usize;
-                if lens.len() + rep > total {
+                if len_count + rep > total {
                     return Err(Error::protocol("deflate: code-length repeat overflow"));
                 }
                 for _ in 0..rep {
-                    lens.push(prev);
+                    lens[len_count] = prev;
+                    len_count += 1;
                 }
             }
             17 => {
                 let rep = 3 + br.take(3)? as usize;
-                if lens.len() + rep > total {
+                if len_count + rep > total {
                     return Err(Error::protocol("deflate: code-length repeat overflow"));
                 }
-                lens.resize(lens.len() + rep, 0);
+                // The array is zeroed once per block and every slot is
+                // written at most once, so skipping the cursor is exactly
+                // "n zero code lengths".
+                len_count += rep;
             }
             18 => {
                 let rep = 11 + br.take(7)? as usize;
-                if lens.len() + rep > total {
+                if len_count + rep > total {
                     return Err(Error::protocol("deflate: code-length repeat overflow"));
                 }
-                lens.resize(lens.len() + rep, 0);
+                len_count += rep;
             }
             _ => return Err(Error::protocol("deflate: invalid code-length symbol")),
         }
@@ -658,7 +701,7 @@ fn inflate_dynamic(
     let mut litlen = [0u8; 288];
     litlen[..hlit].copy_from_slice(&lens[..hlit]);
     let mut dist = [0u8; 30];
-    dist[..hdist].copy_from_slice(&lens[hlit..]);
+    dist[..hdist].copy_from_slice(&lens[hlit..hlit + hdist]);
     inflate_huffman(br, &litlen, &dist, window, out, max_out)
 }
 
@@ -896,19 +939,19 @@ pub fn deflate(data: &[u8]) -> Vec<u8> {
 pub fn deflate_sync(data: &[u8]) -> Vec<u8> {
     let mut mf = MatchFinder::default();
     mf.prepare(data.len());
-    deflate_sync_with(data, &mut mf)
+    let mut w = BitWriter::new();
+    deflate_sync_into(data, &mut mf, &mut w);
+    w.finish_permessage()
 }
 
-/// [`deflate_sync`] with caller-owned match-finder state, so a context
-/// that already owns a [`MatchFinder`] (see [`Deflater`]) performs no
-/// per-message allocation or table rebuild.
-fn deflate_sync_with(data: &[u8], mf: &mut MatchFinder) -> Vec<u8> {
-    let mut w = BitWriter::new();
+/// [`deflate_sync`] writing into a caller-owned writer, so a context that
+/// already owns the match finder *and* the bit writer (see [`Deflater`])
+/// performs no per-message allocation or table rebuild at all.
+fn deflate_sync_into(data: &[u8], mf: &mut MatchFinder, w: &mut BitWriter) {
     w.write_bits(0, 1); // BFINAL=0: the stream continues
     w.write_bits(1, 2); // BTYPE = fixed Huffman
-    encode_lz77(&mut w, data, mf);
+    encode_lz77(w, data, mf);
     w.write_bits(0, 7); // end-of-block
-    w.finish_permessage()
 }
 
 // ---------------------------------------------------------------------
@@ -1197,6 +1240,10 @@ pub struct Deflater {
     /// send the message uncompressed (RSV1 clear).
     threshold: usize,
     finder: MatchFinder,
+    /// Owned bit writer: its buffer is reused across messages, so steady
+    /// state compression allocates nothing (not even on the
+    /// "compression did not pay" path).
+    writer: BitWriter,
 }
 
 impl Deflater {
@@ -1211,6 +1258,7 @@ impl Deflater {
         Self {
             threshold: 128,
             finder: MatchFinder::default(),
+            writer: BitWriter::new(),
         }
     }
 
@@ -1225,18 +1273,27 @@ impl Deflater {
 
     /// Compress one message. `None` means "send this one uncompressed":
     /// the payload was below the threshold, or compression did not pay
-    /// for itself (incompressible data), in which case RSV1 must stay 0.
+    /// for itself (incompressible data), in which case RSV1 must stay 0
+    /// and `out` is left exactly as the caller passed it.
+    ///
+    /// Both the match finder and the bit writer are owned by this
+    /// context, so an uncompressed outcome costs a bounded amount of
+    /// memory rather than a per-message buffer the size of the payload.
     pub fn deflate_message(&mut self, data: &[u8], out: &mut Vec<u8>) -> Option<()> {
         if data.len() < self.threshold {
             return None;
         }
-        out.clear();
+        self.writer.reset();
         self.finder.prepare(data.len());
-        let compressed = deflate_sync_with(data, &mut self.finder);
-        if compressed.len() >= data.len() {
+        deflate_sync_into(data, &mut self.finder, &mut self.writer);
+        self.writer.sync_flush();
+        let encoded = self.writer.encoded();
+        if encoded.len() >= data.len() {
+            // Not worth sending: the caller sends the payload as-is.
             return None;
         }
-        out.extend_from_slice(&compressed);
+        out.clear();
+        out.extend_from_slice(encoded);
         Some(())
     }
 }
@@ -1427,6 +1484,51 @@ mod tests {
             }
             i.reset(); // no context takeover on the decoder either
         }
+    }
+
+    #[test]
+    fn deflater_reuse_produces_identical_bytes() {
+        // The context owns its match finder *and* its bit writer; reusing
+        // both across messages must not change a single byte on the wire.
+        let payload = b"the quick brown fox jumps over the lazy dog ".repeat(64);
+        let expected = deflate_sync(&payload);
+        let mut d = Deflater::new();
+        d.set_threshold(1);
+        let mut out = Vec::new();
+        for round in 0..3 {
+            out.clear();
+            assert!(
+                d.deflate_message(&payload, &mut out).is_some(),
+                "a repetitive payload must compress (round {round})"
+            );
+            assert_eq!(out, expected, "reused context must encode identically");
+        }
+    }
+
+    #[test]
+    fn an_unprofitable_message_leaves_the_output_untouched() {
+        // `None` means "send it verbatim": the caller's buffer must not be
+        // silently emptied, and must never be filled with a stale frame.
+        let mut d = Deflater::new();
+        d.set_threshold(1);
+        let mut out = b"sentinel".to_vec();
+        // The same deterministic pseudo-random stream the complexity bench
+        // uses: no three-byte repetition for the match finder to latch on
+        // to, so the encoder must report "not worth compressing".
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut incompressible = Vec::with_capacity(512);
+        while incompressible.len() < 512 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            incompressible.extend_from_slice(&state.to_le_bytes());
+        }
+        incompressible.truncate(512);
+        assert!(
+            d.deflate_message(&incompressible, &mut out).is_none(),
+            "payloads that do not compress must be reported as stored"
+        );
+        assert_eq!(out, b"sentinel", "the caller's buffer must be untouched");
     }
 
     #[test]

@@ -92,6 +92,11 @@ name = "ws"
 harness = false
 path = "src/ws.rs"
 
+[[bench]]
+name = "complexity"
+harness = false
+path = "src/complexity.rs"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

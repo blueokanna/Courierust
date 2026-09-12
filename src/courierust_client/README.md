@@ -7,6 +7,7 @@ The multi-core HTTP client: an HTTP/1.1 keep-alive pool grouped by authority, HT
 - **HTTP/1.1** — a keep-alive pool per authority with bounded reuse. Each connection owns its read/write buffers and a `Scratch`, so steady-state keep-alive requests perform **zero per-request allocation** and zero socket reconfiguration.
 - **HTTP/2** — each connection is driven by a dedicated driver thread that serializes wire access while multiplexing streams. Requests arrive over a channel; responses stream back over per-stream channels. `max_connections_per_host` caps live connections per authority; the h2 pool is shared by authority.
 - **HTTP/3** — `http3://` (and ALPN `h3`) routes into the H3 runtime's UDP reactor, with pooled connection reuse.
+- **WebSocket** — `courierust_client::ws::WebSocket` upgrades over `ws://` or TLS (`wss://`) and exposes `send_text` / `send_binary` / `send_ping` / `read_message` / `close` with subprotocols, an Origin header, a compression preference and a read deadline, all from the same `ClientConfig`. It shares the framing / UTF-8 / close-handshake engine (`courierust_ws`) with the server, so both ends enforce the same rules.
 - **TLS** — `https://` is a first-class citizen: `TlsSettings { roots, verify, alpn, now, min_version, max_version }` against the crate's own TLS stack.
 
 ## The details that matter
@@ -15,6 +16,7 @@ The multi-core HTTP client: an HTTP/1.1 keep-alive pool grouped by authority, HT
 - **Priorities** — `execute_priority(url, req, Priority { urgency, incremental })` drives the WUCS scheduler (see `blogs/01`).
 - **Worker occupancy is per connection, not per stream** — a single h2 connection with many streams holds exactly one worker, so streams never multiply worker usage and never block each other.
 - **Timeouts** — connect, handshake (TLS), read, and total request timeouts, all configurable.
+- **A WebSocket read deadline is a socket deadline.** `ClientConfig::read_timeout` (60 s by default) is the right liveness mechanism for interactive traffic, but on Windows it is charged on every blocking operation: a 256 KiB WebSocket bulk push runs roughly **2× slower** with it armed. A bulk-transfer client should set `read_timeout: None` and use application-level liveness instead — the server does exactly that (measurements: [`courierust_ws` README](../courierust_ws/README.md)).
 - **h2c prior knowledge** is opt-in (`cfg.http2 = true`); `h2c` Upgrade is supported on the server side.
 
 ## The honest bit

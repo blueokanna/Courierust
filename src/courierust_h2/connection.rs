@@ -468,12 +468,40 @@ impl<R: Read, W: Write> Connection<R, W> {
     /// Send a header block on a stream (request on the client, response
     /// on the server). The stream must already exist (client: via
     /// [`Connection::open_request`]; server: created by inbound HEADERS).
+    ///
+    /// The block is checked against the outbound half of RFC 9113 §8.2.2
+    /// first: an endpoint MUST NOT *generate* connection-specific fields,
+    /// and a peer is entitled to reset the stream when it sees one. Failing
+    /// here turns "the far end resets my request" into an error at the call
+    /// site, with the field named.
     pub fn send_headers(
         &mut self,
         stream_id: u32,
         fields: &HeaderList,
         end_stream: bool,
     ) -> Result<()> {
+        for f in fields.iter() {
+            let name = f.name.as_str();
+            if matches!(
+                name,
+                "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding" | "upgrade"
+            ) {
+                return Err(Error::protocol(alloc::format!(
+                    "refusing to send connection-specific header `{name}` in HTTP/2 (RFC 9113 §8.2.2)"
+                )));
+            }
+            if name == "te"
+                && !f
+                    .value
+                    .to_str()
+                    .unwrap_or("")
+                    .eq_ignore_ascii_case("trailers")
+            {
+                return Err(Error::protocol(
+                    "refusing to send a TE header other than `trailers` in HTTP/2 (RFC 9113 §8.2.2)",
+                ));
+            }
+        }
         if self.goaway_sent || self.closed {
             return Err(Error::canceled("connection closing"));
         }
@@ -1232,7 +1260,11 @@ impl<R: Read, W: Write> Connection<R, W> {
         let is_new = !self.streams.contains(&sid);
 
         if is_new {
-            self.validate_header_block(&fields, !self.config.client, false)?;
+            if !self.validate_header_block(sid, &fields, !self.config.client, false)? {
+                // The block was malformed: the stream is reset and the
+                // connection carries on (RFC 9113 §8.1.1).
+                return Ok(());
+            }
 
             if self.config.client {
                 if self.recently_closed.iter().any(|&c| c == sid) {
@@ -1316,7 +1348,9 @@ impl<R: Read, W: Write> Connection<R, W> {
             return Ok(());
         }
         if delivered {
-            self.validate_header_block(&fields, false, true)?;
+            if !self.validate_header_block(sid, &fields, false, true)? {
+                return Ok(());
+            }
             self.verify_content_length(sid);
             if !self.streams.contains(&sid) {
                 return Ok(());
@@ -1348,7 +1382,11 @@ impl<R: Read, W: Write> Connection<R, W> {
                 "unexpected HEADERS on existing stream",
             );
         }
-        self.validate_header_block(&fields, false, false)?;
+        if !self.validate_header_block(sid, &fields, false, false)? {
+            // Malformed response (RFC 9113 §8.1.1): reset the stream and
+            // leave the connection usable for its other streams.
+            return Ok(());
+        }
         let cl = self.parse_content_length(&fields)?;
         let status = fields
             .iter()
@@ -1437,23 +1475,37 @@ impl<R: Read, W: Write> Connection<R, W> {
         Ok(())
     }
 
-    /// Validate an inbound header block against RFC 9113 §8.1.2:
+    /// Validate an inbound header block against RFC 9113 §8.1:
     ///
-    /// * Pseudo-headers must precede all regular fields.
+    /// * Pseudo-headers must precede all regular fields, and pseudo-header
+    ///   fields must not be repeated.
     /// * Requests require `:method`, `:scheme` and `:path` (or, for
     ///   `CONNECT`, exactly `:authority`); responses require exactly one
     ///   three-digit `:status`.
     /// * No unknown pseudo-headers, and no cross-contamination of
-    ///   request/response pseudo-headers.
-    /// * Trailers must not contain pseudo-headers at all.
+    ///   request/response pseudo-headers. `:protocol` (RFC 8441 extended
+    ///   CONNECT) is unknown to this stack, and resetting the stream is
+    ///   the outcome RFC 8441 §3 defines for a peer that never sent
+    ///   `SETTINGS_ENABLE_CONNECT_PROTOCOL` — which this stack never sends.
+    /// * Connection-specific fields (RFC 9113 §8.2.2) must be absent; `te`
+    ///   may only carry `trailers`. This is the rule that makes a
+    ///   WebSocket `Upgrade` attempt over HTTP/2 fail as a rejected stream
+    ///   instead of being handed to the handler as an ordinary request.
+    /// * Trailers must not contain pseudo-headers or framing fields.
     ///
-    /// Violations are connection errors (`PROTOCOL_ERROR`).
+    /// A violation resets **that stream** (`Ok(false)`, `PROTOCOL_ERROR`)
+    /// and leaves the connection and every other stream usable — RFC 9113
+    /// §8.1.1 makes a malformed *message* a stream error for exactly that
+    /// reason. `Err` is reserved for conditions that would desynchronise
+    /// the connection, and the caller must stop processing the block when
+    /// this returns `Ok(false)`.
     fn validate_header_block(
         &mut self,
+        stream_id: u32,
         fields: &HeaderList,
         is_request: bool,
         is_trailer: bool,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let mut saw_regular = false;
         let mut method: Option<&str> = None;
         let mut has_scheme = false;
@@ -1479,79 +1531,98 @@ impl<R: Read, W: Write> Connection<R, W> {
                         | "transfer-encoding"
                         | "upgrade"
                 ) {
-                    return self.conn_error(
-                        ErrorCode::ProtocolError,
-                        "connection-specific header in HTTP/2",
+                    self.reject_malformed(
+                        stream_id,
+                        &alloc::format!(
+                            "connection-specific header `{n}` in HTTP/2 (RFC 9113 §8.2.2); a WebSocket upgrade belongs on HTTP/1.1"
+                        ),
                     );
+                    return Ok(false);
                 }
                 if n == "te" {
                     let v = f.value.to_str().unwrap_or("");
                     if !v.eq_ignore_ascii_case("trailers") {
-                        return self
-                            .conn_error(ErrorCode::ProtocolError, "TE header must be 'trailers'");
+                        self.reject_malformed(
+                            stream_id,
+                            "TE header must be `trailers` in HTTP/2 (RFC 9113 §8.2.2)",
+                        );
+                        return Ok(false);
                     }
                 }
                 if is_trailer && matches!(n, "content-length" | "host" | "trailer" | "te") {
-                    return self.conn_error(ErrorCode::ProtocolError, "framing field in trailers");
+                    self.reject_malformed(stream_id, "framing field in trailers");
+                    return Ok(false);
                 }
                 continue;
             }
             if saw_regular {
-                return self.conn_error(
-                    ErrorCode::ProtocolError,
-                    "pseudo-header after regular field",
+                self.reject_malformed(
+                    stream_id,
+                    "pseudo-header after regular field (RFC 9113 §8.3)",
                 );
+                return Ok(false);
             }
             if is_trailer {
-                return self.conn_error(ErrorCode::ProtocolError, "pseudo-header in trailers");
+                self.reject_malformed(stream_id, "pseudo-header in trailers (RFC 9113 §8.1)");
+                return Ok(false);
             }
             match f.name.as_str() {
                 ":method" => {
                     if !is_request {
-                        return self.conn_error(ErrorCode::ProtocolError, ":method in response");
+                        self.reject_malformed(stream_id, ":method in response");
+                        return Ok(false);
                     }
                     if saw_method {
-                        return self.conn_error(ErrorCode::ProtocolError, "duplicate :method");
+                        self.reject_malformed(stream_id, "duplicate :method (RFC 9113 §8.3)");
+                        return Ok(false);
                     }
                     saw_method = true;
                     method = f.value.to_str().ok();
                 }
                 ":scheme" => {
                     if !is_request {
-                        return self.conn_error(ErrorCode::ProtocolError, ":scheme in response");
+                        self.reject_malformed(stream_id, ":scheme in response");
+                        return Ok(false);
                     }
                     if saw_scheme {
-                        return self.conn_error(ErrorCode::ProtocolError, "duplicate :scheme");
+                        self.reject_malformed(stream_id, "duplicate :scheme (RFC 9113 §8.3)");
+                        return Ok(false);
                     }
                     saw_scheme = true;
                     has_scheme = true;
                 }
                 ":path" => {
                     if !is_request {
-                        return self.conn_error(ErrorCode::ProtocolError, ":path in response");
+                        self.reject_malformed(stream_id, ":path in response");
+                        return Ok(false);
                     }
                     if saw_path {
-                        return self.conn_error(ErrorCode::ProtocolError, "duplicate :path");
+                        self.reject_malformed(stream_id, "duplicate :path (RFC 9113 §8.3)");
+                        return Ok(false);
                     }
                     saw_path = true;
                     path = f.value.to_str().ok();
                 }
                 ":authority" => {
                     if !is_request {
-                        return self.conn_error(ErrorCode::ProtocolError, ":authority in response");
+                        self.reject_malformed(stream_id, ":authority in response");
+                        return Ok(false);
                     }
                     if saw_authority {
-                        return self.conn_error(ErrorCode::ProtocolError, "duplicate :authority");
+                        self.reject_malformed(stream_id, "duplicate :authority (RFC 9113 §8.3)");
+                        return Ok(false);
                     }
                     saw_authority = true;
                     has_authority = true;
                 }
                 ":status" => {
                     if is_request {
-                        return self.conn_error(ErrorCode::ProtocolError, ":status in request");
+                        self.reject_malformed(stream_id, ":status in request");
+                        return Ok(false);
                     }
                     if has_status {
-                        return self.conn_error(ErrorCode::ProtocolError, "duplicate :status");
+                        self.reject_malformed(stream_id, "duplicate :status (RFC 9113 §8.3)");
+                        return Ok(false);
                     }
                     has_status = true;
                     let v = f.value.as_bytes();
@@ -1562,51 +1633,66 @@ impl<R: Read, W: Write> Connection<R, W> {
                         && v[0] >= b'1'
                         && v[0] <= b'5';
                     if !ok {
-                        return self.conn_error(ErrorCode::ProtocolError, "invalid :status value");
+                        self.reject_malformed(stream_id, "invalid :status value");
+                        return Ok(false);
                     }
                 }
+                ":protocol" => {
+                    self.reject_malformed(
+                        stream_id,
+                        "extended CONNECT (:protocol) is not implemented; WebSocket over HTTP/2 (RFC 8441) is rejected and must use HTTP/1.1",
+                    );
+                    return Ok(false);
+                }
                 _ => {
-                    return self.conn_error(ErrorCode::ProtocolError, "unknown pseudo-header");
+                    self.reject_malformed(stream_id, "unknown pseudo-header (RFC 9113 §8.3)");
+                    return Ok(false);
                 }
             }
         }
         if is_trailer {
-            return Ok(());
+            return Ok(true);
         }
         if is_request {
             let is_connect = method == Some("CONNECT");
             if is_connect {
                 if has_scheme || path.is_some() {
-                    return self.conn_error(
-                        ErrorCode::ProtocolError,
-                        "CONNECT must not carry :scheme or :path",
+                    self.reject_malformed(
+                        stream_id,
+                        "CONNECT must not carry :scheme or :path (RFC 9113 §8.5)",
                     );
+                    return Ok(false);
                 }
                 if !has_authority {
-                    return self
-                        .conn_error(ErrorCode::ProtocolError, "CONNECT requires :authority");
+                    self.reject_malformed(stream_id, "CONNECT requires :authority (RFC 9113 §8.5)");
+                    return Ok(false);
                 }
             } else {
                 if method.is_none() {
-                    return self.conn_error(ErrorCode::ProtocolError, "request missing :method");
+                    self.reject_malformed(stream_id, "request missing :method (RFC 9113 §8.3.1)");
+                    return Ok(false);
                 }
                 if !has_scheme {
-                    return self.conn_error(ErrorCode::ProtocolError, "request missing :scheme");
+                    self.reject_malformed(stream_id, "request missing :scheme (RFC 9113 §8.3.1)");
+                    return Ok(false);
                 }
                 match path {
                     None => {
-                        return self.conn_error(ErrorCode::ProtocolError, "request missing :path");
+                        self.reject_malformed(stream_id, "request missing :path (RFC 9113 §8.3.1)");
+                        return Ok(false);
                     }
                     Some("") => {
-                        return self.conn_error(ErrorCode::ProtocolError, "empty :path");
+                        self.reject_malformed(stream_id, "empty :path (RFC 9113 §8.3.1)");
+                        return Ok(false);
                     }
                     _ => {}
                 }
             }
         } else if !has_status {
-            return self.conn_error(ErrorCode::ProtocolError, "response missing :status");
+            self.reject_malformed(stream_id, "response missing :status (RFC 9113 §8.3.2)");
+            return Ok(false);
         }
-        Ok(())
+        Ok(true)
     }
 
     fn on_data(&mut self, stream_id: u32, data: Bytes, end_stream: bool) -> Result<()> {
@@ -1806,20 +1892,49 @@ impl<R: Read, W: Write> Connection<R, W> {
     /// Surface a stream-level error (RFC 9113 §5.4.2): send `RST_STREAM`,
     /// notify the application via [`Event::StreamError`], and terminate
     /// the stream. The connection itself stays usable.
+    ///
+    /// The stream does not have to exist yet. The malformed-message paths
+    /// (RFC 9113 §8.1.1) run *before* a request is registered, and
+    /// resetting a not-yet-registered stream is exactly the behaviour the
+    /// RFC prescribes — including RFC 8441 §3, where a peer that does not
+    /// support extended CONNECT resets the stream rather than the
+    /// connection.
     fn stream_error(&mut self, stream_id: u32, code: ErrorCode, msg: &str) {
-        if !self.streams.contains(&stream_id) || self.closed {
+        if self.closed {
             return;
+        }
+        if self.streams.contains(&stream_id) {
+            self.events.push_back(Event::StreamError {
+                stream_id,
+                error_code: code,
+                message: alloc::string::String::from(msg),
+            });
         }
         self.pending_frames.push_back(Frame::RstStream {
             stream_id,
             error_code: code,
         });
-        self.events.push_back(Event::StreamError {
-            stream_id,
-            error_code: code,
-            message: alloc::string::String::from(msg),
-        });
         self.close_stream(stream_id);
+    }
+
+    /// Reject one stream for a malformed message (RFC 9113 §8.1.1) and
+    /// keep the connection — and every other stream on it — usable.
+    ///
+    /// §8.1.1 makes a malformed *message* a stream error precisely so one
+    /// bad field block cannot fail the whole multiplex; §5.4 permits the
+    /// stricter reading, and this stack takes it where a desynchronised
+    /// decoder is the likelier explanation (HPACK errors are
+    /// `COMPRESSION_ERROR` connection errors, and conflicting framing
+    /// fields stay connection errors as a request-smuggling guard).
+    fn reject_malformed(&mut self, stream_id: u32, msg: &str) {
+        if !self.config.client {
+            // Remember a peer-initiated id even when its block is
+            // rejected: §5.1.1 requires later ids to be strictly higher,
+            // and the normal path records this one only for accepted
+            // requests.
+            self.streams.accept_peer_id(stream_id);
+        }
+        self.stream_error(stream_id, ErrorCode::ProtocolError, msg);
     }
 
     /// Parse a message's `content-length` (RFC 9113 §8.1.2.6). Multiple
@@ -1970,9 +2085,9 @@ mod tests {
         }
     }
 
-    fn hf(name: &str, value: &str) -> HeaderField {
+    fn hf(name: &'static str, value: &str) -> HeaderField {
         HeaderField::new(
-            HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            HeaderName::from_lowercase(name),
             HeaderValue::from_bytes(value.as_bytes()).unwrap(),
         )
     }
@@ -2007,5 +2122,49 @@ mod tests {
         let mut conn = Connection::new(reader, writer, Config::default());
 
         assert!(conn.poll_available(64).unwrap());
+    }
+
+    /// RFC 9113 §8.2.2 forbids *generating* connection-specific fields.
+    /// The outbound check turns "the peer will reset this stream" into a
+    /// local error that names the field — this is the mirror image of the
+    /// inbound rule, and it is what keeps a WebSocket-shaped request from
+    /// leaving this stack over HTTP/2.
+    #[test]
+    fn send_headers_refuses_connection_specific_fields() {
+        let reader = OneRead {
+            data: Vec::new(),
+            used: false,
+        };
+        let writer = crate::courierust_io::VecWriter(Vec::new());
+        let mut conn = Connection::new(reader, writer, Config::default());
+        let stream = conn.open_request(Priority::default()).unwrap();
+
+        let base = vec![
+            hf(":method", "GET"),
+            hf(":scheme", "http"),
+            hf(":path", "/"),
+            hf(":authority", "example.test"),
+        ];
+        let mut with_upgrade = base.clone();
+        with_upgrade.push(hf("upgrade", "websocket"));
+        let err = conn
+            .send_headers(stream, &with_upgrade, true)
+            .expect_err("a WebSocket upgrade must not be sent over HTTP/2");
+        assert!(
+            err.to_string().contains("upgrade"),
+            "the error must name the offending field: {err}"
+        );
+
+        let mut with_bad_te = base.clone();
+        with_bad_te.push(hf("te", "gzip"));
+        assert!(
+            conn.send_headers(stream, &with_bad_te, true).is_err(),
+            "TE must be `trailers` or absent"
+        );
+
+        // `te: trailers` and ordinary fields are legal and still go out.
+        let mut legal = base;
+        legal.push(hf("te", "trailers"));
+        assert!(conn.send_headers(stream, &legal, true).is_ok());
     }
 }

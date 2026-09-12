@@ -254,7 +254,8 @@ fn h2_rejects_pseudo_header_after_regular() {
     let mut peer = RawH2Peer::connect(addr).unwrap();
     peer.send_preface_and_settings();
     // A request whose header block puts a regular field before the
-    // pseudo-headers (RFC 9113 §8.1.2 violation).
+    // pseudo-headers is a malformed message (RFC 9113 §8.3), which is a
+    // *stream* error: that stream is reset and the connection survives.
     let block = hpack(&[
         hdr("x-regular", "first"),
         hdr(":method", "GET"),
@@ -262,8 +263,9 @@ fn h2_rejects_pseudo_header_after_regular() {
         hdr(":scheme", "http"),
     ]);
     peer.send_frame(0x1, 0x4, 1, &block);
-    let code = peer.wait_goaway(Duration::from_secs(5));
-    assert_eq!(code, Some(0x1), "expected PROTOCOL_ERROR GOAWAY");
+    let rst = wait_rst(&mut peer, 1, Duration::from_secs(5));
+    assert_eq!(rst, Some(0x1), "expected PROTOCOL_ERROR RST_STREAM");
+    assert_connection_survives(&mut peer, 3);
 }
 
 #[test]
@@ -271,11 +273,13 @@ fn h2_rejects_request_missing_pseudo_headers() {
     let addr = spawn_h2_server(1 << 20);
     let mut peer = RawH2Peer::connect(addr).unwrap();
     peer.send_preface_and_settings();
-    // A request with only :method (missing :scheme and :path).
+    // A request with only :method (missing :scheme and :path) is malformed
+    // (§8.3.1): stream error, connection intact.
     let block = hpack(&[hdr(":method", "GET")]);
     peer.send_frame(0x1, 0x4, 1, &block);
-    let code = peer.wait_goaway(Duration::from_secs(5));
-    assert_eq!(code, Some(0x1), "expected PROTOCOL_ERROR GOAWAY");
+    let rst = wait_rst(&mut peer, 1, Duration::from_secs(5));
+    assert_eq!(rst, Some(0x1), "expected PROTOCOL_ERROR RST_STREAM");
+    assert_connection_survives(&mut peer, 3);
 }
 
 #[test]
@@ -312,8 +316,67 @@ fn h2_rejects_unknown_pseudo_header() {
         hdr(":bogus", "x"),
     ]);
     peer.send_frame(0x1, 0x4, 1, &block);
-    let code = peer.wait_goaway(Duration::from_secs(5));
-    assert_eq!(code, Some(0x1), "expected PROTOCOL_ERROR GOAWAY");
+    let rst = wait_rst(&mut peer, 1, Duration::from_secs(5));
+    assert_eq!(rst, Some(0x1), "expected PROTOCOL_ERROR RST_STREAM");
+    assert_connection_survives(&mut peer, 3);
+}
+
+#[test]
+fn h2_rejects_rfc8441_extended_connect_as_stream_error() {
+    // RFC 8441 extended CONNECT: `:method = CONNECT` plus
+    // `:protocol = websocket`. This stack does not implement WebSocket over
+    // HTTP/2 and never advertises SETTINGS_ENABLE_CONNECT_PROTOCOL, so the
+    // request is malformed (an undefined pseudo-header, RFC 9113 §8.3) —
+    // and RFC 8441 §3 names the outcome for exactly this case: a *stream*
+    // error. What must never happen is the other two behaviours: a 200 that
+    // leaves the caller with a tunnel that carries no frames, or a
+    // connection-wide failure for a request a conforming peer would not
+    // send. The connection and its other streams stay usable.
+    let addr = spawn_h2_server(1 << 20);
+    let mut peer = RawH2Peer::connect(addr).unwrap();
+    peer.send_preface_and_settings();
+    let block = hpack(&[
+        hdr(":method", "CONNECT"),
+        hdr(":protocol", "websocket"),
+        hdr(":scheme", "http"),
+        hdr(":path", "/chat"),
+        hdr(":authority", "127.0.0.1"),
+        hdr("sec-websocket-version", "13"),
+    ]);
+    peer.send_frame(0x1, 0x4, 1, &block);
+    let rst = wait_rst(&mut peer, 1, Duration::from_secs(5));
+    assert_eq!(
+        rst,
+        Some(0x1),
+        "extended CONNECT must be reset with PROTOCOL_ERROR"
+    );
+    assert_connection_survives(&mut peer, 3);
+}
+
+#[test]
+fn h2_rejects_websocket_upgrade_header_over_h2() {
+    // A client that tries the RFC 6455 upgrade on an established HTTP/2
+    // connection sends `upgrade` and `connection`: both are
+    // connection-specific fields and therefore malformed in HTTP/2
+    // (RFC 9113 §8.2.2), and HTTP/2 has no 101 to answer with (§8.6).
+    // Resetting the stream is what stops a misdirected WebSocket client
+    // from holding a connection that looks established and never carries a
+    // frame; the connection itself keeps serving other streams.
+    let addr = spawn_h2_server(1 << 20);
+    let mut peer = RawH2Peer::connect(addr).unwrap();
+    peer.send_preface_and_settings();
+    let block = hpack(&[
+        hdr(":method", "GET"),
+        hdr(":path", "/chat"),
+        hdr(":scheme", "http"),
+        hdr("upgrade", "websocket"),
+        hdr("connection", "Upgrade"),
+        hdr("sec-websocket-version", "13"),
+    ]);
+    peer.send_frame(0x1, 0x4, 1, &block);
+    let rst = wait_rst(&mut peer, 1, Duration::from_secs(5));
+    assert_eq!(rst, Some(0x1), "expected PROTOCOL_ERROR RST_STREAM");
+    assert_connection_survives(&mut peer, 3);
 }
 
 // ---------------------------------------------------------------------
@@ -323,8 +386,9 @@ fn h2_rejects_unknown_pseudo_header() {
 #[test]
 fn h2_client_rejects_pseudo_after_regular_response() {
     // A raw server sends a response whose header block has a regular
-    // field before :status — the client must treat it as a connection
-    // error (RFC 9113 §8.1.2).
+    // field before :status — a malformed response, which is a *stream*
+    // error (RFC 9113 §8.1.1): the client must never accept it, and one
+    // bad response must not take down the connection's other streams.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
@@ -611,6 +675,22 @@ fn wait_rst(peer: &mut RawH2Peer, stream_id: u32, timeout: Duration) -> Option<u
     None
 }
 
+/// Assert the connection is still usable after a stream error: send a
+/// fresh, valid GET on `stream_id` and wait for a response on it.
+fn assert_connection_survives(peer: &mut RawH2Peer, stream_id: u32) {
+    peer.send_frame(0x1, 0x5, stream_id, &get_block()); // END_HEADERS | END_STREAM
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        match peer.read_frame() {
+            Some((0x1, _, sid, _)) if sid == stream_id => return,
+            Some((0x0, _, sid, _)) if sid == stream_id => return,
+            Some(_) => continue,
+            None => break,
+        }
+    }
+    panic!("connection must survive a stream error (no response on stream {stream_id})");
+}
+
 /// A standard GET request header block.
 fn get_block() -> Vec<u8> {
     hpack(&[
@@ -685,7 +765,8 @@ fn h2_rejects_content_length_mismatch_stream_error() {
 #[test]
 fn h2_rejects_transfer_encoding() {
     // transfer-encoding is forbidden in HTTP/2 (RFC 9113 §8.2.2); it is
-    // an HTTP/1.1 hop-by-hop smuggling vector.
+    // an HTTP/1.1 hop-by-hop smuggling vector. Malformed message, so the
+    // stream is reset and the connection stays usable.
     let addr = spawn_h2_server(1 << 20);
     let mut peer = RawH2Peer::connect(addr).unwrap();
     peer.send_preface_and_settings();
@@ -696,8 +777,9 @@ fn h2_rejects_transfer_encoding() {
         hdr("transfer-encoding", "chunked"),
     ]);
     peer.send_frame(0x1, 0x4, 1, &block);
-    let code = peer.wait_goaway(Duration::from_secs(5));
-    assert_eq!(code, Some(0x1), "expected PROTOCOL_ERROR GOAWAY");
+    let rst = wait_rst(&mut peer, 1, Duration::from_secs(5));
+    assert_eq!(rst, Some(0x1), "expected PROTOCOL_ERROR RST_STREAM");
+    assert_connection_survives(&mut peer, 3);
 }
 
 #[test]
@@ -713,8 +795,9 @@ fn h2_rejects_connection_specific_header() {
         hdr("connection", "keep-alive"),
     ]);
     peer.send_frame(0x1, 0x4, 1, &block);
-    let code = peer.wait_goaway(Duration::from_secs(5));
-    assert_eq!(code, Some(0x1), "expected PROTOCOL_ERROR GOAWAY");
+    let rst = wait_rst(&mut peer, 1, Duration::from_secs(5));
+    assert_eq!(rst, Some(0x1), "expected PROTOCOL_ERROR RST_STREAM");
+    assert_connection_survives(&mut peer, 3);
 }
 
 #[test]
@@ -730,8 +813,9 @@ fn h2_rejects_te_with_non_trailers_value() {
         hdr("te", "gzip"),
     ]);
     peer.send_frame(0x1, 0x4, 1, &block);
-    let code = peer.wait_goaway(Duration::from_secs(5));
-    assert_eq!(code, Some(0x1), "expected PROTOCOL_ERROR GOAWAY");
+    let rst = wait_rst(&mut peer, 1, Duration::from_secs(5));
+    assert_eq!(rst, Some(0x1), "expected PROTOCOL_ERROR RST_STREAM");
+    assert_connection_survives(&mut peer, 3);
 }
 
 #[test]
@@ -750,8 +834,9 @@ fn h2_rejects_content_length_in_trailers() {
     peer.send_frame(0x0, 0x0, 1, b"abc"); // DATA, no END_STREAM
     let trailer = hpack(&[hdr("content-length", "3")]);
     peer.send_frame(0x1, 0x4, 1, &trailer); // trailers + END_HEADERS
-    let code = peer.wait_goaway(Duration::from_secs(5));
-    assert_eq!(code, Some(0x1), "expected PROTOCOL_ERROR GOAWAY");
+    let rst = wait_rst(&mut peer, 1, Duration::from_secs(5));
+    assert_eq!(rst, Some(0x1), "expected PROTOCOL_ERROR RST_STREAM");
+    assert_connection_survives(&mut peer, 3);
 }
 
 // ---------------------------------------------------------------------
@@ -1118,8 +1203,9 @@ fn h2_client_handles_interim_1xx_then_final_response() {
 
 #[test]
 fn h2_rejects_duplicate_request_pseudo_header() {
-    // RFC 9113 §8.1.2.3: a request pseudo-header must not appear more
-    // than once; duplicates are a malformed (connection error) input.
+    // RFC 9113 §8.3: a request pseudo-header must not appear more than
+    // once; a duplicate is a malformed message, so that stream is reset
+    // and the connection stays usable for its other streams.
     let addr = spawn_h2_server(1 << 20);
     let mut peer = RawH2Peer::connect(addr).unwrap();
     peer.send_preface_and_settings();
@@ -1130,12 +1216,13 @@ fn h2_rejects_duplicate_request_pseudo_header() {
         hdr(":path", "/two"),
     ]);
     peer.send_frame(0x1, 0x4, 1, &block);
-    let code = peer.wait_goaway(Duration::from_secs(5));
+    let rst = wait_rst(&mut peer, 1, Duration::from_secs(5));
     assert_eq!(
-        code,
+        rst,
         Some(0x1),
-        "expected PROTOCOL_ERROR GOAWAY for duplicate :path"
+        "expected PROTOCOL_ERROR RST_STREAM for duplicate :path"
     );
+    assert_connection_survives(&mut peer, 3);
 }
 
 #[test]

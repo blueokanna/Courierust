@@ -32,14 +32,9 @@ fn main() -> courierust::Result<()> {
     let url = url.unwrap_or_else(|| "wss://echo.websocket.org/".to_string());
 
     let opts = WsClientOptions {
-        // Ask for a subprotocol; `require_subprotocol` decides whether a
-        // server that ignores the offer is an error or a normal
-        // connection without one.
         protocols: vec!["echo".into()],
         require_subprotocol: false,
         compression: true,
-        // Sent so a server with an Origin policy can accept us; a browser
-        // sets this for you, a native client has to say who it is.
         origin: Some("https://example.com".to_string()),
         ..Default::default()
     };
@@ -74,8 +69,6 @@ fn main() -> courierust::Result<()> {
         loop {
             match ws.read_message() {
                 Ok(Event::Ping(p)) => {
-                    // The session already answered with the identical
-                    // payload; this is just visibility.
                     println!("ping {:?}", p.as_ref());
                 }
                 Ok(Event::Pong(p)) => println!("pong {:?}", p.as_ref()),
@@ -94,9 +87,6 @@ fn main() -> courierust::Result<()> {
     }
 
     println!("stats -> {:?}", ws.stats());
-    // A bounded close: send Close, wait for the echo, then drop. If the
-    // peer never answers, the connection is abandoned after the deadline
-    // instead of hanging.
     ws.close(1000, "bye")?;
     Ok(())
 }

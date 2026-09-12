@@ -104,7 +104,7 @@ let ws = WsConfig {
 
 ## 诚实说明
 
-- **未实现 RFC 8441（WebSocket over HTTP/2）。** 如果 ALPN 协商出 `h2`，客户端会明确报错，而不是建立一个看似成功、却永远不会承载帧的连接。请像绝大多数场景那样使用 HTTP/1.1 承载 WebSocket。
+- **未实现 RFC 8441（WebSocket over HTTP/2）。** 客户端在 ALPN 中**只**提供 `http/1.1`——即使 `ClientConfig::http2` 为 `true`——且如果连接最终落在 h2 上，会在读到任何一帧之前拒绝。服务器侧：在**已建立的** h2 连接上尝试 WebSocket 属于畸形消息，按 RFC 9113 §8.1.1 作为**流级错误（`PROTOCOL_ERROR`）** 拒绝，两种形式都如此：RFC 8441 的扩展 CONNECT（`:method = CONNECT` 配 `:protocol = websocket`，在本栈里是未定义伪首部——正是 RFC 8441 §3 为「对端从未声明 `SETTINGS_ENABLE_CONNECT_PROTOCOL`」定义的拒绝方式），以及 HTTP/1.1 式的 `Upgrade: websocket` / `Connection: Upgrade`（连接专用字段，§8.2.2）。连接与其它流保持可用。绝不会出现的两种失败形态值得点名：对一个不可能成为 WebSocket 的请求回 `200`，以及建立一条看似成功却不承载任何帧的连接。WebSocket 请用 HTTP/1.1 承载，与绝大多数场景一致。
 - **`permessage-deflate` 对每条消息独立压缩。** 我们的编码器从不使用上下文接管（context takeover）——这永远合法（解码器的窗口是超集），并且彻底消除了"某条消息的明文泄漏进另一条消息"这类缺陷。代价是对大量微小重复消息的压缩率有上限损失，收益是服务端不必为每条连接保留 32 KiB 滑动窗口，可以承载数千连接。
 - **`SO_RCVTIMEO` 只在空闲等待时开启。** Windows 会对 socket 的每一次阻塞操作计费，包括写操作：实测 256 KiB 推送循环在发送方设置了截止时间后慢约 2 倍，两端都设置则慢约 10 倍。因此阻塞服务端仅在等待下一帧时开启截止时间，处理消息期间清除（`ping_interval` 仍是存活检测机制）。**客户端** 会按 `ClientConfig::read_timeout` 在整个连接期间保留截止时间——这对交互式流量是合理的默认值，但在 Windows 上对 256 KiB 批量传输约多花一倍时间；批量传输的客户端应设 `read_timeout: None` 并用应用层存活检测，与服务端一致。两项结论的实测数据见 [`benches/WS_BENCHMARK.md`](../../benches/WS_BENCHMARK.md)。
 - **不要在 reactor 回调里做批量推送。** 事件驱动驱动中，服务回调运行在 reactor 工作线程上；在 `on_message` 里循环推送成千上万条消息会阻塞本该排空发送队列的 reactor，队列上限最终会关闭连接。扇出的正确姿势是其他线程使用 `WsConn::sender()`（`WsSender`）排队并唤醒。
@@ -161,4 +161,11 @@ for msg in [ws.read_message()?] {
 ws.close(1000, "done")?;
 ```
 
-可运行版本见 [`examples/ws_echo.rs`](../../examples/ws_echo.rs) 与 [`examples/ws_client.rs`](../../examples/ws_client.rs)；[`tests/ws.rs`](../../tests/ws.rs) 中的 25 个端到端测试针对真实 socket 验证线上协议，包括跨驱动推送、Origin 拒绝、TLS 上的 `wss` 以及各类错误码。
+可运行版本见 [`examples/ws_echo.rs`](../../examples/ws_echo.rs) 与 [`examples/ws_client.rs`](../../examples/ws_client.rs)；[`tests/ws.rs`](../../tests/ws.rs) 中的 27 个端到端测试针对真实 socket 验证线上协议，包括跨驱动推送、Origin 拒绝、TLS 上的 `wss` 以及各类错误码。
+
+## 接下来看哪里
+
+- 中英文教程：Wiki —— [WebSocket 使用指南](https://github.com/blueokanna/Courierust/wiki/WebSocket-%E4%BD%BF%E7%94%A8%E6%8C%87%E5%8D%97) / [WebSockets](https://github.com/blueokanna/Courierust/wiki/WebSockets)。
+- 可直接运行的示例：`cargo run --example ws_echo`（同进程内服务器 + 客户端）、`cargo run --example ws_client`（带生产级配置的客户端，可连任意端点）。
+- 实测数据与诚实的弱点：[`benches/WS_BENCHMARK.md`](../../benches/WS_BENCHMARK.md)。
+- 服务端/客户端接入细节：[`../courierust_server/README_CN.md`](../courierust_server/README_CN.md)（`Handler::websocket` 钩子与 reactor）与 [`../courierust_client/README_CN.md`](../courierust_client/README_CN.md)。

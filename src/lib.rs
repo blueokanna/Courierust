@@ -1,12 +1,15 @@
-//! Courierust — a self-contained HTTP/1.1 + HTTP/2 + gRPC stack.
+//! Courierust — a self-contained HTTP/1.1 + HTTP/2 + HTTP/3 + WebSocket + gRPC stack.
 //!
 //! The protocol core (`courierust_http`, `courierust_hpack`,
-//! `courierust_h2`, `courierust_fingerprint`, `courierust_crypto`,
-//! `courierust_bytes`, `courierust_io`) compiles on `no_std + alloc`
-//! with **zero** third-party dependencies. The `std` feature (enabled by
-//! default) adds the threaded networking layer: `courierust_pool`
-//! (work-stealing scheduler), `courierust_net`, `courierust_client`,
-//! `courierust_server` and `courierust_grpc`.
+//! `courierust_h2`, `courierust_ws`, `courierust_deflate`,
+//! `courierust_quic`, `courierust_h3`, `courierust_fingerprint`,
+//! `courierust_crypto`, `courierust_bytes`, `courierust_io`) compiles on
+//! `no_std + alloc` with **zero** third-party dependencies. The `std`
+//! feature (enabled by default) adds the threaded networking layer:
+//! `courierust_pool` (work-stealing scheduler), `courierust_net`,
+//! `courierust_client` (the h1 pool, the h2/h3 drivers and the WebSocket
+//! client), `courierust_server` (the event-driven scheduler plus the
+//! WebSocket upgrade path) and `courierust_grpc`.
 //!
 //! Every public module carries the crate's `courierust_` prefix so no
 //! module path collides with a third-party crate of the same short name
@@ -28,6 +31,21 @@
 //!   cutting control-frame overhead.
 //! * **Table-driven HPACK** — 8-bit two-level Huffman decode tables and a
 //!   hash-accelerated static/dynamic header index fast path.
+//! * **WebSocket** — RFC 6455 framing, masking, UTF-8 validation, the
+//!   close handshake and RFC 7692 `permessage-deflate`, in
+//!   `courierust_ws`. Masking is XORed in 16-byte lanes (a 4-byte
+//!   repeating key cannot vectorise, but 16 is a multiple of four, so
+//!   every lane starts at the same key phase), a payload over 8 KiB is
+//!   read straight into the message buffer instead of through the
+//!   buffered reader, and the DEFLATE context is reused per message
+//!   rather than rebuilt. A live HTTP/1.1 connection is upgraded in
+//!   place by both server drivers — in the event reactor an idle
+//!   WebSocket costs a poller slot, not a thread — and the client speaks
+//!   `ws://` / `wss://` over the crate's own TLS stack.
+//! * **HTTP/3 over QUIC v1** — `courierust_quic` (packet and frame
+//!   codecs, varints, header protection, key update) plus `courierust_h3`
+//!   (QPACK, H3 framing, and a poller-driven UDP reactor whose poll
+//!   timeout is an absolute protocol deadline rather than a fixed tick).
 //! * **Fingerprint profiles** — exact Chrome HTTP/2 settings/header
 //!   ordering plus JA3/JA4 TLS `ClientHello` parameter profiles with
 //!   self-contained MD5/SHA-256, so a browser-shaped fingerprint can be

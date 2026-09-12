@@ -9,7 +9,7 @@ This page gets a client and a server talking over loopback in five minutes.
 courierust = "1.0.0"
 ```
 
-The default `std` feature pulls in the client, server, pool, and gRPC layers. If you only want the `no_std` protocol core, see [no_std](no_std).
+The default `std` feature pulls in the client, server, pool, and gRPC layers (the WebSocket engine is in the protocol core, so `courierust_ws` is available either way; [WebSockets](WebSockets) shows the server hook and the client). If you only want the `no_std` protocol core, see [no_std](no_std).
 
 ## 2. A one-file hello server + client
 
@@ -86,5 +86,6 @@ POST -> 200 hello from client
 
 - [HTTP client](HTTP-Client) — timeouts, redirects, priorities, streaming response bodies
 - [HTTP server](HTTP-Server) — streaming responses, thread count, background serving
+- [WebSockets](WebSockets) — in-place upgrade, `WsService`, client, proxy deployment
 - [gRPC](gRPC) — unary and streaming RPCs over the same stack
 - [Fingerprints](Fingerprints) — make the client *look like* Chrome

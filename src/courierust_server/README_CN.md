@@ -42,6 +42,17 @@ flowchart LR
 - 长时间阻塞的同步 handler 会占住一个 worker（事件驱动与否都一样）——任何同步服务器的通病。流式请用 channel body。
 - 同时服务 h2c 前导知识和 `h2c` Upgrade。
 
+## WebSocket 升级
+
+handler 拥有 WebSocket 路由的方式跟拥有 HTTP 路由完全一样：`Handler::websocket(&self, req) -> WsUpgradeReply` 对自己服务的路径返回 `Accept(service)`，其余返回 `Pass`，于是明文 HTTP 与 WebSocket 共用同一个端口、同一个 handler。
+
+升级是**原地的，两条驱动路径都支持**：
+
+- **阻塞驱动**（`event_driven: false`）——`courierust_server::ws::serve_blocking` 用阻塞循环驱动连接，只在等待下一帧时才 armed socket 读超时（Windows 会对每次阻塞操作收费，写也包括在内）。
+- **事件驱动**（默认）——HTTP 连接变成 `WsEventConn` 留在 reactor 里：只在 socket 可读时读帧，只在可写时冲刷应用层入队的发送，于是一个空闲 WebSocket 只占**一个 poller 槽位，不占线程**。服务回调跑在 event worker 上；从其他线程扇出走 `WsConn::sender()`（`WsSender`），它是入队 + 唤醒 reactor，而不是阻塞 reactor。
+
+`WsConfig`（Origin 策略、子协议、帧/消息/分片上限、有界发送队列、Ping/Pong 保活、`trusted_proxies`）两条驱动共用，所以策略绝不会因为跑在哪条路径上而不同——`tests/ws.rs` 也是把同样的场景在两条路径上各跑一遍。引擎本身与其协议级保证见 [`courierust_ws`](../courierust_ws/README_CN.md)。
+
 ## H1 每请求阶段计时
 
 `COURIERUST_H1_TRACE=1` 开启每请求分段计时，输出 `H1SEG|...` 行——一条连接建立行（`event=newconn|accept_us`），以及每个已服务请求批一条行，覆盖 1 KiB keep-alive 请求的完整九段分解：

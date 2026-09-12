@@ -42,6 +42,34 @@ A closed descriptor sitting in a wait set is not a harmless stale entry: POSIX `
 - A long-blocking synchronous handler occupies a worker (event-driven or not) — any synchronous server's disease. Use channel bodies for streaming.
 - Both h2c prior knowledge and `h2c` Upgrade are served.
 
+## WebSocket upgrades
+
+A handler owns WebSocket routes the same way it owns HTTP routes:
+`Handler::websocket(&self, req) -> WsUpgradeReply` returns
+`Accept(service)` for the paths it serves and `Pass` for everything else,
+so plain HTTP and WebSockets share one port and one handler.
+
+The upgrade happens **in place, on both drivers**:
+
+- **Blocking driver** (`event_driven: false`) — `courierust_server::ws::serve_blocking`
+  drives the connection with a blocking loop, arming the socket's read
+  deadline only while it waits for the next frame (Windows charges for a
+  deadline on every blocking operation, writes included).
+- **Event driver** (the default) — the HTTP connection becomes a
+  `WsEventConn` that stays in the reactor: frames are read only when the
+  socket is readable and queued application sends are flushed only when it
+  is writable, so an idle WebSocket costs **a poller slot, not a thread**.
+  A service callback runs on an event worker; fan-out from another thread
+  goes through `WsConn::sender()` (`WsSender`), which queues and nudges the
+  reactor instead of blocking it.
+
+`WsConfig` (origin policy, subprotocols, frame/message/fragment caps, the
+bounded send queue, Ping/Pong keepalive, `trusted_proxies`) is shared by
+both drivers, so a policy decision can never depend on which one is
+active — and `tests/ws.rs` runs the same scenarios through both. See
+[`courierust_ws`](../courierust_ws/README.md) for the engine itself and
+its protocol-level guarantees.
+
 ## H1 per-request stage timing
 
 `COURIERUST_H1_TRACE=1` turns on per-request segment timing, emitted as

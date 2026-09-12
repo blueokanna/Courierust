@@ -11,6 +11,7 @@ if [[ $# -eq 4 ]]; then
     fuzz_log=''
     h3_log=''
     tls_interop_log=''
+    complexity_log=''
 elif [[ $# -eq 7 ]]; then
     throughput_log=$1
     compare_log=$2
@@ -21,6 +22,7 @@ elif [[ $# -eq 7 ]]; then
     output=$7
     h3_log=''
     tls_interop_log=''
+    complexity_log=''
 elif [[ $# -eq 8 ]]; then
     throughput_log=$1
     compare_log=$2
@@ -31,6 +33,7 @@ elif [[ $# -eq 8 ]]; then
     h3_log=$7
     output=$8
     tls_interop_log=''
+    complexity_log=''
 elif [[ $# -eq 9 ]]; then
     throughput_log=$1
     compare_log=$2
@@ -41,8 +44,20 @@ elif [[ $# -eq 9 ]]; then
     h3_log=$7
     tls_interop_log=$8
     output=$9
+    complexity_log=''
+elif [[ $# -eq 10 ]]; then
+    throughput_log=$1
+    compare_log=$2
+    concurrency_log=$3
+    interop_log=$4
+    network_log=$5
+    fuzz_log=$6
+    h3_log=$7
+    tls_interop_log=$8
+    complexity_log=$9
+    output=${10}
 else
-    printf 'usage: %s THROUGHPUT_LOG COMPARE_LOG [CONCURRENCY_LOG] INTEROP_LOG [NETWORK_LOG] [FUZZ_LOG] [H3_LOG] [TLS_INTEROP_LOG] OUTPUT\n' "$0" >&2
+    printf 'usage: %s THROUGHPUT_LOG COMPARE_LOG [CONCURRENCY_LOG] INTEROP_LOG [NETWORK_LOG] [FUZZ_LOG] [H3_LOG] [TLS_INTEROP_LOG] [COMPLEXITY_LOG] OUTPUT\n' "$0" >&2
     exit 2
 fi
 
@@ -440,6 +455,103 @@ write_raw_block() {
     fi
 }
 
+write_complexity_fit_table() {
+    local lines=$1
+
+    if [[ -z "$lines" ]]; then
+        printf '| _No complexity fit captured_ | | | | | | | |\n'
+        return
+    fi
+
+    printf '| family | implementation | operation | metric | fitted class | median k | max k | slope b | fixed a | R² | points |\n'
+    printf '|---|---|---|---|---|---:|---:|---:|---:|---:|---:|\n'
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
+            "$(result_field "$line" family)" \
+            "$(result_field "$line" impl)" \
+            "$(result_field "$line" op)" \
+            "$(result_field "$line" metric)" \
+            "$(result_field "$line" class)" \
+            "$(result_field "$line" median_k)" \
+            "$(result_field "$line" max_k)" \
+            "$(result_field "$line" slope_b)" \
+            "$(result_field "$line" fixed_a)" \
+            "$(result_field "$line" r2)" \
+            "$(result_field "$line" points)"
+    done <<< "$lines"
+}
+
+write_complexity_ratio_table() {
+    local lines=$1
+
+    if [[ -z "$lines" ]]; then
+        printf '| _No paired comparison captured_ | | | | | | |\n'
+        return
+    fi
+
+    printf '| family | operation | metric | n | courierust | reference | ratio (ours/reference) |\n'
+    printf '|---|---|---|---:|---:|---:|---:|\n'
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        printf '| %s | %s | %s | %s | %s | %s | %s |\n' \
+            "$(result_field "$line" family)" \
+            "$(result_field "$line" op)" \
+            "$(result_field "$line" metric)" \
+            "$(result_field "$line" n)" \
+            "$(result_field "$line" a)" \
+            "$(result_field "$line" b)" \
+            "$(result_field "$line" ratio)"
+    done <<< "$lines"
+}
+
+write_complexity_memory_table() {
+    local lines=$1
+
+    if [[ -z "$lines" ]]; then
+        printf '| _No per-connection memory captured_ | | | |\n'
+        return
+    fi
+
+    printf '| implementation | connections | live KiB/conn | RSS KiB/conn |\n'
+    printf '|---|---:|---:|---:|\n'
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        printf '| %s | %s | %s | %s |\n' \
+            "$(result_field "$line" impl)" \
+            "$(result_field "$line" connections)" \
+            "$(result_field "$line" live_kib_per_conn)" \
+            "$(result_field "$line" rss_kib_per_conn)"
+    done <<< "$lines"
+}
+
+write_complexity_scale_table() {
+    local lines=$1
+    local selected
+
+    # Only the headline operations of the time dimension: the complete
+    # point set (every size, every metric) stays in complexity.log, which
+    # the workflow uploads next to this report.
+    selected=$(printf '%s\n' "$lines" | grep -E '^SCALE\|family=(codec|http)\|.*\|metric=time_ns\|' | grep -E 'op=encode_unmasked|op=encode_masked|op=get_roundtrip' || true)
+
+    if [[ -z "$selected" ]]; then
+        printf '| _No scale points captured_ | | | |\n'
+        return
+    fi
+
+    printf '| family | implementation | operation | n (bytes) | ns/op |\n'
+    printf '|---|---|---|---:|---:|\n'
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        printf '| %s | %s | %s | %s | %s |\n' \
+            "$(result_field "$line" family)" \
+            "$(result_field "$line" impl)" \
+            "$(result_field "$line" op)" \
+            "$(result_field "$line" n)" \
+            "$(result_field "$line" value)"
+    done <<< "$selected"
+}
+
 sha=${GITHUB_SHA:-local}
 run_id=${GITHUB_RUN_ID:-local}
 ref=${GITHUB_REF_NAME:-local}
@@ -451,6 +563,7 @@ interop_status=${BENCHMARK_INTEROP_EXIT:-not-recorded}
 network_status=${BENCHMARK_NETWORK_EXIT:-not-recorded}
 fuzz_status=${BENCHMARK_FUZZ_EXIT:-not-recorded}
 h3_status=${BENCHMARK_H3_EXIT:-not-recorded}
+complexity_status=${BENCHMARK_COMPLEXITY_EXIT:-not-recorded}
 
 throughput_results=$(extract_lines '^RESULT\|suite=throughput' "$throughput_log")
 tlsverify_results=$(extract_lines '^TLSVERIFY\|' "$throughput_log")
@@ -462,6 +575,10 @@ fuzz_results=$(extract_lines '^FUZZ\|' "$fuzz_log")
 h3_results=$(extract_lines '^RESULT\|suite=h3' "$h3_log")
 stats_results=$(extract_lines '^STATS\|' "$throughput_log")
 tlsinterop_results=$(extract_lines '^TLSINTEROP\|' "$tls_interop_log")
+complexity_fits=$(extract_lines '^COMPLEXITY\|' "$complexity_log")
+complexity_scales=$(extract_lines '^SCALE\|' "$complexity_log")
+complexity_ratios=$(extract_lines '^RATIO\|' "$complexity_log")
+complexity_memory=$(extract_lines '^MEMORY\|' "$complexity_log")
 
 {
     printf '# GitHub Action Benchmark\n\n'
@@ -475,6 +592,7 @@ tlsinterop_results=$(extract_lines '^TLSINTEROP\|' "$tls_interop_log")
     printf -- '- Concurrency exit code: %s\n' "$concurrency_status"
     printf -- '- Interop exit code: %s\n' "$interop_status"
     printf -- '- HTTP/3 exit code: %s\n' "$h3_status"
+    printf -- '- Complexity exit code: %s\n' "$complexity_status"
     printf -- '- Cross-machine exit code: %s\n' "$network_status"
     printf -- '- Fuzz exit code: %s\n' "$fuzz_status"
     if [[ -n "${GITHUB_SERVER_URL:-}" && -n "${GITHUB_REPOSITORY:-}" && -n "${GITHUB_RUN_ID:-}" ]]; then
@@ -491,6 +609,7 @@ tlsinterop_results=$(extract_lines '^TLSINTEROP\|' "$tls_interop_log")
     printf '%s\n' '- TLS rows measure the built-in TLS 1.2/1.3 path; certificate, hostname, and ALPN checks must pass for the case to be valid. `negotiated_alpn` is reported; `session_resumption=n/a` because each TLSVERIFY row is a single handshake that does not measure resumption (the stack does implement TLS 1.3 session tickets).'
     printf '%s\n' '- Fuzz status is evidence only for the recorded target, run count, and duration; an unconfigured target is not a pass.'
     printf '%s\n' '- The `STATS` table is the reactor/connection/stream/syscall evidence behind the throughput rows (especially the h2 multi-worker scaling).'
+    printf '%s\n' '- The complexity tables are scaling evidence, not a speed claim: the class is fitted from the largest measured sizes, and the paired `ratio` is only meaningful within one run.'
 
     printf '\n%s\n\n' '## Reading the numbers (correct interpretation)'
     printf '%s\n' '- RPS and median latency are comparable only within a paired row (same client, server, payload, concurrency). Never divide across rows, clients or protocols to claim "N× faster".'
@@ -518,6 +637,20 @@ tlsinterop_results=$(extract_lines '^TLSINTEROP\|' "$tls_interop_log")
     # Blank line between the list and the table (see above).
     printf '\n'
     write_h3_table "$h3_results"
+    printf '\n%s\n\n' '## Complexity (time and space)'
+    printf '%s\n' '- Each family is measured at several input sizes (three orders of magnitude), and every point is the minimum of three repeats — noise only ever makes a measurement slower, so the minimum is the right estimator and a noisy point would otherwise invent curvature that is not in the code.'
+    printf '%s\n' '- `class` is named by `median k`, the median of the adjacent-pair exponents, so the label describes the *typical* growth factor per 16× inside the measured range; `max k` is the worst pair, so one noisy pair cannot pass as a trend. `slope b` is the per-unit cost and `fixed a` the per-operation cost that does not scale with the input; R² is the fit quality (1.0 = exact).'
+    printf '%s\n' '- A range whose fixed term dwarfs its per-unit term is labelled `fixed-cost dominated` instead of quoting a sublinear-looking exponent that is really the constant; for those families read `slope b` (for example nanoseconds per extra header).'
+    printf '%s\n' '- Space is attributed per operation by a counting allocator compiled into the bench binary (allocation bytes and allocation calls), and per connection by a live-bytes/RSS delta between 1 and 65 idle keep-alive connections — the fixed process/runtime cost cancels out of a delta.'
+    printf '%s\n' '- `ratio` is Courierust divided by the reference at the same size: below 1 means Courierust is cheaper. Rows are comparable only within one run.'
+    printf '\n'
+    write_complexity_fit_table "$complexity_fits"
+    printf '\n%s\n\n' '### Constant factors (paired at the same size)'
+    write_complexity_ratio_table "$complexity_ratios"
+    printf '\n%s\n\n' '### Space: cost of one idle connection'
+    write_complexity_memory_table "$complexity_memory"
+    printf '\n%s\n\n' '### Time: selected scaling points'
+    write_complexity_scale_table "$complexity_scales"
     printf '\n%s\n\n' '## Reactor / Connection / Stream Evidence'
     write_stats_table "$stats_results"
     printf '\n%s\n\n' '## Cross-Machine'

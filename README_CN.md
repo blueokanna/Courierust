@@ -4,20 +4,20 @@
   <img src="assets/Courierust.png" alt="高性能 Rust 网络传输栈" width="20%" />
 </p>
 
-> 一个零依赖、协议自研的 HTTP/1.1 + HTTP/2 + gRPC 协议栈。
+> 一个零依赖、协议自研的 HTTP/1.1 + HTTP/2 + HTTP/3 + WebSocket + gRPC 协议栈。
 
 > 中英文手把手教程见 [Wiki](https://github.com/blueokanna/Courierust/wiki)。
 
-`courierust` 的协议核心（`courierust_http` / `courierust_hpack` / `courierust_h2` / `courierust_fingerprint` / `courierust_crypto` / `courierust_bytes` / `courierust_io`）在 `no_std + alloc` 下即可编译，**不依赖任何第三方库**。`std` feature（默认开启）在此基础上补上多线程网络层：工作窃取线程池、TCP 适配、客户端、服务器与 gRPC。
+`courierust` 的协议核心（`courierust_http` / `courierust_hpack` / `courierust_h2` / `courierust_ws` / `courierust_deflate` / `courierust_quic` / `courierust_h3` / `courierust_fingerprint` / `courierust_crypto` / `courierust_bytes` / `courierust_io`）在 `no_std + alloc` 下即可编译，**不依赖任何第三方库**。`std` feature（默认开启）在此基础上补上多线程网络层：工作窃取线程池、TCP 适配、客户端（h1 连接池、h2/h3 驱动与 WebSocket 客户端）、服务器（事件驱动调度器 + WebSocket 升级）与 gRPC。
 
-这不是对某个现成库的封装，帧编解码、HPACK 头压缩、流状态机、流控、优先级调度、指纹构造都是从头实现的。
+这不是对某个现成库的封装：帧编解码、HPACK/QPACK 头压缩、QUIC 包保护、WebSocket 组帧/掩码/DEFLATE、流状态机、流控、优先级调度、指纹构造全部从头实现，不依赖任何其他 HTTP 栈。
 
 ## 为什么会有这个项目
 
 常见的 Rust HTTP 生态（hyper / h2 / h3 等）能力很强，但依赖树很深，且往往把 `no_std`、多核亲和、以及「客户端看起来像什么浏览器」这类问题留给使用者自己解决。这个仓库的目标是：
 
 - 协议层与平台完全解耦：核心代码不碰 `std`，`std` 只负责线程、TCP 和时钟；
-- 多核是真的多核（在模型范围内）：服务端连接通过工作窃取池调度；客户端连接池按 authority 共享，HTTP/2 请求按 reservation 选择负载最小的 driver，并由 `max_connections_per_host` 控制独立连接上限。**worker 占用按连接计**：一条 HTTP/2 连接上的任意多个流（慢流、SSE、gRPC 服务端流）只占同一个 worker，流之间互不阻塞。**事件驱动调度器（全平台默认）**把空闲/半截明文 HTTP 连接挂在就绪轮询器上，慢连接羊群不再耗尽 worker；`idle_timeout` 回收空转连接，`max_connections` 封顶驻留连接数。
+- 多核是真的多核（在模型范围内）：服务端连接通过工作窃取池调度，并配有**事件驱动调度器（全平台默认）**把空闲/半截明文 HTTP 连接挂在就绪轮询器上，慢连接羊群不再耗尽 worker；`idle_timeout` 回收空转连接，`max_connections` 封顶驻留连接数。客户端连接池按 authority 共享，HTTP/2 请求多路复用，连接不足时按**加权负载**（活跃流数 + 在途请求体字节 + 封顶的 EWMA 服务时间）选连接，并由 `max_connections_per_host` 控制独立连接上限。**worker 占用按连接计**：一条 HTTP/2 连接上的任意多个流（慢流、SSE、gRPC 服务端流）只占同一个 worker，流之间互不阻塞。
 - 协议细节按 RFC 实现并对照公开测试向量验证过，不是「能跑就行」的玩具。
 
 ## 特性
@@ -45,10 +45,11 @@
 - **工作窃取线程池**（`courierust_pool`）：每个 worker 一条本地 LIFO 栈 + 全局 FIFO 窃取队列；任务可嵌套提交，窃取时优先挑空闲最久的 worker。
 - **客户端**（`courierust_client`）：
   - HTTP/1.1 keep-alive 连接池按 authority 分组并有上限；
-  - HTTP/2 连接由独立 driver 多路复用，按 reservation 选择负载最小的连接并受 `max_connections_per_host` 限制；
+  - HTTP/2 连接由独立 driver 多路复用；连接数达到 `max_connections_per_host` 上限时按**加权负载**选连接（活跃流 + 在途请求体字节 + 封顶的 EWMA 服务时间）；
   - 重定向跟随（301/302/303 自动转 GET）、超时、`User-Agent` 等配置项。
-- **服务器**（`courierust_server`）：每个 accept 的连接作为任务投递到工作窃取池，连接处理跨核并行。
-- **gRPC**（`courierust_grpc`）：HTTP/2 + 长度前缀消息帧 + `grpc-status`/`grpc-message` 处理；protobuf 编解码刻意留给你（实现 `EncodeMessage` / `DecodeMessage`，或直接用字节 API）。
+- **服务器**（`courierust_server`）：默认是**事件驱动调度器**——accept 线程只负责 accept，事件循环把连接按前几个字节分类（TLS / h2 / h1），把空闲的明文 HTTP 连接挂在就绪轮询器（Winsock `select` / POSIX `poll`）上，就绪的连接按批交给 event worker。TLS 与 HTTP/2 连接走阻塞工作窃取池。`event_driven: false` 可恢复旧的「每连接一池任务」模型，供对比与调试。
+- **WebSocket**（`courierust_ws` + 服务端/客户端接入）：RFC 6455 组帧、掩码、UTF-8 校验、握手、分片重组、关闭握手，以及 RFC 7692 `permessage-deflate` —— 全部从头实现。服务端在 handler 钩子里把一条活着的 HTTP/1.1 连接升级（`Handler::websocket` → `WsService` + `WsConfig`：Origin 策略、子协议、帧/消息/分片上限、有界发送队列、Ping/Pong 保活），并且**两条驱动路径都支持升级**——事件 reactor 里一个空闲 WebSocket 只占一个 poller 槽位，不占线程。客户端是 `courierust_client::ws::WebSocket`，`ws://` 与 `wss://`（复用本 crate 自带的 TLS 栈）。引擎细节、部署配方与诚实的基准行：[`src/courierust_ws/README_CN.md`](src/courierust_ws/README_CN.md) 与 [`benches/WS_BENCHMARK.md`](benches/WS_BENCHMARK.md)。
+- **gRPC**（`courierust_grpc`）：HTTP/2 + 长度前缀消息帧 + `grpc-status` / `grpc-message` 处理，两端都支持 unary、服务端流、客户端流与双向流。`gzip` 消息压缩从头实现（RFC 1951/1952：可解压任意标准生产者的 DEFLATE，定长 Huffman LZ77 压缩），并按 gRPC A6 协商。服务端执行 `grpc-timeout` deadline，支持 metadata 与拦截器，`dns:///` 目标可轮询，`grpc.health.v1.Health` 同时提供 `Check` 与 `Watch`。protobuf 刻意留给你（实现 `EncodeMessage` / `DecodeMessage`，或直接用原始字节 API）。
 - **流式响应**（`courierust_body`）：channel 背靠背的 `Body::Channel`，服务器可跨线程推送响应体块。
 
 ## 多核与调度：真正花心思的地方
@@ -71,7 +72,28 @@ RFC 9218 用 8 个 urgency 级别替代了旧版依赖树。我们把它实现�
 
 ### 连接池所有权与调度
 
-每条客户端连接拥有自己的 codec 缓冲区；HTTP/2 连接还拥有一个串行化 wire 访问并复用 stream 的 driver。连接池按 authority 管理，reservation 反映正在 dispatch 的请求，`max_connections_per_host` 是独立连接上限。单条 HTTP/2 连接不会因为调用线程增加就线性扩展，应结合并发基准和延迟尾部选择连接数。
+每条客户端连接拥有自己的 codec 缓冲区；HTTP/2 连接还拥有一个串行化 wire 访问并复用 stream 的 driver。连接池按 authority 与 `max_connections_per_host` 记账，这并不等于「一条 HTTP/2 连接会随调用线程线性扩展」。给部署选连接数之前，请先看并发基准与完整延迟尾部。
+
+### 事件调度器是 self-pipe，而不是 sleep-and-scan 循环
+
+默认服务端路径是 accept 线程 + 事件循环线程 + 若干 event worker。陷阱在于：事件循环会阻塞在 `select`/`poll` 上，而*控制消息*（新连接、worker 刚服务完需要重新注册的连接）走 mpsc 通道。如果事件循环只在下一次 poll tick 才看到它们，每个 keep-alive 往返就要多付一整个 poll 超时（这就是当初那个 ~5 ms 的 P99 尖峰）。修法是一条 **self-pipe**：一对回环 socket，读端注册进 poller，于是 accept 线程和任何 worker 都能在消息入队的*那一刻*用一个字节打断阻塞的 poll。socket 就绪（客户端发数据）本来就会立刻唤醒 poll；有了 self-pipe，*消息*唤醒也是即时的，poll 超时只在完全没有事情发生时限定等待长度——它不在请求延迟路径上。就绪连接按**批**派发给 worker（每 16 个 id 一条通道消息），Windows 上 `select` 分批后每个后续批次都用零超时，因此第 k 批里就绪的 socket 不会被第 0..k-1 批的超时拖累。
+
+慢连接与空闲羊群的防护在 worker 介入之前就完成：不完整的请求挂在 poller 上（零 worker），超过 `idle_timeout` 的连接被回收，`max_connections` 直接封顶驻留连接数。
+
+等待集合的诚实性是构造保证的：连接结束时 worker 把 socket 句柄交给事件循环，事件循环**先注销描述符再关闭它**，所以等待集合里永远不会出现已关闭的 socket（Winsock 的 `select` 会因一个坏描述符让整个等待集合失败，而 POSIX `poll` 只为该项报错）。万一等待仍然失败，事件循环会按连接注册表重建等待集合并退避，而不是空转——自愈次数计入 `Stats::event_wait_errors`，健康运行恒为 0（详见 [`src/courierust_server/README_CN.md`](src/courierust_server/README_CN.md)）。
+
+每请求**分段计时**内置在事件路径里：`COURIERUST_H1_TRACE=1` 输出 `H1SEG|...` 行，把一个请求拆成 accept→注册、注册→首次拾取、keep-alive 的 reactor 往返、worker→首字节读取、解析、handler、构建、写出。环回上占主导的是 reactor 往返与 socket 写出——解析器与 handler 都是个位微秒，这就是「时间花在解析器还是花在交接上」的实测答案。详见 `courierust_server` README。
+
+## 安全加固
+
+这个仓库把解析器当作攻击面来对待。除了到处都有的大小上限（头/行/正文），几个值得特别指出的防御：
+
+- **请求走私（CWE-444）。** 值不一致的重复 `Content-Length` 直接拒绝；`Transfer-Encoding` 按码字列表解析，`chunked` 必须是最后一个且只出现一次（`Transfer-Encoding: notchunked`、`chunked, gzip`、空码字全部拒绝）；请求行必须恰好三个 token。关键在于**阻塞式解析器与事件驱动增量解析器共享同一套 chunk-size 解析与分帧规则**——两条路径对同一个请求的含义产生分歧，正是代理后面发生走私的根源，所以这里只有一个权威。
+- **TLS 记录层。** 密文长度边界、padding 校验、内层 content-type 检查、按方向独立序号（被篡改的记录以 `bad_record_mac` 失败）。TLS 1.2 沿用同一套 AEAD 纪律：只实现 AEAD 套件（RFC 5246 §6.2.3.3 的 AAD 构造；CBC/HMAC、RC4、静态 RSA 从不提供），Finished 的 `verify_data` 在两个版本上都用常量时间比较。解密后的握手缓冲区按协议上限封顶在 16 MiB，对端连发握手记录也无法无限增长内存。握手在两个方向都跑在专用的 `handshake_timeout`（默认 10 s）下，因此连接后卡在握手中的对端会释放 worker/调用方，而不是占满整个读超时。
+- **TLS 信任。** 证书链校验（有效期、名称链、签名、CA/key-usage、信任锚）、RFC 6125 主机名匹配（含 IP SAN 与单通配符）、EKU 强制（叶子证书带 EKU 扩展时必须允许 `serverAuth`）。`verify: false` 仅为测试与确无锚点的对端存在，且仍会校验 `CertificateVerify` + `Finished`——握手在密码学上依然成立。
+- **HTTP/2。** HPACK 炸弹（整数溢出、头列表上限、动态表大小、Huffman EOS/padding）全部拒绝；流控窗口按帧在流与连接两级检查（溢出即 `FLOW_CONTROL_ERROR`）；无正文消息上的 DATA、流结束时的 `content-length` 不一致、空闲流上的 RST 都是流/连接错误；`SETTINGS_TIMEOUT` 与 keepalive 死对端检测会关闭静默的对端。
+- **WebSocket。** 掩码方向双向强制（服务端拒绝未掩码的客户端帧，客户端拒绝被掩码的服务端帧，§5.1）；默认 `OriginPolicy::SameOrigin`，其他站点的页面无法带着会话 Cookie 打开已认证的 socket；`X-Forwarded-For` / `X-Forwarded-Proto` 只在来自 `trusted_proxies` 网段时才被采信，客户端无法伪造自己的地址或声称走了 TLS；握手只接受恰好一个规范长度的 `Sec-WebSocket-Key`、`Version: 13`、按 token 列表匹配的 `Connection: Upgrade`，RSV 位需协商后才允许，长度编码必须最短；所有上限（`max_frame` / `max_message` / `max_fragments` / `max_send_queue`）都以 RFC 规定的错误码（1009/1007/1002）失败而不是先缓冲，解压炸弹同样得到 1009 而不是 OOM。掩码密钥来自平台熵播种的 ChaCha20 流——每帧一个，不是计数器。
+- **重定向从不跨 origin 转发 `Authorization` / `Cookie`**（RFC 9110 §15.4）。
 
 ## 快速上手
 
@@ -139,6 +161,48 @@ let client = GrpcClient::new("http://127.0.0.1:50051")?;
 let reply = client.call("helloworld.Greeter/SayHello", Bytes::from("world"))?;
 ```
 
+### WebSocket
+
+```rust
+use courierust::courierust_client::ClientConfig;
+use courierust::courierust_client::ws::WebSocket;
+
+// ws:// 或 wss:// —— TLS 那一段走本 crate 自己的栈。
+let mut ws = WebSocket::connect("wss://example.com/ws", &ClientConfig::default())?;
+ws.send_text("hello")?;
+println!("{:?}", ws.read_message()?); // Event::Text("hello")
+ws.close(1000, "done")?;
+```
+
+服务端是在 handler 钩子里把一条活着的 HTTP/1.1 连接升级：`Handler::websocket` 对自己负责的路由返回 `WsUpgradeReply::Accept(service)`，其余返回 `WsUpgradeReply::Pass`，于是明文 HTTP 与 WebSocket 共用同一端口、同一个 handler。
+
+```rust
+use courierust::courierust_server::ws::{WsConn, WsData, WsService, WsUpgradeReply};
+use std::sync::Arc;
+
+struct Echo;
+
+impl WsService for Echo {
+    fn on_message(&self, conn: &mut WsConn, msg: WsData) {
+        match msg {
+            WsData::Text(t) => { let _ = conn.send_text(&t); }
+            WsData::Binary(b) => { let _ = conn.send_binary(&b); }
+        }
+    }
+}
+
+impl courierust::courierust_server::Handler for App {
+    // ... handle() 同上 ...
+    fn websocket(&self, req: &courierust::courierust_http::request::Request<
+        courierust::courierust_body::Body>) -> WsUpgradeReply {
+        if req.path == "/ws" { WsUpgradeReply::Accept(Arc::new(Echo)) }
+        else { WsUpgradeReply::Pass }   // 交给 HTTP handler 返回 404
+    }
+}
+```
+
+`cargo run --example ws_echo` 会在一个进程里同时跑服务端与客户端（升级、文本/二进制往返、同一连接上的服务端主动推送、子协议协商、干净关闭）；`cargo run --example ws_client` 则用生产级配置（子协议、Origin、压缩偏好、读超时）连任意 `ws://` / `wss://` 端点。
+
 ## HTTPS（内置 TLS 1.2 + TLS 1.3）
 
 自 0.1 起，本 crate 自带一套零依赖、从零实现的 TLS 栈——**TLS 1.3（RFC 8446）与 TLS 1.2（RFC 5246 / RFC 8422）**——因此 `https://` 成为同一套客户端/服务端的一等公民能力：
@@ -204,7 +268,7 @@ RSA-PKCS#1 v1.5 / ECDSA P-256 / P-384 / Ed25519 证书签名；完整的 X.509
 级。从不提供 0-RTT / early data；TLS 1.3 会话恢复走标准 1-RTT PSK
 路径（服务端签发 session ticket，`psk_dhe_ke`）。QUIC 必须协商 ALPN `h3`；HTTPS
 的 ALPN 必须是 `h2` 或 `http/1.1`。
-`cargo run --example https` 可跑一个自签名证书的端到端示例；`cargo run --example h3` 是 HTTP/3（QUIC v1 + TLS 1.3）端到端示例（冷连接 vs 池化复用、大响应流控、并发多路复用、证书拒绝）；`cargo run --example grpc_streaming` 演示 gRPC 服务端流/客户端流/双向流、deadline、gzip 压缩协商与元数据/拦截器。
+`cargo run --example https` 可跑一个自签名证书的端到端示例；`cargo run --example h3` 是 HTTP/3（QUIC v1 + TLS 1.3）端到端示例（冷连接 vs 池化复用、大响应流控、并发多路复用、证书拒绝）；`cargo run --example grpc_streaming` 演示 gRPC 服务端流/客户端流/双向流、deadline、gzip 压缩协商与元数据/拦截器；`cargo run --example ws_echo` / `cargo run --example ws_client` 则是 WebSocket 的服务端+客户端组合与生产级客户端配置。
 
 ## 指纹：让连接「看起来像」 Chrome
 
@@ -244,7 +308,7 @@ courierust = { version = "0.1", default-features = false }
 - **请求体流式上传目前只在 HTTP/2 下可靠**（h2 天然分帧）。HTTP/1.1 的请求体要么一次性给全（`Body::Bytes`），要么你自己拼 chunked。
 - **gRPC 不含 protobuf、`.proto` 代码生成与 `grpc.reflection`**。消息编解码需要你实现 codec trait 或接你自己的 protobuf 生成代码；reflection 需要 protobuf 模式清单，属外部职责。
 - **长时间阻塞的同步 handler 会占住一个 worker**（事件驱动与否都一样）——任何同步服务器的通病；流式场景用 channel 响应体。worker 占用**按连接而非按流**：一条连接上的任意空闲流只占同一个 worker，慢流不阻塞同连接其他流——两者均有集成测试覆盖。
-- **WebSocket 只实现 RFC 6455 与 RFC 7692。** 未实现 RFC 8441（WebSocket over HTTP/2）：若 ALPN 协商出 `h2`，客户端会明确报错，而不是建立一个永远不承载帧的连接。事件驱动驱动中服务回调运行在 reactor 工作线程上，因此在 `on_message` 里做批量推送会阻塞 reactor，最终触发有界发送队列；扇出的正确路径是其他线程使用 `WsConn::sender()`。本 crate 两端之间传输 256 KiB 消息比 tungstenite 的组合慢（原因定位与 Windows socket deadline 的发现见 [`benches/WS_BENCHMARK.md`](benches/WS_BENCHMARK.md)）——小消息与中等消息为持平或领先。
+- **WebSocket 只实现 RFC 6455 与 RFC 7692。** 未实现 RFC 8441（WebSocket over HTTP/2）：`ws://`/`wss://` 客户端在 ALPN 中**只**提供 `http/1.1`（即使 `ClientConfig::http2 = true`），并在读到任何一帧之前拒绝落在 h2 上的连接；而在已建立的 h2 连接上尝试 WebSocket 会被服务端按畸形消息处理——**流级错误 `PROTOCOL_ERROR`**（RFC 9113 §8.1.1），RFC 8441 扩展 CONNECT（`:protocol = websocket`，即 RFC 8441 §3 定义的拒绝）与 HTTP/1.1 式的 `Upgrade`/`Connection` 字段（§8.2.2）两种形式都如此——因此连接与其它流保持可用。绝不会发生的是：对一个不可能成为 WebSocket 的请求回 `200`，或建立一条看似成功却不承载任何帧的连接。事件驱动驱动中服务回调运行在 reactor 工作线程上，因此在 `on_message` 里做批量推送会阻塞 reactor，最终触发有界发送队列；扇出的正确路径是其他线程使用 `WsConn::sender()`。本 crate 两端之间传输 256 KiB 消息比 tungstenite 的组合慢（原因定位与 Windows socket deadline 的发现见 [`benches/WS_BENCHMARK.md`](benches/WS_BENCHMARK.md)）——小消息与中等消息为持平或领先。
 - **HTTPS 是一等公民**：客户端与服务端内置从零实现的 TLS 1.2 + TLS 1.3；`https://` 需要自备根证书库（无内置 CA）。**ALPN 强制一致**：配置 h2 的客户端连到协商出 `http/1.1` 的服务器，或对方**完全未协商 ALPN**（RFC 9113 §3.3 要求 TLS 上必须用 ALPN `h2`），都会得到明确错误而非静默协议错乱。
 - 客户端重定向、keep-alive 复用等策略以「正确」为先，未做激进调优。
 
@@ -284,6 +348,7 @@ src/
 - HTTP/2 多 worker 多路复用；
 - HTTPS（TLS 1.2/1.3 + h2）经本仓库自带 TLS 栈的端到端；
 - WebSocket（`--bench ws`）：编解码（编码/掩码/解码/UTF-8）、回显往返与单向推送，与 `tungstenite 0.30`、`tokio-tungstenite 0.30` 在同一进程内对比 —— 代码、方法论与诚实行都写在 [`benches/WS_BENCHMARK.md`](benches/WS_BENCHMARK.md)；
+- 复杂度（`--bench complexity`）：**时间与空间复杂度**——每操作的耗时与分配量随规模拟合（`cost = a + b·n`，并以相邻规模对的指数中位数命名量级、同时给出最差的一对；每个测量点取三次重复的最小值），以及一条空闲连接在事件驱动、阻塞与 hyper/tokio 三种服务端形态下的内存代价；有公平对端的地方都与 `tungstenite` / `reqwest`+hyper 对比 —— 方法、一次实测与每条热路径的算法量级见 [`benches/COMPLEXITY.md`](benches/COMPLEXITY.md)；
 - RFC 9218 优先级调度；
 - 并发模型对比（空闲连接群 vs worker 池）与慢发送者群基准。
 
@@ -298,6 +363,8 @@ Workflow 还记录跨机 endpoint（含 TLS 与进程内限速场景）、reacto
 ```bash
 cargo bench --manifest-path benches/Cargo.toml --bench throughput
 cargo bench --manifest-path benches/Cargo.toml --bench concurrency
+cargo bench --manifest-path benches/Cargo.toml --bench ws
+cargo bench --manifest-path benches/Cargo.toml --bench complexity
 cargo bench --manifest-path benches/Cargo.toml --bench interop
 cargo bench --manifest-path benches/Cargo.toml --bench network
 cargo fuzz run h2_frame --fuzz-dir fuzz -- -runs=10000
@@ -320,9 +387,14 @@ cargo fuzz run h2_frame --fuzz-dir fuzz -- -runs=10000
 
 ## 测试
 
-- 单元测试 260 个：覆盖 HPACK 全部 RFC 向量（C.2/C.3/C.4/C.6）、Huffman 编解码（含解码输出上限）、帧编解码、状态机、流控、WUCS 调度、JA3/JA4 公开记录比对、指纹解析、TLS 1.3 握手与 RFC 8448 密钥调度、TLS 1.2 握手（ECDHE-RSA/ECDSA AEAD 套件、PRF、RFC 5746 重协商回显、Ed25519 ServerKeyExchange 签名/验证）、X.25519/Ed25519/ECDSA/RSA 原语、DEFLATE/gzip 编解码（往返、CRC-32 向量、损坏拒绝、输出上限、与 Python zlib 输出交叉验证），以及轮询器 self-pipe（唤醒描述符）语义与 h2 池的加权负载记账。
-- 集成测试 63 个：真实 TCP 环回上的 h1/h2/HTTPS 请求往返、keep-alive 复用、chunked、重定向、h2 并发多路复用、流式响应、大体积流控往返、gRPC unary/服务端流/客户端流/双向流与错误状态/trailers/deadline 执行、gzip 往返、`grpc.health.v1.Health` `Check` + `Watch`、RFC 7540 §3.2 `h2c` Upgrade、**TLS 策略/加固**（信任拒绝、过期证书、不可信签发链、自签名但显式信任、主机名不匹配、ALPN 一致、TLS 1.2 与 TLS 1.3 分别用 RSA / P-384 / Ed25519 身份的完整往返、纯 TLS 1.3 客户端拒绝 TLS 1.2 服务器——绝不静默降级——与 RFC 8446 降级哨兵、握手中断失败、畸形 TLS 输入存活、`verify:false`）、并发证明（慢流不阻塞同连接其他流；大量空闲流按连接而非按流占 worker；空闲连接羊群不阻塞新请求；事件调度器回收 slow-loris 并执行 `max_connections`；服务端流式响应按短节奏冲刷；单条 h2 连接并发突发不饥饿），以及 **13 个 HTTP/3 集成测试**（QUIC v1 + TLS 1.3 真实 UDP 套接字、走公共 `Client`/`Server`）：GET/POST 往返、池化连接复用、双向 256 KiB 请求/响应流控、并发多路复用、每请求 deadline 执行、双向 key update，以及 H3 TLS 安全（不信任 / 过期 / 错误证书链 / 主机名不匹配证书均在握手阶段拒绝）。
-- 加固测试 30 个：恶意帧输入（超长帧、畸形 SETTINGS/PING/WINDOW_UPDATE、流控窗口溢出、HPACK 头表与 Huffman 炸弹、截断/EOS Huffman、伪头顺序、`content-length` 不一致、非法 `transfer-encoding`/`connection` 系头、两端 `SETTINGS_MAX_CONCURRENT_STREAMS` 强制、`h2c` 存活检测：SETTINGS_TIMEOUT 与 keepalive 死对端检测）。
+下面的数量按测试二进制区分，可与一次实际运行一一对应：
+
+- **单元测试 376 个**（`cargo test --lib`）：覆盖 HPACK 全部 RFC 向量（C.2/C.3/C.4/C.6）、Huffman 编解码（含解码输出上限）、帧编解码、状态机、流控、WUCS 调度、JA3/JA4 公开记录比对、指纹解析、TLS 1.3 握手与 RFC 8448 密钥调度、TLS 1.2 握手（ECDHE-RSA/ECDSA AEAD 套件、PRF、RFC 5746 重协商回显、Ed25519 ServerKeyExchange 签名/验证）、X.25519/Ed25519/ECDSA/RSA 原语、DEFLATE/gzip 编解码（往返、CRC-32 向量、损坏拒绝、输出上限、与 Python zlib 输出交叉验证）、**WebSocket 引擎**（掩码相位表、最短长度编码、控制帧规则、增量 UTF-8 校验、握手解析、共享关闭标志、RFC 7692 协商）、轮询器 self-pipe（唤醒描述符）语义与「已关闭描述符」契约，以及 h2 池的加权负载记账。
+- **集成测试 52 个**（`tests/integration.rs`）：真实 TCP 环回上的 h1/h2/HTTPS 请求往返、keep-alive 复用、chunked、重定向、h2 并发多路复用、流式响应、大体积流控往返、gRPC unary/服务端流/客户端流/双向流与错误状态/trailers/deadline 执行、gzip 往返、`grpc.health.v1.Health` `Check` + `Watch`、RFC 7540 §3.2 `h2c` Upgrade、并发证明（慢流不阻塞同连接其他流；大量空闲流按连接而非按流占 worker；空闲连接羊群不阻塞新请求；事件调度器回收 slow-loris 并执行 `max_connections`；服务端流式响应按短节奏冲刷；单条 h2 连接并发突发不饥饿），以及 **TLS 策略/加固**（信任拒绝、过期证书、不可信签发链、自签名但显式信任、主机名不匹配、ALPN 一致、TLS 1.2 与 TLS 1.3 分别用 RSA / P-384 / Ed25519 身份的完整往返、纯 TLS 1.3 客户端拒绝 TLS 1.2 服务器——绝不静默降级——与 RFC 8446 降级哨兵、握手中断失败、畸形 TLS 输入存活、`verify:false`）。
+- **HTTP/3 测试 13 个**（`tests/h3.rs` + `tests/h3_key_update.rs`）：QUIC v1 + TLS 1.3 真实 UDP 套接字、走公共 `Client`/`Server`：GET/POST 往返、池化连接复用、双向 256 KiB 请求/响应流控、并发多路复用、每请求 deadline 执行、双向 key update，以及 H3 TLS 安全（不信任 / 过期 / 错误证书链 / 主机名不匹配证书均在握手阶段拒绝）。
+- **HTTP/2 加固测试 33 个**（`tests/h2_hardening.rs`）：恶意帧输入（超长帧、畸形 SETTINGS/PING/WINDOW_UPDATE、流控窗口溢出、HPACK 头表与 Huffman 炸弹、截断/EOS Huffman、伪头顺序、`content-length` 不一致、非法 `transfer-encoding`/`connection` 系头、两端 `SETTINGS_MAX_CONCURRENT_STREAMS` 强制、`h2c` 存活检测：SETTINGS_TIMEOUT 与 keepalive 死对端检测）。
+- **WebSocket 端到端测试 27 个**（`tests/ws.rs`）：真实服务端 + 真实客户端 + 真实 socket，覆盖升级握手（含 RFC 6455 accept-key 官方向量）、双向掩码、带交错控制帧的分片重组、`permessage-deflate` 协商与 RFC 7692 互操作、UTF-8 失败码、关闭握手的干净性、本 crate TLS 上的 `wss://`、其他线程推送、Origin / 子协议策略、帧/消息/队列上限，以及 reactor 回归（一条连接关闭后仍打开的连接必须继续被服务；健康 reactor 的等待自愈次数为 0）。
+- **4 个 fuzz 目标**（`cargo-fuzz`）：`h2_frame`、`hpack_block`，加上 **`h1_request`**（两个服务端解析器共用 的 request/header/chunked 路径）与 **`h2_connection`**（用恶意帧流在两种角色下驱动完整 h2 状态机）。nightly 长跑工作流给每个目标一个墙钟预算；PR 期在 `benchmark.yml` 里跑同一批目标的冒烟运行。
 
 ```bash
 cargo test                 # 全部测试

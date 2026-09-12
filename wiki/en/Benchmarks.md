@@ -42,6 +42,40 @@ The reactor's latency model is deadline-driven, not cadence-driven. The poll tim
 
 Loopback H3 numbers are one-runner evidence: they depend on CPU allocation, kernel scheduling, and background load. The `network` bench is the cross-host measurement, and it is reported `not_configured` when no `COURIERUST_NETWORK_URL` is supplied — never invented.
 
+## WebSocket (`ws` bench)
+
+The `ws` bench (`cargo bench --manifest-path benches/Cargo.toml --bench ws`) measures the WebSocket path in three layers, and compares the first two against `tungstenite 0.30` and `tokio-tungstenite 0.30` **in the same process, same build profile, same run** (comparing rows across runs on a loaded machine is meaningless — the document says so explicitly):
+
+- **codec**: encode, mask, decode and UTF-8 validation over a range of payload sizes;
+- **echo round trip**: client-masked request → server-unmasked response, so both ends of this crate and the reference implementations are measured on the same socket pair;
+- **one-way push**: a server pushing a stream of messages to a client that only reads (the fan-out shape), which is where the bounded send queue and the reactor wakeup path show up.
+
+The engine decisions this measures (16-byte-lane masking, zero-copy reads above 8 KiB, a reusable DEFLATE context, one write per small frame) are written up next to the numbers, together with the rows this crate **loses** — 256 KiB messages between two ends of this crate are slower than tungstenite's pairing, and the localised cause (plus the Windows socket-deadline finding behind it) is in `benches/WS_BENCHMARK.md`. `WS_BENCH_SECTION=echo|push|codec` runs one layer only.
+
+## Complexity (time and space)
+
+`cargo bench --manifest-path benches/Cargo.toml --bench complexity` measures how
+cost *grows*, not just how fast something is. Every family is sampled at several
+sizes spanning three orders of magnitude — each point is the minimum of three
+repeats, because noise only ever makes a measurement slower — and two models are
+fitted: the affine model `cost = a + b·n` (a fixed per-operation term plus a
+per-unit term, with R²) and the adjacent-size-pair exponents, whose *median*
+names the reported class while the worst pair is printed next to it so a single
+noisy pair cannot pass as a trend. Space is attributed per operation by a
+counting allocator compiled into the bench binary, and per connection by a
+live-bytes/RSS delta between 1 and 65 idle keep-alive connections.
+
+| family | scales | compared against |
+|---|---|---|
+| `codec` | WebSocket frame encode / mask / decode / UTF-8, 64 B → 1 MiB | `tungstenite` |
+| `http` | one GET round trip, 1 KiB → 1 MiB | `reqwest` (hyper) |
+| `headers` | request header count, 4 → 64 | `reqwest` (hyper) |
+| `connections` | space of one idle keep-alive connection | blocking driver, hyper + tokio |
+| `deflate` | permessage-deflate encode (reused vs fresh context) and inflate | no fair third-party peer in this workspace |
+
+Method, a sample run, per-connection memory and the algorithmic class of every
+hot path: `benches/COMPLEXITY.md`. The CI report carries the current numbers.
+
 ## Cross-library comparison
 
 `compare` keeps the peer fixed while measuring one implementation at a time:

@@ -128,3 +128,34 @@ Send an error mid-stream with `tx.fail(err)` — the connection resets that stre
 - The event scheduler is the default on every platform for plain HTTP/1.1: a partial request parks on the poller (zero workers), and connections idle for `ServerConfig::idle_timeout` are reaped. `max_connections` caps the parked population. TLS and HTTP/2 connections run on the blocking pool, bounded by `handshake_timeout` / `h2_idle_timeout`. Setting `event_driven: false` restores the legacy one-pool-job-per-connection model.
 - A *synchronous handler* that blocks holds its event worker for as long as it blocks — exactly like any synchronous server. Use a channel body (`Body::Channel`) for streaming so the worker returns promptly.
 - gRPC servers are a thin layer on this server — see [gRPC](gRPC).
+
+## WebSockets
+
+The same server upgrades HTTP/1.1 connections into WebSockets: implement
+`Handler::websocket` and answer `WsUpgradeReply::Accept(service)` for the
+paths you own (`Pass` keeps the request on the HTTP path). No second port,
+no second listener, and no per-connection thread: in the default event
+driver an idle WebSocket holds one poller slot and **zero workers**.
+
+```rust
+use courierust::courierust_server::ws::WsUpgradeReply;
+use std::sync::Arc;
+
+impl Handler for App {
+    // ... handle() as usual ...
+    fn websocket(&self, req: &Request<Body>) -> WsUpgradeReply {
+        if req.path == "/ws" {
+            WsUpgradeReply::Accept(Arc::new(Echo))
+        } else {
+            WsUpgradeReply::Pass
+        }
+    }
+}
+```
+
+`WsConfig` covers the Origin policy, subprotocols, the frame / message /
+fragment / send-queue limits, `permessage-deflate`, the Ping/Pong
+keepalive and `trusted_proxies` — and both drivers run the same engine, so
+the policy cannot depend on which one is active. The full tutorial (server
+hook, client, proxy deployment, the rules enforced for you) is
+[WebSockets](WebSockets).

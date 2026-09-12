@@ -7,6 +7,7 @@
 - **HTTP/1.1**——按 authority 的 keep-alive 池，有界复用。每条连接拥有自己的读写缓冲区和 `Scratch`，稳态 keep-alive 请求**零按请求分配**、零 socket 重配。
 - **HTTP/2**——每条连接由专用 driver 线程驱动，串行化线上访问的同时多路复用流。请求经 channel 到达；响应经每流 channel 流回。`max_connections_per_host` 按 authority 封顶存活连接；h2 池按 authority 共享。
 - **HTTP/3**——`http3://`（以及 ALPN `h3`）路由进 H3 runtime 的 UDP reactor，支持池化连接复用。
+- **WebSocket**——`courierust_client::ws::WebSocket` 通过 `ws://` 或 TLS（`wss://`）升级，提供 `send_text` / `send_binary` / `send_ping` / `read_message` / `close`，并支持子协议、Origin 头、压缩偏好与读超时，全部沿用同一个 `ClientConfig`。它与服务端共用组帧/UTF-8/关闭握手引擎（`courierust_ws`），两端强制的是同一套规则。
 - **TLS**——`https://` 是一等公民：`TlsSettings { roots, verify, alpn, now, min_version, max_version }`，对着 crate 自己的 TLS 栈。
 
 ## 重要的细节
@@ -15,6 +16,7 @@
 - **优先级**——`execute_priority(url, req, Priority { urgency, incremental })` 驱动 WUCS 调度器（见 `blogs/01`）。
 - **worker 占用按连接而非按流**——一条带很多流的 h2 连接只占一个 worker，流永远不会把 worker 用量翻倍，也互不阻塞。
 - **超时**——连接、握手（TLS）、读、整请求超时，全部可配。
+- **WebSocket 的读超时就是 socket 超时。** `ClientConfig::read_timeout`（默认 60 s）对交互式流量是正确的存活机制，但 Windows 会在每次阻塞操作上收费：armed 状态下 256 KiB 的 WebSocket 批量推送大约**慢 2 倍**。批量传输的客户端应设 `read_timeout: None`，改用应用层存活判断——服务端就是这么做的（实测见 [`courierust_ws` README](../courierust_ws/README_CN.md)）。
 - **h2c 前导知识**是选配（`cfg.http2 = true`）；服务端支持 `h2c` Upgrade。
 
 ## 诚实的话

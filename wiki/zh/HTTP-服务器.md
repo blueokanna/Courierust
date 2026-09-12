@@ -114,3 +114,25 @@ let handler = |_req: Request<Body>| -> Response<Body> {
 - 明文 HTTP/1.1 全平台默认走事件调度器：半截请求挂在轮询器上（零 worker），超过 `ServerConfig::idle_timeout` 的空转连接被回收，`max_connections` 封顶驻留连接数。TLS 与 HTTP/2 连接走阻塞池，由 `handshake_timeout` / `h2_idle_timeout` 约束。设 `event_driven: false` 恢复旧的每连接一池任务模型。
 - **同步 handler** 阻塞多久就占住事件 worker 多久——与任何同步服务器一致。流式场景用 channel body（`Body::Channel`），worker 可及时归还。
 - gRPC 服务器就是这层之上的薄封装，见 [gRPC 使用指南](gRPC-使用指南)。
+
+## WebSocket
+
+同一个服务器把 HTTP/1.1 连接就地升级成 WebSocket：实现 `Handler::websocket`，对自己负责的路径返回 `WsUpgradeReply::Accept(service)`（`Pass` 则保持在 HTTP 路径上）。不需要第二个端口、第二个监听线程，也不需要每连接一线程：默认的事件驱动路径下，一个空闲 WebSocket 只占一个 poller 槽位、**零 worker**。
+
+```rust
+use courierust::courierust_server::ws::WsUpgradeReply;
+use std::sync::Arc;
+
+impl Handler for App {
+    // ... handle() 照旧 ...
+    fn websocket(&self, req: &Request<Body>) -> WsUpgradeReply {
+        if req.path == "/ws" {
+            WsUpgradeReply::Accept(Arc::new(Echo))
+        } else {
+            WsUpgradeReply::Pass
+        }
+    }
+}
+```
+
+`WsConfig` 覆盖 Origin 策略、子协议、帧/消息/分片/发送队列上限、`permessage-deflate`、Ping/Pong 保活与 `trusted_proxies`；两条驱动路径跑的是同一套引擎，所以策略不会因为跑在哪条路径上而不同。完整教程（服务端钩子、客户端、代理部署、替你强制的规则）见 [WebSocket 使用指南](WebSocket-使用指南)。

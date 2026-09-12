@@ -10,14 +10,24 @@
 //!
 //! Two properties make it fast enough to sit in the receive path:
 //!
-//! * An ASCII fast path scans eight bytes per iteration with a single
-//!   mask-and-branch (`w & 0x8080…`) while the decoder is in the ground
-//!   state — the common case for chat/JSON traffic.
-//! * The multi-byte path is a 12-state machine with *no table lookups*:
-//!   restricted ranges (overlong, surrogate, and > U+10FFFF guards) are
-//!   checked with two comparisons on the one continuation byte that
-//!   needs them, exactly reproducing the well-formed byte-sequence table
-//!   of Unicode §3.9.
+//! * Bulk validation is delegated to [`core::str::from_utf8`], which is
+//!   the fastest validator reachable without a dependency (word-at-a-time
+//!   ASCII scan, and SIMD where the target has it). Re-implementing that
+//!   scan here would be slower *and* a second place for the Unicode rules
+//!   to be wrong.
+//! * The state machine runs only where the standard library cannot help:
+//!   finishing a character that started in an earlier frame, and naming
+//!   the offending byte when a message is rejected. Both are bounded by
+//!   a handful of bytes, so the hot path is a single library call.
+//!
+//! The multi-byte path is a 12-state machine with *no table lookups*:
+//! restricted ranges (overlong, surrogate, and > U+10FFFF guards) are
+//! checked with two comparisons on the one continuation byte that needs
+//! them, exactly reproducing the well-formed byte-sequence table of
+//! Unicode §3.9. The oracle tests below cross-check the two
+//! implementations against each other on every two-byte input and on
+//! 20 000 pseudo-random sequences, so "delegate the bulk" cannot turn
+//! into "accept what the standard library rejects".
 //!
 //! The rejection rules implemented here are the strict ones — no
 //! “replacement character”, no lenient surrogate pass-through — because
@@ -76,82 +86,98 @@ impl Utf8Validator {
     /// `bytes`) plus a stable reason, so a server can fail the
     /// connection with a precise log line instead of “bad UTF-8”.
     pub fn feed(&mut self, bytes: &[u8]) -> core::result::Result<(), Utf8Error> {
-        let mut i = 0usize;
-        // ---- ASCII fast path (only meaningful from the ground state) --
-        if self.state == 0 {
-            while i + 8 <= bytes.len() {
-                let w = u64::from_ne_bytes(
-                    bytes[i..i + 8]
-                        .try_into()
-                        .expect("slice of exactly 8 bytes"),
-                );
-                if w & 0x8080_8080_8080_8080 != 0 {
-                    break;
+        let mut start = 0usize;
+        if self.state != 0 {
+            // A character was left open by an earlier frame: finish it
+            // first, so the bulk call below starts at a character
+            // boundary (the whole point of a streaming validator).
+            start = self.finish_open_character(bytes)?;
+        }
+        match core::str::from_utf8(&bytes[start..]) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // Everything before `up_to` is valid. What remains is
+                // either a truncated sequence at the very end of the
+                // frame — legal, and the state machine keeps it for the
+                // next one — or a real error that the state machine
+                // names precisely.
+                let mut i = start + e.valid_up_to();
+                while i < bytes.len() {
+                    self.feed_byte(bytes[i], i)?;
+                    i += 1;
                 }
-                i += 8;
-            }
-            while i < bytes.len() && bytes[i] < 0x80 {
-                i += 1;
-            }
-            if i == bytes.len() {
-                return Ok(());
+                Ok(())
             }
         }
+    }
 
-        // ---- State machine for the multi-byte run ---------------------
-        while i < bytes.len() {
-            let b = bytes[i];
-            match self.state {
-                0 => {
-                    self.state = match b {
-                        0x00..=0x7F => 0,
-                        0xC2..=0xDF => 1,
-                        0xE1..=0xEC | 0xEE..=0xEF => 2,
-                        0xE0 => 4,
-                        0xED => 5,
-                        0xF0 => 6,
-                        0xF1..=0xF3 => 3,
-                        0xF4 => 7,
-                        // 80..=BF: bare continuation. C0/C1: overlong
-                        // two-byte form. F5..=FF: above U+10FFFF.
-                        _ => {
-                            return Err(Utf8Error {
-                                offset: i,
-                                reason: "invalid lead byte",
-                            })
-                        }
-                    };
-                }
-                1..=3 => {
-                    if !(0x80..=0xBF).contains(&b) {
-                        return Err(Utf8Error {
-                            offset: i,
-                            reason: "invalid continuation byte",
-                        });
-                    }
-                    self.state -= 1;
-                }
-                _ => {
-                    let idx = (self.state - 4) as usize;
-                    let (lo, hi) = RANGES[idx];
-                    if b < lo || b > hi {
-                        return Err(Utf8Error {
-                            offset: i,
-                            reason: if idx == 1 {
-                                "UTF-16 surrogate half is not a scalar value"
-                            } else if idx == 3 {
-                                "codepoint above U+10FFFF"
-                            } else {
-                                "overlong encoding"
-                            },
-                        });
-                    }
-                    // `E0`/`ED` are three-byte sequences (one continuation
-                    // left); `F0`/`F4` are four-byte ones (two left).
-                    self.state = if idx < 2 { 1 } else { 2 };
-                }
-            }
+    /// Consume the rest of a character opened by an earlier frame.
+    ///
+    /// At most three bytes (the longest continuation), so this is a
+    /// handful of comparisons before the standard library takes over.
+    fn finish_open_character(&mut self, bytes: &[u8]) -> core::result::Result<usize, Utf8Error> {
+        let mut i = 0usize;
+        while self.state != 0 && i < bytes.len() {
+            self.feed_byte(bytes[i], i)?;
             i += 1;
+        }
+        Ok(i)
+    }
+
+    /// One byte of the decoder state machine at `offset` in the current
+    /// frame (used for continuation across frames and for error
+    /// reporting; bulk validation is the standard library's job).
+    #[inline]
+    fn feed_byte(&mut self, b: u8, offset: usize) -> core::result::Result<(), Utf8Error> {
+        match self.state {
+            0 => {
+                self.state = match b {
+                    0x00..=0x7F => 0,
+                    0xC2..=0xDF => 1,
+                    0xE1..=0xEC | 0xEE..=0xEF => 2,
+                    0xE0 => 4,
+                    0xED => 5,
+                    0xF0 => 6,
+                    0xF1..=0xF3 => 3,
+                    0xF4 => 7,
+                    // 80..=BF: bare continuation. C0/C1: overlong
+                    // two-byte form. F5..=FF: above U+10FFFF.
+                    _ => {
+                        return Err(Utf8Error {
+                            offset,
+                            reason: "invalid lead byte",
+                        })
+                    }
+                };
+            }
+            1..=3 => {
+                if !(0x80..=0xBF).contains(&b) {
+                    return Err(Utf8Error {
+                        offset,
+                        reason: "invalid continuation byte",
+                    });
+                }
+                self.state -= 1;
+            }
+            _ => {
+                let idx = (self.state - 4) as usize;
+                let (lo, hi) = RANGES[idx];
+                if b < lo || b > hi {
+                    return Err(Utf8Error {
+                        offset,
+                        reason: if idx == 1 {
+                            "UTF-16 surrogate half is not a scalar value"
+                        } else if idx == 3 {
+                            "codepoint above U+10FFFF"
+                        } else {
+                            "overlong encoding"
+                        },
+                    });
+                }
+                // `E0`/`ED` are three-byte sequences (one continuation
+                // left); `F0`/`F4` are four-byte ones (two left).
+                self.state = if idx < 2 { 1 } else { 2 };
+            }
         }
         Ok(())
     }

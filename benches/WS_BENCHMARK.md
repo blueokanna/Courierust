@@ -12,6 +12,11 @@ $env:WS_BENCH_SECTION = "codec" | "echo" | "push"
 $env:WS_BENCH_TRACE = "1"
 ```
 
+The suite runs in CI (`.github/workflows/benchmark.yml`, suite `ws`) on every
+pull request and push, and its `ws.log` is attached to the workflow
+artifacts — so a regression in either direction fails the pipeline instead
+of being noticed later.
+
 ## Methodology
 
 - **Codec layer** (no sockets): each sample runs `iters` operations and reports the median of 15 samples. Batching matters: `Instant::now()` on Windows has ~100 ns granularity, so timing a single 64-byte frame would measure the clock.

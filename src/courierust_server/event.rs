@@ -1132,16 +1132,6 @@ fn handle_msg(
             poller.register(id, fd, want_write);
         }
         EventMsg::Closed { id, socket } => {
-            // The reactor stops watching the descriptor *here*, and only
-            // afterwards drops the handle the worker handed over — so
-            // the descriptor is still open while a concurrent wait may
-            // name it, and closed once it is no longer named. A wait set
-            // that names a closed descriptor is not a harmless stale
-            // entry either: POSIX `poll` reports `POLLNVAL` for that one
-            // entry, but Winsock's `select` fails the whole call with
-            // `WSAENOTSOCK`, which used to leave the loop spinning in
-            // its error path with every other connection parked until
-            // its peer gave up.
             poller.unregister(id);
             pending.remove(&id);
             if activity.remove(&id).is_some() {
@@ -1170,8 +1160,6 @@ fn event_loop(
     let mut activity: HashMap<usize, Instant> = HashMap::new();
     let stats = config.stats.clone();
     let stats = stats.as_deref();
-    // Consecutive failed waits; reset by every successful one. A healthy
-    // reactor never sees a non-zero value.
     let mut wait_errors = 0usize;
 
     let wake_fd = fd_of(&wake_reader);
@@ -1239,13 +1227,6 @@ fn event_loop(
                 r
             }
             Err(_) => {
-                // Recovering beats spinning. A wait fails as a whole when
-                // one descriptor in its set is no longer usable, so the
-                // set is rebuilt from the live connections (the
-                // registries are the source of truth) and waits resume
-                // immediately. If the rebuilt set still cannot be waited
-                // on, the loop backs off instead of burning a core — a
-                // broken wait must cost latency, never the process.
                 wait_errors += 1;
                 if let Some(s) = stats {
                     s.event_wait_errors.fetch_add(1, Ordering::Relaxed);
@@ -1448,8 +1429,6 @@ fn refuse_malformed(conn: &EventConn, e: &Error) {
                 413
             }
         }
-        // A timeout, an EOF or a transport failure is not something the
-        // peer's request got wrong; nothing is claimed on the wire.
         _ => return,
     };
     let resp = crate::courierust_server::h1::error_response(status, "bad request");
@@ -1536,7 +1515,6 @@ fn event_worker(
             Err(_) => return,
         };
         for id in ids {
-            // ---- WebSocket connections stay in the reactor ----------
             let ws_conn = registries.ws.lock().unwrap().remove(&id);
             if let Some(mut ws_conn) = ws_conn {
                 let step =
@@ -1556,8 +1534,6 @@ fn event_worker(
                         wake_nudge(wake_writer);
                     }
                     crate::courierust_server::ws::WsStep::Close => {
-                        // Hand the handle over: the reactor must stop
-                        // watching the descriptor before it is closed.
                         let socket = ws_conn.socket().clone();
                         let _ = msg_tx.send(EventMsg::Closed {
                             id,
@@ -1597,16 +1573,9 @@ fn event_worker(
             let outcome = match step {
                 Ok(Ok(o)) => o,
                 Ok(Err(e)) => {
-                    // A request the server could not parse still gets an
-                    // answer: the default (event-driven) driver and the
-                    // blocking one must behave the same way, or a client
-                    // behind a proxy cannot tell a server bug from a
-                    // network failure.
                     refuse_malformed(&conn, &e);
                     StepOutcome::Close
                 }
-                // A panicking handler is not answered for: the connection
-                // is already in an unknown state.
                 Err(_) => StepOutcome::Close,
             };
             match outcome {
@@ -1622,8 +1591,6 @@ fn event_worker(
                 }
                 StepOutcome::Close => {
                     emit_trace(&mut conn, id, 0, 0);
-                    // Hand the handle over: the reactor must stop
-                    // watching the descriptor before it is closed.
                     let socket = conn.socket.clone();
                     let _ = msg_tx.send(EventMsg::Closed {
                         id,
@@ -1660,8 +1627,6 @@ fn event_worker(
                             wake_nudge(wake_writer);
                         }
                         crate::courierust_server::ws::WsStep::Close => {
-                            // Hand the handle over: the reactor must stop
-                            // watching the descriptor before it is closed.
                             let socket = ws_conn.socket().clone();
                             let _ = msg_tx.send(EventMsg::Closed {
                                 id,

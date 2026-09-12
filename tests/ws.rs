@@ -10,7 +10,7 @@
 
 use courierust::courierust_body::Body;
 use courierust::courierust_client::ws::{WebSocket, WsClientOptions};
-use courierust::courierust_client::ClientConfig;
+use courierust::courierust_client::{ClientConfig, TlsSettings as ClientTls};
 use courierust::courierust_http::header::{HeaderName, HeaderValue};
 use courierust::courierust_http::request::Request;
 use courierust::courierust_http::response::Response;
@@ -147,6 +147,77 @@ fn connect_within(addr: SocketAddr, path: &str, read_timeout: Duration) -> WebSo
         ..ClientConfig::default()
     };
     WebSocket::connect(&format!("ws://{addr}{path}"), &cfg).expect("handshake")
+}
+
+// ---------------------------------------------------------------------
+// Transport: WebSocket rides HTTP/1.1, never a silently-negotiated h2
+// ---------------------------------------------------------------------
+
+/// Start a TLS WebSocket server whose ALPN offer is exactly `alpn`.
+fn spawn_ws_tls_server(path: &str, service: Arc<dyn WsService>, alpn: Vec<Vec<u8>>) -> SocketAddr {
+    spawn_ws_server(
+        ServerConfig {
+            http2: alpn.iter().any(|p| p.as_slice() == b"h2"),
+            tls: Some(ServerTls {
+                identity: common::server_identity(),
+                alpn,
+                ..Default::default()
+            }),
+            ..blocking_config()
+        },
+        path,
+        service,
+    )
+}
+
+/// A client config that *asks* for HTTP/2 — as a normal HTTPS client
+/// would — and trusts the test root. WebSocket-over-HTTP/2 (RFC 8441) is
+/// not implemented, so these settings must be ignored by the WebSocket
+/// client when it builds its ALPN offer.
+fn ws_tls_client(http2: bool) -> ClientConfig {
+    ClientConfig {
+        http2,
+        tls: Some(ClientTls {
+            roots: common::root_store(),
+            verify: true,
+            alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            now: common::NOW,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// The whole point of the “RFC 6455 only” rule: a server that *does*
+/// speak h2 must still serve this WebSocket over HTTP/1.1, because that
+/// is the only transport this client implements.
+///
+/// The assertion has teeth: `spawn_ws_tls_server` lists `h2` **first**,
+/// so a client that offered h2 would negotiate it, hit the post-TLS guard
+/// and fail this handshake. A passing echo therefore proves the offer was
+/// HTTP/1.1-only — the alternative was a connection that looks
+/// established and never carries a frame.
+#[test]
+fn wss_negotiates_http_1_1_against_an_h2_capable_server() {
+    let service = Arc::new(EchoService::default());
+    let observed = service.clone();
+    let addr = spawn_ws_tls_server("/echo", service, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+    let mut ws = WebSocket::connect_with(
+        &format!("wss://{addr}/echo"),
+        &ws_tls_client(true),
+        &WsClientOptions::default(),
+    )
+    .expect("wss handshake over HTTP/1.1");
+    assert!(ws.info().secure, "the connection must be TLS");
+    ws.send_text("over tls").unwrap();
+    assert_eq!(
+        ws.read_message().unwrap(),
+        Event::Text(String::from("over tls"))
+    );
+    ws.close(1000, "bye").unwrap();
+    wait_for("the close to reach the service", || {
+        !observed.closed.lock().unwrap().is_empty()
+    });
 }
 
 // ---------------------------------------------------------------------

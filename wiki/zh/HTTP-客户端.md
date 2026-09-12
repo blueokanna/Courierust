@@ -141,3 +141,19 @@ match client.get("http://127.0.0.1:9/") {
 - **配置后支持 HTTPS**。客户端默认 `tls: None`，因此默认会拒绝 `https://`；通过 `ClientConfig::tls` 提供 `RootStore`，或使用 `Client::with_tls_roots` 启用内置 TLS 1.2 + 1.3。crate 不内置 CA 根证书。ALPN 必须与 `ClientConfig::http2` 一致：HTTP/2 使用 `h2`，HTTP/1.1 使用 `http/1.1`。
 - **HTTP/2 并发取决于连接策略**。每条连接由一个 driver 负责复用多个 stream；需要独立 HTTP/2 driver 时提高 `max_connections_per_host`，并针对实际配置观察完整延迟尾部。
 - **流式请求体仅 HTTP/2 支持**。`Client::execute` 会把 `Body::Channel` 请求体先完整读进内存再发送；真正的客户端上传流式使用 `execute_h2_stream`。
+
+## WebSocket 客户端
+
+同一个客户端也能说 WebSocket——`ws://` 与 `wss://`（后者走本 crate 自带的 TLS 栈），读超时由 `ClientConfig` 提供：
+
+```rust
+use courierust::courierust_client::ClientConfig;
+use courierust::courierust_client::ws::WebSocket;
+
+let mut ws = WebSocket::connect("wss://example.com/ws", &ClientConfig::default())?;
+ws.send_text("hello")?;
+println!("{:?}", ws.read_message()?);   // Event::Text("hello")
+ws.close(1000, "done")?;
+```
+
+它与服务端共用组帧 / UTF-8 / 关闭握手引擎，两端强制的是同一套规则；完整教程（可选项、协商、部署、诚实说明）见 [WebSocket 使用指南](WebSocket-使用指南)。
