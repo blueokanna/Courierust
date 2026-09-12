@@ -127,11 +127,7 @@ impl<S: FrameSink> FrameWriter<S> {
     /// from application threads) must build both with
     /// [`FrameWriter::with_close_flag`] so a close on either side stops
     /// the other.
-    pub fn new(
-        sink: S,
-        mask_source: MaskSource,
-        compression: Option<CompressionParams>,
-    ) -> Self {
+    pub fn new(sink: S, mask_source: MaskSource, compression: Option<CompressionParams>) -> Self {
         Self::with_close_flag(sink, mask_source, compression, CloseFlag::new())
     }
 
@@ -372,8 +368,8 @@ impl<S: FrameSink> FrameWriter<S> {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_nanos() as u64)
                         .unwrap_or(0);
-                    let rng = crate::courierust_tls::crypto::rng::ChaChaRng::new().unwrap_or_else(
-                        || {
+                    let rng =
+                        crate::courierust_tls::crypto::rng::ChaChaRng::new().unwrap_or_else(|| {
                             let mut seed = [0u8; 44];
                             seed[..8].copy_from_slice(&time_seed.to_le_bytes());
                             seed[8..16].copy_from_slice(&addr_seed.to_le_bytes());
@@ -381,8 +377,7 @@ impl<S: FrameSink> FrameWriter<S> {
                                 &(self.head.as_ptr() as usize as u64).to_le_bytes(),
                             );
                             crate::courierust_tls::crypto::rng::ChaChaRng::from_seed(&seed)
-                        },
-                    );
+                        });
                     self.rng = Some(rng);
                 }
                 let mut key = [0u8; 4];
@@ -455,7 +450,8 @@ mod tests {
     #[test]
     fn close_reason_is_trimmed_to_fit() {
         let mut w = FrameWriter::new(VecSink::new(), MaskSource::None, None);
-        w.send_close(frame::close::NORMAL, &"x".repeat(500)).unwrap();
+        w.send_close(frame::close::NORMAL, &"x".repeat(500))
+            .unwrap();
         let header = FrameHeader::parse(&w.sink().bytes).unwrap().unwrap();
         assert_eq!(header.payload_len, 125);
         assert_eq!(header.opcode, OpCode::Close);
@@ -506,7 +502,10 @@ mod tests {
         app_writer.send_text("hello").unwrap();
         session_writer.send_close(frame::close::NORMAL, "").unwrap();
         assert!(flag.is_set());
-        assert!(app_writer.is_closed(), "the application writer sees the close");
+        assert!(
+            app_writer.is_closed(),
+            "the application writer sees the close"
+        );
         assert!(app_writer.send_text("too late").is_err());
         assert!(app_writer.sink().bytes.len() < 20);
     }

@@ -927,7 +927,11 @@ pub fn crc32(data: &[u8]) -> u32 {
         let mut c = i as u32;
         let mut k = 0;
         while k < 8 {
-            c = if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 != 0 {
+                0xedb8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
             k += 1;
         }
         table[i] = c;
@@ -1113,7 +1117,12 @@ impl Inflater {
     /// input there is a *complete* message rather than an error.
     /// `out` is cleared first; `max_out` bounds the decompressed size so
     /// a compression bomb cannot be turned into an allocation.
-    pub fn inflate_message(&mut self, input: &[u8], out: &mut Vec<u8>, max_out: usize) -> Result<()> {
+    pub fn inflate_message(
+        &mut self,
+        input: &[u8],
+        out: &mut Vec<u8>,
+        max_out: usize,
+    ) -> Result<()> {
         out.clear();
         self.scratch.clear();
         self.scratch.reserve(input.len() + 4);
@@ -1136,7 +1145,12 @@ impl Inflater {
     /// Inflate a raw DEFLATE stream that may reference the retained
     /// window, appending to `out` (lower-level entry point used by tests
     /// and by callers that manage framing themselves).
-    pub fn inflate_append(&mut self, input: &[u8], out: &mut Vec<u8>, max_out: usize) -> Result<()> {
+    pub fn inflate_append(
+        &mut self,
+        input: &[u8],
+        out: &mut Vec<u8>,
+        max_out: usize,
+    ) -> Result<()> {
         let mut br = BitReader::new(input);
         inflate_blocks(&mut br, &self.window, out, max_out, false)
     }
@@ -1472,7 +1486,10 @@ mod tests {
         assert_eq!(out.len(), 300);
         assert_eq!(i.window_len(), 256);
         let err = i.inflate_message(&second, &mut out, 1 << 20);
-        assert!(err.is_err(), "a distance beyond the negotiated window must fail");
+        assert!(
+            err.is_err(),
+            "a distance beyond the negotiated window must fail"
+        );
         // The failed message must not poison the context.
         assert_eq!(i.window_len(), 0);
     }

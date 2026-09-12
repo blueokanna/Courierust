@@ -220,9 +220,7 @@ impl<R: Read, S: frame::FrameSink> Session<R, S> {
     /// cloned (via the sink's own sharing) so application threads can
     /// push messages while this session reads.
     pub fn new(reader: BufReader<R>, writer: FrameWriter<S>, cfg: SessionConfig) -> Self {
-        let inflater = cfg
-            .compression
-            .map(|c| Inflater::new(c.recv_window_bits));
+        let inflater = cfg.compression.map(|c| Inflater::new(c.recv_window_bits));
         Self {
             reader,
             writer,
@@ -382,7 +380,7 @@ impl<R: Read, S: frame::FrameSink> Session<R, S> {
         if filled == 0 {
             let (need, ready) = {
                 let buf = match self.reader.fill_buf() {
-                    Ok(b) if b.is_empty() => return Err(Error::eof()),
+                    Ok([]) => return Err(Error::eof()),
                     Ok(b) => b,
                     Err(e) if e.kind == ErrorKind::WouldBlock => return Ok(None),
                     Err(e) => return Err(e),
@@ -395,7 +393,7 @@ impl<R: Read, S: frame::FrameSink> Session<R, S> {
             if ready {
                 let parsed = {
                     let buf = match self.reader.fill_buf() {
-                        Ok(b) if b.is_empty() => return Err(Error::eof()),
+                        Ok([]) => return Err(Error::eof()),
                         Ok(b) => b,
                         Err(e) if e.kind == ErrorKind::WouldBlock => return Ok(None),
                         Err(e) => return Err(e),
@@ -450,9 +448,7 @@ impl<R: Read, S: frame::FrameSink> Session<R, S> {
         // backwards is how intermediaries get cache-poisoned.
         match self.cfg.role {
             Role::Server if !header.masked => {
-                return Err(self.fatal(Error::protocol(
-                    "websocket: client frame was not masked",
-                )))
+                return Err(self.fatal(Error::protocol("websocket: client frame was not masked")))
             }
             Role::Client if header.masked => {
                 return Err(self.fatal(Error::protocol("websocket: server masked a frame")))
@@ -506,9 +502,7 @@ impl<R: Read, S: frame::FrameSink> Session<R, S> {
         if header.payload_len > self.cfg.max_frame as u64 || total > self.cfg.max_message as u64 {
             // 1009 "message too big": reported as an overflow so the
             // server layer can answer with that code before closing.
-            return Err(self.fatal(Error::overflow(
-                "websocket: message exceeds the size limit",
-            )));
+            return Err(self.fatal(Error::overflow("websocket: message exceeds the size limit")));
         }
         if self.cfg.max_fragments != 0 && self.fragments >= self.cfg.max_fragments {
             return Err(self.fatal(Error::overflow("websocket: too many fragments")));
@@ -572,10 +566,7 @@ impl<R: Read, S: frame::FrameSink> Session<R, S> {
                 self.msg.resize(start + remaining, 0);
                 let n = match self.reader.read_direct(&mut self.msg[start..]) {
                     Ok(n) => n,
-                    Err(e)
-                        if e.kind == ErrorKind::WouldBlock
-                            || e.kind == ErrorKind::Timeout =>
-                    {
+                    Err(e) if e.kind == ErrorKind::WouldBlock || e.kind == ErrorKind::Timeout => {
                         self.msg.truncate(start);
                         self.phase = Phase::Payload { header, got };
                         return if e.kind == ErrorKind::WouldBlock {
@@ -611,7 +602,7 @@ impl<R: Read, S: frame::FrameSink> Session<R, S> {
 
             let take = {
                 let buf = match self.reader.fill_buf() {
-                    Ok(b) if b.is_empty() => return Err(Error::eof()),
+                    Ok([]) => return Err(Error::eof()),
                     Ok(b) => b,
                     Err(e) if e.kind == ErrorKind::WouldBlock => {
                         self.phase = Phase::Payload { header, got };
@@ -823,7 +814,6 @@ impl<R: Read, S: frame::FrameSink> Session<R, S> {
         self.writer.flush()
     }
 
-
     /// Record a fatal protocol violation: bump the counter, make the
     /// session terminal so no further application traffic can be read or
     /// written, and hand the error back to the caller (which decides
@@ -873,11 +863,7 @@ mod tests {
     fn server_on(input: &[u8], cfg: SessionConfig) -> TestSession {
         let leaked: &'static [u8] = alloc::boxed::Box::leak(input.to_vec().into_boxed_slice());
         let writer = FrameWriter::new(VecSink::new(), MaskSource::None, cfg.compression);
-        Session::new(
-            BufReader::new(SliceReader::new(leaked), 4096),
-            writer,
-            cfg,
-        )
+        Session::new(BufReader::new(SliceReader::new(leaked), 4096), writer, cfg)
     }
 
     fn server(input: &[u8]) -> TestSession {
@@ -892,11 +878,7 @@ mod tests {
             ..Default::default()
         };
         let writer = FrameWriter::new(VecSink::new(), MaskSource::Random, None);
-        Session::new(
-            BufReader::new(SliceReader::new(&[]), 4096),
-            writer,
-            cfg,
-        )
+        Session::new(BufReader::new(SliceReader::new(&[]), 4096), writer, cfg)
     }
 
     /// A client with a pinned mask key, for byte-exact expectations.
@@ -906,11 +888,7 @@ mod tests {
             ..Default::default()
         };
         let writer = FrameWriter::new(VecSink::new(), MaskSource::Fixed(key), None);
-        Session::new(
-            BufReader::new(SliceReader::new(&[]), 4096),
-            writer,
-            cfg,
-        )
+        Session::new(BufReader::new(SliceReader::new(&[]), 4096), writer, cfg)
     }
 
     /// The bytes a session has written so far.
@@ -993,7 +971,10 @@ mod tests {
         let header = FrameHeader::parse(out).unwrap().unwrap();
         assert_eq!(header.opcode, OpCode::Close);
         // Our echo carries the same code.
-        assert_eq!(u16::from_be_bytes([out[header.header_len], out[header.header_len + 1]]), 1001);
+        assert_eq!(
+            u16::from_be_bytes([out[header.header_len], out[header.header_len + 1]]),
+            1001
+        );
         // Further reads fail: the session is terminal.
         assert!(next(&mut s).is_err());
     }
@@ -1098,7 +1079,12 @@ mod tests {
     fn accepts_text_split_inside_a_sequence() {
         let emoji = "🦀".as_bytes();
         let mut wire = masked_frame(OpCode::Text, &emoji[..2], false, false);
-        wire.extend_from_slice(&masked_frame(OpCode::Continuation, &emoji[2..], true, false));
+        wire.extend_from_slice(&masked_frame(
+            OpCode::Continuation,
+            &emoji[2..],
+            true,
+            false,
+        ));
         let mut s = server(&wire);
         assert_eq!(next(&mut s).unwrap(), Event::Text(String::from("🦀")));
     }
@@ -1134,8 +1120,18 @@ mod tests {
     fn resumes_across_partial_reads() {
         let text = "a fragmented ünïcode 🦀 message";
         let mut wire = masked_frame(OpCode::Text, "a fragmented ".as_bytes(), false, false);
-        wire.extend_from_slice(&masked_frame(OpCode::Continuation, "ünïcode 🦀".as_bytes(), false, false));
-        wire.extend_from_slice(&masked_frame(OpCode::Continuation, " message".as_bytes(), true, false));
+        wire.extend_from_slice(&masked_frame(
+            OpCode::Continuation,
+            "ünïcode 🦀".as_bytes(),
+            false,
+            false,
+        ));
+        wire.extend_from_slice(&masked_frame(
+            OpCode::Continuation,
+            " message".as_bytes(),
+            true,
+            false,
+        ));
         let leaked: &'static [u8] = alloc::boxed::Box::leak(wire.into_boxed_slice());
         let mut s = Session::new(
             BufReader::new(SliceReader::new(leaked), 2),
@@ -1156,7 +1152,10 @@ mod tests {
             FrameWriter::new(VecSink::new(), MaskSource::None, None),
             SessionConfig::default(),
         );
-        assert_eq!(s.poll_message().unwrap(), Some(Event::Text(String::from("later"))));
+        assert_eq!(
+            s.poll_message().unwrap(),
+            Some(Event::Text(String::from("later")))
+        );
     }
 
     #[test]
@@ -1183,7 +1182,10 @@ mod tests {
         // The server decodes exactly what the client sent.
         let mut s = server(&out);
         assert_eq!(next(&mut s).unwrap(), Event::Text(String::from("hello 🦀")));
-        assert_eq!(next(&mut s).unwrap(), Event::Binary(Bytes::from(&[1u8, 2, 3][..])));
+        assert_eq!(
+            next(&mut s).unwrap(),
+            Event::Binary(Bytes::from(&[1u8, 2, 3][..]))
+        );
         assert_eq!(next(&mut s).unwrap(), Event::Ping(Bytes::from(&b"pp"[..])));
     }
 
@@ -1218,7 +1220,13 @@ mod tests {
         assert!((header.payload_len as usize) < text.len());
         assert_eq!(c.stats().compressed_written, 1);
 
-        let mut s = server_on(&out, SessionConfig { compression: Some(params), ..Default::default() });
+        let mut s = server_on(
+            &out,
+            SessionConfig {
+                compression: Some(params),
+                ..Default::default()
+            },
+        );
         assert_eq!(next(&mut s).unwrap(), Event::Text(text));
         assert_eq!(s.stats().compressed_read, 1);
     }
@@ -1233,7 +1241,10 @@ mod tests {
         let body = deflate_sync(text.as_bytes());
         let mut s = server_on(
             &masked_frame(OpCode::Text, &body, true, true),
-            SessionConfig { compression: Some(params), ..Default::default() },
+            SessionConfig {
+                compression: Some(params),
+                ..Default::default()
+            },
         );
         assert_eq!(next(&mut s).unwrap(), Event::Text(text));
     }
@@ -1243,7 +1254,13 @@ mod tests {
         let params = CompressionParams::default();
         let bad = deflate_sync(&[0x41, 0xff, 0x41]);
         let wire = masked_frame(OpCode::Text, &bad, true, true);
-        let mut s = server_on(&wire, SessionConfig { compression: Some(params), ..Default::default() });
+        let mut s = server_on(
+            &wire,
+            SessionConfig {
+                compression: Some(params),
+                ..Default::default()
+            },
+        );
         assert!(next(&mut s).is_err());
     }
 

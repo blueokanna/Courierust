@@ -52,7 +52,8 @@ use crate::courierust_net as net;
 use crate::courierust_net::ConnStream;
 use crate::courierust_ws::frame::SharedSink;
 use crate::courierust_ws::handshake::{
-    accept_key, generate_key, header_has_token, parse_extensions, PerMessageDeflate, PmDeflatePolicy,
+    accept_key, generate_key, header_has_token, parse_extensions, PerMessageDeflate,
+    PmDeflatePolicy,
 };
 use crate::courierust_ws::session::{MaskSource, Role, Session, SessionConfig, Stats};
 use crate::courierust_ws::writer::FrameWriter;
@@ -204,10 +205,9 @@ impl WebSocket {
             // carries a frame.
             let mut settings = tls.clone();
             settings.alpn = vec![b"http/1.1".to_vec()];
-            let connector =
-                crate::courierust_tls::TlsConnector::new(crate::courierust_client::connector_config(
-                    &settings,
-                ));
+            let connector = crate::courierust_tls::TlsConnector::new(
+                crate::courierust_client::connector_config(&settings),
+            );
             let conn = ConnStream::tls_client(stream, &connector, &host)?;
             if let Some(alpn) = conn.alpn() {
                 if alpn.as_slice() == b"h2" {
@@ -242,7 +242,11 @@ impl WebSocket {
         push(&mut headers, "sec-websocket-key", &key)?;
         push(&mut headers, "sec-websocket-version", "13")?;
         if !opts.protocols.is_empty() {
-            push(&mut headers, "sec-websocket-protocol", &opts.protocols.join(", "))?;
+            push(
+                &mut headers,
+                "sec-websocket-protocol",
+                &opts.protocols.join(", "),
+            )?;
         }
         if opts.compression {
             push(&mut headers, "sec-websocket-extensions", PM_DEFLATE_OFFER)?;
@@ -290,10 +294,7 @@ impl WebSocket {
         }
 
         let mut compression = None;
-        if response_headers
-            .get("sec-websocket-extensions")
-            .is_some()
-        {
+        if response_headers.get("sec-websocket-extensions").is_some() {
             // Validate against the offer this client actually sent:
             // parsing our own header back is the only way that check can
             // never drift from what went on the wire.
@@ -572,10 +573,14 @@ fn validate_response(
         }
     }
     if !header_has_token(headers, "upgrade", "websocket") {
-        return Err(Error::protocol("ws: 101 response is missing 'Upgrade: websocket'"));
+        return Err(Error::protocol(
+            "ws: 101 response is missing 'Upgrade: websocket'",
+        ));
     }
     if !header_has_token(headers, "connection", "upgrade") {
-        return Err(Error::protocol("ws: 101 response is missing the 'upgrade' connection token"));
+        return Err(Error::protocol(
+            "ws: 101 response is missing the 'upgrade' connection token",
+        ));
     }
     let accepts: Vec<&HeaderValue> = headers.get_all("sec-websocket-accept").collect();
     if accepts.len() != 1 {
@@ -605,7 +610,10 @@ fn validate_response(
 mod tests {
     use super::*;
 
-    fn response(status: u16, extra: &[(&str, &str)]) -> (crate::courierust_http::status::StatusCode, HeaderMap) {
+    fn response(
+        status: u16,
+        extra: &[(&str, &str)],
+    ) -> (crate::courierust_http::status::StatusCode, HeaderMap) {
         let mut headers = HeaderMap::new();
         headers.insert(
             HeaderName::from_lowercase("upgrade"),
@@ -617,10 +625,8 @@ mod tests {
         );
         headers.insert(
             HeaderName::from_lowercase("sec-websocket-accept"),
-            HeaderValue::from_bytes(
-                accept_key("dGhlIHNhbXBsZSBub25jZQ==").unwrap().as_bytes(),
-            )
-            .unwrap(),
+            HeaderValue::from_bytes(accept_key("dGhlIHNhbXBsZSBub25jZQ==").unwrap().as_bytes())
+                .unwrap(),
         );
         for (n, v) in extra {
             headers.append(

@@ -181,6 +181,32 @@ impl ConnStream {
             ConnStreamKind::Tls { socket, .. } => configure(socket, read_timeout),
         }
     }
+
+    /// Drain a bounded amount of unread request data before the socket is
+    /// closed, then leave the deadline in place.
+    ///
+    /// Closing a socket whose receive buffer still holds unread bytes
+    /// makes Linux answer with a RST, and a RST can destroy the error
+    /// response we just wrote — the client sees a connection reset
+    /// instead of the `400` it needs to understand what went wrong. The
+    /// budget and the deadline keep this from becoming a slowloris
+    /// vector: it is a bounded courtesy, not a promise to read a body.
+    pub(crate) fn linger_close(&self, budget: usize, deadline: Duration) {
+        let _ = self.configure(Some(deadline));
+        let mut sink = [0u8; 8 * 1024];
+        let mut left = budget;
+        while left > 0 {
+            let mut reader = self;
+            let want = core::cmp::min(left, sink.len());
+            match crate::courierust_io::Read::read(&mut reader, &mut sink[..want]) {
+                Ok(0) => break,
+                Ok(n) => left = left.saturating_sub(n),
+                // A timeout, a reset or a TLS error all mean the peer has
+                // nothing more to say: stop waiting for it.
+                Err(_) => break,
+            }
+        }
+    }
 }
 
 impl crate::courierust_io::Read for &ConnStream {

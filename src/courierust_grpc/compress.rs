@@ -11,6 +11,6 @@
 //! gzip stream whose 5-byte framing header sets the compressed flag.
 
 pub use crate::courierust_deflate::{
-    crc32, deflate, deflate_sync, gzip, gunzip, inflate, inflate_into, Deflater, Inflater,
+    crc32, deflate, deflate_sync, gunzip, gzip, inflate, inflate_into, Deflater, Inflater,
     MAX_WINDOW_BITS, MIN_WINDOW_BITS,
 };

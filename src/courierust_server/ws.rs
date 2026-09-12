@@ -6,8 +6,8 @@
 //! [`crate::courierust_server::Handler::websocket`]. The transport then
 //! decides how the service is driven:
 //!
-//! * **Blocking driver** ([`serve_blocking`]) 鈥?one worker thread per
-//!   WebSocket. Used for TLS connections and for
+//! * **Blocking driver** (`serve_blocking`, private to this module) — one
+//!   worker thread per WebSocket. Used for TLS connections and for
 //!   `ServerConfig::event_driven = false`. It applies keepalive pings, a
 //!   read timeout for liveness, and completes the closing handshake with
 //!   a bounded wait.
@@ -37,7 +37,8 @@
 
 use crate::courierust_body::Body;
 use crate::courierust_bytes::Bytes;
-use crate::courierust_error::{Error, ErrorKind, Result};use crate::courierust_http::header::{HeaderMap, HeaderName, HeaderValue};
+use crate::courierust_error::{Error, ErrorKind, Result};
+use crate::courierust_http::header::{HeaderMap, HeaderName, HeaderValue};
 use crate::courierust_http::method::Method;
 use crate::courierust_http::request::Request;
 use crate::courierust_http::response::Response;
@@ -65,7 +66,7 @@ pub struct WsConfig {
     /// Master switch. When off, upgrade requests are answered as normal
     /// HTTP requests.
     pub enabled: bool,
-    /// Which `Origin` values are accepted. 
+    /// Which `Origin` values are accepted.
     /// the only default a random web page cannot exploit.
     pub origin: OriginPolicy,
     /// Addresses whose `X-Forwarded-*` headers are believed.
@@ -1120,12 +1121,9 @@ pub(crate) fn serve_blocking(
                 }
                 if conn.is_closing() {
                     // The application asked to close: finish the handshake.
-                    match drain_close(&mut session, &stream, ws) {
-                        Some((code, is_clean)) => {
-                            close_code = code;
-                            clean = is_clean;
-                        }
-                        None => {}
+                    if let Some((code, is_clean)) = drain_close(&mut session, &stream, ws) {
+                        close_code = code;
+                        clean = is_clean;
                     }
                     break;
                 }
@@ -1191,9 +1189,7 @@ fn drain_close(
             return Some((None, false));
         }
         match session.poll_message() {
-            Ok(Some(Event::Close(frame))) => {
-                return Some((frame.as_ref().map(|f| f.code), true))
-            }
+            Ok(Some(Event::Close(frame))) => return Some((frame.as_ref().map(|f| f.code), true)),
             Ok(Some(_)) => continue,
             Ok(None) => return Some((None, false)),
             Err(e) => match e.kind {
@@ -1214,12 +1210,18 @@ mod tests {
     fn upgrade_request() -> Request<Body> {
         let mut req = Request::new(Method::GET, PathAndQuery::from_static("/chat"));
         req.version = Version::HTTP_11;
-        req.headers
-            .append(HeaderName::from_static("host"), HeaderValue::from_static("ws.example.com"));
-        req.headers
-            .append(HeaderName::from_static("upgrade"), HeaderValue::from_static("websocket"));
-        req.headers
-            .append(HeaderName::from_static("connection"), HeaderValue::from_static("Upgrade"));
+        req.headers.append(
+            HeaderName::from_static("host"),
+            HeaderValue::from_static("ws.example.com"),
+        );
+        req.headers.append(
+            HeaderName::from_static("upgrade"),
+            HeaderValue::from_static("websocket"),
+        );
+        req.headers.append(
+            HeaderName::from_static("connection"),
+            HeaderValue::from_static("Upgrade"),
+        );
         req.headers.append(
             HeaderName::from_static("sec-websocket-key"),
             HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
@@ -1234,15 +1236,31 @@ mod tests {
     #[test]
     fn plan_accepts_a_well_formed_upgrade() {
         let req = upgrade_request();
-        let p = plan(&req, "127.0.0.1".parse().unwrap(), false, &WsConfig::default()).unwrap();
+        let p = plan(
+            &req,
+            "127.0.0.1".parse().unwrap(),
+            false,
+            &WsConfig::default(),
+        )
+        .unwrap();
         assert_eq!(p.offer.path, "/chat");
         let headers = p.accept_headers().unwrap();
         assert_eq!(
-            headers.get("sec-websocket-accept").unwrap().to_str().unwrap(),
+            headers
+                .get("sec-websocket-accept")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
         );
-        assert_eq!(headers.get("upgrade").unwrap().to_str().unwrap(), "websocket");
-        assert_eq!(headers.get("connection").unwrap().to_str().unwrap(), "Upgrade");
+        assert_eq!(
+            headers.get("upgrade").unwrap().to_str().unwrap(),
+            "websocket"
+        );
+        assert_eq!(
+            headers.get("connection").unwrap().to_str().unwrap(),
+            "Upgrade"
+        );
     }
 
     #[test]
@@ -1253,11 +1271,24 @@ mod tests {
             HeaderName::from_static("sec-websocket-version"),
             HeaderValue::from_static("8"),
         );
-        let refusal = plan(&req, "127.0.0.1".parse().unwrap(), false, &WsConfig::default()).unwrap_err();
+        let refusal = plan(
+            &req,
+            "127.0.0.1".parse().unwrap(),
+            false,
+            &WsConfig::default(),
+        )
+        .unwrap_err();
         assert_eq!(refusal.status, StatusCode::from_u16(426));
         assert!(refusal.advertise_version);
         let resp = refusal.response();
-        assert_eq!(resp.headers.get("sec-websocket-version").unwrap().to_str().unwrap(), "13");
+        assert_eq!(
+            resp.headers
+                .get("sec-websocket-version")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "13"
+        );
     }
 
     #[test]
@@ -1267,7 +1298,13 @@ mod tests {
             HeaderName::from_static("origin"),
             HeaderValue::from_static("https://evil.test"),
         );
-        let refusal = plan(&req, "127.0.0.1".parse().unwrap(), false, &WsConfig::default()).unwrap_err();
+        let refusal = plan(
+            &req,
+            "127.0.0.1".parse().unwrap(),
+            false,
+            &WsConfig::default(),
+        )
+        .unwrap_err();
         assert_eq!(refusal.status, StatusCode::from_u16(403));
 
         // ...while a same-origin browser request passes.
@@ -1276,7 +1313,13 @@ mod tests {
             HeaderName::from_static("origin"),
             HeaderValue::from_static("http://ws.example.com"),
         );
-        assert!(plan(&req, "127.0.0.1".parse().unwrap(), false, &WsConfig::default()).is_ok());
+        assert!(plan(
+            &req,
+            "127.0.0.1".parse().unwrap(),
+            false,
+            &WsConfig::default()
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1286,7 +1329,13 @@ mod tests {
             HeaderName::from_static("sec-websocket-version"),
             HeaderValue::from_static("13"),
         );
-        assert!(plan(&req, "127.0.0.1".parse().unwrap(), false, &WsConfig::default()).is_err());
+        assert!(plan(
+            &req,
+            "127.0.0.1".parse().unwrap(),
+            false,
+            &WsConfig::default()
+        )
+        .is_err());
     }
 
     #[test]
@@ -1326,15 +1375,16 @@ mod tests {
 
         conn.send_text("hello").unwrap();
         // The session's writer closes the connection.
-        let mut session_writer = FrameWriter::with_close_flag(
-            Box::new(sink) as BoxSink,
-            MaskSource::None,
-            None,
-            flag,
-        );
-        session_writer.send_close(crate::courierust_ws::close::NORMAL, "bye").unwrap();
+        let mut session_writer =
+            FrameWriter::with_close_flag(Box::new(sink) as BoxSink, MaskSource::None, None, flag);
+        session_writer
+            .send_close(crate::courierust_ws::close::NORMAL, "bye")
+            .unwrap();
 
-        assert!(conn.is_closing() == false, "the flag is the writer's, not the handle's");
+        assert!(
+            !conn.is_closing(),
+            "the close was the writer's, not the application handle's"
+        );
         let err = conn.send_text("too late").unwrap_err();
         assert_eq!(err.kind, ErrorKind::Canceled, "{err}");
         assert!(conn.sender().send_binary(b"too late").is_err());
@@ -1367,7 +1417,11 @@ mod tests {
         assert_eq!(p.protocol.as_deref(), Some("chat.v2"));
         let headers = p.accept_headers().unwrap();
         assert_eq!(
-            headers.get("sec-websocket-protocol").unwrap().to_str().unwrap(),
+            headers
+                .get("sec-websocket-protocol")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "chat.v2"
         );
     }
@@ -1379,7 +1433,13 @@ mod tests {
             HeaderName::from_static("sec-websocket-extensions"),
             HeaderValue::from_static("permessage-deflate; client_max_window_bits=10"),
         );
-        let p = plan(&req, "127.0.0.1".parse().unwrap(), false, &WsConfig::default()).unwrap();
+        let p = plan(
+            &req,
+            "127.0.0.1".parse().unwrap(),
+            false,
+            &WsConfig::default(),
+        )
+        .unwrap();
         let pm = p.compression.expect("permessage-deflate selected");
         assert_eq!(pm.client_max_window_bits, 10);
         let headers = p.accept_headers().unwrap();
@@ -1426,7 +1486,10 @@ mod tests {
     fn protocol_errors_map_to_the_right_close_codes() {
         assert_eq!(protocol_close(&Error::overflow("x")).0, 1009);
         assert_eq!(
-            protocol_close(&Error::protocol("websocket: invalid UTF-8 in a text message")).0,
+            protocol_close(&Error::protocol(
+                "websocket: invalid UTF-8 in a text message"
+            ))
+            .0,
             1007
         );
         assert_eq!(protocol_close(&Error::protocol("anything else")).0, 1002);
@@ -1436,7 +1499,9 @@ mod tests {
     fn only_a_peer_violation_is_reported_to_the_peer() {
         assert!(reports_violation(&Error::protocol("websocket: bad frame")));
         assert!(reports_violation(&Error::overflow("websocket: too big")));
-        assert!(reports_violation(&Error::protocol("websocket: invalid UTF-8")));
+        assert!(reports_violation(&Error::protocol(
+            "websocket: invalid UTF-8"
+        )));
         // Transport-level failures are not the peer's protocol error.
         assert!(!reports_violation(&Error::io("connection reset")));
         assert!(!reports_violation(&Error::eof()));
@@ -1447,4 +1512,3 @@ mod tests {
         )));
     }
 }
-

@@ -16,7 +16,7 @@ use courierust::courierust_http::request::Request;
 use courierust::courierust_http::response::Response;
 use courierust::courierust_http::status::StatusCode;
 use courierust::courierust_server::ws::{
-    WsConn, WsData, WsSender, WsService, WsUpgradeReply, WsConfig,
+    WsConfig, WsConn, WsData, WsSender, WsService, WsUpgradeReply,
 };
 use courierust::courierust_server::{Handler, Server, ServerConfig, TlsSettings as ServerTls};
 use courierust::courierust_ws::{Event, OriginPolicy};
@@ -40,8 +40,7 @@ struct WsHandler {
 
 impl Handler for WsHandler {
     fn handle(&self, _req: Request<Body>) -> Response<Body> {
-        let mut resp: Response<Body> =
-            Response::with_status(StatusCode::from_u16(404));
+        let mut resp: Response<Body> = Response::with_status(StatusCode::from_u16(404));
         resp.headers.insert(
             HeaderName::from_static("content-type"),
             HeaderValue::from_static("text/plain"),
@@ -153,7 +152,10 @@ fn echo_roundtrip_blocking_driver() {
     ws.send_text("日本語 🦀").unwrap();
     ws.send_binary(&[0u8, 1, 2, 255]).unwrap();
 
-    assert_eq!(ws.read_message().unwrap(), Event::Text(String::from("hello")));
+    assert_eq!(
+        ws.read_message().unwrap(),
+        Event::Text(String::from("hello"))
+    );
     assert_eq!(
         ws.read_message().unwrap(),
         Event::Text(String::from("日本語 🦀"))
@@ -296,7 +298,10 @@ fn a_push_after_close_is_refused() {
         "{err}"
     );
     assert!(sender.send_binary(b"too late").is_err());
-    assert!(sender.close(1000, "again").is_ok(), "a second close is a no-op");
+    assert!(
+        sender.close(1000, "again").is_ok(),
+        "a second close is a no-op"
+    );
 }
 
 #[test]
@@ -349,7 +354,11 @@ fn subprotocols_are_negotiated_by_server_preference() {
         ..Default::default()
     };
     let mut ws = WebSocket::connect_with(&format!("ws://{addr}/echo"), &cfg, &opts).unwrap();
-    assert_eq!(ws.protocol(), Some("chat.v1"), "first offered wins by default");
+    assert_eq!(
+        ws.protocol(),
+        Some("chat.v1"),
+        "first offered wins by default"
+    );
     ws.send_text("hi").unwrap();
     assert_eq!(ws.read_message().unwrap(), Event::Text(String::from("hi")));
 
@@ -371,8 +380,14 @@ fn a_second_connection_reuses_the_server_without_interference() {
     let mut b = connect(addr, "/echo");
     a.send_text("for a").unwrap();
     b.send_text("for b").unwrap();
-    assert_eq!(a.read_message().unwrap(), Event::Text(String::from("for a")));
-    assert_eq!(b.read_message().unwrap(), Event::Text(String::from("for b")));
+    assert_eq!(
+        a.read_message().unwrap(),
+        Event::Text(String::from("for a"))
+    );
+    assert_eq!(
+        b.read_message().unwrap(),
+        Event::Text(String::from("for b"))
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -487,7 +502,8 @@ fn an_oversized_message_is_closed_with_1009() {
 
     // One frame over the frame limit: the server must refuse before it
     // buffers the payload.
-    raw.write_all(&masked_frame(0x2, &vec![0u8; 2048], true)).unwrap();
+    raw.write_all(&masked_frame(0x2, &vec![0u8; 2048], true))
+        .unwrap();
     raw.flush().unwrap();
     let (opcode, payload) = read_frame(&mut raw);
     assert_eq!(opcode, 0x8, "expected a Close frame");
@@ -502,7 +518,8 @@ fn an_unmasked_client_frame_is_closed_with_1002() {
 
     // RFC 6455 §5.1: a server MUST fail the connection on an unmasked
     // client frame.
-    raw.write_all(&unmasked_frame(0x1, b"cheeky", true)).unwrap();
+    raw.write_all(&unmasked_frame(0x1, b"cheeky", true))
+        .unwrap();
     raw.flush().unwrap();
     let (opcode, payload) = read_frame(&mut raw);
     assert_eq!(opcode, 0x8);
@@ -515,7 +532,8 @@ fn invalid_utf8_in_a_text_frame_is_closed_with_1007() {
     let mut raw = raw_handshake(addr, "/echo");
     raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
-    raw.write_all(&masked_frame(0x1, &[0x41, 0xff, 0x42], true)).unwrap();
+    raw.write_all(&masked_frame(0x1, &[0x41, 0xff, 0x42], true))
+        .unwrap();
     raw.flush().unwrap();
     let (opcode, payload) = read_frame(&mut raw);
     assert_eq!(opcode, 0x8);
@@ -601,7 +619,10 @@ fn a_hostile_client_cannot_stall_the_server_with_a_partial_frame() {
             Err(_) => break,
         }
     }
-    assert!(saw_eof_or_close, "the connection must not stay open forever");
+    assert!(
+        saw_eof_or_close,
+        "the connection must not stay open forever"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -648,7 +669,10 @@ fn echo_roundtrip_on_the_event_driven_server() {
         !observed.closed.lock().unwrap().is_empty()
     });
     let closed = observed.closed.lock().unwrap().clone();
-    assert!(closed[0].1, "the closing handshake must be clean: {closed:?}");
+    assert!(
+        closed[0].1,
+        "the closing handshake must be clean: {closed:?}"
+    );
 }
 
 #[test]
@@ -769,21 +793,26 @@ fn wss_round_trip_over_tls() {
     };
     let addr = spawn_ws_server(config, "/echo", Arc::new(EchoService::default()));
 
-    let mut cfg = ClientConfig::default();
-    cfg.tls = Some(courierust::courierust_client::TlsSettings {
-        roots: common::root_store(),
-        verify: true,
-        alpn: vec![b"http/1.1".to_vec()],
-        now: common::NOW,
-        min_version: courierust::courierust_tls::TlsVersion::Tls12,
-        max_version: courierust::courierust_tls::TlsVersion::Tls13,
-    });
+    let cfg = ClientConfig {
+        tls: Some(courierust::courierust_client::TlsSettings {
+            roots: common::root_store(),
+            verify: true,
+            alpn: vec![b"http/1.1".to_vec()],
+            now: common::NOW,
+            min_version: courierust::courierust_tls::TlsVersion::Tls12,
+            max_version: courierust::courierust_tls::TlsVersion::Tls13,
+        }),
+        ..Default::default()
+    };
     let mut ws = WebSocket::connect(&format!("wss://localhost:{}/echo", addr.port()), &cfg)
         .expect("wss handshake");
     assert!(ws.info().secure);
 
     ws.send_text("over tls").unwrap();
-    assert_eq!(ws.read_message().unwrap(), Event::Text(String::from("over tls")));
+    assert_eq!(
+        ws.read_message().unwrap(),
+        Event::Text(String::from("over tls"))
+    );
     ws.send_binary(&[9u8; 100_000]).unwrap();
     match ws.read_message().unwrap() {
         Event::Binary(b) => assert_eq!(b.len(), 100_000),

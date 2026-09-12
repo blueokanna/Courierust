@@ -128,14 +128,13 @@ fn codec_benchmarks() {
         print_row("tungstenite encode (unmasked)", theirs, size);
 
         // --- frame encode, client role (masked) ---------------------
-        let mut client_writer = FrameWriter::new(
-            VecSink::new(),
-            MaskSource::Fixed([1, 2, 3, 4]),
-            None,
-        );
+        let mut client_writer =
+            FrameWriter::new(VecSink::new(), MaskSource::Fixed([1, 2, 3, 4]), None);
         let ours_masked = median_ns(15, iters, || {
             client_writer.sink_mut().bytes.clear();
-            client_writer.write_frame(OpCode::Binary, &payload, true, false).ok();
+            client_writer
+                .write_frame(OpCode::Binary, &payload, true, false)
+                .ok();
         });
         print_row("courierust encode (masked)", ours_masked, size);
 
@@ -210,8 +209,7 @@ fn codec_benchmarks() {
     }
 
     // --- UTF-8 validation over a realistic text block ---------------
-    let text = "The quick brown fox jumps over the lazy dog. 日本語テキスト 🦀 "
-        .repeat(64);
+    let text = "The quick brown fox jumps over the lazy dog. 日本語テキスト 🦀 ".repeat(64);
     let bytes = text.as_bytes();
     let ours = median_ns(15, 2000, || {
         let mut v = Utf8Validator::new();
@@ -246,7 +244,9 @@ impl WsService for EchoService {
 
 impl Handler for EchoHandler {
     fn handle(&self, _req: Request<Body>) -> Response<Body> {
-        Response::with_status(courierust::courierust_http::status::StatusCode::from_u16(404))
+        Response::with_status(courierust::courierust_http::status::StatusCode::from_u16(
+            404,
+        ))
     }
 
     fn websocket(&self, _req: &Request<Body>) -> WsUpgradeReply {
@@ -651,7 +651,12 @@ fn echo_benchmarks() {
     let courierust_deflate_addr = start_courierust_server_with(true, true);
     let tungstenite_addr = start_tungstenite_server();
 
-    for &(size, count) in &[(64usize, 20_000usize), (1024, 20_000), (16 * 1024, 5_000), (256 * 1024, 500)] {
+    for &(size, count) in &[
+        (64usize, 20_000usize),
+        (1024, 20_000),
+        (16 * 1024, 5_000),
+        (256 * 1024, 500),
+    ] {
         println!("message {size} bytes, {count} round trips");
 
         // Warmup (page faults, TCP slow start, JIT-free but Rust still
@@ -660,12 +665,18 @@ fn echo_benchmarks() {
         let _ = echo_tungstenite(tungstenite_addr, size, 100);
         let _ = echo_tokio_tungstenite(size, 100);
 
-        let ours: Vec<f64> = (0..3).map(|_| echo_courierust(courierust_addr, size, count)).collect();
+        let ours: Vec<f64> = (0..3)
+            .map(|_| echo_courierust(courierust_addr, size, count))
+            .collect();
         let ours_deflate: Vec<f64> = (0..3)
             .map(|_| echo_courierust_with(courierust_deflate_addr, size, count, true, true))
             .collect();
-        let sync_t: Vec<f64> = (0..3).map(|_| echo_tungstenite(tungstenite_addr, size, count)).collect();
-        let async_t: Vec<f64> = (0..3).map(|_| echo_tokio_tungstenite(size, count)).collect();
+        let sync_t: Vec<f64> = (0..3)
+            .map(|_| echo_tungstenite(tungstenite_addr, size, count))
+            .collect();
+        let async_t: Vec<f64> = (0..3)
+            .map(|_| echo_tokio_tungstenite(size, count))
+            .collect();
         // Cross pairs: our client on their server and vice versa, so a
         // regression can be attributed to one side instead of guessed at.
         let cross_client: Vec<f64> = (0..3)
@@ -761,7 +772,9 @@ impl WsService for PushService {
 
 impl Handler for PushHandler {
     fn handle(&self, _req: Request<Body>) -> Response<Body> {
-        Response::with_status(courierust::courierust_http::status::StatusCode::from_u16(404))
+        Response::with_status(courierust::courierust_http::status::StatusCode::from_u16(
+            404,
+        ))
     }
 
     fn websocket(&self, _req: &Request<Body>) -> WsUpgradeReply {
@@ -878,7 +891,7 @@ fn push_read_courierust_opts(
     // in `send_binary` (back-pressure) versus how much was the client's
     // own receive path.
     if let Ok(courierust::courierust_ws::Event::Text(t)) = ws.read_message() {
-        println!("    [server send-binary total: {t}]", );
+        println!("    [server send-binary total: {t}]",);
     }
     secs
 }
@@ -976,7 +989,11 @@ fn push_benchmarks() {
         let _ = push_read_tungstenite(&theirs_url, 20, size);
 
         let best = |v: Vec<f64>| v.iter().cloned().fold(f64::MAX, f64::min);
-        let ours_reads = best((0..3).map(|_| push_read_courierust(&ours_url, count, size)).collect());
+        let ours_reads = best(
+            (0..3)
+                .map(|_| push_read_courierust(&ours_url, count, size))
+                .collect(),
+        );
         let ours_reads_no_deadline = best(
             (0..3)
                 .map(|_| push_read_courierust_opts(&ours_url, count, size, 64 * 1024, false))
@@ -996,19 +1013,34 @@ fn push_benchmarks() {
                 })
                 .collect(),
         );
-        let ours_client_theirs_server =
-            best((0..3).map(|_| push_read_courierust(&theirs_url, count, size)).collect());
-        let theirs_client_ours_server =
-            best((0..3).map(|_| push_read_tungstenite(&ours_url, count, size)).collect());
-        let theirs_reads =
-            best((0..3).map(|_| push_read_tungstenite(&theirs_url, count, size)).collect());
+        let ours_client_theirs_server = best(
+            (0..3)
+                .map(|_| push_read_courierust(&theirs_url, count, size))
+                .collect(),
+        );
+        let theirs_client_ours_server = best(
+            (0..3)
+                .map(|_| push_read_tungstenite(&ours_url, count, size))
+                .collect(),
+        );
+        let theirs_reads = best(
+            (0..3)
+                .map(|_| push_read_tungstenite(&theirs_url, count, size))
+                .collect(),
+        );
 
         report("courierust srv -> courierust client", ours_reads);
         report("  ... client deadline off", ours_reads_no_deadline);
         report("  ... both deadlines off", ours_both_no_deadline);
         report("  ... client deadline only", ours_client_deadline_only);
-        report("tungstenite srv -> courierust client", ours_client_theirs_server);
-        report("courierust srv -> tungstenite client", theirs_client_ours_server);
+        report(
+            "tungstenite srv -> courierust client",
+            ours_client_theirs_server,
+        );
+        report(
+            "courierust srv -> tungstenite client",
+            theirs_client_ours_server,
+        );
         report("tungstenite srv -> tungstenite client", theirs_reads);
         report(
             "raw TCP, same write pattern",
@@ -1025,7 +1057,9 @@ fn main() {
     println!("courierust WebSocket benchmark");
     println!(
         "machine: {} logical cores",
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0)
     );
     // `WS_BENCH_SECTION=push` (or `codec`, `echo`) runs one section only:
     // useful while investigating a single number.

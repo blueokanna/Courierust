@@ -224,22 +224,22 @@ mod tests {
     #[test]
     fn rejects_the_unicode_spec_falsehoods() {
         let cases: &[&[u8]] = &[
-            &[0x80],                         // bare continuation
-            &[0xC0, 0x80],                   // overlong NUL
-            &[0xC1, 0xBF],                   // overlong
-            &[0xE0, 0x80, 0x80],             // overlong
-            &[0xE0, 0x9F, 0xBF],             // overlong (boundary)
-            &[0xED, 0xA0, 0x80],             // surrogate half U+D800
-            &[0xED, 0xBF, 0xBF],             // surrogate half U+DFFF
-            &[0xF0, 0x80, 0x80, 0x80],       // overlong
-            &[0xF0, 0x8F, 0xBF, 0xBF],       // overlong (boundary)
-            &[0xF4, 0x90, 0x80, 0x80],       // > U+10FFFF
-            &[0xF5, 0x80, 0x80, 0x80],       // lead out of range
-            &[0xFF],                         // lead out of range
-            &[0xC2],                         // truncated (incomplete)
-            &[0xE2, 0x82],                   // truncated
-            &[0xF0, 0x9F, 0x98],             // truncated emoji
-            &[0xE2, 0x28, 0xA1],             // invalid continuation
+            &[0x80],                   // bare continuation
+            &[0xC0, 0x80],             // overlong NUL
+            &[0xC1, 0xBF],             // overlong
+            &[0xE0, 0x80, 0x80],       // overlong
+            &[0xE0, 0x9F, 0xBF],       // overlong (boundary)
+            &[0xED, 0xA0, 0x80],       // surrogate half U+D800
+            &[0xED, 0xBF, 0xBF],       // surrogate half U+DFFF
+            &[0xF0, 0x80, 0x80, 0x80], // overlong
+            &[0xF0, 0x8F, 0xBF, 0xBF], // overlong (boundary)
+            &[0xF4, 0x90, 0x80, 0x80], // > U+10FFFF
+            &[0xF5, 0x80, 0x80, 0x80], // lead out of range
+            &[0xFF],                   // lead out of range
+            &[0xC2],                   // truncated (incomplete)
+            &[0xE2, 0x82],             // truncated
+            &[0xF0, 0x9F, 0x98],       // truncated emoji
+            &[0xE2, 0x28, 0xA1],       // invalid continuation
         ];
         for c in cases {
             let mut v = Utf8Validator::new();

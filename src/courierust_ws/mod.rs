@@ -73,8 +73,8 @@ pub mod utf8;
 pub mod writer;
 
 pub use frame::{
-    close, FrameHeader, FrameSink, Mask, OpCode, StreamSink, MAX_CONTROL_PAYLOAD, MAX_HEADER_LEN,
-    MASK_WINDOW, MASK_WINDOW_MAX,
+    close, FrameHeader, FrameSink, Mask, OpCode, StreamSink, MASK_WINDOW, MASK_WINDOW_MAX,
+    MAX_CONTROL_PAYLOAD, MAX_HEADER_LEN,
 };
 pub use handshake::{
     accept_key, client_ip, effective_host, is_secure, is_valid_key, is_websocket_upgrade,

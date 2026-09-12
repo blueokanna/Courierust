@@ -201,10 +201,7 @@ mod tests {
             h.update(&chunk);
         }
         let digest = h.finish();
-        assert_eq!(
-            hex(&digest),
-            "34aa973cd4c4daa4f61eeb2bdbad27316534016f"
-        );
+        assert_eq!(hex(&digest), "34aa973cd4c4daa4f61eeb2bdbad27316534016f");
     }
 
     #[test]

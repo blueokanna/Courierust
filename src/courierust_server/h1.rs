@@ -15,6 +15,12 @@ use crate::courierust_server::{ws, Handler, ServerConfig};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
 
+/// Bytes of unread request data a refusal is willing to drain before the
+/// socket closes (`linger_close`), and how long it is willing to wait.
+///
+pub(crate) const LINGER_BUDGET: usize = 64 * 1024;
+pub(crate) const LINGER_DEADLINE: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Serve HTTP/1.1 requests on `stream` until the connection closes.
 pub(crate) fn serve(
     stream: &Arc<ConnStream>,
@@ -44,6 +50,7 @@ pub(crate) fn serve(
                 // indistinguishable from a network failure.
                 write_early_error(&mut writer, 400, "bad request")?;
                 let _ = writer.flush();
+                stream.linger_close(LINGER_BUDGET, LINGER_DEADLINE);
                 return Err(e);
             }
         };
@@ -54,10 +61,9 @@ pub(crate) fn serve(
         // means an ambiguous request cannot reach a handler or pin a body
         // buffer, and a proxy in front never has to guess which authority
         // the request meant.
-        let mut early = match courierust_h1::host_header_error(rl.version, &headers) {
-            Some(reason) => Some(error_response(400, reason)),
-            None => None,
-        };
+        let mut early = courierust_h1::host_header_error(rl.version, &headers)
+            .map(|reason| error_response(400, reason));
+        let refuses_early = early.is_some();
 
         let upgrade = early.is_none() && is_h2c_upgrade(&headers);
         let body = if early.is_some() {
@@ -231,6 +237,12 @@ pub(crate) fn serve(
             }
         }
         writer.flush()?;
+        if refuses_early {
+            // The peer is likely still sending a body we chose not to
+            // read; draining a bounded amount keeps the response from
+            // being destroyed by a RST on Linux.
+            stream.linger_close(LINGER_BUDGET, LINGER_DEADLINE);
+        }
 
         if !keep_alive {
             break;

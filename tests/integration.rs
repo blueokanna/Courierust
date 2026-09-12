@@ -1498,7 +1498,10 @@ fn http11_requires_exactly_one_non_empty_host_header() {
         assert!(resp.starts_with("HTTP/1.1 400"), "{driver}: got {resp}");
 
         // Duplicate Host -> 400 (two authorities are not a request).
-        let resp = ask("duplicate Host", b"GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n");
+        let resp = ask(
+            "duplicate Host",
+            b"GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n",
+        );
         assert!(resp.starts_with("HTTP/1.1 400"), "{driver}: got {resp}");
 
         // Empty Host -> 400.
@@ -1516,6 +1519,12 @@ fn http11_requires_exactly_one_non_empty_host_header() {
         // HTTP/1.0 may omit Host; the request is still served.
         let resp = ask("HTTP/1.0 without Host", b"GET / HTTP/1.0\r\n\r\n");
         assert!(resp.starts_with("HTTP/1.1 200"), "{driver}: got {resp}");
+
+        // A request line the server cannot parse is answered, not dropped:
+        // both drivers must agree, because a client behind a proxy cannot
+        // tell a server bug from a network failure otherwise.
+        let resp = ask("malformed request line", b"GARBAGE\r\n\r\n");
+        assert!(resp.starts_with("HTTP/1.1 400"), "{driver}: got {resp}");
     }
 }
 

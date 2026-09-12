@@ -1136,7 +1136,10 @@ mod tests {
 
         // IPv6 literals: the brackets come off, and the port is only the
         // colon *after* the closing bracket.
-        assert!(origin_equivalent("https://[::1]:8443", "https://[::1]:8443"));
+        assert!(origin_equivalent(
+            "https://[::1]:8443",
+            "https://[::1]:8443"
+        ));
         assert!(!origin_equivalent("https://[::1]", "https://[::1]:8443"));
         assert!(origin_equivalent("https://[::1]", "https://[::1]:443"));
         assert!(origin_matches(

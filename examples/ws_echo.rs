@@ -26,11 +26,7 @@ impl WsService for Echo {
         let info = conn.info();
         println!(
             "open: path={} peer={} secure={} protocol={:?} compression={:?}",
-            info.path,
-            info.client_ip,
-            info.secure,
-            info.protocol,
-            info.compression
+            info.path, info.client_ip, info.secure, info.protocol, info.compression
         );
     }
 
@@ -111,11 +107,8 @@ fn main() -> courierust::Result<()> {
         protocols: vec!["courierust.echo".into()],
         ..Default::default()
     };
-    let mut ws = WebSocket::connect_with(
-        &format!("ws://{addr}/ws"),
-        &ClientConfig::default(),
-        &opts,
-    )?;
+    let mut ws =
+        WebSocket::connect_with(&format!("ws://{addr}/ws"), &ClientConfig::default(), &opts)?;
     println!("connected: protocol={:?}", ws.protocol());
 
     ws.send_text("hello over a WebSocket")?;

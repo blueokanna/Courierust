@@ -397,6 +397,153 @@
 			"command": "cargo test --test integration 2>&1 | Select-String -Pattern '^error|test result|FAILED|warning:' | ForEach-Object { $_.Line }",
 			"problemMatcher": [],
 			"group": "test"
+		},
+		{
+			"label": "ci-build-178",
+			"type": "shell",
+			"command": "$env:RUSTFLAGS='-D warnings'; cargo +1.78.0 build --all-targets > tmp_ci_build.txt 2>&1; Write-Output \"EXIT=$LASTEXITCODE\"",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "ci-build-log",
+			"type": "shell",
+			"command": "Get-Content tmp_ci_build.txt -Tail 50",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "ci-clippy-178",
+			"type": "shell",
+			"command": "$env:RUSTFLAGS=''; cargo +1.78.0 clippy --all-targets -- -D warnings > tmp_ci_clippy.txt 2>&1; Write-Output \"CLIPPY_EXIT=$LASTEXITCODE\"; cargo +1.78.0 clippy --no-default-features --lib -- -D warnings > tmp_ci_clippy_nostd.txt 2>&1; Write-Output \"CLIPPY_NOSTD_EXIT=$LASTEXITCODE\"; cargo +1.78.0 build --no-default-features --lib > tmp_ci_nostd.txt 2>&1; Write-Output \"NOSTD_BUILD_EXIT=$LASTEXITCODE\"",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "ci-logs",
+			"type": "shell",
+			"command": "Write-Output '=== clippy (std) ==='; Select-String -Path tmp_ci_clippy.txt -Pattern '^error|^warning|-->' | Select-Object -First 40 | ForEach-Object { $_.Line }; Write-Output '=== clippy (no_std) ==='; Select-String -Path tmp_ci_clippy_nostd.txt -Pattern '^error|^warning|-->' | Select-Object -First 30 | ForEach-Object { $_.Line }; Write-Output '=== no_std build ==='; Select-String -Path tmp_ci_nostd.txt -Pattern '^error|^warning|-->' | Select-Object -First 30 | ForEach-Object { $_.Line }",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "clippy-detail",
+			"type": "shell",
+			"command": "$c = Get-Content tmp_ci_clippy.txt; $idx = ($c | Select-String -Pattern '^error' | Select-Object -First 10).LineNumber; foreach ($i in $idx) { $c[($i-1)..([Math]::Min($i+14, $c.Count-1))]; '-----' }",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "ci-clippy-again",
+			"type": "shell",
+			"command": "$env:RUSTFLAGS=''; cargo +1.78.0 clippy --all-targets -- -D warnings > tmp_ci_clippy.txt 2>&1; Write-Output \"CLIPPY_EXIT=$LASTEXITCODE\"; cargo +1.78.0 build --no-default-features --lib > tmp_ci_nostd.txt 2>&1; Write-Output \"NOSTD_EXIT=$LASTEXITCODE\"; cargo +1.78.0 clippy --no-default-features --lib -- -D warnings > tmp_ci_clippy_nostd.txt 2>&1; Write-Output \"CLIPPY_NOSTD_EXIT=$LASTEXITCODE\"",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "ci-logs2",
+			"type": "shell",
+			"command": "Write-Output '=== clippy std ==='; $c = Get-Content tmp_ci_clippy.txt; $idx = ($c | Select-String -Pattern '^error' | Select-Object -First 8).LineNumber; foreach ($i in $idx) { $c[($i-1)..([Math]::Min($i+8, $c.Count-1))]; '---' }; Write-Output '=== no_std ==='; Select-String -Path tmp_ci_nostd.txt -Pattern '^error|-->' | Select-Object -First 25 | ForEach-Object { $_.Line }",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "ci-clippy-3",
+			"type": "shell",
+			"command": "$env:RUSTFLAGS=''; cargo +1.78.0 clippy --all-targets -- -D warnings > tmp_ci_clippy.txt 2>&1; Write-Output \"CLIPPY_EXIT=$LASTEXITCODE\"; cargo +1.78.0 build --no-default-features --lib > tmp_ci_nostd.txt 2>&1; Write-Output \"NOSTD_EXIT=$LASTEXITCODE\"; cargo +1.78.0 clippy --no-default-features --lib -- -D warnings > tmp_ci_clippy_nostd.txt 2>&1; Write-Output \"CLIPPY_NOSTD_EXIT=$LASTEXITCODE\"; cargo +1.78.0 fmt --all -- --check > tmp_fmt78.txt 2>&1; Write-Output \"FMT_EXIT=$LASTEXITCODE\"",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "ci-doc-test-178",
+			"type": "shell",
+			"command": "$env:RUSTFLAGS='-D warnings'; $env:RUSTDOCFLAGS='-D warnings'; cargo +1.78.0 doc --no-deps > tmp_ci_doc.txt 2>&1; Write-Output \"DOC_EXIT=$LASTEXITCODE\"; $env:RUSTFLAGS=''; cargo +1.78.0 test --all-targets > tmp_ci_test.txt 2>&1; Write-Output \"TEST_EXIT=$LASTEXITCODE\"; cargo +1.78.0 test --doc > tmp_ci_doctest.txt 2>&1; Write-Output \"DOCTEST_EXIT=$LASTEXITCODE\"",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "doc-log",
+			"type": "shell",
+			"command": "$c = Get-Content tmp_ci_doc.txt; $idx = ($c | Select-String -Pattern '^error|^warning' | Select-Object -First 6).LineNumber; foreach ($i in $idx) { $c[($i-1)..([Math]::Min($i+12, $c.Count-1))]; '---' }",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "ci-doc-2",
+			"type": "shell",
+			"command": "$env:RUSTFLAGS='-D warnings'; $env:RUSTDOCFLAGS='-D warnings'; cargo +1.78.0 doc --no-deps > tmp_ci_doc.txt 2>&1; Write-Output \"DOC_EXIT=$LASTEXITCODE\"; $c = Get-Content tmp_ci_doc.txt; $idx = ($c | Select-String -Pattern '^error' | Select-Object -First 8).LineNumber; foreach ($i in $idx) { $c[($i-1)..([Math]::Min($i+6, $c.Count-1))]; '---' }",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "test-summary-178",
+			"type": "shell",
+			"command": "Select-String -Path tmp_ci_test.txt -Pattern 'test result:|running \\d+ tests|^error|FAILED' | ForEach-Object { $_.Line }; Write-Output '--- doc tests ---'; Select-String -Path tmp_ci_doctest.txt -Pattern 'test result:|^error' | ForEach-Object { $_.Line }",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "ci-strict-final",
+			"type": "shell",
+			"command": "$env:RUSTFLAGS='-D warnings'; $env:RUSTDOCFLAGS='-D warnings'; cargo +1.78.0 test --all-targets > tmp_ci_test2.txt 2>&1; Write-Output \"TEST_STRICT_EXIT=$LASTEXITCODE\"; cargo +1.78.0 test --doc > tmp_ci_doctest2.txt 2>&1; Write-Output \"DOCTEST_STRICT_EXIT=$LASTEXITCODE\"; cargo +1.78.0 build --no-default-features --lib > tmp_ci_nostd2.txt 2>&1; Write-Output \"NOSTD_STRICT_EXIT=$LASTEXITCODE\"; rustfmt --edition 2021 benches/src/ws.rs; Write-Output \"RUSTFMT_BENCH_EXIT=$LASTEXITCODE\"; cargo +1.78.0 fmt --all -- --check; Write-Output \"FMT_EXIT=$LASTEXITCODE\"",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "build-after-linger",
+			"type": "shell",
+			"command": "$env:RUSTFLAGS='-D warnings'; cargo +1.78.0 build --all-targets > tmp_ci_build2.txt 2>&1; Write-Output \"BUILD_EXIT=$LASTEXITCODE\"; $c = Get-Content tmp_ci_build2.txt; $idx = ($c | Select-String -Pattern '^error' | Select-Object -First 6).LineNumber; foreach ($i in $idx) { $c[($i-1)..([Math]::Min($i+8, $c.Count-1))]; '---' }",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "build-after-refactor",
+			"type": "shell",
+			"command": "$env:RUSTFLAGS='-D warnings'; cargo +1.78.0 build --all-targets > tmp_ci_build3.txt 2>&1; Write-Output \"BUILD_EXIT=$LASTEXITCODE\"; $c = Get-Content tmp_ci_build3.txt; $idx = ($c | Select-String -Pattern '^error' | Select-Object -First 6).LineNumber; foreach ($i in $idx) { $c[($i-1)..([Math]::Min($i+8, $c.Count-1))]; '---' }",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "build-after-fix",
+			"type": "shell",
+			"command": "$env:RUSTFLAGS='-D warnings'; cargo +1.78.0 build --all-targets > tmp_ci_build4.txt 2>&1; Write-Output \"BUILD_EXIT=$LASTEXITCODE\"; $c = Get-Content tmp_ci_build4.txt; $idx = ($c | Select-String -Pattern '^error' | Select-Object -First 6).LineNumber; foreach ($i in $idx) { $c[($i-1)..([Math]::Min($i+8, $c.Count-1))]; '---' }",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "malformed-test",
+			"type": "shell",
+			"command": "$env:RUSTFLAGS='-D warnings'; cargo +1.78.0 test --test integration http11_requires > tmp_host_test.txt 2>&1; Write-Output \"EXIT=$LASTEXITCODE\"; $c = Get-Content tmp_host_test.txt; $idx = ($c | Select-String -Pattern 'panicked|test result|no response|got ' | Select-Object -First 6).LineNumber; foreach ($i in $idx) { $c[($i-1)..([Math]::Min($i+4, $c.Count-1))]; '---' }",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "ci-full-final",
+			"type": "shell",
+			"command": "$R = [ordered]@{}; cargo +1.78.0 fmt --all -- --check; $R['fmt']=$LASTEXITCODE; $env:RUSTFLAGS='-D warnings'; $env:RUSTDOCFLAGS='-D warnings'; cargo +1.78.0 clippy --all-targets -- -D warnings > tmp_v_clippy.txt 2>&1; $R['clippy']=$LASTEXITCODE; cargo +1.78.0 clippy --no-default-features --lib -- -D warnings > tmp_v_clippy_nostd.txt 2>&1; $R['clippy_nostd']=$LASTEXITCODE; cargo +1.78.0 build --all-targets > tmp_v_build.txt 2>&1; $R['build_all']=$LASTEXITCODE; cargo +1.78.0 build --no-default-features --lib > tmp_v_nostd.txt 2>&1; $R['build_nostd']=$LASTEXITCODE; cargo +1.78.0 test --all-targets > tmp_v_test.txt 2>&1; $R['test']=$LASTEXITCODE; cargo +1.78.0 test --doc > tmp_v_doctest.txt 2>&1; $R['doctest']=$LASTEXITCODE; cargo +1.78.0 doc --no-deps > tmp_v_doc.txt 2>&1; $R['doc']=$LASTEXITCODE; $R.GetEnumerator() | ForEach-Object { \"$($_.Key)=$($_.Value)\" }",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "ci-final-a",
+			"type": "shell",
+			"command": "$env:RUSTFLAGS='-D warnings'; $env:RUSTDOCFLAGS='-D warnings'; cargo +1.78.0 fmt --all -- --check; Write-Output ('fmt=' + $LASTEXITCODE); cargo +1.78.0 clippy --all-targets -- -D warnings; Write-Output ('clippy=' + $LASTEXITCODE); cargo +1.78.0 clippy --no-default-features --lib -- -D warnings; Write-Output ('clippy_nostd=' + $LASTEXITCODE)",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "ci-final-b",
+			"type": "shell",
+			"command": "$env:RUSTFLAGS='-D warnings'; $env:RUSTDOCFLAGS='-D warnings'; cargo +1.78.0 build --all-targets; Write-Output ('build_all=' + $LASTEXITCODE); cargo +1.78.0 build --no-default-features --lib; Write-Output ('build_nostd=' + $LASTEXITCODE); cargo +1.78.0 test --all-targets > tmp_v_test.txt 2>&1; Write-Output ('test=' + $LASTEXITCODE); cargo +1.78.0 test --doc; Write-Output ('doctest=' + $LASTEXITCODE); cargo +1.78.0 doc --no-deps; Write-Output ('doc=' + $LASTEXITCODE)",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "final-summary-cleanup",
+			"type": "shell",
+			"command": "Select-String -Path tmp_v_test.txt -Pattern 'test result:' | ForEach-Object { $_.Line }; Write-Output '--- tasks.json ---'; (Get-Content .vscode/tasks.json -Raw).Length; Write-Output '--- cleanup ---'; Remove-Item tmp_*.txt -ErrorAction SilentlyContinue; (Get-ChildItem tmp_* -ErrorAction SilentlyContinue | Measure-Object).Count",
+			"problemMatcher": [],
+			"group": "test"
 		}
 	]
 }

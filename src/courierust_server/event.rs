@@ -685,8 +685,8 @@ impl EventConn {
                                 other => return Ok(other),
                             }
                         }
-                        WsDecision::Upgrade(plan, service) => {
-                            let head = plan.accept_headers()?;
+                        WsDecision::Upgrade(upgrade) => {
+                            let head = upgrade.plan.accept_headers()?;
                             self.out.clear();
                             courierust_h1::write_response_head(
                                 &mut self.out,
@@ -696,7 +696,7 @@ impl EventConn {
                             )?;
                             self.out_pos = 0;
                             self.keep_alive = true;
-                            self.pending_upgrade = Some((plan, service));
+                            self.pending_upgrade = Some((upgrade.plan, upgrade.service));
                             continue;
                         }
                     }
@@ -761,16 +761,24 @@ impl EventConn {
 }
 
 /// The outcome of inspecting a request for a WebSocket upgrade.
+///
+/// `WsDecision` is produced for **every** request, so its common variants
+/// stay small and the (rare) upgrade payload is boxed: otherwise each
+/// request would carry a 232-byte `WsPlan` around by value before the
+/// enum is matched away.
 enum WsDecision {
     /// Handle it as ordinary HTTP.
     Pass,
     /// Answer with this response instead of `101`.
     Respond(Response<Body>),
     /// Switch the connection to the WebSocket reactor.
-    Upgrade(
-        crate::courierust_server::ws::WsPlan,
-        Arc<dyn crate::courierust_server::ws::WsService>,
-    ),
+    Upgrade(Box<WsUpgrade>),
+}
+
+/// The handshake state of an accepted upgrade.
+struct WsUpgrade {
+    plan: crate::courierust_server::ws::WsPlan,
+    service: Arc<dyn crate::courierust_server::ws::WsService>,
 }
 
 impl EventConn {
@@ -796,7 +804,7 @@ impl EventConn {
                     .map(|a| a.ip())
                     .unwrap_or(core::net::IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED));
                 match crate::courierust_server::ws::plan(req, peer, false, &config.websocket) {
-                    Ok(plan) => Ok(WsDecision::Upgrade(plan, service)),
+                    Ok(plan) => Ok(WsDecision::Upgrade(Box::new(WsUpgrade { plan, service }))),
                     Err(refusal) => Ok(WsDecision::Respond(refusal.response())),
                 }
             }
@@ -1313,6 +1321,77 @@ fn event_loop(
     }
 }
 
+/// Answer a request that could not be parsed, then linger briefly before
+/// the connection is dropped.
+///
+/// The blocking driver does the same thing (see `h1::serve`); keeping the
+/// two identical matters because which one runs depends on
+/// `ServerConfig::event_driven`, and a client must not be able to tell
+/// the difference between them by the *absence* of a `400`.
+///
+/// The status is the honest one: a protocol error is a `400`, a header
+/// block or request line over the limit is a `431`, and a body over the
+/// limit is a `413`.
+fn refuse_malformed(conn: &EventConn, e: &Error) {
+    use crate::courierust_error::ErrorKind;
+    let status = match e.kind {
+        ErrorKind::Protocol => 400,
+        ErrorKind::Overflow => {
+            let header = e
+                .message
+                .as_deref()
+                .map(|m| m.contains("header") || m.contains("line"))
+                .unwrap_or(false);
+            if header {
+                431
+            } else {
+                413
+            }
+        }
+        // A timeout, an EOF or a transport failure is not something the
+        // peer's request got wrong; nothing is claimed on the wire.
+        _ => return,
+    };
+    let resp = crate::courierust_server::h1::error_response(status, "bad request");
+    let body: &[u8] = match &resp.body {
+        Body::Bytes(b) => b.as_ref(),
+        _ => b"",
+    };
+    let mut out = Vec::with_capacity(128 + body.len());
+    if courierust_h1::write_response_head(&mut out, resp.status, Version::HTTP_11, &resp.headers)
+        .is_err()
+    {
+        return;
+    }
+    out.extend_from_slice(body);
+    write_and_linger(&conn.socket, &out);
+}
+
+/// Write `bytes` to a raw accepted socket and linger briefly before the
+/// close, so the answer is not destroyed by the RST Linux sends when a
+/// socket with unread data is closed.
+fn write_and_linger(socket: &std::net::TcpStream, bytes: &[u8]) {
+    use std::io::{Read, Write};
+    {
+        let mut writer: &std::net::TcpStream = socket;
+        if writer.write_all(bytes).is_err() || writer.flush().is_err() {
+            return;
+        }
+    }
+    let _ = socket.set_read_timeout(Some(crate::courierust_server::h1::LINGER_DEADLINE));
+    let mut sink = [0u8; 8 * 1024];
+    let mut left = crate::courierust_server::h1::LINGER_BUDGET;
+    let mut reader: &std::net::TcpStream = socket;
+    while left > 0 {
+        let want = core::cmp::min(left, sink.len());
+        match reader.read(&mut sink[..want]) {
+            Ok(0) => break,
+            Ok(n) => left = left.saturating_sub(n),
+            Err(_) => break,
+        }
+    }
+}
+
 /// Emit and reset the per-request trace accumulators of one connection.
 /// Called on every dispatch pickup (reporting the previous batch) and on
 /// close (reporting the final batch, which would otherwise never be
@@ -1412,7 +1491,18 @@ fn event_worker(
             }));
             let outcome = match step {
                 Ok(Ok(o)) => o,
-                _ => StepOutcome::Close,
+                Ok(Err(e)) => {
+                    // A request the server could not parse still gets an
+                    // answer: the default (event-driven) driver and the
+                    // blocking one must behave the same way, or a client
+                    // behind a proxy cannot tell a server bug from a
+                    // network failure.
+                    refuse_malformed(&conn, &e);
+                    StepOutcome::Close
+                }
+                // A panicking handler is not answered for: the connection
+                // is already in an unknown state.
+                Err(_) => StepOutcome::Close,
             };
             match outcome {
                 StepOutcome::Idle | StepOutcome::NeedWrite => {

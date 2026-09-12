@@ -20,6 +20,8 @@
 //! * The 64-bit length's most significant bit set → error.
 
 use crate::courierust_error::{Error, Result};
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 /// Longest possible frame header (2 + 8 length + 4 mask).
 pub const MAX_HEADER_LEN: usize = 14;
@@ -358,7 +360,9 @@ impl Mask {
         let mut i = 0usize;
         while i + 16 <= data.len() {
             let lane = u128::from_ne_bytes(
-                data[i..i + 16].try_into().expect("slice of exactly 16 bytes"),
+                data[i..i + 16]
+                    .try_into()
+                    .expect("slice of exactly 16 bytes"),
             ) ^ wide;
             data[i..i + 16].copy_from_slice(&lane.to_ne_bytes());
             i += 16;
@@ -386,7 +390,9 @@ impl Mask {
         let mut i = 0usize;
         while i + 16 <= src.len() {
             let lane = u128::from_ne_bytes(
-                src[i..i + 16].try_into().expect("slice of exactly 16 bytes"),
+                src[i..i + 16]
+                    .try_into()
+                    .expect("slice of exactly 16 bytes"),
             ) ^ wide;
             dst[i..i + 16].copy_from_slice(&lane.to_ne_bytes());
             i += 16;
