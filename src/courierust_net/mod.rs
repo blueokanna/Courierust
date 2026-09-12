@@ -263,15 +263,18 @@ impl crate::courierust_io::Write for Arc<ConnStream> {
 
 /// Configure a stream for the blocking driver loops used by the client
 /// and server.
+///
+/// The deadline is applied **explicitly**, including when it is `None`:
+/// a driver that arms a deadline for an idle wait and clears it for bulk
+/// transfers has to be able to clear it, and "leave whatever was there"
+/// would silently keep the slow path in place.
 pub fn configure(stream: &TcpStream, read_timeout: Option<Duration>) -> Result<()> {
     stream
         .set_nodelay(true)
         .map_err(|e| Error::io(e.to_string()))?;
-    if let Some(t) = read_timeout {
-        stream
-            .set_read_timeout(Some(t))
-            .map_err(|e| Error::io(e.to_string()))?;
-    }
+    stream
+        .set_read_timeout(read_timeout)
+        .map_err(|e| Error::io(e.to_string()))?;
     Ok(())
 }
 

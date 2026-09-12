@@ -1365,6 +1365,30 @@ impl RawConn {
         &mut self.stream
     }
 
+    /// Read one complete HTTP/1.1 response, or `None` when the peer
+    /// closed without answering (used by tests that assert on *where* a
+    /// request fails).
+    fn try_read_response(&mut self) -> Option<String> {
+        loop {
+            if let Some((head_end, cl)) = self.find_response() {
+                let total = head_end + cl;
+                while self.leftover.len() - self.pos < total {
+                    if !self.try_fill() {
+                        return None;
+                    }
+                }
+                let s =
+                    String::from_utf8_lossy(&self.leftover[self.pos..self.pos + total]).to_string();
+                self.pos += total;
+                self.compact();
+                return Some(s);
+            }
+            if !self.try_fill() {
+                return None;
+            }
+        }
+    }
+
     /// Read one complete HTTP/1.1 response (head + Content-Length body).
     fn read_response(&mut self) -> String {
         loop {
@@ -1411,11 +1435,87 @@ impl RawConn {
         self.leftover.extend_from_slice(&tmp[..n]);
     }
 
+    /// `fill` that reports EOF instead of panicking.
+    fn try_fill(&mut self) -> bool {
+        use std::io::Read;
+        let mut tmp = [0u8; 4096];
+        match self.stream.read(&mut tmp) {
+            Ok(0) => false,
+            Ok(n) => {
+                self.leftover.extend_from_slice(&tmp[..n]);
+                true
+            }
+            Err(e) => panic!("read failed: {e}"),
+        }
+    }
+
     fn compact(&mut self) {
         if self.pos >= 64 * 1024 {
             self.leftover.drain(..self.pos);
             self.pos = 0;
         }
+    }
+}
+
+/// RFC 9112 §3.2: an HTTP/1.1 request must carry exactly one non-empty
+/// `Host` field. A server that skips the check lets a proxy and the
+/// origin disagree about which authority a request was for — the shape
+/// of a request-smuggling bug — so the check is a test, not a comment.
+///
+/// Both drivers are exercised: the event-driven path is the default one,
+/// and a rule implemented in only one of them is a rule with a hole.
+#[test]
+fn http11_requires_exactly_one_non_empty_host_header() {
+    use std::io::Write;
+    use std::net::TcpStream;
+
+    for event_driven in [true, false] {
+        let base = spawn_server(
+            ServerConfig {
+                event_driven,
+                threads: 2,
+                ..Default::default()
+            },
+            |_req| {
+                let mut resp = courierust::courierust_http::response::Response::<Body>::with_status(
+                    200.into(),
+                );
+                resp.body = Body::Bytes(Bytes::from_static(b"ok"));
+                resp
+            },
+        );
+        let addr = base.trim_start_matches("http://").to_string();
+        let ask = |label: &str, request: &[u8]| -> String {
+            let mut conn = RawConn::new(TcpStream::connect(&addr).unwrap());
+            conn.stream().write_all(request).unwrap();
+            conn.try_read_response()
+                .unwrap_or_else(|| panic!("no response at all for {label}"))
+        };
+        let driver = if event_driven { "event" } else { "blocking" };
+
+        // Missing Host -> 400.
+        let resp = ask("no Host", b"GET / HTTP/1.1\r\n\r\n");
+        assert!(resp.starts_with("HTTP/1.1 400"), "{driver}: got {resp}");
+
+        // Duplicate Host -> 400 (two authorities are not a request).
+        let resp = ask("duplicate Host", b"GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n");
+        assert!(resp.starts_with("HTTP/1.1 400"), "{driver}: got {resp}");
+
+        // Empty Host -> 400.
+        let resp = ask("empty Host", b"GET / HTTP/1.1\r\nHost:\r\n\r\n");
+        assert!(resp.starts_with("HTTP/1.1 400"), "{driver}: got {resp}");
+
+        // One Host -> 200.
+        let resp = ask(
+            "one Host",
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "{driver}: got {resp}");
+        assert!(resp.ends_with("ok"), "{driver}: got {resp}");
+
+        // HTTP/1.0 may omit Host; the request is still served.
+        let resp = ask("HTTP/1.0 without Host", b"GET / HTTP/1.0\r\n\r\n");
+        assert!(resp.starts_with("HTTP/1.1 200"), "{driver}: got {resp}");
     }
 }
 

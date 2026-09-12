@@ -155,6 +155,32 @@ pub fn read_headers_scratch<R: Read>(
     Ok(headers)
 }
 
+/// Whether an HTTP/1.1 request violates the `Host` requirement.
+///
+/// RFC 9112 §3.2: an HTTP/1.1 request carries **exactly one** `Host`
+/// field, and it is not empty. HTTP/1.0 and older may omit it. Both
+/// server drivers call this — one rule, checked in one place, before any
+/// handler sees the request — because a server that lets a proxy and the
+/// origin disagree about the request's authority has handed the proxy a
+/// request-smuggling primitive.
+///
+/// Returns the reason a request must be refused with `400`, or `None`
+/// when the request is fine.
+pub fn host_header_error(version: Version, headers: &HeaderMap) -> Option<&'static str> {
+    if version != Version::HTTP_11 {
+        return None;
+    }
+    let mut all = headers.get_all("host");
+    match (all.next(), all.next()) {
+        (None, _) => Some("missing Host header"),
+        (Some(_), Some(_)) => Some("multiple Host headers"),
+        (Some(value), None) => match value.to_str() {
+            Ok(text) if !text.trim().is_empty() => None,
+            _ => Some("empty or non-ASCII Host header"),
+        },
+    }
+}
+
 /// Split a single `Name: value` line.
 pub(crate) fn split_header(line: &[u8]) -> Result<(HeaderName, HeaderValue)> {
     let colon = line

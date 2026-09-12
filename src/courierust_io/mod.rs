@@ -20,6 +20,23 @@ pub trait Write {
 
     /// Flush any buffered output.
     fn flush(&mut self) -> Result<()>;
+
+    /// Write the whole buffer, looping over short writes.
+    ///
+    /// A transport error (including `WouldBlock` on a non-blocking
+    /// socket) aborts the loop and is propagated as-is: the caller must
+    /// be able to tell “nothing more fit” from “the peer vanished”,
+    /// which is exactly the difference between parking and closing.
+    fn write_all(&mut self, mut data: &[u8]) -> Result<()> {
+        while !data.is_empty() {
+            let n = self.write(data)?;
+            if n == 0 {
+                return Err(Error::io("write made no progress"));
+            }
+            data = &data[n.min(data.len())..];
+        }
+        Ok(())
+    }
 }
 
 impl<T: Read + ?Sized> Read for &mut T {
@@ -81,6 +98,27 @@ impl<R> BufReader<R> {
         let n = core::cmp::min(data.len(), self.buf.len());
         self.buf[..n].copy_from_slice(&data[..n]);
         self.cap = n;
+    }
+
+    /// Grow the buffer to at least `cap` bytes, preserving whatever is
+    /// still buffered.
+    ///
+    /// Used when a connection changes protocol (an HTTP/1.1 request that
+    /// upgrades to WebSocket): the framing that follows is read in much
+    /// larger chunks than request headers, and re-allocating the reader
+    /// would throw away bytes the parser already read past the handshake.
+    pub fn ensure_capacity(&mut self, cap: usize) {
+        if cap <= self.buf.len() {
+            return;
+        }
+        let mut grown = vec![0u8; cap];
+        let held = self.cap - self.pos;
+        if held > 0 {
+            grown[..held].copy_from_slice(&self.buf[self.pos..self.cap]);
+        }
+        self.buf = grown;
+        self.pos = 0;
+        self.cap = held;
     }
 }
 
@@ -164,6 +202,35 @@ impl<R: Read> BufReader<R> {
             }
         }
         Ok(filled)
+    }
+
+    /// Read up to `out.len()` bytes, serving from the internal buffer when
+    /// it holds data and otherwise reading **straight into `out`**.
+    ///
+    /// Unlike [`BufReader::read_more`] this makes exactly one transport
+    /// read per call and never copies through the internal buffer, which
+    /// is what a protocol layer wants when it has already committed to
+    /// placing the next bulk of bytes somewhere: a frame payload or a
+    /// request body can land in its destination on the first attempt.
+    ///
+    /// Errors are returned as the transport reported them (`WouldBlock`
+    /// and `Timeout` included, so a caller can distinguish "no data yet"
+    /// from "this connection is gone"); a clean EOF is
+    /// [`ErrorKind::UnexpectedEof`].
+    pub fn read_direct(&mut self, out: &mut [u8]) -> Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        if self.pos < self.cap {
+            let take = core::cmp::min(out.len(), self.cap - self.pos);
+            out[..take].copy_from_slice(&self.buf[self.pos..self.pos + take]);
+            self.consume(take);
+            return Ok(take);
+        }
+        match self.inner.read(out) {
+            Ok(0) => Err(Error::eof()),
+            other => other,
+        }
     }
 
     /// Read a single byte.

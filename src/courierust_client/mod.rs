@@ -3,6 +3,7 @@
 
 pub mod h1;
 pub mod h2;
+pub mod ws;
 
 use crate::courierust_body::Body;
 use crate::courierust_client::h1::H1Connection;

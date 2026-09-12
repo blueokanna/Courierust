@@ -244,6 +244,7 @@ courierust = { version = "0.1", default-features = false }
 - **请求体流式上传目前只在 HTTP/2 下可靠**（h2 天然分帧）。HTTP/1.1 的请求体要么一次性给全（`Body::Bytes`），要么你自己拼 chunked。
 - **gRPC 不含 protobuf、`.proto` 代码生成与 `grpc.reflection`**。消息编解码需要你实现 codec trait 或接你自己的 protobuf 生成代码；reflection 需要 protobuf 模式清单，属外部职责。
 - **长时间阻塞的同步 handler 会占住一个 worker**（事件驱动与否都一样）——任何同步服务器的通病；流式场景用 channel 响应体。worker 占用**按连接而非按流**：一条连接上的任意空闲流只占同一个 worker，慢流不阻塞同连接其他流——两者均有集成测试覆盖。
+- **WebSocket 只实现 RFC 6455 与 RFC 7692。** 未实现 RFC 8441（WebSocket over HTTP/2）：若 ALPN 协商出 `h2`，客户端会明确报错，而不是建立一个永远不承载帧的连接。事件驱动驱动中服务回调运行在 reactor 工作线程上，因此在 `on_message` 里做批量推送会阻塞 reactor，最终触发有界发送队列；扇出的正确路径是其他线程使用 `WsConn::sender()`。本 crate 两端之间传输 256 KiB 消息比 tungstenite 的组合慢（原因定位与 Windows socket deadline 的发现见 [`benches/WS_BENCHMARK.md`](benches/WS_BENCHMARK.md)）——小消息与中等消息为持平或领先。
 - **HTTPS 是一等公民**：客户端与服务端内置从零实现的 TLS 1.2 + TLS 1.3；`https://` 需要自备根证书库（无内置 CA）。**ALPN 强制一致**：配置 h2 的客户端连到协商出 `http/1.1` 的服务器，或对方**完全未协商 ALPN**（RFC 9113 §3.3 要求 TLS 上必须用 ALPN `h2`），都会得到明确错误而非静默协议错乱。
 - 客户端重定向、keep-alive 复用等策略以「正确」为先，未做激进调优。
 
@@ -259,7 +260,9 @@ src/
 ├── courierust_quic/        # QUIC v1 包/帧编解码、varint、连接 ID、crypto 标签  [no_std]
 ├── courierust_h3/          # HTTP/3：QPACK 静态/动态表 + H3 帧/流角色         [no_std]
 ├── courierust_fingerprint/ # JA3 / JA4 / Chrome HTTP/2 指纹                    [no_std]
-├── courierust_crypto/      # 自带 MD5 / SHA-256（指纹用）                      [no_std]
+├── courierust_crypto/      # 自带 MD5 / SHA-256 / SHA-1 / base64（指纹与 RFC 6455 用）  [no_std]
+├── courierust_deflate/     # DEFLATE/gzip，带可复用的按消息上下文（RFC 7692）  [no_std]
+├── courierust_ws/          # RFC 6455 组帧 + 掩码 + 握手 + permessage-deflate    [no_std]
 ├── courierust_bytes/       # 字节缓冲（BytesMut）                              [no_std]
 ├── courierust_io/          # Read/Write trait（no_std 版）                     [no_std]
 ├── courierust_error/       # 统一错误类型
@@ -280,6 +283,7 @@ src/
 - HTTP/1.1 keep-alive，顺序与多 worker 并行；
 - HTTP/2 多 worker 多路复用；
 - HTTPS（TLS 1.2/1.3 + h2）经本仓库自带 TLS 栈的端到端；
+- WebSocket（`--bench ws`）：编解码（编码/掩码/解码/UTF-8）、回显往返与单向推送，与 `tungstenite 0.30`、`tokio-tungstenite 0.30` 在同一进程内对比 —— 代码、方法论与诚实行都写在 [`benches/WS_BENCHMARK.md`](benches/WS_BENCHMARK.md)；
 - RFC 9218 优先级调度；
 - 并发模型对比（空闲连接群 vs worker 池）与慢发送者群基准。
 

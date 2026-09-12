@@ -96,7 +96,6 @@ enum EventMsg {
 }
 
 /// How a worker wants the connection handled next.
-#[derive(Debug)]
 enum StepOutcome {
     /// Back to the poller (waiting for the next request / readability).
     Idle,
@@ -104,6 +103,10 @@ enum StepOutcome {
     NeedWrite,
     /// Close the connection.
     Close,
+    /// The connection became a WebSocket: the worker moves it to the
+    /// WebSocket registry, where it stays in the reactor for its whole
+    /// life instead of occupying a thread.
+    Upgrade(Box<crate::courierust_server::ws::WsEventConn>),
 }
 
 /// The protocol class of a fresh connection, decided from its first
@@ -345,11 +348,6 @@ impl IncrRequest {
                         self.phase = match bl {
                             courierust_h1::BodyLen::None => Phase::Done,
                             courierust_h1::BodyLen::Length(n) => {
-                                // Reject an over-limit Content-Length up
-                                // front, exactly like the blocking path —
-                                // otherwise a huge advertised length would
-                                // park this connection waiting for a body
-                                // that is never allowed to arrive.
                                 if n > self.body_limit {
                                     return Err(Error::overflow("request body too large"));
                                 }
@@ -449,9 +447,6 @@ impl IncrRequest {
             ChunkState::Crlf => {
                 let avail = self.buf.len() - self.pos;
                 if avail >= 2 {
-                    // Strict CRLF (mirrors the blocking decoder). A bare
-                    // LF or any other terminator is rejected — the two
-                    // paths must agree on where a chunk ends.
                     if &self.buf[self.pos..self.pos + 2] == b"\r\n" {
                         self.pos += 2;
                         ch.state = ChunkState::Size;
@@ -486,8 +481,6 @@ impl IncrRequest {
     /// Build the parsed request and reset per-request state (buffered
     /// pipelined bytes are kept for the next call).
     fn finish_request(&mut self) -> Result<Request<Body>> {
-        // The request line was parsed once when the header block ended;
-        // re-parsing here would duplicate that work on every request.
         let rl = self
             .parsed_req_line
             .take()
@@ -518,6 +511,14 @@ impl IncrRequest {
 /// An active event-loop HTTP/1.1 connection.
 struct EventConn {
     socket: Arc<TcpStream>,
+    /// Set once a `101` head has been queued: the next moment the head is
+    /// fully written, this connection becomes a WebSocket.
+    pending_upgrade: Option<(
+        crate::courierust_server::ws::WsPlan,
+        Arc<dyn crate::courierust_server::ws::WsService>,
+    )>,
+    /// Late-bound reactor wakeup, installed by the worker.
+    wake_slot: Arc<crate::courierust_server::ws::WakeSlot>,
     reader: IncrRequest,
     /// Full response bytes pending write.
     out: Vec<u8>,
@@ -553,7 +554,12 @@ struct EventConn {
 }
 
 impl EventConn {
-    fn new(socket: TcpStream, body_limit: usize, stats: Option<&Stats>) -> Self {
+    fn new(
+        socket: TcpStream,
+        body_limit: usize,
+        stats: Option<&Stats>,
+        wake_slot: Arc<crate::courierust_server::ws::WakeSlot>,
+    ) -> Self {
         let (reads, writes) = match stats {
             Some(s) => (
                 Some(s.h1_read_syscalls.clone()),
@@ -564,6 +570,8 @@ impl EventConn {
         let trace = h1_trace();
         Self {
             socket: Arc::new(socket),
+            pending_upgrade: None,
+            wake_slot,
             reader: IncrRequest::new(body_limit, trace),
             out: Vec::new(),
             out_pos: 0,
@@ -590,7 +598,22 @@ impl EventConn {
         let trace = self.trace;
         loop {
             if self.out_pos < self.out.len() {
-                return self.write_more();
+                let outcome = self.write_more()?;
+                if !matches!(outcome, StepOutcome::Idle) {
+                    return Ok(outcome);
+                }
+            }
+            if let Some((plan, service)) = self.pending_upgrade.take() {
+                let leftover = self.reader.buf[self.reader.pos..].to_vec();
+                let conn = crate::courierust_server::ws::WsEventConn::new(
+                    self.socket.clone(),
+                    &leftover,
+                    plan,
+                    service,
+                    &config.websocket,
+                    self.wake_slot.clone(),
+                );
+                return Ok(StepOutcome::Upgrade(Box::new(conn)));
             }
             let parse = seg_start(trace);
             match self
@@ -598,13 +621,6 @@ impl EventConn {
                 .next_request(&self.socket, self.reads.as_deref())?
             {
                 Some(req) => {
-                    // Stage split: `dispatch_us` is worker pickup → first
-                    // byte read; `parse_us` is first byte read → request
-                    // complete. For a request fully buffered in one read
-                    // they are two halves of the same `next_request` call;
-                    // for a partial request the first read lands inside it
-                    // and the parse accumulates across parks (the parked
-                    // interval is charged to `handoff_us`, never to parse).
                     if trace {
                         if let Some(first_read) = self.reader.first_read_at.take() {
                             let done = Instant::now();
@@ -628,6 +644,63 @@ impl EventConn {
                         seg_end(&mut self.parse_us, parse);
                     }
                     let request_close = courierust_h1::wants_close(&req.headers);
+
+                    // RFC 9112 §3.2: an HTTP/1.1 request must carry
+                    // exactly one non-empty `Host`. Refused before the
+                    // WebSocket decision and before the handler, so an
+                    // ambiguous request cannot be routed at all.
+                    if let Some(reason) =
+                        courierust_h1::host_header_error(req.version, &req.headers)
+                    {
+                        self.out.clear();
+                        let keep_alive = build_response(
+                            crate::courierust_server::h1::error_response(400, reason),
+                            config,
+                            request_close,
+                            &mut self.out,
+                        )?;
+                        self.out_pos = 0;
+                        self.keep_alive = keep_alive;
+                        let outcome = self.write_more()?;
+                        match outcome {
+                            StepOutcome::Idle => continue,
+                            other => return Ok(other),
+                        }
+                    }
+
+                    // ---- WebSocket upgrade ------------------------------
+                    match self.websocket_decision(handler, &req, config)? {
+                        WsDecision::Pass => {}
+                        WsDecision::Respond(resp) => {
+                            let handle = seg_start(trace);
+                            seg_end(&mut self.handler_us, handle);
+                            self.out.clear();
+                            let keep_alive =
+                                build_response(resp, config, request_close, &mut self.out)?;
+                            self.out_pos = 0;
+                            self.keep_alive = keep_alive;
+                            let outcome = self.write_more()?;
+                            match outcome {
+                                StepOutcome::Idle => continue,
+                                other => return Ok(other),
+                            }
+                        }
+                        WsDecision::Upgrade(plan, service) => {
+                            let head = plan.accept_headers()?;
+                            self.out.clear();
+                            courierust_h1::write_response_head(
+                                &mut self.out,
+                                crate::courierust_http::status::StatusCode::SWITCHING_PROTOCOLS,
+                                Version::HTTP_11,
+                                &head,
+                            )?;
+                            self.out_pos = 0;
+                            self.keep_alive = true;
+                            self.pending_upgrade = Some((plan, service));
+                            continue;
+                        }
+                    }
+
                     let handle = seg_start(trace);
                     let resp = handler.handle(req);
                     seg_end(&mut self.handler_us, handle);
@@ -645,10 +718,6 @@ impl EventConn {
                     }
                     match outcome {
                         StepOutcome::Idle => {
-                            // Response fully written. Loop to serve any
-                            // pipelined request already buffered; when
-                            // nothing is complete the next call to
-                            // `next_request` parks the connection.
                             continue;
                         }
                         other => return Ok(other),
@@ -657,10 +726,6 @@ impl EventConn {
                 None => {
                     seg_end(&mut self.parse_us, parse);
                     if trace {
-                        // A partial request parks: drop the first-read
-                        // marker so the resumed pickup measures its own
-                        // dispatch/parse split instead of inheriting the
-                        // parked interval (which belongs to `handoff_us`).
                         self.reader.first_read_at = None;
                     }
                     return Ok(StepOutcome::Idle);
@@ -695,6 +760,50 @@ impl EventConn {
     }
 }
 
+/// The outcome of inspecting a request for a WebSocket upgrade.
+enum WsDecision {
+    /// Handle it as ordinary HTTP.
+    Pass,
+    /// Answer with this response instead of `101`.
+    Respond(Response<Body>),
+    /// Switch the connection to the WebSocket reactor.
+    Upgrade(
+        crate::courierust_server::ws::WsPlan,
+        Arc<dyn crate::courierust_server::ws::WsService>,
+    ),
+}
+
+impl EventConn {
+    /// Ask the handler about an upgrade and validate it against policy.
+    fn websocket_decision(
+        &self,
+        handler: &dyn Handler,
+        req: &Request<Body>,
+        config: &ServerConfig,
+    ) -> Result<WsDecision> {
+        if !config.websocket.enabled || !crate::courierust_ws::is_websocket_upgrade(&req.headers) {
+            return Ok(WsDecision::Pass);
+        }
+        match handler.websocket(req) {
+            crate::courierust_server::ws::WsUpgradeReply::Pass => Ok(WsDecision::Pass),
+            crate::courierust_server::ws::WsUpgradeReply::Refuse(resp) => {
+                Ok(WsDecision::Respond(resp))
+            }
+            crate::courierust_server::ws::WsUpgradeReply::Accept(service) => {
+                let peer = self
+                    .socket
+                    .peer_addr()
+                    .map(|a| a.ip())
+                    .unwrap_or(core::net::IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED));
+                match crate::courierust_server::ws::plan(req, peer, false, &config.websocket) {
+                    Ok(plan) => Ok(WsDecision::Upgrade(plan, service)),
+                    Err(refusal) => Ok(WsDecision::Respond(refusal.response())),
+                }
+            }
+        }
+    }
+}
+
 /// Serialize a response (head + body, chunked for channel bodies) into
 /// `out` and decide keep-alive. The caller owns the buffer (`out` is the
 /// connection's write buffer), so steady-state responses perform no
@@ -707,9 +816,6 @@ fn build_response(
     request_close: bool,
     out: &mut Vec<u8>,
 ) -> Result<bool> {
-    // `keep_alive_requested` already applies the exact-token `Connection`
-    // semantics (a `closex` token does not close); no separate substring
-    // check here, or the two paths would disagree.
     let keep_alive = !request_close
         && courierust_h1::keep_alive_requested(resp.version, &resp.headers)
         && resp.version != Version::HTTP_10;
@@ -802,9 +908,9 @@ pub(crate) fn serve_event(
     let ready_rx = Arc::new(std::sync::Mutex::new(ready_rx));
     let registry: Arc<std::sync::Mutex<HashMap<usize, EventConn>>> =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
-    // Self-pipe: the accept thread and the workers write one byte here
-    // whenever they queue a control message, so the event loop's blocking
-    // poll returns immediately instead of waiting for the next poll tick.
+    let ws_registry: Arc<
+        std::sync::Mutex<HashMap<usize, crate::courierust_server::ws::WsEventConn>>,
+    > = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let (wake_reader, wake_writer) = wakeup_pair()?;
     let wake_writer = Arc::new(wake_writer);
 
@@ -838,6 +944,7 @@ pub(crate) fn serve_event(
     let mut worker_handles = Vec::new();
     for _ in 0..workers {
         let w_registry = registry.clone();
+        let w_ws_registry = ws_registry.clone();
         let w_handler = handler.clone();
         let w_config = config.clone();
         let w_ready_rx = ready_rx.clone();
@@ -850,6 +957,7 @@ pub(crate) fn serve_event(
                     event_worker(
                         w_ready_rx,
                         w_registry,
+                        w_ws_registry,
                         &*w_handler,
                         &w_config,
                         &w_msg_tx,
@@ -859,9 +967,6 @@ pub(crate) fn serve_event(
         );
     }
 
-    // Acceptor thread: accept and hand the raw socket to the event loop.
-    // It never reads, peeks, sleeps or classifies, so a slow client can
-    // never stall the accept path.
     let a_msg_tx = msg_tx.clone();
     let a_wake = wake_writer.clone();
     let a_stats = config.stats.clone();
@@ -886,9 +991,6 @@ pub(crate) fn wakeup_pair() -> std::io::Result<(TcpStream, TcpStream)> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let writer = TcpStream::connect(listener.local_addr()?)?;
     let (reader, _) = listener.accept()?;
-    // No Nagle: a wake is one byte and must reach the reader's receive
-    // buffer immediately — a delayed-ACK/Nagle pause here would hold a
-    // worker→reactor handoff open for a full poll timeout.
     reader.set_nonblocking(true)?;
     writer.set_nonblocking(true)?;
     let _ = reader.set_nodelay(true);
@@ -932,21 +1034,10 @@ fn handle_msg(
             stream,
             accepted_at,
         } => {
-            // Connection cap: beyond it, the new socket is closed
-            // immediately (its fd is never registered, so the idle
-            // timeout does not even have to reap it). The accept thread
-            // has already accepted, so this is an accept-then-close —
-            // the standard way to bound resources at the accept queue.
             if max_connections > 0 && activity.len() >= max_connections {
                 drop(stream);
                 return;
             }
-            // The accept thread hands us a blocking socket; the event
-            // loop requires non-blocking mode. `set_nodelay` disables
-            // Nagle so a small response write is not held back by an
-            // un-ACKed segment — without it, keep-alive requests on
-            // loopback stall tens of milliseconds per request (the
-            // exact issue the benchmark had to fix on the hyper side).
             if stream.set_nonblocking(true).is_err() {
                 return;
             }
@@ -958,9 +1049,6 @@ fn handle_msg(
             pending.insert(id, stream);
             activity.insert(id, Instant::now());
             poller.register(id, fd, false);
-            // Trace-only: accept → registered with the poller (the
-            // connection-setup stage). Emitted as its own event line so
-            // the per-request `H1SEG` rows stay warm-path measurements.
             if let Some(accepted_at) = accepted_at {
                 eprintln!(
                     "H1SEG|id={id}|event=newconn|accept_us={}",
@@ -1004,10 +1092,6 @@ fn event_loop(
     let idle_timeout = config.idle_timeout;
 
     loop {
-        // 1. Drain control messages (new connections / re-registrations /
-        //    closures). The depth of this drain is the control-queue
-        //    depth: how many control messages arrived while the loop was
-        //    busy (a herd of accepts/registers at once).
         let mut drained = 0usize;
         loop {
             match msg_rx.try_recv() {
@@ -1032,11 +1116,6 @@ fn event_loop(
             }
         }
 
-        // 2. With nothing registered, block for a message instead of
-        //    busy-spinning the poller (which would otherwise return an
-        //    empty ready set immediately). The received message must be
-        //    handled here — it has already been consumed from the
-        //    channel and would otherwise be lost.
         if poller.is_empty() {
             match msg_rx.recv() {
                 Ok(msg) => handle_msg(
@@ -1052,18 +1131,7 @@ fn event_loop(
             continue;
         }
 
-        // 3. Poll. `wait` also watches the self-pipe, so a queued control
-        //    message interrupts the timeout immediately; socket
-        //    readiness (a client sending data) interrupts it the moment
-        //    it happens. The timeout therefore only bounds the wait when
-        //    nothing at all is happening — it never sits in the request
-        //    latency path.
         let now = Instant::now();
-        // Earliest remaining idle deadline across connections; `None`
-        // when idle reaping is disabled. Reused by the poll wait (so an
-        // expiring connection is reaped promptly) and by the reap scan
-        // (skipped when no connection can have crossed the deadline
-        // inside this iteration).
         let next_idle = idle_timeout.map(|t| {
             activity
                 .values()
@@ -1086,9 +1154,6 @@ fn event_loop(
             s.event_poll_syscalls.fetch_add(1, Ordering::Relaxed);
         }
 
-        // 4. A wake byte means a control message is queued. Drain the
-        //    pipe (so it cannot fire spuriously) and the channel (so the
-        //    message is applied before the next poll).
         if ready.contains(&WAKE_ID) {
             if let Some(s) = stats {
                 s.event_wakeups.fetch_add(1, Ordering::Relaxed);
@@ -1119,8 +1184,6 @@ fn event_loop(
             }
         }
 
-        // 5. Classify and dispatch the ready connections. Ready ids are
-        //    collected and sent to the workers in batches.
         let mut to_dispatch: Vec<usize> = Vec::new();
         for id in ready {
             if id == WAKE_ID {
@@ -1133,14 +1196,12 @@ fn event_loop(
                 let n = match stream.peek(&mut prefix) {
                     Ok(n) => n,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // Spurious wake: park again.
                         let fd = fd_of(&stream);
                         pending.insert(id, stream);
                         poller.register(id, fd, false);
                         continue;
                     }
                     Err(_) => {
-                        // Peer error: the connection leaves the reactor.
                         activity.remove(&id);
                         if let Some(s) = stats {
                             Stats::decrement(&s.connections_active, 1);
@@ -1149,7 +1210,6 @@ fn event_loop(
                     }
                 };
                 if n == 0 {
-                    // Peer closed before sending anything.
                     activity.remove(&id);
                     if let Some(s) = stats {
                         Stats::decrement(&s.connections_active, 1);
@@ -1188,7 +1248,12 @@ fn event_loop(
                         }
                     }
                     Class::H1 => {
-                        let conn = EventConn::new(stream, config.max_body, stats);
+                        let conn = EventConn::new(
+                            stream,
+                            config.max_body,
+                            stats,
+                            crate::courierust_server::ws::WakeSlot::new(),
+                        );
                         if let Some(s) = stats {
                             s.h1_connections.fetch_add(1, Ordering::Relaxed);
                         }
@@ -1208,8 +1273,6 @@ fn event_loop(
                     }
                 }
             } else {
-                // An HTTP/1.1 connection (or a stale id — the worker
-                // drops it defensively).
                 to_dispatch.push(id);
             }
         }
@@ -1219,12 +1282,6 @@ fn event_loop(
             }
         }
 
-        // 6. Reap connections that have made no progress for the idle
-        //    timeout (slow-loris / idle keep-alive bound). The registry
-        //    is locked once per scan, not once per candidate. The scan
-        //    runs only when a deadline falls inside the poll window —
-        //    otherwise nothing can have expired, and the per-iteration
-        //    registry lock + key copy is pure overhead on every request.
         if let Some(t) = idle_timeout {
             let near_idle = next_idle
                 .map(|next| next <= Duration::from_millis(poll_timeout as u64))
@@ -1289,6 +1346,7 @@ fn emit_trace(conn: &mut EventConn, id: usize, handoff_us: u64, fresh_wait_us: u
 fn event_worker(
     ready_rx: Arc<std::sync::Mutex<Receiver<Vec<usize>>>>,
     registry: Arc<std::sync::Mutex<HashMap<usize, EventConn>>>,
+    ws_registry: Arc<std::sync::Mutex<HashMap<usize, crate::courierust_server::ws::WsEventConn>>>,
     handler: &dyn Handler,
     config: &ServerConfig,
     msg_tx: &Sender<EventMsg>,
@@ -1300,18 +1358,37 @@ fn event_worker(
             Err(_) => return,
         };
         for id in ids {
+            // ---- WebSocket connections stay in the reactor ----------
+            let ws_conn = ws_registry.lock().unwrap().remove(&id);
+            if let Some(mut ws_conn) = ws_conn {
+                let step =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ws_conn.step()));
+                let outcome = match step {
+                    Ok(o) => o,
+                    Err(_) => crate::courierust_server::ws::WsStep::Close,
+                };
+                match outcome {
+                    crate::courierust_server::ws::WsStep::Idle
+                    | crate::courierust_server::ws::WsStep::NeedWrite => {
+                        let fd = fd_of(ws_conn.socket());
+                        let want_write =
+                            matches!(outcome, crate::courierust_server::ws::WsStep::NeedWrite);
+                        ws_registry.lock().unwrap().insert(id, ws_conn);
+                        let _ = msg_tx.send(EventMsg::Register { id, fd, want_write });
+                        wake_nudge(wake_writer);
+                    }
+                    crate::courierust_server::ws::WsStep::Close => {
+                        let _ = msg_tx.send(EventMsg::Closed { id });
+                        wake_nudge(wake_writer);
+                    }
+                }
+                continue;
+            }
             let mut conn = match registry.lock().unwrap().remove(&id) {
                 Some(c) => c,
                 None => continue,
             };
-            // Handoff measurement (trace-only): how long the connection
-            // sat away from a worker. For a keep-alive connection this is
-            // the release → next pickup round trip (the sum of
-            // last_write_to_reregistered and
-            // poll_ready_to_worker_dispatch); for a fresh connection it
-            // is the registered → first pickup wait. Kept behind
-            // `conn.trace` so the steady-state path pays no
-            // `Instant::now()` at all.
+
             let (handoff_us, fresh_wait_us) = if conn.trace {
                 let pickup_at = Instant::now();
                 let handoff = conn
@@ -1349,11 +1426,43 @@ fn event_worker(
                     wake_nudge(wake_writer);
                 }
                 StepOutcome::Close => {
-                    // Report the final request batch before the
-                    // connection leaves the reactor.
                     emit_trace(&mut conn, id, 0, 0);
                     let _ = msg_tx.send(EventMsg::Closed { id });
                     wake_nudge(wake_writer);
+                }
+                StepOutcome::Upgrade(upgraded) => {
+                    let mut ws_conn = *upgraded;
+                    let fd = fd_of(ws_conn.socket());
+                    let tx = msg_tx.clone();
+                    let wake = wake_writer.clone();
+                    ws_conn.set_wake(Arc::new(move || {
+                        let _ = tx.send(EventMsg::Register {
+                            id,
+                            fd,
+                            want_write: true,
+                        });
+                        wake_nudge(&wake);
+                    }));
+                    let step =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ws_conn.step()));
+                    let outcome = match step {
+                        Ok(o) => o,
+                        Err(_) => crate::courierust_server::ws::WsStep::Close,
+                    };
+                    match outcome {
+                        crate::courierust_server::ws::WsStep::Idle
+                        | crate::courierust_server::ws::WsStep::NeedWrite => {
+                            let want_write =
+                                matches!(outcome, crate::courierust_server::ws::WsStep::NeedWrite);
+                            ws_registry.lock().unwrap().insert(id, ws_conn);
+                            let _ = msg_tx.send(EventMsg::Register { id, fd, want_write });
+                            wake_nudge(wake_writer);
+                        }
+                        crate::courierust_server::ws::WsStep::Close => {
+                            let _ = msg_tx.send(EventMsg::Closed { id });
+                            wake_nudge(wake_writer);
+                        }
+                    }
                 }
             }
         }

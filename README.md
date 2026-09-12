@@ -279,6 +279,7 @@ Things this crate deliberately does not do:
 - **Streaming request bodies are only reliable over HTTP/2** (h2 frames naturally). Over HTTP/1.1, either send the whole body at once (`Body::Bytes`) or build chunked framing yourself.
 - **gRPC does not include protobuf, `.proto` code generation, or `grpc.reflection`.** You implement the codec traits or wire in your own protobuf-generated code; reflection needs a protobuf schema inventory, which is external by design.
 - **A synchronous handler that blocks for a long time holds a worker** (event-driven or not) — exactly as with any synchronous server; use channel response bodies for streaming. Worker occupancy is **per-connection, not per-stream**: on one HTTP/2 connection, any number of idle streams (SSE / long-poll / gRPC server-streaming) occupy the same single worker, and a slow stream never blocks its connection's other streams — both are covered by integration tests. A large herd of _connections_ is handled by the event scheduler (idle reaping + `max_connections`) rather than by adding workers.
+- **WebSocket: RFC 6455 and RFC 7692 only.** RFC 8441 (WebSocket over HTTP/2) is not implemented — a client offered `h2` by ALPN fails with a clear error instead of opening a connection that never carries a frame. In the event-driven driver a service callback runs on a reactor worker, so a bulk push loop from inside `on_message` blocks the reactor and eventually trips the bounded send queue; the supported fan-out path is `WsConn::sender()` from another thread. 256 KiB messages between two ends of this crate are slower than tungstenite's pairing (see [`benches/WS_BENCHMARK.md`](benches/WS_BENCHMARK.md), which reports the localised cause and the socket-deadline finding behind it) — small and medium messages are at parity or ahead.
 - **HTTPS is first-class**: the client and server ship a from-scratch TLS 1.2 + TLS 1.3 implementation; `https://` needs a root store (supply your own — there is no bundled CA set). ALPN is enforced: a client configured for h2 speaking to a server that negotiates `http/1.1` — or that negotiates **no** ALPN at all — fails with a clear error instead of a silent protocol mismatch (RFC 9113 §3.3 requires ALPN `h2` over TLS).
 - Redirects, keep-alive reuse, and friends prioritize correctness over aggressive tuning.
 
@@ -296,7 +297,9 @@ src/
 ├── courierust_quic/        # QUIC v1 packet/frame codecs, varint, connection ids, crypto tags [no_std]
 ├── courierust_h3/          # HTTP/3: QPACK static/dynamic tables + H3 framing/stream roles   [no_std]
 ├── courierust_fingerprint/ # JA3 / JA4 / Chrome HTTP/2 fingerprints                        [no_std]
-├── courierust_crypto/      # self-contained MD5 / SHA-256 (used by fingerprints)            [no_std]
+├── courierust_crypto/      # self-contained MD5 / SHA-256 / SHA-1 / base64 (fingerprints, RFC 6455)  [no_std]
+├── courierust_deflate/     # DEFLATE/gzip with a reusable per-message context (RFC 7692)     [no_std]
+├── courierust_ws/          # RFC 6455 framing + masking + handshake + permessage-deflate      [no_std]
 ├── courierust_bytes/       # byte buffers (BytesMut)                                        [no_std]
 ├── courierust_io/          # Read/Write traits (no_std flavor)                              [no_std]
 ├── courierust_error/       # unified error type
@@ -317,6 +320,7 @@ The `benches/` package is a self-contained suite (no `criterion` required) that 
 - HTTP/1.1 keep-alive, sequential and multi-worker parallel;
 - HTTP/2 multiplexing across many workers;
 - HTTPS (TLS 1.2/1.3 + h2) end to end through the crate's own TLS stack;
+- WebSocket (`--bench ws`): codec (encode/mask/decode/UTF-8), echo round trips and one-way push, against `tungstenite 0.30` and `tokio-tungstenite 0.30` in the same process — code, methodology and the honest rows are in [`benches/WS_BENCHMARK.md`](benches/WS_BENCHMARK.md);
 - RFC 9218 priority scheduling;
 - a concurrency model comparison (idle-connection herd vs. worker pool) and a slow-sender herd benchmark.
 

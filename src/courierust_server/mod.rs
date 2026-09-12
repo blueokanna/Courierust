@@ -12,6 +12,7 @@
 
 pub mod h1;
 pub mod h2;
+pub mod ws;
 
 pub(crate) mod event;
 
@@ -147,6 +148,9 @@ pub struct ServerConfig {
     /// stream / reactor / syscall evidence for benchmarks). `None`
     /// (default) disables the accounting entirely.
     pub stats: Option<Arc<crate::courierust_net::stats::Stats>>,
+    /// WebSocket policy: origin checks, subprotocols, limits,
+    /// `permessage-deflate` and keepalive.
+    pub websocket: ws::WsConfig,
 }
 
 impl Default for ServerConfig {
@@ -172,6 +176,7 @@ impl Default for ServerConfig {
             h2_max_concurrent_streams: 1024,
             auto_release_credit: true,
             stats: None,
+            websocket: ws::WsConfig::default(),
         }
     }
 }
@@ -180,6 +185,21 @@ impl Default for ServerConfig {
 pub trait Handler: Send + Sync + 'static {
     /// Handle one request and produce a response.
     fn handle(&self, req: Request<Body>) -> Response<Body>;
+
+    /// Decide whether to accept a WebSocket upgrade.
+    ///
+    /// Called *before* [`Handler::handle`] for requests that carry a
+    /// syntactically valid RFC 6455 upgrade, so the handler can inspect
+    /// the request (path, headers, query) and either accept it, refuse it
+    /// with an HTTP response, or pass it through to normal HTTP handling.
+    ///
+    /// The server performs the wire work — `Sec-WebSocket-Accept`, the
+    /// subprotocol echo, extension negotiation, origin policy, limits —
+    /// from [`ServerConfig::websocket`]; a handler never has to build a
+    /// `101` by hand.
+    fn websocket(&self, _req: &Request<Body>) -> ws::WsUpgradeReply {
+        ws::WsUpgradeReply::Pass
+    }
 }
 
 impl<F> Handler for F
@@ -470,6 +490,7 @@ pub(crate) fn serve_connection(
     handler: &dyn Handler,
     config: &ServerConfig,
 ) -> crate::Result<()> {
+    let stream = Arc::new(stream);
     if let Some(alpn) = stream.alpn() {
         if config.http2 && alpn == b"h2" {
             return h2::serve(&stream, handler, config);

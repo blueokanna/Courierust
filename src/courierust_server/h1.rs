@@ -6,20 +6,23 @@ use crate::courierust_error::{Error, Result};
 use crate::courierust_h1;
 use crate::courierust_http::header::{HeaderMap, HeaderName, HeaderValue};
 use crate::courierust_http::request::Request;
+use crate::courierust_http::response::Response;
+use crate::courierust_http::status::StatusCode;
 use crate::courierust_http::version::Version;
 use crate::courierust_io::{BufReader, BufWriter, Scratch};
 use crate::courierust_net::ConnStream;
-use crate::courierust_server::{Handler, ServerConfig};
+use crate::courierust_server::{ws, Handler, ServerConfig};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::Arc;
 
 /// Serve HTTP/1.1 requests on `stream` until the connection closes.
 pub(crate) fn serve(
-    stream: &ConnStream,
+    stream: &Arc<ConnStream>,
     handler: &dyn Handler,
     config: &ServerConfig,
 ) -> Result<()> {
-    let mut reader = BufReader::new(stream, 16 * 1024);
-    let mut writer = BufWriter::new(stream, 16 * 1024);
+    let mut reader = BufReader::new(stream.clone(), 16 * 1024);
+    let mut writer = BufWriter::new(stream.clone(), 16 * 1024);
     let mut scratch = Scratch::new();
     loop {
         // Request line.
@@ -32,25 +35,51 @@ pub(crate) fn serve(
             Err(e) => return Err(e),
             Ok(()) => {}
         }
-        let rl = courierust_h1::parse_request_line(line)?;
-        let headers = courierust_h1::read_headers_scratch(&mut reader, &mut scratch)?;
-        let upgrade = is_h2c_upgrade(&headers);
-        let body = match courierust_h1::body_length(&headers, Some(&rl.method), None)? {
-            courierust_h1::BodyLen::None => Body::Empty,
-            courierust_h1::BodyLen::Length(n) => {
-                Body::Bytes(courierust_h1::read_body_fixed_scratch(
-                    &mut reader,
-                    n,
-                    config.max_body,
-                    &mut scratch,
-                )?)
+        let rl = match courierust_h1::parse_request_line(line) {
+            Ok(rl) => rl,
+            Err(e) => {
+                // A malformed request line gets an answer, not a silent
+                // disconnect: a client (or a proxy in front) that sends a
+                // bad request should learn that, and a silent close is
+                // indistinguishable from a network failure.
+                write_early_error(&mut writer, 400, "bad request")?;
+                let _ = writer.flush();
+                return Err(e);
             }
-            courierust_h1::BodyLen::Chunked => {
-                Body::Bytes(courierust_h1::read_body_chunked_scratch(
-                    &mut reader,
-                    config.max_body,
-                    &mut scratch,
-                )?)
+        };
+        let headers = courierust_h1::read_headers_scratch(&mut reader, &mut scratch)?;
+
+        // RFC 9112 §3.2: an HTTP/1.1 request must carry exactly one,
+        // non-empty `Host` field. Checking it *before* the body is read
+        // means an ambiguous request cannot reach a handler or pin a body
+        // buffer, and a proxy in front never has to guess which authority
+        // the request meant.
+        let mut early = match courierust_h1::host_header_error(rl.version, &headers) {
+            Some(reason) => Some(error_response(400, reason)),
+            None => None,
+        };
+
+        let upgrade = early.is_none() && is_h2c_upgrade(&headers);
+        let body = if early.is_some() {
+            Body::Empty
+        } else {
+            match courierust_h1::body_length(&headers, Some(&rl.method), None)? {
+                courierust_h1::BodyLen::None => Body::Empty,
+                courierust_h1::BodyLen::Length(n) => {
+                    Body::Bytes(courierust_h1::read_body_fixed_scratch(
+                        &mut reader,
+                        n,
+                        config.max_body,
+                        &mut scratch,
+                    )?)
+                }
+                courierust_h1::BodyLen::Chunked => {
+                    Body::Bytes(courierust_h1::read_body_chunked_scratch(
+                        &mut reader,
+                        config.max_body,
+                        &mut scratch,
+                    )?)
+                }
             }
         };
         // RFC 7230 §6.3: a request carrying `Connection: close` forces the
@@ -64,7 +93,62 @@ pub(crate) fn serve(
             headers,
             body,
         };
-        let resp = handler.handle(req);
+
+        // ---- WebSocket upgrade -------------------------------------
+        // Decided *before* the normal handler runs, so the policy checks
+        // (origin, subprotocol, extensions, version) can inspect the very
+        // request the client sent. When the upgrade is accepted this call
+        // never returns: the connection becomes a framed byte stream.
+        if early.is_none()
+            && config.websocket.enabled
+            && crate::courierust_ws::is_websocket_upgrade(&req.headers)
+        {
+            match handler.websocket(&req) {
+                ws::WsUpgradeReply::Pass => {}
+                ws::WsUpgradeReply::Refuse(resp) => early = Some(resp),
+                ws::WsUpgradeReply::Accept(service) => {
+                    let peer = stream.peer_addr().ip();
+                    let tls_active = config.tls.is_some();
+                    match ws::plan(&req, peer, tls_active, &config.websocket) {
+                        Ok(plan) => {
+                            let mut head = HeaderMap::with_capacity(6);
+                            for (n, v) in plan.accept_headers()?.iter() {
+                                head.append(n.clone(), v.clone());
+                            }
+                            let bytes = scratch.body();
+                            courierust_h1::write_response_head(
+                                bytes,
+                                StatusCode::SWITCHING_PROTOCOLS,
+                                Version::HTTP_11,
+                                &head,
+                            )?;
+                            writer.write_all(bytes)?;
+                            writer.flush()?;
+                            // The reader still holds any bytes the client
+                            // pipelined behind the handshake — hand it to
+                            // the session so none are lost. Frame traffic
+                            // is read in much larger chunks than a request
+                            // head, so the buffer grows first.
+                            let mut reader = reader;
+                            reader.ensure_capacity(config.websocket.read_buffer);
+                            return ws::serve_blocking(
+                                stream.clone(),
+                                reader,
+                                plan,
+                                service,
+                                &config.websocket,
+                            );
+                        }
+                        Err(refusal) => early = Some(refusal.response()),
+                    }
+                }
+            }
+        }
+
+        let resp = match early {
+            Some(resp) => resp,
+            None => handler.handle(req),
+        };
 
         // RFC 7540 §3.2: an `h2c` Upgrade request switches this connection
         // to HTTP/2 (when the server is configured to speak h2). The
@@ -78,7 +162,12 @@ pub(crate) fn serve(
             writer.flush()?;
             drop(writer);
             drop(reader);
-            return crate::courierust_server::h2::serve_upgraded(stream, handler, config, resp);
+            return crate::courierust_server::h2::serve_upgraded(
+                stream.as_ref(),
+                handler,
+                config,
+                resp,
+            );
         }
 
         // `keep_alive_requested` applies exact-token `Connection`
@@ -150,6 +239,65 @@ pub(crate) fn serve(
     Ok(())
 }
 
+/// RFC 9112 §3.2: an HTTP/1.1 request carries exactly one `Host` field,
+/// and it is not empty. HTTP/1.0 (and older) may omit it.
+/// A small, fully-framed error response (`Connection: close`), used for
+/// requests refused before a handler sees them (the `Host` rule, a
+/// malformed request line).
+pub(crate) fn error_response(status: u16, message: &str) -> Response<Body> {
+    let mut resp: Response<Body> = Response::with_status(StatusCode::from_u16(status));
+    resp.headers.insert(
+        HeaderName::from_lowercase("content-type"),
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    resp.headers.insert(
+        HeaderName::from_lowercase("connection"),
+        HeaderValue::from_static("close"),
+    );
+    resp.body = Body::Bytes(Bytes::from(alloc::format!("{message}\n")));
+    resp
+}
+
+/// Write an error response for a request that failed to parse, where the
+/// normal response path (which needs a parsed `Request`) cannot be used.
+///
+/// Fully framed (`Content-Length` + `Connection: close`) so the peer
+/// knows exactly where the message ends even though this is the last
+/// thing it will get.
+fn write_early_error(
+    writer: &mut BufWriter<Arc<ConnStream>>,
+    status: u16,
+    message: &str,
+) -> Result<()> {
+    let body = alloc::format!("{message}\n");
+    let mut headers = HeaderMap::with_capacity(3);
+    headers.insert(
+        HeaderName::from_lowercase("content-type"),
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    headers.insert(
+        HeaderName::from_lowercase("content-length"),
+        HeaderValue::from_bytes(courierust_h1::IToA::new(body.len()).as_slice())?,
+    );
+    headers.insert(
+        HeaderName::from_lowercase("connection"),
+        HeaderValue::from_static("close"),
+    );
+    let mut scratch = Scratch::new();
+    // `Scratch::body()` clears the buffer on every call, so the slice must
+    // be taken once and used for both the write and the send.
+    let head = scratch.body();
+    courierust_h1::write_response_head(
+        head,
+        StatusCode::from_u16(status),
+        Version::HTTP_11,
+        &headers,
+    )?;
+    writer.write_all(head)?;
+    writer.write_all(body.as_bytes())?;
+    Ok(())
+}
+
 /// Whether the request is an RFC 7540 §3.2 `h2c` Upgrade: `Upgrade: h2c`
 /// plus a `Connection` token of `upgrade` and an `HTTP2-Settings` header.
 fn is_h2c_upgrade(headers: &HeaderMap) -> bool {
@@ -175,7 +323,7 @@ fn is_h2c_upgrade(headers: &HeaderMap) -> bool {
 
 /// Stream a channel body as chunked encoding.
 fn stream_response(
-    writer: &mut BufWriter<&ConnStream>,
+    writer: &mut BufWriter<Arc<ConnStream>>,
     rx: Receiver<Result<Bytes>>,
     timeout: Option<std::time::Duration>,
 ) -> Result<()> {
