@@ -4,10 +4,13 @@ The HTTP server, and the home of the event-driven scheduler. By default, idle / 
 
 ## The architecture
 
-```
-accept thread ──> event loop (poller + classify) ──> event workers (batches)
-                      │                                   │
-                      └── TLS / h2 ──> blocking pool       └── h1
+```mermaid
+flowchart LR
+    A[accept Threads] --> B[Event loop<br/>poller + Classification]
+    B --> C[event worker<br/>By batch]
+
+    B -->|TLS / h2| D[Blocking pool]
+    C -->|h1| E[h1]
 ```
 
 - **Accept thread** only accepts — it never reads, peeks, sleeps, or classifies, so a slow client can never stall the accept path.

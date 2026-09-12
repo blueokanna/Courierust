@@ -4,10 +4,13 @@ HTTP 服务器，也是事件驱动调度器的家。默认情况下，空闲 / 
 
 ## 架构
 
-```
-accept 线程 ──> 事件循环（poller + 分类）──> event worker（按批）
-                      │                                   │
-                      └── TLS / h2 ──> 阻塞池              └── h1
+```mermaid
+flowchart LR
+    A[accept 线程] --> B[事件循环<br/>poller + 分类]
+    B --> C[event worker<br/>按批]
+
+    B -->|TLS / h2| D[阻塞池]
+    C -->|h1| E[h1]
 ```
 
 - **Accept 线程**只 accept——从不读、从不 peek、从不睡、从不分类，慢客户端永远卡不住 accept 路径。
