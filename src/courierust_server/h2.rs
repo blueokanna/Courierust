@@ -4,7 +4,7 @@
 //! responses stream back with flow-control-aware backpressure: channel
 //! bodies are only drained when the connection accepts more data.
 
-use crate::courierust_body::Body;
+use crate::courierust_body::{Body, ChannelStream};
 use crate::courierust_bytes::Bytes;
 use crate::courierust_error::{Error, Result};
 use crate::courierust_h2::connection::{Config as H2Config, Connection, Event};
@@ -19,12 +19,12 @@ use crate::courierust_net::ConnStream;
 use crate::courierust_server::{Handler, ServerConfig};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::TryRecvError;
 use std::sync::Arc;
 
 /// A response body waiting for flow-control room.
 struct Deferred {
-    rx: Receiver<Result<Bytes>>,
+    rx: ChannelStream,
     ending: bool,
     /// Trailing header block to send once the body ends (HTTP/2).
     trailers: Option<Vec<HeaderField>>,
@@ -407,13 +407,14 @@ fn send_response(
     enum K {
         Empty,
         Bytes(Bytes),
-        Channel(Receiver<Result<Bytes>>),
+        Channel(ChannelStream),
     }
     let kind = match resp.body {
         Body::Empty => K::Empty,
         Body::Bytes(b) if b.is_empty() => K::Empty,
         Body::Bytes(b) => K::Bytes(b),
-        Body::Channel(rx) => K::Channel(rx),
+        Body::Channel(rx) => K::Channel(ChannelStream::raw(rx)),
+        Body::Stream(stream) => K::Channel(stream),
     };
     let has_trailers = trailers.is_some();
     match kind {

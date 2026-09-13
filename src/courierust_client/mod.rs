@@ -340,7 +340,7 @@ impl Client {
         let replay_body = match &req.body {
             Body::Empty => Some(Body::Empty),
             Body::Bytes(b) => Some(Body::Bytes(b.clone())),
-            Body::Channel(_) => None,
+            Body::Channel(_) | Body::Stream(_) => None,
         };
         let resp = self.execute_inner(url, req, Priority::default())?;
         if depth >= self.inner.config.max_redirects {
@@ -493,19 +493,37 @@ impl Client {
         // reuse each other's connections — reusing the plaintext one for
         // an https URL would silently downgrade the request.
         let key = format!("{}://{authority}", url.scheme);
-        let conn = {
-            let mut pool = self.inner.h1_pool.lock().unwrap();
-            let entry = pool.entry(key.clone()).or_default();
-            entry
-                .iter()
-                .position(|(a, _)| *a == addr)
-                .map(|i| entry.remove(i).1)
-        };
         let hostname = url.host.clone();
-        let mut owned = match conn {
-            Some(c) => c,
-            None => H1Connection::connect(addr, tls.as_ref(), &hostname, &self.inner.config)?,
+
+        // A pooled keep-alive connection can die while it sits idle (the
+        // server's own idle timeout, a proxy, a restart). Probing before
+        // writing anything is what makes that free: a spent connection is
+        // dropped here, so no request — not even a non-idempotent one —
+        // is put on the wire to discover it.
+        let mut reused = false;
+        let mut owned = loop {
+            let pooled = {
+                let mut pool = self.inner.h1_pool.lock().unwrap();
+                let entry = pool.entry(key.clone()).or_default();
+                entry
+                    .iter()
+                    .position(|(a, _)| *a == addr)
+                    .map(|i| entry.remove(i).1)
+            };
+            match pooled {
+                Some(conn) if conn.is_alive() => {
+                    reused = true;
+                    break conn;
+                }
+                // Spent: dropped, and the next pooled connection (if any)
+                // is tried before opening a new one.
+                Some(_) => continue,
+                None => {
+                    break H1Connection::connect(addr, tls.as_ref(), &hostname, &self.inner.config)?
+                }
+            }
         };
+
         let result = owned.send(&req, &self.inner.config, authority);
         match result {
             Ok(resp) => {
@@ -518,7 +536,29 @@ impl Client {
                 }
                 Ok(resp)
             }
-            Err(e) => Err(e),
+            Err(error) => {
+                // A reused connection that failed before the peer answered
+                // a single byte was almost certainly already gone when the
+                // request was written: retry it once on a fresh
+                // connection. Only methods that are safe to replay
+                // (RFC 9110 §9.2.2) qualify — a POST may well have been
+                // executed, so its error is returned instead of risking a
+                // second execution.
+                if reused && req.method.is_idempotent() && owned.is_stale_failure(&error) {
+                    let mut retry =
+                        H1Connection::connect(addr, tls.as_ref(), &hostname, &self.inner.config)?;
+                    let resp = retry.send(&req, &self.inner.config, authority)?;
+                    if retry.is_reusable() {
+                        let mut pool = self.inner.h1_pool.lock().unwrap();
+                        let entry = pool.entry(key).or_default();
+                        if entry.len() < self.inner.config.max_connections_per_host {
+                            entry.push((addr, retry));
+                        }
+                    }
+                    return Ok(resp);
+                }
+                Err(error)
+            }
         }
     }
 
@@ -1123,20 +1163,26 @@ fn build_h2_cmd(
             priority,
             reply: tx,
         },
-        other => {
-            let (body, end_stream) = match other {
-                Body::Empty => (None, true),
-                Body::Bytes(b) => (Some(b), true),
-                Body::Channel(_) => unreachable!(),
-            };
-            H2Cmd::Request {
-                fields,
-                body,
-                end_stream,
-                priority,
-                reply: tx,
-            }
-        }
+        Body::Stream(stream) => H2Cmd::RequestStream {
+            fields,
+            body: stream.into_receiver(),
+            priority,
+            reply: tx,
+        },
+        Body::Empty => H2Cmd::Request {
+            fields,
+            body: None,
+            end_stream: true,
+            priority,
+            reply: tx,
+        },
+        Body::Bytes(b) => H2Cmd::Request {
+            fields,
+            body: Some(b),
+            end_stream: true,
+            priority,
+            reply: tx,
+        },
     }
 }
 

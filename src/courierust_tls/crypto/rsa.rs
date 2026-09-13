@@ -1,9 +1,11 @@
-//! RSA signature verification (RFC 8017): PKCS#1 v1.5 and PSS.
+//! RSA signatures (RFC 8017): PKCS#1 v1.5 and PSS, plus the private-key
+//! signing path the TLS server uses for `CertificateVerify`.
 //!
 //! Includes a compact arbitrary-precision integer (`BigInt`) with
-//! Montgomery-modular exponentiation. Only the public-key verification
-//! path is implemented (the server never signs here); `e = 65537` is
-//! assumed in the fast path with a generic fallback.
+//! Montgomery-modular exponentiation. The private-key exponentiation is
+//! fixed time and blinded with a fresh random factor per signature
+//! (`mod_pow_blinded`); the public-key checks keep the generic path with
+//! `e = 65537` common-case handling.
 
 use super::hash::{BoxDigest, Digest, Sha256, Sha384};
 use alloc::vec::Vec;
@@ -45,10 +47,6 @@ impl BigInt {
 
     /// From big-endian bytes.
     pub(crate) fn from_be_bytes(bytes: &[u8]) -> Self {
-        // Chunk from the end so limb boundaries align with the byte
-        // stream: the least significant 8 bytes form limb 0, the next
-        // 8 form limb 1, etc. The most significant chunk may be short
-        // and is left-padded within its limb.
         let mut limbs = Vec::with_capacity(bytes.len().div_ceil(8));
         let mut i = bytes.len();
         while i > 0 {
@@ -74,16 +72,6 @@ impl BigInt {
             limbs: limbs.to_vec(),
         };
         out.trim();
-        out
-    }
-
-    /// The value as exactly 32 little-endian bytes.
-    pub(crate) fn to_le_32(&self) -> [u8; 32] {
-        let mut out = [0u8; 32];
-        let be = self.to_be_bytes_padded(32);
-        for i in 0..32 {
-            out[i] = be[31 - i];
-        }
         out
     }
 
@@ -115,20 +103,29 @@ impl BigInt {
         }
     }
 
-    /// Compare with `other`.
-    pub(crate) fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        let a = self.clone();
-        let b = other.clone();
-        let mut a = a;
-        let mut b = b;
-        a.trim();
-        b.trim();
-        if a.limbs.len() != b.limbs.len() {
-            return a.limbs.len().cmp(&b.limbs.len());
+    /// The number of significant limbs: leading zero limbs are ignored.
+    ///
+    /// [`BigInt::select`] deliberately leaves zero limbs in place (trimming
+    /// would branch on the value it is trying to keep secret), so every
+    /// comparison has to look past them.
+    fn significant_len(&self) -> usize {
+        let mut i = self.limbs.len();
+        while i > 0 && self.limbs[i - 1] == 0 {
+            i -= 1;
         }
-        for i in (0..a.limbs.len()).rev() {
-            if a.limbs[i] != b.limbs[i] {
-                return a.limbs[i].cmp(&b.limbs[i]);
+        i
+    }
+
+    /// Compare with `other` by *value*.
+    pub(crate) fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        let a = self.significant_len();
+        let b = other.significant_len();
+        if a != b {
+            return a.cmp(&b);
+        }
+        for i in (0..a).rev() {
+            if self.limbs[i] != other.limbs[i] {
+                return self.limbs[i].cmp(&other.limbs[i]);
             }
         }
         core::cmp::Ordering::Equal
@@ -178,9 +175,6 @@ impl BigInt {
         }
         let mut out = vec![0u64; self.limbs.len() + other.limbs.len()];
         for (i, &a) in self.limbs.iter().enumerate() {
-            // The carry can exceed 2^64 by a few bits, so it is tracked
-            // as (lo, hi) where hi is 0..=3. Each 128-bit product is
-            // split so no intermediate exceeds u128.
             let mut carry_lo = 0u64;
             let mut carry_hi = 0u64;
             for (j, &b) in other.limbs.iter().enumerate() {
@@ -222,8 +216,6 @@ impl BigInt {
         for i in 0..k {
             let ti = t[i];
             let mi = ti.wrapping_mul(nprime);
-            // Carry tracked as (lo, hi) with hi small (0..=3) to avoid
-            // u128 overflow in the accumulate step.
             let mut carry_lo = 0u64;
             let mut carry_hi = 0u64;
             let mut idx = i;
@@ -250,35 +242,68 @@ impl BigInt {
             }
         }
         // result = t[k..2k+1] (k+1 limbs), value < 2m.
-        let mut r_limbs: Vec<u64> = t[k..k * 2 + 1].to_vec();
-        // The result is < 2m: subtract m at most once (borrow tracks
-        // whether the subtraction underflowed). If it underflowed the
-        // value was already < m and we add m back.
+        let r_limbs: Vec<u64> = t[k..k * 2 + 1].to_vec();
+        // The value is < 2m, so one subtraction of m is enough — but
+        // "conditional" has to mean *masked*: whether the subtraction was
+        // needed is a function of the value being reduced, and during a
+        // private-key exponentiation that value is secret. This is the
+        // classic Montgomery "extra reduction" timing signal.
+        let mut diff: Vec<u64> = Vec::with_capacity(k + 1);
         let mut borrow = 0u64;
-        for (i, limb) in r_limbs.iter_mut().enumerate() {
-            let a = *limb;
+        for (i, &low) in r_limbs.iter().enumerate().take(k + 1) {
             let b = if i < k { m.limbs[i] } else { 0 };
-            let (s1, b1) = a.overflowing_sub(b);
+            let (s1, b1) = low.overflowing_sub(b);
             let (s2, b2) = s1.overflowing_sub(borrow);
-            *limb = s2;
-            borrow = b1 as u64 + b2 as u64;
+            diff.push(s2);
+            borrow = (b1 as u64) + (b2 as u64);
         }
-        if borrow != 0 {
-            let mut carry = 0u64;
-            for (i, limb) in r_limbs.iter_mut().enumerate() {
-                let a = *limb;
-                let b = if i < k { m.limbs[i] } else { 0 };
-                let (s1, c1) = a.overflowing_add(b);
-                let (s2, c2) = s1.overflowing_add(carry);
-                *limb = s2;
-                carry = c1 as u64 + c2 as u64;
-            }
+        // borrow == 0 → the subtraction was valid, so take `diff`;
+        // borrow == 1 → the value was already < m, so keep `r_limbs`.
+        let mask = borrow.wrapping_sub(1);
+        let mut out: Vec<u64> = Vec::with_capacity(k);
+        for (&below, &above) in r_limbs.iter().zip(diff.iter()).take(k) {
+            out.push((below & !mask) | (above & mask));
         }
-        let mut r = Self {
-            limbs: r_limbs[..k].to_vec(),
-        };
+        let mut r = Self { limbs: out };
         r.trim();
         r
+    }
+
+    /// `self >> shift` bits (shift may exceed the width: result is 0).
+    pub(crate) fn shr_bits(&self, shift: usize) -> Self {
+        let word_shift = shift / 64;
+        let bit_shift = (shift % 64) as u32;
+        if word_shift >= self.limbs.len() {
+            return Self::zero();
+        }
+        let mut out = vec![0u64; self.limbs.len() - word_shift];
+        for (i, slot) in out.iter_mut().enumerate() {
+            let mut v = self.limbs[i + word_shift] >> bit_shift;
+            if bit_shift > 0 && i + word_shift + 1 < self.limbs.len() {
+                v |= self.limbs[i + word_shift + 1] << (64 - bit_shift);
+            }
+            *slot = v;
+        }
+        let mut r = Self { limbs: out };
+        r.trim();
+        r
+    }
+
+    /// Constant-time selection: `a` when `choice == 0`, `b` when 1.
+    ///
+    /// The result keeps the wider operand's limb count rather than being
+    /// trimmed: a trim branches on the value, which is exactly what the
+    /// caller (`mod_pow`) is avoiding.
+    fn select(a: &Self, b: &Self, choice: u64) -> Self {
+        let len = core::cmp::max(a.limbs.len(), b.limbs.len());
+        let mask = choice.wrapping_neg();
+        let mut limbs = Vec::with_capacity(len);
+        for i in 0..len {
+            let x = a.limbs.get(i).copied().unwrap_or(0);
+            let y = b.limbs.get(i).copied().unwrap_or(0);
+            limbs.push((x & !mask) | (y & mask));
+        }
+        Self { limbs }
     }
 
     /// `self` shifted left by `shift` bits.
@@ -328,7 +353,14 @@ impl BigInt {
         r
     }
 
-    /// `self^exp mod m` via Montgomery square-and-multiply.
+    /// `self^exp mod m` via Montgomery square-and-multiply, in fixed time.
+    ///
+    /// Both shortcuts that a textbook implementation takes here leak the
+    /// exponent: stopping the loop at the top set bit reveals its length,
+    /// and skipping the multiply when a bit is 0 reveals its pattern. The
+    /// exponent is the RSA private exponent, and the base is attacker-\n    /// chosen (PKCS#1 v1.5 gives a fully controlled encoding), so the loop
+    /// runs over every bit of `exp` and the multiply is always performed,
+    /// with the two candidates selected by a mask.
     ///
     /// Montgomery reduction requires an odd modulus; for an even modulus
     /// (which cannot occur for a real RSA public key but may be fed by a
@@ -351,30 +383,29 @@ impl BigInt {
             t.redc_raw(m, nprime)
         };
         let mut result = r; // Montgomery form of 1 is R mod N
-        for bit in (0..exp.bit_len()).rev() {
-            result = {
-                let t = result.mul(&result);
-                t.redc_raw(m, nprime)
-            };
-            if (exp.limbs[bit / 64] >> (bit % 64)) & 1 == 1 {
-                let t = result.mul(&a);
-                result = t.redc_raw(m, nprime);
-            }
+        for bit in (0..exp.limbs.len() * 64).rev() {
+            let t = result.mul(&result);
+            result = t.redc_raw(m, nprime);
+            let product = result.mul(&a);
+            let candidate = product.redc_raw(m, nprime);
+            let choice = (exp.limbs[bit / 64] >> (bit % 64)) & 1;
+            result = Self::select(&result, &candidate, choice);
         }
         // Convert back: REDC(result).
         let t = result.mul(&Self::from_u64(1));
         t.redc_raw(m, nprime)
     }
 
-    /// `self^exp mod m` via plain square-and-multiply (any modulus).
+    /// `self^exp mod m` via plain square-and-multiply (any modulus),
+    /// branch-free for the same reason as [`Self::mod_pow`].
     pub(crate) fn mod_pow_plain(&self, exp: &Self, m: &Self) -> Self {
         let base = self.rem(m);
         let mut result = Self::from_u64(1);
-        for bit in (0..exp.bit_len()).rev() {
-            result = result.mul(&result).rem(m);
-            if (exp.limbs[bit / 64] >> (bit % 64)) & 1 == 1 {
-                result = result.mul(&base).rem(m);
-            }
+        for bit in (0..exp.limbs.len() * 64).rev() {
+            let squared = result.mul(&result).rem(m);
+            let product = squared.mul(&base).rem(m);
+            let choice = (exp.limbs[bit / 64] >> (bit % 64)) & 1;
+            result = Self::select(&squared, &product, choice);
         }
         result
     }
@@ -415,6 +446,108 @@ pub(crate) fn mont_r2(m: &BigInt, r: &BigInt) -> BigInt {
         }
     }
     r2
+}
+
+/// `x / 2 mod m` for odd `m` and `0 <= x < 2m`.
+fn half_mod(x: &BigInt, m: &BigInt) -> BigInt {
+    if x.limbs.first().map_or(false, |l| l & 1 == 1) {
+        x.add(m).shr_bits(1)
+    } else {
+        x.shr_bits(1)
+    }
+}
+
+/// `a - b mod m` for `0 <= a, b < m`.
+fn sub_mod(a: &BigInt, b: &BigInt, m: &BigInt) -> BigInt {
+    if a.cmp(b) != core::cmp::Ordering::Less {
+        a.sub(b)
+    } else {
+        a.add(m).sub(b)
+    }
+}
+
+/// Modular inverse `a^-1 mod m` for odd `m`, or `None` when
+/// `gcd(a, m) != 1`.
+///
+/// Binary extended Euclid (HAC 14.61). It is deliberately *not* constant
+/// time: its only caller is RSA blinding, where `a` is a fresh random
+/// value, so the iteration counts follow randomness rather than key
+/// material.
+pub(crate) fn mod_inv(a: &BigInt, m: &BigInt) -> Option<BigInt> {
+    if m.is_zero() || m.limbs[0] & 1 == 0 || a.is_zero() {
+        return None;
+    }
+    let one = BigInt::from_u64(1);
+    let mut u = a.rem(m);
+    let mut v = m.clone();
+    if u.is_zero() {
+        return None;
+    }
+    let mut x1 = one.clone();
+    let mut x2 = BigInt::zero();
+    while u.cmp(&one) != core::cmp::Ordering::Equal && v.cmp(&one) != core::cmp::Ordering::Equal {
+        if u.is_zero() || v.is_zero() {
+            return None; // gcd(a, m) > 1: no inverse exists
+        }
+        while u.limbs.first().map_or(true, |l| l & 1 == 0) {
+            u = u.shr_bits(1);
+            x1 = half_mod(&x1, m);
+        }
+        while v.limbs.first().map_or(true, |l| l & 1 == 0) {
+            v = v.shr_bits(1);
+            x2 = half_mod(&x2, m);
+        }
+        if u.cmp(&v) != core::cmp::Ordering::Less {
+            u = u.sub(&v);
+            x1 = sub_mod(&x1, &x2, m);
+        } else {
+            v = v.sub(&u);
+            x2 = sub_mod(&x2, &x1, m);
+        }
+    }
+    let inv = if u.cmp(&one) == core::cmp::Ordering::Equal {
+        x1
+    } else {
+        x2
+    };
+    Some(inv.rem(m))
+}
+
+/// Blinded `m^d mod n`.
+///
+/// With a fresh random `r`, `(m·r^e)^d·r^-1 = m^d mod n`. The arithmetic
+/// is not the point — what matters is what the exponentiation *sees*:
+/// without blinding, a chosen-message attack (PKCS#1 v1.5 lets the peer
+/// control the encoded message completely) can line the intermediate
+/// values up with the bits of `d` and read the private exponent out of
+/// the timing, the branch predictor, or the power draw. The factor is
+/// regenerated per signature; reusing one across messages would give that
+/// control straight back.
+///
+/// `e` is the public exponent, so the extra exponentiation costs a
+/// handful of Montgomery steps for the 65537 every real key uses.
+pub(crate) fn mod_pow_blinded(m: &BigInt, d: &BigInt, n: &BigInt, e: &BigInt) -> Option<BigInt> {
+    let bytes = n.limbs.len() * 8;
+    if bytes == 0 || n.limbs[0] & 1 == 0 {
+        return None;
+    }
+    let mut buf = alloc::vec![0u8; bytes];
+    let r = loop {
+        if !super::rng::fill_random(&mut buf) {
+            // No entropy available: refuse to sign rather than fall back to
+            // an unblinded exponentiation.
+            return None;
+        }
+        buf[0] |= 0x80; // keep the factor large
+        let candidate = BigInt::from_be_bytes(&buf).rem(n);
+        if candidate.cmp(&BigInt::from_u64(1)) == core::cmp::Ordering::Greater {
+            break candidate;
+        }
+    };
+    let r_inv = mod_inv(&r, n)?;
+    let blinded = m.mul(&r.mod_pow(e, n)).rem(n);
+    let s = blinded.mod_pow(d, n).mul(&r_inv).rem(n);
+    Some(s)
 }
 
 /// An RSA public key.
@@ -639,9 +772,11 @@ pub fn verify_rsa_pss(key: &RsaPublicKey, sha384: bool, digest: &[u8], sig: &[u8
 // ---------------------------------------------------------------------
 
 /// RSA private-key signing, PKCS#1 v1.5: `s = EMSA-PKCS1-v1_5^d mod n`.
-/// `n` and `d` are big-endian byte strings of the same length.
+/// `n`, `e` and `d` are big-endian byte strings (`e` is only used to blind
+/// the exponentiation — see [`mod_pow_blinded`]).
 pub(crate) fn sign_pkcs1v15(
     n: &[u8],
+    e: &[u8],
     d: &[u8],
     digest_info: &[u8],
     digest: &[u8],
@@ -662,11 +797,13 @@ pub(crate) fn sign_pkcs1v15(
     em[k - digest.len()..].copy_from_slice(digest);
     let m = BigInt::from_be_bytes(&em);
     let n_big = BigInt::from_be_bytes(n);
+    let e_big = BigInt::from_be_bytes(e);
     let d_big = BigInt::from_be_bytes(d);
-    if m.cmp(&n_big) != core::cmp::Ordering::Less {
+    if m.cmp(&n_big) != core::cmp::Ordering::Less || e_big.is_zero() {
         return None;
     }
-    Some(m.mod_pow(&d_big, &n_big).to_be_bytes_padded(k))
+    let s = mod_pow_blinded(&m, &d_big, &n_big, &e_big)?;
+    Some(s.to_be_bytes_padded(k))
 }
 
 /// RSA-PSS signing (RFC 8017 §8.1.1) with a random salt of `salt_len`
@@ -674,6 +811,7 @@ pub(crate) fn sign_pkcs1v15(
 pub(crate) fn sign_pss(
     hash: &mut dyn Digest,
     n: &[u8],
+    e: &[u8],
     d: &[u8],
     message: &[u8],
     salt_len: usize,
@@ -712,11 +850,13 @@ pub(crate) fn sign_pss(
 
     let m = BigInt::from_be_bytes(&em);
     let n_big = BigInt::from_be_bytes(n);
+    let e_big = BigInt::from_be_bytes(e);
     let d_big = BigInt::from_be_bytes(d);
-    if m.cmp(&n_big) != core::cmp::Ordering::Less {
+    if m.cmp(&n_big) != core::cmp::Ordering::Less || e_big.is_zero() {
         return None;
     }
-    Some(m.mod_pow(&d_big, &n_big).to_be_bytes_padded(em_len))
+    let s = mod_pow_blinded(&m, &d_big, &n_big, &e_big)?;
+    Some(s.to_be_bytes_padded(em_len))
 }
 
 #[cfg(test)]
@@ -775,6 +915,58 @@ mod tests {
         // The digest-info prefixes embed the digest length; validate.
         assert_eq!(DIGEST_INFO_SHA256.len(), 19);
         assert_eq!(DIGEST_INFO_SHA384.len(), 19);
+    }
+
+    /// The blinding factor's inverse has to be exact for every random
+    /// factor the signer might draw, so check the identity on a real
+    /// modulus for a spread of values (and the coprimality rejection for
+    /// a composite that shares a factor with the modulus).
+    #[test]
+    fn mod_inv_is_exact() {
+        let n = BigInt::from_be_bytes(&[
+            0x93, 0x9e, 0xca, 0x3a, 0x3e, 0x96, 0xde, 0x65, 0x2d, 0x86, 0x18, 0x0c, 0x79, 0x30,
+            0x94, 0x6a, 0xfb, 0x59, 0x4b, 0x29, 0x9f, 0x76, 0xdc, 0x9b, 0x7d, 0xd4, 0x71, 0xe5,
+            0xc2, 0x7d, 0x58, 0x6f, 0x92, 0x6c, 0x90, 0x29, 0x73, 0xda, 0x8a, 0x54, 0xc3, 0x3c,
+            0x72, 0x09, 0x71, 0xcb, 0x22, 0xbf,
+        ]);
+        let one = BigInt::from_u64(1);
+        for seed in 1..200u64 {
+            let a = BigInt::from_u64(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15)).rem(&n);
+            if a.is_zero() {
+                continue;
+            }
+            let inv = mod_inv(&a, &n).expect("coprime factor has an inverse");
+            assert_eq!(a.mul(&inv).rem(&n), one, "seed {seed}: a * a^-1 != 1 mod n");
+        }
+        // n is composite, so a shared factor has no inverse.
+        assert!(mod_inv(&n, &n).is_none());
+        assert!(mod_inv(&BigInt::zero(), &n).is_none());
+        // Small *prime* moduli exercise the same code path with one- or
+        // two-limb values, where every residue has an inverse.
+        for m in [3u64, 5, 7, 11, 13, 17, 19, 23, 101, 65537, 1_000_003] {
+            let mm = BigInt::from_u64(m);
+            for a in 1..m.min(40) {
+                let aa = BigInt::from_u64(a);
+                let inv = mod_inv(&aa, &mm).unwrap_or_else(|| panic!("m = {m}, a = {a}"));
+                assert_eq!(aa.mul(&inv).rem(&mm), one, "m = {m}, a = {a}");
+            }
+        }
+    }
+
+    /// Blinding is an implementation detail: the exponentiation it
+    /// replaces must return exactly the same value.
+    #[test]
+    fn mod_pow_blinded_matches_plain() {
+        // A small but genuine RSA key: n = 3233, e = 17, d = 2753.
+        let n = BigInt::from_be_bytes(&[0x0c, 0xa1]);
+        let e = BigInt::from_be_bytes(&[0x11]);
+        let d = BigInt::from_be_bytes(&[0x0a, 0xc1]);
+        for m in [2u64, 3, 42, 100, 1000, 3232] {
+            let v = BigInt::from_u64(m);
+            let plain = v.mod_pow(&d, &n);
+            let blinded = mod_pow_blinded(&v, &d, &n, &e).expect("blinding needs entropy");
+            assert_eq!(plain, blinded, "m = {m}");
+        }
     }
 
     /// A hostile certificate with an oversized RSA modulus (or exponent)

@@ -141,6 +141,7 @@ match client.get("http://127.0.0.1:9/") {
 - **配置后支持 HTTPS**。客户端默认 `tls: None`，因此默认会拒绝 `https://`；通过 `ClientConfig::tls` 提供 `RootStore`，或使用 `Client::with_tls_roots` 启用内置 TLS 1.2 + 1.3。crate 不内置 CA 根证书。ALPN 必须与 `ClientConfig::http2` 一致：HTTP/2 使用 `h2`，HTTP/1.1 使用 `http/1.1`。
 - **HTTP/2 并发取决于连接策略**。每条连接由一个 driver 负责复用多个 stream；需要独立 HTTP/2 driver 时提高 `max_connections_per_host`，并针对实际配置观察完整延迟尾部。
 - **流式请求体仅 HTTP/2 支持**。`Client::execute` 会把 `Body::Channel` 请求体先完整读进内存再发送；真正的客户端上传流式使用 `execute_h2_stream`。
+- **HTTP/1.1 keep-alive 池在复用前会探活**。服务器在空转期间关掉的连接不付出任何代价——什么都没写入，因此即使非幂等方法在新建连接上也是安全的。若池中连接在请求途中死亡，只在新连接上重试**一次**，且仅限可安全重放的方法（RFC 9110 §9.2.2：GET/HEAD/OPTIONS/TRACE/PUT/DELETE/PROPFIND）——`POST` 直接返回失败，不冒二次执行的风险。
 
 ## WebSocket 客户端
 

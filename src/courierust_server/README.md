@@ -31,6 +31,8 @@ A closed descriptor sitting in a wait set is not a harmless stale entry: POSIX `
 ## The protection, before workers are involved
 
 - An incomplete request parks on the poller (zero workers).
+- A streaming response body parks between chunks too: the worker returns as soon as the producer stops feeding it, and the producer's own `send` wakes the reactor (a raw `Body::Channel` without that wake handle is polled instead). Waiting for the next chunk no longer holds a worker.
+- Streaming responses to a `Connection: close` request are written in full before the connection closes.
 - Connections idle for `idle_timeout` are reaped.
 - `max_connections` caps the parked population outright.
 - A herd of keep-alive / SSE / slow-loris connections cannot consume the pool — the concurrency benchmark proves it: 200 idle half-open connections + 2 workers still serve a probe in ~300 µs, while the legacy one-pool-job-per-connection model blocks entirely.
@@ -39,7 +41,7 @@ A closed descriptor sitting in a wait set is not a harmless stale entry: POSIX `
 
 - The event path serves HTTP/1.1. TLS and h2 run on the blocking pool by design.
 - `event_driven: false` restores the legacy model — one pool job per connection — for comparison and debugging. Not recommended for production: idle/slow herds will exhaust the pool.
-- A long-blocking synchronous handler occupies a worker (event-driven or not) — any synchronous server's disease. Use channel bodies for streaming.
+- A long-blocking synchronous handler occupies a worker (event-driven or not) — any synchronous server's disease. Use channel bodies for streaming: waiting for a chunk parks the connection instead of the worker.
 - Both h2c prior knowledge and `h2c` Upgrade are served.
 
 ## WebSocket upgrades

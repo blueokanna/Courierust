@@ -1169,7 +1169,7 @@ pub(crate) fn build_upgrade_request(
     let body = match &req.body {
         Body::Empty => None,
         Body::Bytes(b) => Some(b),
-        Body::Channel(_) => {
+        Body::Channel(_) | Body::Stream(_) => {
             return Err(Error::protocol(
                 "streaming request bodies cannot use the h2c Upgrade",
             ));

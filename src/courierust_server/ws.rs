@@ -684,7 +684,7 @@ pub fn plan(
         offer.select_protocol(&ws.subprotocols)
     };
     let compression = offer
-        .extension("permessage-deflate")
+        .extension(crate::courierust_ws::handshake::PERMESSAGE_DEFLATE)
         .and_then(|e| PerMessageDeflate::negotiate(e, &ws.compression));
     Ok(WsPlan {
         offer,

@@ -20,7 +20,7 @@
 //! Scope: TLS and HTTP/2 connections still use the blocking pool; a
 //! long-blocking synchronous handler still occupies a worker.
 
-use crate::courierust_body::Body;
+use crate::courierust_body::{Body, ChannelStream};
 use crate::courierust_bytes::Bytes;
 use crate::courierust_error::{Error, Result};
 use crate::courierust_h1;
@@ -34,7 +34,7 @@ use crate::courierust_server::{Handler, ServerConfig};
 use std::collections::{HashMap, HashSet};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -48,6 +48,21 @@ const MAX_HEADER_BLOCK: usize = 1024 * 1024;
 /// event workers. Batching amortizes the shared channel + mutex so a
 /// burst of ready connections cannot serialize one send/recv per id.
 const DISPATCH_BATCH: usize = 16;
+
+/// Poll cadence for a parked streaming response body (ms).
+///
+/// A producer without a wake — a raw [`Body::Channel`] built from a plain
+/// `std::sync::mpsc` pair — can only be noticed by polling, so its first
+/// polls are fast and double up to [`BODY_POLL_MAX_MS`] while the stream
+/// stays silent: a slow chunk still goes out promptly, and a quiet stream
+/// costs a bounded number of dispatches per second instead of a worker
+/// thread.
+const BODY_POLL_MIN_MS: u64 = 1;
+const BODY_POLL_MAX_MS: u64 = 16;
+/// Poll cadence for a body that *did* install a wake (ms). The deadline
+/// then only enforces `read_timeout` and covers a wake lost to a dispatch
+/// race, so it can be coarse.
+const BODY_POLL_WAKE_MS: u64 = 25;
 
 /// Cached `COURIERUST_H1_TRACE` presence. The per-request segment timing
 /// reads it at connection construction and per segment, so it is cached
@@ -89,6 +104,17 @@ enum EventMsg {
         id: usize,
         fd: Fd,
         want_write: bool,
+    },
+    /// A streaming response body produced another chunk: dispatch the
+    /// connection so its worker can write it.
+    ///
+    /// The message carries no descriptor on purpose: an application
+    /// thread is the sender, and it may fire after the connection it
+    /// belonged to is gone. The reactor resolves the id against its own
+    /// tables, so a stale wake is a no-op rather than a registration of a
+    /// recycled file descriptor.
+    BodyChunk {
+        id: usize,
     },
     Closed {
         id: usize,
@@ -540,6 +566,51 @@ impl IncrRequest {
 // ---------------------------------------------------------------------
 
 /// An active event-loop HTTP/1.1 connection.
+/// The receive side of a streaming response body, plus the park state the
+/// reactor needs while the producer is between chunks.
+///
+/// One type covers both body variants: a raw [`Body::Channel`] wraps a
+/// plain channel ([`ChannelStream::raw`]) and a [`Body::Stream`] carries
+/// the producer wake handle that makes delivery immediate.
+struct BodyRx {
+    stream: ChannelStream,
+    /// When the current wait for the next chunk began. The per-chunk
+    /// `read_timeout` is measured from here, exactly like the blocking
+    /// driver's `recv_timeout`.
+    wait_started: Option<Instant>,
+    /// Consecutive dispatches that found the queue empty: the poll
+    /// backoff for a producer that cannot wake us.
+    empty_polls: u32,
+    /// When the reactor must re-dispatch this connection to look at the
+    /// body again. `None` while the connection is being processed.
+    poll_at: Option<Instant>,
+}
+
+impl BodyRx {
+    fn new(stream: ChannelStream) -> Self {
+        Self {
+            stream,
+            wait_started: None,
+            empty_polls: 0,
+            poll_at: None,
+        }
+    }
+}
+
+/// How long to wait before polling a parked body again.
+///
+/// A body with a wake is polled coarsely (the deadline only enforces the
+/// read timeout and covers a lost wake). Without one, the poll *is* the
+/// progress path, so it starts at 1 ms and backs off to 16 ms; a chunk
+/// resets it, so a bursty stream is never charged the backoff.
+fn body_poll_delay(body: &BodyRx) -> Duration {
+    if body.stream.has_wake() {
+        return Duration::from_millis(BODY_POLL_WAKE_MS);
+    }
+    let shift = body.empty_polls.min(4);
+    Duration::from_millis((BODY_POLL_MIN_MS << shift).min(BODY_POLL_MAX_MS))
+}
+
 struct EventConn {
     socket: Arc<TcpStream>,
     /// Set once a `101` head has been queued: the next moment the head is
@@ -555,10 +626,15 @@ struct EventConn {
     out: Vec<u8>,
     /// Write cursor into `out`.
     out_pos: usize,
-    /// Body of a `Body::Channel` response that is still being produced.
-    /// The head has already been written; each chunk is written as it
-    /// arrives, so `out` never holds more than one chunk.
-    stream_rx: Option<Receiver<Result<Bytes>>>,
+    /// Body of a streaming response that is still being produced. The
+    /// head has already been written; each chunk is written as it
+    /// arrives, so `out` never holds more than one chunk, and the worker
+    /// parks between chunks instead of blocking on the channel.
+    stream_rx: Option<BodyRx>,
+    /// True once the reactor's wake has been installed into `wake_slot`.
+    /// Armed on the first dispatch: a wake must be in place before any
+    /// body exists, and every later response reuses it.
+    wake_armed: bool,
     keep_alive: bool,
     /// Transport read-call counter (h1 syscall evidence), when attached.
     reads: Option<Arc<AtomicUsize>>,
@@ -611,6 +687,7 @@ impl EventConn {
             out: Vec::new(),
             out_pos: 0,
             stream_rx: None,
+            wake_armed: false,
             keep_alive: true,
             reads,
             writes,
@@ -634,6 +711,51 @@ impl EventConn {
     /// registries, it is derived from this fact.
     fn has_pending_output(&self) -> bool {
         self.out_pos < self.out.len()
+    }
+
+    /// Install the reactor's wake callback into this connection, once.
+    ///
+    /// Called by the worker, which is the only component that holds the
+    /// reactor's dispatch handle. A streaming body fires this slot from
+    /// the producer's thread, so a chunk goes out the moment it exists
+    /// instead of when a poll tick notices it. `make` is only invoked the
+    /// first time: every later response reuses the wake already armed.
+    fn arm_wake(&mut self, make: impl FnOnce() -> Arc<dyn Fn() + Send + Sync>) {
+        if self.wake_armed {
+            return;
+        }
+        self.wake_slot.set(make());
+        self.wake_armed = true;
+    }
+
+    /// Point a freshly installed streaming body at this connection's wake
+    /// slot. The body's producer fires the slot on every chunk.
+    fn attach_body_wake(&self, stream: &ChannelStream) {
+        let slot = self.wake_slot.clone();
+        stream.install_wake(move || slot.fire());
+    }
+
+    /// Adopt a freshly built response body.
+    ///
+    /// The wake is installed before the body is stored: the producer may
+    /// already have queued a chunk, and a body that missed its wake would
+    /// otherwise wait for the poll deadline.
+    fn set_stream(&mut self, stream: Option<ChannelStream>) {
+        if let Some(stream) = &stream {
+            self.attach_body_wake(stream);
+        }
+        self.stream_rx = stream.map(BodyRx::new);
+    }
+
+    /// Whether this connection is parked on a body chunk whose poll
+    /// deadline has already elapsed.
+    fn body_poll_due(&self, now: Instant) -> bool {
+        self.body_poll_at().is_some_and(|at| at <= now)
+    }
+
+    /// When the parked streaming body must be polled again.
+    fn body_poll_at(&self) -> Option<Instant> {
+        self.stream_rx.as_ref().and_then(|body| body.poll_at)
     }
 
     /// Process the connection one step (non-blocking). Serves as many
@@ -710,7 +832,7 @@ impl EventConn {
                             &mut self.out,
                         )?;
                         self.out_pos = 0;
-                        self.stream_rx = stream;
+                        self.set_stream(stream);
                         self.keep_alive = keep_alive;
                         let outcome = self.write_more()?;
                         match outcome {
@@ -729,11 +851,17 @@ impl EventConn {
                             let (keep_alive, stream) =
                                 build_response(resp, request_close, &mut self.out)?;
                             self.out_pos = 0;
-                            self.stream_rx = stream;
+                            self.set_stream(stream);
                             self.keep_alive = keep_alive;
                             let outcome = self.write_more()?;
                             match outcome {
                                 StepOutcome::Idle => continue,
+                                // A body still to come outranks the close
+                                // decision: the head is only part of the
+                                // response, and returning here would
+                                // truncate every streamed response to a
+                                // `Connection: close` request.
+                                StepOutcome::Close if self.stream_rx.is_some() => continue,
                                 other => return Ok(other),
                             }
                         }
@@ -761,7 +889,7 @@ impl EventConn {
                     let (keep_alive, stream) = build_response(resp, request_close, &mut self.out)?;
                     seg_end(&mut self.build_us, build);
                     self.out_pos = 0;
-                    self.stream_rx = stream;
+                    self.set_stream(stream);
                     self.keep_alive = keep_alive;
                     let write = seg_start(trace);
                     let outcome = self.write_more()?;
@@ -773,6 +901,12 @@ impl EventConn {
                         StepOutcome::Idle => {
                             continue;
                         }
+                        // Same as the WebSocket-respond path above: the
+                        // streaming body has not been written yet, so the
+                        // close decision waits for it. Returning here would
+                        // truncate every streamed response to a
+                        // `Connection: close` request.
+                        StepOutcome::Close if self.stream_rx.is_some() => continue,
                         other => return Ok(other),
                     }
                 }
@@ -796,42 +930,60 @@ impl EventConn {
     /// that stalls past the read timeout fails the connection *without*
     /// the terminating chunk, so a truncated body is detectable; that
     /// matches the blocking driver.
+    ///
+    /// The worker never blocks here. When the queue is empty the
+    /// connection is parked (zero workers held for a stream) and the
+    /// reactor re-dispatches it when the producer fires the wake, or when
+    /// the poll deadline armed below elapses — the latter is the only
+    /// progress path for a producer that installed no wake.
     fn pump_body(&mut self, config: &ServerConfig) -> Result<StepOutcome> {
-        let Some(rx) = self.stream_rx.take() else {
+        let Some(mut body) = self.stream_rx.take() else {
             return Ok(StepOutcome::Idle);
         };
         loop {
-            let chunk = match config.read_timeout {
-                Some(t) => match rx.recv_timeout(t) {
-                    Ok(c) => c?,
-                    Err(RecvTimeoutError::Timeout) => {
-                        return Err(Error::timeout("body stream timed out"));
+            match body.stream.try_recv() {
+                Ok(Ok(chunk)) => {
+                    if chunk.is_empty() {
+                        continue;
                     }
-                    Err(RecvTimeoutError::Disconnected) => break,
-                },
-                None => match rx.recv() {
-                    Ok(c) => c?,
-                    Err(_) => break,
-                },
-            };
-            if chunk.is_empty() {
-                continue;
-            }
-            self.out.clear();
-            self.out_pos = 0;
-            courierust_h1::encode_chunk(&chunk, &mut self.out);
-            if matches!(self.write_more()?, StepOutcome::NeedWrite) {
-                // The socket is full: keep the receiver so the reactor's
-                // writability wake-up resumes where we left off.
-                self.stream_rx = Some(rx);
-                return Ok(StepOutcome::NeedWrite);
+                    body.wait_started = None;
+                    body.empty_polls = 0;
+                    self.out.clear();
+                    self.out_pos = 0;
+                    courierust_h1::encode_chunk(&chunk, &mut self.out);
+                    if matches!(self.write_more()?, StepOutcome::NeedWrite) {
+                        // The socket is full: keep the receiver so the
+                        // reactor's writability wake-up resumes here.
+                        self.stream_rx = Some(body);
+                        return Ok(StepOutcome::NeedWrite);
+                    }
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(TryRecvError::Empty) => {
+                    // The per-chunk timeout runs from the last chunk (or
+                    // from when the body first asked for one), which is
+                    // what the blocking driver's `recv_timeout` measured.
+                    if let Some(timeout) = config.read_timeout {
+                        let started = *body.wait_started.get_or_insert_with(Instant::now);
+                        if started.elapsed() >= timeout {
+                            return Err(Error::timeout("body stream timed out"));
+                        }
+                    }
+                    body.empty_polls = body.empty_polls.saturating_add(1);
+                    body.poll_at = Some(Instant::now() + body_poll_delay(&body));
+                    self.stream_rx = Some(body);
+                    return Ok(StepOutcome::Idle);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    // The producer finished: terminate the chunked body.
+                    body.stream.clear_wake();
+                    self.out.clear();
+                    self.out_pos = 0;
+                    self.out.extend_from_slice(courierust_h1::CHUNKED_END);
+                    return self.write_more();
+                }
             }
         }
-        // The producer finished: terminate the chunked body.
-        self.out.clear();
-        self.out_pos = 0;
-        self.out.extend_from_slice(courierust_h1::CHUNKED_END);
-        self.write_more()
     }
 
     /// Write pending output; returns the continuation.
@@ -929,7 +1081,7 @@ fn build_response(
     resp: Response<Body>,
     request_close: bool,
     out: &mut Vec<u8>,
-) -> Result<(bool, Option<Receiver<Result<Bytes>>>)> {
+) -> Result<(bool, Option<ChannelStream>)> {
     let keep_alive = !request_close
         && courierust_h1::keep_alive_requested(resp.version, &resp.headers)
         && resp.version != Version::HTTP_10;
@@ -941,7 +1093,7 @@ fn build_response(
         }
         out_headers.append(n.clone(), v.clone());
     }
-    let chunked = matches!(resp.body, Body::Channel(_));
+    let chunked = resp.body.is_stream();
     let body_len = match &resp.body {
         Body::Bytes(b) => Some(b.len()),
         _ => None,
@@ -978,7 +1130,8 @@ fn build_response(
             out.extend_from_slice(&b);
             Ok((keep_alive, None))
         }
-        Body::Channel(rx) => Ok((keep_alive, Some(rx))),
+        Body::Channel(rx) => Ok((keep_alive, Some(ChannelStream::raw(rx)))),
+        Body::Stream(stream) => Ok((keep_alive, Some(stream))),
     }
 }
 
@@ -1117,6 +1270,47 @@ fn ws_due_ids(registries: &Registries, now: Instant) -> Vec<usize> {
         .collect()
 }
 
+/// Parked streaming responses whose poll deadline has elapsed.
+///
+/// A producer that installed no wake can only be noticed by polling, and
+/// the same deadline is what turns a stalled producer into the read
+/// timeout — neither of which socket readiness can deliver.
+fn h1_body_due_ids(registries: &Registries, now: Instant) -> Vec<usize> {
+    registries
+        .h1
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, conn)| conn.body_poll_due(now))
+        .map(|(&id, _)| id)
+        .collect()
+}
+
+/// The earliest streaming-body poll deadline, so the reactor's wait can
+/// end when the first one comes due.
+fn h1_body_next_deadline(registries: &Registries) -> Option<Instant> {
+    registries
+        .h1
+        .lock()
+        .unwrap()
+        .values()
+        .filter_map(|conn| conn.body_poll_at())
+        .min()
+}
+
+/// Re-dispatch a parked connection for a producer-side event.
+///
+/// Nothing is looked up first: the worker that receives the id resolves
+/// it, so a wake that arrives after its connection closed costs one
+/// lookup instead of risking a registration of a recycled descriptor.
+fn wake_connection(id: usize, poller: &mut Poller, ready_tx: &Sender<Vec<usize>>) {
+    if id == WAKE_ID {
+        return;
+    }
+    poller.unregister(id);
+    let _ = ready_tx.send(vec![id]);
+}
+
 /// The earliest keepalive/close deadline across the live WebSocket
 /// connections, so the reactor's wait can end when the first one is due.
 fn ws_next_deadline(registries: &Registries) -> Option<Instant> {
@@ -1158,19 +1352,39 @@ fn rebuild_wait_set(
     }
 }
 
+/// The reactor's mutable state, borrowed for one control message.
+///
+/// The three tables belong together — a message that registers a socket
+/// also refreshes its activity clock — so they travel as one value
+/// instead of being threaded through every call separately.
+struct Reactor<'a> {
+    poller: &'a mut Poller,
+    pending: &'a mut HashMap<usize, TcpStream>,
+    activity: &'a mut HashMap<usize, Instant>,
+}
+
 /// Apply one control message to the poller / pending / activity state.
 /// Used by both the message-drain path and the block-on-channel path, so
 /// a message consumed from the channel is never dropped.
 fn handle_msg(
     msg: EventMsg,
-    poller: &mut Poller,
-    pending: &mut HashMap<usize, TcpStream>,
-    activity: &mut HashMap<usize, Instant>,
+    reactor: Reactor<'_>,
     registries: &Registries,
+    ready_tx: &Sender<Vec<usize>>,
     max_connections: usize,
     stats: Option<&Stats>,
 ) {
+    let Reactor {
+        poller,
+        pending,
+        activity,
+    } = reactor;
     match msg {
+        // A streaming body produced a chunk. Handled here — not filtered
+        // out by the callers — so every path that drains the control
+        // channel dispatches it, and the wake is prompt rather than
+        // deferred to the next poll.
+        EventMsg::BodyChunk { id } => wake_connection(id, poller, ready_tx),
         EventMsg::NewConn {
             id,
             stream,
@@ -1260,10 +1474,13 @@ fn event_loop(
                     drained += 1;
                     handle_msg(
                         msg,
-                        &mut poller,
-                        &mut pending,
-                        &mut activity,
+                        Reactor {
+                            poller: &mut poller,
+                            pending: &mut pending,
+                            activity: &mut activity,
+                        },
                         &registries,
+                        &ready_tx,
                         config.max_connections,
                         stats,
                     );
@@ -1282,10 +1499,13 @@ fn event_loop(
             match msg_rx.recv() {
                 Ok(msg) => handle_msg(
                     msg,
-                    &mut poller,
-                    &mut pending,
-                    &mut activity,
+                    Reactor {
+                        poller: &mut poller,
+                        pending: &mut pending,
+                        activity: &mut activity,
+                    },
                     &registries,
+                    &ready_tx,
                     config.max_connections,
                     stats,
                 ),
@@ -1309,8 +1529,18 @@ fn event_loop(
             Some(next) => next.as_millis().min(poll_timeout as u128).max(1) as i32,
             None => poll_timeout,
         };
-        // Wake up for the earliest WebSocket keepalive/close deadline too.
-        let wait_ms = match ws_next_deadline(&registries) {
+        // Wake up for the earliest timed event too: a WebSocket
+        // keepalive/close deadline, or a parked streaming body that must
+        // be looked at again (the only progress path for a producer that
+        // has no wake, and where the body's read timeout is enforced).
+        let timed = [
+            ws_next_deadline(&registries),
+            h1_body_next_deadline(&registries),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let wait_ms = match timed {
             Some(deadline) => {
                 let remaining = deadline.saturating_duration_since(now).as_millis();
                 wait_ms.min(remaining.min(poll_timeout as u128).max(1) as i32)
@@ -1350,10 +1580,13 @@ fn event_loop(
                         drained += 1;
                         handle_msg(
                             msg,
-                            &mut poller,
-                            &mut pending,
-                            &mut activity,
+                            Reactor {
+                                poller: &mut poller,
+                                pending: &mut pending,
+                                activity: &mut activity,
+                            },
                             &registries,
+                            &ready_tx,
                             config.max_connections,
                             stats,
                         );
@@ -1467,6 +1700,14 @@ fn event_loop(
         // half-open connection cannot hold a slot forever.
         let now = Instant::now();
         for id in ws_due_ids(&registries, now) {
+            poller.unregister(id);
+            activity.insert(id, now);
+            to_dispatch.push(id);
+        }
+        // A parked streaming body whose poll deadline elapsed is due the
+        // same way: nothing a silent producer does makes a descriptor
+        // ready.
+        for id in h1_body_due_ids(&registries, now) {
             poller.unregister(id);
             activity.insert(id, now);
             to_dispatch.push(id);
@@ -1677,6 +1918,18 @@ fn event_worker(
                 None => continue,
             };
 
+            // A streaming body wakes the reactor through this callback,
+            // fired by the producer's own thread on every chunk — that is
+            // what keeps the connection off a worker while it waits.
+            conn.arm_wake(|| {
+                let tx = msg_tx.clone();
+                let pipe = wake_writer.clone();
+                Arc::new(move || {
+                    let _ = tx.send(EventMsg::BodyChunk { id });
+                    wake_nudge(&pipe);
+                })
+            });
+
             let (handoff_us, fresh_wait_us) = if conn.trace {
                 let pickup_at = Instant::now();
                 let handoff = conn
@@ -1799,5 +2052,194 @@ fn accept_loop(
             accepted_at,
         });
         wake_nudge(wake_writer);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::courierust_error::ErrorKind;
+    use std::sync::atomic::AtomicUsize;
+
+    /// An `EventConn` on a connected loopback pair, plus the peer end so a
+    /// test can read what the connection wrote.
+    fn conn_pair() -> (EventConn, TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = TcpStream::connect(addr).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let conn = EventConn::new(
+            socket,
+            1024 * 1024,
+            None,
+            crate::courierust_server::ws::WakeSlot::new(),
+        );
+        (conn, peer)
+    }
+
+    fn test_config() -> ServerConfig {
+        ServerConfig {
+            read_timeout: Some(Duration::from_millis(50)),
+            ..ServerConfig::default()
+        }
+    }
+
+    /// A chunk produced by the handler fires the wake the worker armed
+    /// into the connection, which is what lets the reactor re-dispatch the
+    /// connection immediately instead of on its poll deadline.
+    #[test]
+    fn streaming_body_fires_the_connection_wake() {
+        let (mut conn, _peer) = conn_pair();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let armed = hits.clone();
+        conn.arm_wake(move || {
+            let armed = armed.clone();
+            Arc::new(move || {
+                armed.fetch_add(1, Ordering::Relaxed);
+            })
+        });
+        let (tx, body) = crate::courierust_body::channel();
+        conn.set_stream(body.into_stream());
+        assert!(conn.stream_rx.is_some());
+
+        tx.send(Bytes::from_static(b"chunk")).unwrap();
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            1,
+            "a produced chunk must wake the connection"
+        );
+        tx.send_bytes(b"more").unwrap();
+        assert_eq!(hits.load(Ordering::Relaxed), 2);
+
+        // A raw channel has no producer that could fire a wake: adopting it
+        // must not leave it looking wake-capable, or the reactor would poll
+        // it at the slow cadence and delay every chunk.
+        let (_raw_tx, raw) = std::sync::mpsc::channel();
+        conn.set_stream(Some(ChannelStream::raw(raw)));
+        assert!(
+            !conn.stream_rx.as_ref().unwrap().stream.has_wake(),
+            "a raw channel must not claim a wake"
+        );
+        assert_eq!(
+            body_poll_delay(conn.stream_rx.as_ref().unwrap()),
+            Duration::from_millis(BODY_POLL_MIN_MS),
+            "a raw channel is polled, not waited on"
+        );
+    }
+
+    /// Waiting for the next chunk parks the connection instead of holding
+    /// the worker: the pump returns, the receiver survives, and the
+    /// reactor is left a deadline to come back on.
+    #[test]
+    fn a_parked_stream_does_not_block_the_worker() {
+        let (mut conn, mut peer) = conn_pair();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let config = test_config();
+        let (tx, body) = crate::courierust_body::channel();
+        conn.set_stream(body.into_stream());
+
+        assert!(matches!(
+            conn.pump_body(&config).unwrap(),
+            StepOutcome::Idle
+        ));
+        assert!(conn.stream_rx.is_some(), "the receiver must survive a park");
+        let due = conn.body_poll_at().expect("a parked body owes a deadline");
+        assert!(due > Instant::now() && due <= Instant::now() + Duration::from_secs(1));
+
+        // The chunk is written when the reactor comes back…
+        tx.send(Bytes::from_static(b"hello")).unwrap();
+        assert!(matches!(
+            conn.pump_body(&config).unwrap(),
+            StepOutcome::Idle
+        ));
+        // …and the terminating chunk once the producer is done.
+        drop(tx);
+        assert!(matches!(
+            conn.pump_body(&config).unwrap(),
+            StepOutcome::Idle
+        ));
+        assert!(conn.stream_rx.is_none(), "a finished body is released");
+        // Closing the connection flushes what the peer has already read
+        // into its own buffer, so the read below sees the whole body.
+        drop(conn);
+        let mut written = Vec::new();
+        std::io::Read::read_to_end(&mut peer, &mut written).unwrap();
+        assert_eq!(written, b"5\r\nhello\r\n0\r\n\r\n");
+    }
+
+    /// A producer that stalls past `read_timeout` fails the connection
+    /// *without* the terminating chunk, so a truncated body stays
+    /// detectable — the blocking driver's contract.
+    #[test]
+    fn a_stalled_stream_times_out_on_its_poll_deadline() {
+        let (mut conn, _peer) = conn_pair();
+        let config = ServerConfig {
+            read_timeout: Some(Duration::from_millis(20)),
+            ..ServerConfig::default()
+        };
+        let (tx, body) = crate::courierust_body::channel();
+        conn.set_stream(body.into_stream());
+        assert!(matches!(
+            conn.pump_body(&config).unwrap(),
+            StepOutcome::Idle
+        ));
+
+        std::thread::sleep(Duration::from_millis(30));
+        let error = match conn.pump_body(&config) {
+            Err(error) => error,
+            Ok(_) => panic!("a stalled producer must time out"),
+        };
+        assert_eq!(error.kind, ErrorKind::Timeout);
+        drop(tx);
+    }
+
+    /// A producer without a wake is polled: the deadline backs off to the
+    /// cap while the stream stays silent and resets as soon as a chunk
+    /// arrives, so a bursty stream is never charged the backoff.
+    #[test]
+    fn poll_backoff_only_applies_to_a_body_without_a_wake() {
+        let (_tx, raw) = std::sync::mpsc::channel();
+        let mut body = BodyRx::new(ChannelStream::raw(raw));
+        assert_eq!(
+            body_poll_delay(&body),
+            Duration::from_millis(BODY_POLL_MIN_MS)
+        );
+        body.empty_polls = 4;
+        assert_eq!(
+            body_poll_delay(&body),
+            Duration::from_millis(BODY_POLL_MAX_MS)
+        );
+        body.empty_polls = 100;
+        assert_eq!(
+            body_poll_delay(&body),
+            Duration::from_millis(BODY_POLL_MAX_MS),
+            "the backoff is capped"
+        );
+
+        // A wake-capable body is polled coarsely — but only once a
+        // transport has actually installed the wake. The capability alone
+        // changes nothing, so a body nobody adopted polls on the same
+        // backoff as a raw channel.
+        let (_tx, body) = crate::courierust_body::channel();
+        let stream = body.into_stream().unwrap();
+        let mut body = BodyRx::new(stream);
+        body.empty_polls = 100;
+        assert_eq!(
+            body_poll_delay(&body),
+            Duration::from_millis(BODY_POLL_MAX_MS),
+            "an unadopted stream polls on the same backoff as a raw channel"
+        );
+        let (tx, body) = crate::courierust_body::channel();
+        let stream = body.into_stream().unwrap();
+        stream.install_wake(|| {});
+        let mut stream = BodyRx::new(stream);
+        stream.empty_polls = 100;
+        assert_eq!(
+            body_poll_delay(&stream),
+            Duration::from_millis(BODY_POLL_WAKE_MS),
+            "a wake-capable body needs no fast poll"
+        );
+        drop(tx);
     }
 }

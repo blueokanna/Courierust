@@ -17,6 +17,7 @@ use crate::courierust_http::response::{Response, ResponseHead};
 use crate::courierust_http::status::StatusCode;
 use crate::courierust_http::version::Version;
 use crate::courierust_io::{BufReader, BufWriter, Scratch};
+use crate::courierust_net::poller::Poller;
 use crate::courierust_net::{self, ConnStream};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -29,6 +30,12 @@ pub struct H1Connection {
     scratch: Scratch,
     version: Version,
     reusable: bool,
+    /// Whether the peer produced any part of the *current* response.
+    ///
+    /// A failure after this point is a real answer (a truncated
+    /// response), never a stale connection: the request was processed,
+    /// so replaying it would be a second execution, not a retry.
+    read_started: bool,
 }
 
 impl H1Connection {
@@ -69,6 +76,7 @@ impl H1Connection {
             scratch: Scratch::new(),
             version: Version::HTTP_11,
             reusable: true,
+            read_started: false,
         })
     }
 
@@ -94,12 +102,57 @@ impl H1Connection {
             scratch: Scratch::new(),
             version: Version::HTTP_11,
             reusable: true,
+            read_started: false,
         })
     }
 
     /// Whether the connection can be returned to the pool.
     pub fn is_reusable(&self) -> bool {
         self.reusable
+    }
+
+    /// Whether the peer has closed this connection while it sat idle.
+    ///
+    /// A pooled keep-alive connection can die without anyone watching:
+    /// the server's own keep-alive timeout, an intermediary, a restart.
+    /// One zero-timeout poll answers that without consuming anything, and
+    /// nothing else is needed: on an idle HTTP/1.1 connection the peer
+    /// may legally send *nothing*, so a socket that reports readable is
+    /// spent either way — EOF, a reset, an unsolicited record (a TLS
+    /// `close_notify` arrives exactly like that).
+    ///
+    /// Checking *before* a request is what keeps a dead pool entry from
+    /// costing anything: nothing has been written yet, so there is no
+    /// replay question at all — not even for a `POST`.
+    pub fn is_alive(&self) -> bool {
+        thread_local! {
+            /// Reused across probes: the steady state must not allocate.
+            static PROBE: std::cell::RefCell<Poller> =
+                std::cell::RefCell::new(Poller::new());
+        }
+        PROBE.with(|probe| {
+            let mut probe = probe.borrow_mut();
+            probe.clear();
+            probe.register(1, self.stream.raw_fd(), false);
+            probe.wait(0, None).unwrap_or_default().is_empty()
+        })
+    }
+
+    /// Whether the current response has started, i.e. whether the peer
+    /// answered at least in part.
+    pub fn response_started(&self) -> bool {
+        self.read_started
+    }
+
+    /// Whether `error` is the signature of a keep-alive connection that
+    /// was already gone when the request was written: the peer hung up
+    /// without answering anything.
+    ///
+    /// Only meaningful together with [`Self::response_started`] being
+    /// false — a truncated response also ends in an unexpected EOF, but
+    /// there the request *was* processed.
+    pub fn is_stale_failure(&self, error: &Error) -> bool {
+        !self.read_started && matches!(error.kind, ErrorKind::UnexpectedEof | ErrorKind::Canceled)
     }
 
     /// The remote address.
@@ -136,7 +189,7 @@ impl H1Connection {
         let body = match &req.body {
             Body::Empty => None,
             Body::Bytes(b) => Some(b),
-            Body::Channel(_) => {
+            Body::Channel(_) | Body::Stream(_) => {
                 return Err(Error::protocol("streaming request bodies require h2"));
             }
         };
@@ -150,6 +203,7 @@ impl H1Connection {
 
         let head = self.scratch.body();
         courierust_h1::write_request_head(head, &req.method, &req.uri, Version::HTTP_11, &headers)?;
+        self.read_started = false;
         self.writer.write_all(head)?;
         if let Some(b) = body {
             self.writer.write_all(b)?;
@@ -164,6 +218,9 @@ impl H1Connection {
         let status_line = scratch.line();
         reader.read_until_into(b'\n', 16 * 1024, status_line)?;
         let (status, version) = courierust_h1::parse_status_line(status_line)?;
+        // The peer answered: from here on a failure is a truncated
+        // response, not a stale connection.
+        self.read_started = true;
         self.version = version;
         let mut status = status;
         let mut headers = courierust_h1::read_headers_scratch(reader, scratch)?;
@@ -192,6 +249,8 @@ impl H1Connection {
         method: &Method,
         head: ResponseHead,
     ) -> Result<Response<Body>> {
+        // The caller already consumed the head, so the peer has answered.
+        self.read_started = true;
         let status = head.status;
         let version = head.version;
         let (reader, scratch) = (&mut self.reader, &mut self.scratch);

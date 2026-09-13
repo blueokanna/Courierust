@@ -4,7 +4,7 @@
 
 ## 模型
 
-- **HTTP/1.1**——按 authority 的 keep-alive 池，有界复用。每条连接拥有自己的读写缓冲区和 `Scratch`，稳态 keep-alive 请求**零按请求分配**、零 socket 重配。
+- **HTTP/1.1**——按 authority 的 keep-alive 池，有界复用。取用池连接前先做一次活性探测（服务器在空转期间已关掉的连接不付出任何代价：还没写入任何字节，即便是 `POST` 也不会发到死连接上）；请求途中连接死亡则**一次**新连接重试，且仅限于可重放的幂等方法（RFC 9110 §9.2.2），绝不重放 `POST`。每条连接拥有自己的读写缓冲区和 `Scratch`，稳态 keep-alive 请求**零按请求分配**、零 socket 重配。
 - **HTTP/2**——每条连接由专用 driver 线程驱动，串行化线上访问的同时多路复用流。请求经 channel 到达；响应经每流 channel 流回。`max_connections_per_host` 按 authority 封顶存活连接；h2 池按 authority 共享。
 - **HTTP/3**——`http3://`（以及 ALPN `h3`）路由进 H3 runtime 的 UDP reactor，支持池化连接复用。
 - **WebSocket**——`courierust_client::ws::WebSocket` 通过 `ws://` 或 TLS（`wss://`）升级，提供 `send_text` / `send_binary` / `send_ping` / `read_message` / `close`，并支持子协议、Origin 头、压缩偏好与读超时，全部沿用同一个 `ClientConfig`。它与服务端共用组帧/UTF-8/关闭握手引擎（`courierust_ws`），两端强制的是同一套规则。

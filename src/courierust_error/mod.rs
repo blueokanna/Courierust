@@ -29,6 +29,15 @@ pub enum ErrorKind {
     WouldBlock,
     /// HTTP/2 error code (RFC 9113 §7). Payload in `message`.
     H2(u32),
+    /// HTTP/3 *stream* error code (RFC 9114 §8.1). Payload in `message`.
+    ///
+    /// The distinction from [`ErrorKind::Protocol`] is what the transport
+    /// acts on: a malformed message aborts one stream (RESET_STREAM with
+    /// this application code) instead of closing the connection, which is
+    /// what RFC 9114 §4.1.2 requires and what keeps one bad request from
+    /// destroying every other request multiplexed on the same QUIC
+    /// connection.
+    H3Stream(u32),
     /// gRPC status code. Payload in `message`.
     Grpc(u32),
     /// The stream/connection was reset or canceled by either side.
@@ -116,6 +125,13 @@ impl Error {
         Self::with_message(ErrorKind::Grpc(code), msg)
     }
 
+    /// HTTP/3 stream error: abort the stream with this application error
+    /// code (RFC 9114 §8.1), leaving the connection alone.
+    #[inline]
+    pub fn h3_stream(code: u32, msg: impl Into<String>) -> Self {
+        Self::with_message(ErrorKind::H3Stream(code), msg)
+    }
+
     /// Malformed header name.
     #[inline]
     pub fn invalid_header_name() -> Self {
@@ -145,6 +161,15 @@ impl Error {
             _ => None,
         }
     }
+
+    /// Returns the HTTP/3 stream error code if this error carries one.
+    #[inline]
+    pub fn h3_stream_code(&self) -> Option<u32> {
+        match self.kind {
+            ErrorKind::H3Stream(c) => Some(c),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -152,6 +177,7 @@ impl fmt::Display for Error {
         match self.kind {
             ErrorKind::H2(c) => write!(f, "HTTP/2 error 0x{c:x}")?,
             ErrorKind::Grpc(c) => write!(f, "gRPC status {c}")?,
+            ErrorKind::H3Stream(c) => write!(f, "HTTP/3 stream error 0x{c:x}")?,
             k => write!(f, "{k:?}")?,
         }
         if let Some(m) = &self.message {

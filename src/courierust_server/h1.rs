@@ -192,7 +192,7 @@ pub(crate) fn serve(
             }
             out_headers.append(n.clone(), v.clone());
         }
-        let chunked = matches!(resp.body, Body::Channel(_));
+        let chunked = resp.body.is_stream();
         let body_len = match &resp.body {
             Body::Bytes(b) => Some(b.len()),
             _ => None,
@@ -234,6 +234,12 @@ pub(crate) fn serve(
             }
             Body::Channel(rx) => {
                 stream_response(&mut writer, rx, config.read_timeout)?;
+            }
+            Body::Stream(stream) => {
+                // The blocking driver waits on the channel itself (one
+                // thread per connection is this model's contract), so the
+                // wake handle is not installed here.
+                stream_response(&mut writer, stream.into_receiver(), config.read_timeout)?;
             }
         }
         writer.flush()?;

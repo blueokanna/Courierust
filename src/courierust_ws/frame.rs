@@ -1,22 +1,17 @@
 //! WebSocket frame codec (RFC 6455 §5).
 //!
-//! A frame header is 2..=14 bytes. Everything here works on *borrowed*
-//! buffers: the parser reads a header straight out of the connection's
-//! read buffer without copying it into a structure, and the masking
-//! engine transforms payload bytes in place (or fused with the copy into
-//! the message buffer) instead of allocating a scratch copy per frame.
+//! Headers are parsed straight out of the connection's read buffer and
+//! the masking engine transforms payload bytes in place, so no frame
+//! needs a scratch copy.
 //!
-//! Strictness is deliberate and complete — a frame that any mainstream
-//! proxy would reject is rejected here too, so two hops can never
-//! disagree about where a frame ends:
+//! Strictness is deliberate: a frame any mainstream proxy would reject is
+//! rejected here too, so two hops can never disagree about where a frame
+//! ends.
 //!
 //! * Reserved bits set without a negotiated extension → error.
 //! * Unknown opcodes (`0x3`–`0x7`, `0xB`–`0xF`) → error.
 //! * Control frames fragmented or longer than 125 bytes → error.
-//! * Non-minimal length encodings (RFC 6455 §5.2: “the minimal number of
-//!   bytes MUST be used”) → error. A 2/8-byte length used for a value
-//!   that fits in 7 bits is the frame-level equivalent of an HTTP
-//!   request-smuggling primer.
+//! * Non-minimal length encodings (RFC 6455 §5.2) → error.
 //! * The 64-bit length's most significant bit set → error.
 
 use crate::courierust_error::{Error, Result};
@@ -296,22 +291,12 @@ impl FrameHeader {
 
 /// A 4-byte masking key with its lane forms precomputed.
 ///
-/// Masking is a repeating 4-byte XOR, and the whole design follows from
-/// one observation: **16 is a multiple of 4**. Every 16-byte lane
-/// therefore starts at the *same* key phase (`offset & 3`), so the body
-/// of a payload is a plain `lane ^= constant` loop over one constant
-/// value — which the compiler turns into wide SIMD loads and stores. A
-/// phase-dependent loop (the obvious implementation) cannot vectorize,
-/// which is where most of the speed difference between masking
-/// implementations comes from.
-///
-/// The remainder is peeled in the same shape: since 4 divides 16, the
-/// bytes after the last full 16-byte lane are also at a single phase, so
-/// they are handled as 4-byte words with one `u32` constant and then at
-/// most three single bytes.
-///
-/// The type is `Copy` and carries no allocation, so it travels with a
-/// connection and is reused for every frame.
+/// Masking is a repeating 4-byte XOR and 16 is a multiple of 4, so every
+/// 16-byte lane starts at the same key phase (`offset & 3`): the body of
+/// a payload becomes `lane ^= constant`, which vectorizes. The remainder
+/// is peeled as 4-byte words at one phase plus at most three bytes. `Copy`
+/// and allocation-free, so one instance serves every frame on a
+/// connection.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Mask {
     key: [u8; 4],

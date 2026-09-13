@@ -18,9 +18,9 @@
 //!   on a protocol switch is a framing ambiguity, and a client that
 //!   tolerates it is a desynchronised proxy's best friend.
 //! * The `Sec-WebSocket-Protocol` the server selects must be one this
-//!   client offered; `Sec-WebSocket-Extensions` parameters must be ones
-//!   it offered, with window sizes no larger than requested
-//!   ([`PerMessageDeflate::from_response`]).
+//!   client offered, and so must be every `Sec-WebSocket-Extensions`
+//!   element — validated against the bytes this client actually sent, not
+//!   against a constant ([`PerMessageDeflate::from_response`]).
 //!
 //! ```no_run
 //! # #[cfg(feature = "std")]
@@ -52,8 +52,8 @@ use crate::courierust_net as net;
 use crate::courierust_net::ConnStream;
 use crate::courierust_ws::frame::SharedSink;
 use crate::courierust_ws::handshake::{
-    accept_key, generate_key, header_has_token, parse_extensions, PerMessageDeflate,
-    PmDeflatePolicy,
+    accept_key, generate_key, header_has_token, is_token, parse_extension_value, parse_extensions,
+    ExtensionOffer, PerMessageDeflate, PmDeflatePolicy,
 };
 use crate::courierust_ws::session::{MaskSource, Role, Session, SessionConfig, Stats};
 use crate::courierust_ws::writer::FrameWriter;
@@ -62,13 +62,13 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// The one extension this client offers, in the exact wire form that is
-/// sent **and** used to validate the response.
-///
-/// One constant for both directions is deliberate: a hand-written second
-/// copy of "what we offered" is how a client ends up accepting a
-/// parameter it never offered (or rejecting one it did).
+/// The extension this client drives, in the exact wire form it is
+/// offered in.
 const PM_DEFLATE_OFFER: &str = "permessage-deflate; client_max_window_bits";
+
+/// How many `1xx` responses may precede the switch before the handshake
+/// is abandoned (a peer that never stops sending them must not stall it).
+const MAX_INFORMATIONAL: usize = 5;
 
 /// Client-side WebSocket options.
 #[derive(Debug, Clone)]
@@ -231,10 +231,17 @@ impl WebSocket {
         let mut scratch = Scratch::new();
 
         let mut headers = HeaderMap::with_capacity(8 + opts.protocols.len());
-        let host_header = if (secure && port == 443) || (!secure && port == 80) {
-            host.clone()
+        // An IPv6 literal keeps its brackets (RFC 3986 §3.2.2); `Url`
+        // strips them from the host.
+        let literal = if host.contains(':') {
+            alloc::format!("[{host}]")
         } else {
-            alloc::format!("{host}:{port}")
+            host.clone()
+        };
+        let host_header = if (secure && port == 443) || (!secure && port == 80) {
+            literal
+        } else {
+            alloc::format!("{literal}:{port}")
         };
         push(&mut headers, "host", &host_header)?;
         push(&mut headers, "upgrade", "websocket")?;
@@ -242,14 +249,30 @@ impl WebSocket {
         push(&mut headers, "sec-websocket-key", &key)?;
         push(&mut headers, "sec-websocket-version", "13")?;
         if !opts.protocols.is_empty() {
+            for p in &opts.protocols {
+                if !is_token(p) {
+                    return Err(Error::protocol("ws: subprotocol is not a token"));
+                }
+            }
             push(
                 &mut headers,
                 "sec-websocket-protocol",
                 &opts.protocols.join(", "),
             )?;
         }
+        // What actually goes on the wire: the offer above plus any the
+        // caller added. The response is validated against *this*, never
+        // against a constant (RFC 6455 §4.1: an extension that was not
+        // offered fails the connection).
+        let mut offered: Vec<ExtensionOffer> = Vec::new();
         if opts.compression {
+            offered.extend(parse_extension_value(PM_DEFLATE_OFFER)?);
             push(&mut headers, "sec-websocket-extensions", PM_DEFLATE_OFFER)?;
+        }
+        for (name, value) in &opts.headers {
+            if name.eq_ignore_ascii_case("sec-websocket-extensions") {
+                offered.extend(parse_extension_value(value)?);
+            }
         }
         if let Some(origin) = &opts.origin {
             push(&mut headers, "origin", origin)?;
@@ -294,35 +317,20 @@ impl WebSocket {
         }
 
         let mut compression = None;
-        if response_headers.get("sec-websocket-extensions").is_some() {
-            // Validate against the offer this client actually sent:
-            // parsing our own header back is the only way that check can
-            // never drift from what went on the wire.
-            let mut offered =
-                crate::courierust_ws::handshake::parse_extension_value(PM_DEFLATE_OFFER)?;
-            let offers = parse_extensions(&response_headers)?;
-            let mut seen = false;
-            for ext in &offers {
-                if ext.name != "permessage-deflate" {
-                    return Err(Error::protocol(
-                        "ws: the server selected an extension that was not offered",
-                    ));
-                }
-                if seen {
-                    return Err(Error::protocol(
-                        "ws: the server selected permessage-deflate twice",
-                    ));
-                }
-                seen = true;
-                let offer = offered
-                    .first_mut()
-                    .ok_or_else(|| Error::protocol("ws: internal offer is not parseable"))?;
-                compression = Some(PerMessageDeflate::from_response(
-                    offer,
-                    ext,
-                    &PmDeflatePolicy::default(),
-                )?);
+        for (i, ext) in parse_extensions(&response_headers)?.iter().enumerate() {
+            let offer = offered.iter().find(|o| o.name == ext.name).ok_or_else(|| {
+                Error::protocol("ws: the server selected an extension that was not offered")
+            })?;
+            if i > 0 {
+                return Err(Error::protocol(
+                    "ws: the server selected more than one extension",
+                ));
             }
+            compression = Some(PerMessageDeflate::from_response(
+                offer,
+                ext,
+                &PmDeflatePolicy::default(),
+            )?);
         }
 
         // A handshake read may have pulled frame bytes into the reader;
@@ -532,19 +540,19 @@ fn push(headers: &mut HeaderMap, name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Read the response head, skipping any `1xx` informational response.
+/// Read the response head, skipping up to [`MAX_INFORMATIONAL`] `1xx`
+/// responses.
 fn read_response_head(
     reader: &mut BufReader<Arc<ConnStream>>,
     scratch: &mut Scratch,
 ) -> Result<(crate::courierust_http::status::StatusCode, HeaderMap)> {
-    loop {
+    for _ in 0..=MAX_INFORMATIONAL {
         // The status line borrows the scratch line buffer; it is parsed
         // and released before the header block reuses that buffer.
-        let status = {
+        let (status, version) = {
             let line = scratch.line();
             reader.read_until_into(b'\n', 16 * 1024, line)?;
-            let (status, _version) = courierust_h1::parse_status_line(line)?;
-            status
+            courierust_h1::parse_status_line(line)?
         };
         let headers = courierust_h1::read_headers_scratch(reader, scratch)?;
         if status.is_informational()
@@ -552,8 +560,18 @@ fn read_response_head(
         {
             continue;
         }
+        // A protocol switch is an HTTP/1.1 response; a 1.0 status line
+        // means the peer is not following §4.1.
+        if version != Version::HTTP_11 {
+            return Err(Error::protocol(
+                "ws: the handshake response is not HTTP/1.1",
+            ));
+        }
         return Ok((status, headers));
     }
+    Err(Error::protocol(
+        "ws: too many informational responses before the switch",
+    ))
 }
 
 /// Everything a `101` must (and must not) contain.

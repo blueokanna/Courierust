@@ -31,6 +31,8 @@ flowchart LR
 ## worker 介入之前的防护
 
 - 不完整的请求挂在 poller 上（零 worker）。
+- 流式响应体在块与块之间同样挂着：生产者一停，worker 立刻返回，生产者的 `send` 自己唤醒 reactor（没有唤醒句柄的裸 `Body::Channel` 则转为轮询）。等下一块不再占着 worker。
+- 对 `Connection: close` 请求的流式响应会完整写完再关连接。
 - 超过 `idle_timeout` 没动静的连接被回收。
 - `max_connections` 直接封顶驻留连接数。
 - keep-alive / SSE / slow-loris 羊群耗不干池——并发基准证明了：200 条空闲半开连接 + 2 个 worker 仍能 ~300µs 内服务一次探测，而旧的"一连接一池任务"模型直接整体阻塞。
@@ -39,7 +41,7 @@ flowchart LR
 
 - 事件路径服务 HTTP/1.1。TLS 和 h2 按设计走阻塞池。
 - `event_driven: false` 恢复旧模型——每连接一个池任务——供对比与调试。不建议生产用：空闲/慢速羊群会耗尽池。
-- 长时间阻塞的同步 handler 会占住一个 worker（事件驱动与否都一样）——任何同步服务器的通病。流式请用 channel body。
+- 长时间阻塞的同步 handler 会占住一个 worker（事件驱动与否都一样）——任何同步服务器的通病。流式请用 channel body：等下一块时挂起的是连接，不是 worker。
 - 同时服务 h2c 前导知识和 `h2c` Upgrade。
 
 ## WebSocket 升级

@@ -174,6 +174,17 @@ impl ConnStream {
         }
     }
 
+    /// The underlying socket descriptor, for a readiness poll.
+    ///
+    /// A poll (unlike a read) cannot disturb a TLS stream: it observes
+    /// the wire, which is exactly what a liveness probe asks about.
+    pub(crate) fn raw_fd(&self) -> crate::courierust_net::poller::Fd {
+        match &self.inner {
+            ConnStreamKind::Plain(s) => crate::courierust_net::poller::fd_of(s),
+            ConnStreamKind::Tls { socket, .. } => crate::courierust_net::poller::fd_of(socket),
+        }
+    }
+
     /// Configure nodelay + read timeout on the underlying socket.
     pub(crate) fn configure(&self, read_timeout: Option<Duration>) -> Result<()> {
         match &self.inner {

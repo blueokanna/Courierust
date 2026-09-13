@@ -1,32 +1,19 @@
 //! The WebSocket session state machine.
 //!
-//! A [`Session`] owns the framed byte stream on top of any
-//! `Read`/`Write` transport and implements RFC 6455 sections 5 to 7:
+//! Implements RFC 6455 §5–§7 on any `Read`/`Write` transport:
 //! fragmentation and reassembly, control frames interleaved at fragment
 //! boundaries, the closing handshake, masking in the correct direction,
 //! and `permessage-deflate` when negotiated.
 //!
-//! # Interruptible by design
-//!
 //! [`Session::poll_message`] never blocks on a partial frame and never
-//! loses one: the reader keeps the exact state (bytes of the current
-//! header, bytes of the current payload, partial UTF-8 sequence) across
-//! calls, so the same code drives
+//! loses one — header bytes, payload bytes and a partial UTF-8 sequence
+//! all survive across calls — so the same code drives `read_message` on a
+//! worker thread and `poll_message` on an event-loop reactor, where an
+//! idle connection costs a buffer instead of a thread.
 //!
-//! * a blocking worker thread (`read_message`), where the transport's
-//!   read timeout provides liveness, and
-//! * an event-loop reactor (`poll_message` returning `Ok(None)`), where
-//!   ten thousand idle WebSocket connections cost ten thousand buffers
-//!   and **zero** threads.
-//!
-//! # Bounded by construction
-//!
-//! Every buffer is bounded by configuration, not by the peer:
-//! `max_frame` bounds a single frame, `max_message` bounds the
-//! reassembled (and, for compressed traffic, the *decompressed*) message,
-//! the sliding window is at most 32 KiB, and a client's outgoing payloads
-//! are masked in fixed 16 KiB windows so sending a gigabyte never
-//! allocates a gigabyte.
+//! Every buffer is bounded by configuration, not by the peer: `max_frame`,
+//! `max_message` (after inflating), a ≤32 KiB sliding window, and
+//! masking in fixed 16 KiB windows.
 
 use crate::courierust_bytes::Bytes;
 use crate::courierust_deflate::Inflater;
@@ -518,16 +505,9 @@ impl<R: Read, S: frame::FrameSink> Session<R, S> {
         if self.msg_opcode.is_none() {
             self.msg_opcode = Some(header.opcode);
         }
-        // Reserve the message capacity up front: a frame that carries a
-        // whole message is the common case, and without this the buffer
-        // grows geometrically while the payload arrives (a 256 KiB
-        // message read in 64 KiB socket reads copies 64 KiB, then 128 KiB,
-        // then 256 KiB — two extra megabytes-halves of memcpy per
-        // message).
-        //
-        // The eager part is capped: a peer that announces a gigabyte and
-        // then sends nothing must not be able to make us commit a
-        // gigabyte, so anything beyond the cap keeps growing on demand.
+        // Reserve up front (the common case is one frame carrying a whole
+        // message) but cap the eager part: a peer announcing a gigabyte
+        // and sending nothing must not commit one.
         const EAGER_RESERVE: u64 = 1 << 20;
         let want = core::cmp::min(total, EAGER_RESERVE) as usize;
         if self.msg.capacity() < want {

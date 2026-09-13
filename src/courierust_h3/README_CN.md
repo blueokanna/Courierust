@@ -8,6 +8,10 @@ HTTP/3（RFC 9114）：帧、流角色、SETTINGS、QPACK（RFC 9204）字段行
 - **`qpack.rs`**——完整 QPACK codec：**99 项静态表**、前缀整数、Huffman 字符串、每一种字段行表示（T 位、relative/post-base 索引）、动态表、编码器/解码器指令流。对照 RFC 9204 附录 B.1–B.4 验证。
 - **`runtime.rs`**（std）——把它们接起来的 UDP reactor：QUIC v1 包保护、ALPN `h3` 的 TLS 1.3、control/QPACK 流、请求流、响应 trailer、GOAWAY 校验、重传、严格流重组。
 
+## 畸形消息是流级错误
+
+RFC 9114 §4.1.2：帧序列本身合法、但违反消息规则的报文（伪首部规则、连接专用字段、与 body 不符的 `content-length`）会用 `H3_MESSAGE_ERROR`（0x010e）只中止**那一条流**并告知调用方，连接连同其上的其它请求照常工作。这个区分由错误类型（[`ErrorKind::H3Stream`](../courierust_error/index.html)）承载，流层据此决策；连接级错误只保留给真正破坏连接同步的情况（CONTROL 流违规、QPACK 失败、帧层错误）。
+
 ## QPACK 的坑
 
 QPACK 的静态表是 **0 索引**的，跟 HPACK 的 1 索引不一样。这里错一位，每条 indexed 字段行都会解到错误的头上。这正是那种"冒烟测试能过、生产环境炸掉"的 off-by-one——附录向量就是用来抓它的。

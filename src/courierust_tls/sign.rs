@@ -30,7 +30,7 @@ const OID_P521: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x23];
 
 /// A parsed private key.
 enum ParsedKey {
-    Rsa { n: Vec<u8>, d: Vec<u8> },
+    Rsa { n: Vec<u8>, e: Vec<u8>, d: Vec<u8> },
     Ed25519([u8; 32]),
     Ec { curve: Curve, d: Vec<u8> },
 }
@@ -85,13 +85,13 @@ pub(crate) fn sign_tls12_server_key_exchange(
 ) -> TlsResult<Option<(u8, u8, Vec<u8>)>> {
     let key = parse_private_key(&identity.private_key)?;
     match key {
-        ParsedKey::Rsa { n, d } => {
+        ParsedKey::Rsa { n, e, d } => {
             let mut h = Sha256::new();
             let digest = {
                 h.update(message);
                 h.finalize()
             };
-            rsa::sign_pkcs1v15(&n, &d, rsa::DIGEST_INFO_SHA256, &digest)
+            rsa::sign_pkcs1v15(&n, &e, &d, rsa::DIGEST_INFO_SHA256, &digest)
                 .map(|sig| (4, 1, sig))
                 .map(Some)
                 .ok_or_else(|| TlsError::Certificate("RSA signing failed".into()))
@@ -141,7 +141,7 @@ pub(crate) fn sign_server_cert_verify(
 ) -> TlsResult<Option<(u16, Vec<u8>)>> {
     let key = parse_private_key(&identity.private_key)?;
     match key {
-        ParsedKey::Rsa { n, d } => {
+        ParsedKey::Rsa { n, e, d } => {
             let (scheme_pss, scheme_pkcs1, salt_len, digest_info) = match suite.hash() {
                 SuiteHash::Sha256 => (0x0804, 0x0401, 32, rsa::DIGEST_INFO_SHA256),
                 SuiteHash::Sha384 => (0x0805, 0x0501, 48, rsa::DIGEST_INFO_SHA384),
@@ -150,7 +150,7 @@ pub(crate) fn sign_server_cert_verify(
                 SuiteHash::Sha256 => Box::<Sha256>::default(),
                 SuiteHash::Sha384 => Box::<Sha384>::default(),
             };
-            if let Some(sig) = rsa::sign_pss(h.as_mut(), &n, &d, message, salt_len) {
+            if let Some(sig) = rsa::sign_pss(h.as_mut(), &n, &e, &d, message, salt_len) {
                 return Ok(Some((scheme_pss, sig)));
             }
             let mut h: super::crypto::hash::BoxDigest = match suite.hash() {
@@ -161,7 +161,7 @@ pub(crate) fn sign_server_cert_verify(
                 h.update(message);
                 h.finalize()
             };
-            if let Some(sig) = rsa::sign_pkcs1v15(&n, &d, digest_info, &digest) {
+            if let Some(sig) = rsa::sign_pkcs1v15(&n, &e, &d, digest_info, &digest) {
                 return Ok(Some((scheme_pkcs1, sig)));
             }
             Err(TlsError::Certificate("RSA signing failed".into()))
@@ -379,9 +379,14 @@ fn parse_pkcs1_rsa(der: &[u8]) -> Option<ParsedKey> {
     }
     // Strip sign padding from INTEGERs.
     let nv = strip_int(n.content);
+    let ev = strip_int(e.content);
     let dv = strip_int(d.content);
+    if ev.is_empty() {
+        return None;
+    }
     Some(ParsedKey::Rsa {
         n: nv.to_vec(),
+        e: ev.to_vec(),
         d: dv.to_vec(),
     })
 }
@@ -487,23 +492,34 @@ mod tests {
              cacd0b3cb16eb3b70838379844509fae17818045f34953e5201fdf1c65a1a5a1",
         );
         let msg = b"TLS 1.3 server CertificateVerify";
+        let e = vec![0x01u8, 0x00, 0x01];
         // PKCS#1 v1.5 (SHA-256)
         let mut h = Sha256::new();
         let digest = {
             h.update(msg);
             h.finalize()
         };
-        let sig = rsa::sign_pkcs1v15(&n, &d, rsa::DIGEST_INFO_SHA256, &digest).expect("sign pkcs1");
+        let pkcs1_sig =
+            rsa::sign_pkcs1v15(&n, &e, &d, rsa::DIGEST_INFO_SHA256, &digest).expect("sign pkcs1");
         let key = super::super::crypto::rsa::RsaPublicKey {
             n: n.clone(),
-            e: vec![0x01, 0x00, 0x01],
+            e: e.clone(),
         };
-        assert!(key.verify_pkcs1v15(rsa::DIGEST_INFO_SHA256, &digest, &sig));
+        assert!(key.verify_pkcs1v15(rsa::DIGEST_INFO_SHA256, &digest, &pkcs1_sig));
 
         // PSS (SHA-256, salt 32)
         let mut h = Sha256::new();
-        let sig = rsa::sign_pss(&mut h, &n, &d, msg, 32).expect("sign pss");
+        let pss_sig = rsa::sign_pss(&mut h, &n, &e, &d, msg, 32).expect("sign pss");
         let mut h = Sha256::new();
-        assert!(key.verify_pss(&mut h, msg, 32, &sig));
+        assert!(key.verify_pss(&mut h, msg, 32, &pss_sig));
+
+        // Blinding must not change the result, only the path taken: the
+        // PKCS#1 encoding is deterministic, so repeated signatures have
+        // to be byte-identical even though each one picks a fresh factor.
+        for _ in 0..3 {
+            let again = rsa::sign_pkcs1v15(&n, &e, &d, rsa::DIGEST_INFO_SHA256, &digest)
+                .expect("sign pkcs1");
+            assert_eq!(again, pkcs1_sig, "blinding must not alter the signature");
+        }
     }
 }

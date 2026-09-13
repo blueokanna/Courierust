@@ -1,18 +1,13 @@
 //! Outbound frame writer: compression, masking and framing behind one
-//! object that can be shared between the session that owns the
-//! connection and application threads that push messages.
+//! object.
 //!
-//! A server that accepts application-driven sends (a chat fan-out, a
-//! notification stream) needs to write to a connection from a thread that
-//! does not own its read loop. Putting the *frame* boundary inside this
-//! object is what makes that safe: [`FrameWriter::send_text`] frames,
-//! compresses and writes one message under a single acquisition of
-//! whatever lock the sink uses, so two threads can never interleave a
-//! frame's bytes.
+//! A server that accepts application-driven sends needs to write from a
+//! thread that does not own the read loop, so the *frame* boundary lives
+//! in this object: one acquisition of the sink's lock covers a whole
+//! message, and two threads can never interleave a frame's bytes.
 //!
-//! Compression decisions are per message and honest: a payload below the
-//! threshold, or one that did not get smaller, is sent with RSV1 clear
-//! rather than paying to store bytes the peer must then inflate.
+//! Compression is per message and honest: a payload below the threshold,
+//! or one that did not get smaller, is sent with RSV1 clear.
 
 use crate::courierust_deflate::Deflater;
 use crate::courierust_error::{Error, Result};

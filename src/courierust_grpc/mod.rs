@@ -511,6 +511,11 @@ impl MessageStream {
                     Ok(Err(e)) => return Err(e),
                     Err(_) => self.done = true,
                 },
+                Body::Stream(stream) => match stream.recv() {
+                    Ok(Ok(chunk)) => self.buf.extend_from_slice(&chunk),
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => self.done = true,
+                },
                 Body::Empty => self.done = true,
                 Body::Bytes(b) => {
                     self.buf.extend_from_slice(b);
