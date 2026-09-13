@@ -20,6 +20,35 @@ pub(crate) fn eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
             .all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
+/// Whether every byte of `value` may appear in an HTTP field value.
+///
+/// The per-byte class is RFC 9110 §5.5 (`field-vchar = VCHAR / obs-text`,
+/// plus SP and HTAB, which appear inside `field-content`): visible ASCII
+/// `0x20..=0x7E` and `0x80..=0xFF`. Everything else is rejected — CR and
+/// LF because in HTTP/1 a value carrying one is not a value but a second
+/// message (request splitting), NUL and DEL because no field grammar
+/// admits them.
+///
+/// This is the character rule, not the whole of RFC 9113 §8.2.1: the
+/// remaining requirement there is positional (a value must not *start*
+/// or *end* with SP/HTAB), which normalizes a value rather than making
+/// it dangerous to forward, so it is not enforced here.
+///
+/// HTTP/2 and HTTP/3 need this check as much as HTTP/1 does. RFC 9113
+/// §8.2.1 lists `NUL`, `LF` and `CR` in a field value among the
+/// conditions an implementation MUST treat as malformed, and RFC 9114
+/// §10.3 repeats it for HTTP/3 in so many words: such a value can be
+/// "exploited by an attacker if [it is] translated verbatim" into
+/// HTTP/1. Without the check, a value that a downstream HTTP/1 hop
+/// would reject crosses the h2/h3 boundary and only fails there — where
+/// it is a smuggling primitive, not a local typo.
+#[inline]
+pub fn is_valid_field_value(value: &[u8]) -> bool {
+    value
+        .iter()
+        .all(|&c| c == b'\t' || (0x20..=0x7e).contains(&c) || c >= 0x80)
+}
+
 /// An HTTP header field name. Invariant: a lowercase token (RFC 9110
 /// tchar set), so equality is a plain byte comparison.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -137,9 +166,7 @@ pub struct HeaderValue(Bytes);
 impl HeaderValue {
     /// Validate and wrap bytes.
     pub fn from_bytes(b: &[u8]) -> Result<Self> {
-        if b.iter()
-            .any(|&c| c == 0 || c == b'\r' || c == b'\n' || (c < 0x20 && c != b'\t'))
-        {
+        if !is_valid_field_value(b) {
             return Err(Error::invalid_header_value());
         }
         Ok(Self(Bytes::from(b)))

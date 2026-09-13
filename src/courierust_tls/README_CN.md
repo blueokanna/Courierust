@@ -12,7 +12,7 @@ TLS 1.2 + TLS 1.3，**从零实现、零依赖**，跑在本 crate 的 `Read`/`W
 
 **TLS 1.2（RFC 5246 / RFC 8422）：** 仅 AEAD 的 ECDHE 套件——三个 `ECDHE-ECDSA-*` 和三个 `ECDHE-RSA-*`（AES-128/256-GCM、CHACHA20-POLY1305、secp256r1）。没有 CBC/HMAC、没有 RC4、没有静态 RSA，永远没有。RFC 5746 `renegotiation_info` 会发送并回显。
 
-所有原语都在 `crypto/`——ChaCha20、Poly1305、ChaCha20-Poly1305、AES、GCM、SHA-256/384、HMAC、HKDF、X25519、Ed25519、ECDSA、RSA，以及一个 OS 种子的 ChaCha20 DRBG——按公开规范实现，**无 unsafe**。
+所有原语都在 `crypto/`——ChaCha20、Poly1305、ChaCha20-Poly1305、AES、GCM、SHA-256/384、HMAC、HKDF、X25519、Ed25519、ECDSA、RSA，以及一个 OS 种子的 ChaCha20 DRBG——按公开规范实现。除了两处作用域明确的例外（AES-NI 内建包装、Windows 系统熵调用，各自带自己的 `#[allow(unsafe_code)]`），其余均为安全 Rust。
 
 ## 你平时看不见的验证
 
@@ -24,9 +24,9 @@ TLS 1.2 + TLS 1.3，**从零实现、零依赖**，跑在本 crate 的 `Read`/`W
 - 解密握手缓冲区 16 MiB 上限，对端无限流握手记录也涨不爆内存。
 - 两端都有 `handshake_timeout`（默认 10s）——握手中途停摆的对端会释放它的 worker/调用者。
 
-## 诚实的边界
+## 远程会话恢复与密钥更新
 
-无 0-RTT / early data。TLS 1.3 会话恢复已实现——服务端签发 session ticket、1-RTT PSK `psk_dhe_ke`、按主机名分键的客户端会话缓存（上限 8 条）——并有单元测试；但池化客户端目前每个请求新建 connector，跨连接恢复尚未实际生效。QUIC 的 key update 在传输层经 key-phase 位处理（RFC 9001 §6）；记录层 TLS 1.3 KeyUpdate 消息不发送。无 mTLS——服务端从不请求客户端证书。`verify: false` 为测试/不可信对端而存在，但仍然验证 `CertificateVerify` + `Finished`，握手在密码学上保持健全。
+无 0-RTT / early data。TLS 1.3 会话恢复已实现——服务端签发 session ticket、1-RTT PSK `psk_dhe_ke`、按主机名分键的客户端会话缓存（上限 8 条）——并且池化客户端按 authority 缓存 connector，一条连接上拿到的 ticket 会在下一条连接上提供（`tls_session_resumption_across_client_connections` 端到端证明）。`KeyUpdate`（RFC 8446 §4.6.3）已双向实现：收到更新则切换读方向密钥、对端要求响应时先回一个自己的更新；写方向在耗尽单密钥记录预算（§5.5）前主动 rekey；`request_key_update()` 可强制发起。QUIC 的密钥更新仍走传输层 key-phase 位（RFC 9001 §6）。无 mTLS——服务端从不请求客户端证书。`verify: false` 为测试/不可信对端而存在，但仍然验证 `CertificateVerify` + `Finished`，握手在密码学上保持健全。
 
 ## 用法
 

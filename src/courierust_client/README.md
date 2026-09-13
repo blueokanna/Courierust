@@ -4,7 +4,7 @@ The multi-core HTTP client: an HTTP/1.1 keep-alive pool grouped by authority, HT
 
 ## The model
 
-- **HTTP/1.1** — a keep-alive pool per authority with bounded reuse. A pooled connection is probed for liveness before it is reused (a server that closed it while it sat idle costs nothing: nothing was written yet, so no request — not even a `POST` — is exposed to a dead socket), and a connection that dies mid-request is retried **once** on a fresh one — only for methods that are safe to replay (RFC 9110 §9.2.2), never for a `POST`. Each connection owns its read/write buffers and a `Scratch`, so steady-state keep-alive requests perform **zero per-request allocation** and zero socket reconfiguration.
+- **HTTP/1.1** — a keep-alive pool per authority with bounded reuse. A pooled connection is probed for liveness before it is reused (a server that closed it while it sat idle costs nothing: nothing was written yet, so no request — not even a `POST` — is exposed to a dead socket), and a connection that dies mid-request is retried **once** on a fresh one — only for methods that are safe to replay (RFC 9110 §9.2.2), never for a `POST`. Each connection owns its read/write buffers and a `Scratch`, so a steady-state keep-alive request reuses every buffer it can — the header block, the body scratch and the request line are written through memory the connection already has — and reconfigures nothing on the socket. (The request's own `Url`, authority and pool key are still built per call: this is buffer reuse, not a claim that a request costs no allocation at all.)
 - **HTTP/2** — each connection is driven by a dedicated driver thread that serializes wire access while multiplexing streams. Requests arrive over a channel; responses stream back over per-stream channels. `max_connections_per_host` caps live connections per authority; the h2 pool is shared by authority.
 - **HTTP/3** — `http3://` (and ALPN `h3`) routes into the H3 runtime's UDP reactor, with pooled connection reuse.
 - **WebSocket** — `courierust_client::ws::WebSocket` upgrades over `ws://` or TLS (`wss://`) and exposes `send_text` / `send_binary` / `send_ping` / `read_message` / `close` with subprotocols, an Origin header, a compression preference and a read deadline, all from the same `ClientConfig`. It shares the framing / UTF-8 / close-handshake engine (`courierust_ws`) with the server, so both ends enforce the same rules.
@@ -15,7 +15,9 @@ The multi-core HTTP client: an HTTP/1.1 keep-alive pool grouped by authority, HT
 - **Redirects** (301/302/303 → GET, 307/308 keep method and body) never forward `Authorization` / `Cookie` across origins (RFC 9110 §15.4).
 - **Priorities** — `execute_priority(url, req, Priority { urgency, incremental })` drives the WUCS scheduler (see `blogs/01`).
 - **Worker occupancy is per connection, not per stream** — a single h2 connection with many streams holds exactly one worker, so streams never multiply worker usage and never block each other.
-- **Timeouts** — connect, handshake (TLS), read, and total request timeouts, all configurable.
+- **Timeouts** — connect, handshake (TLS) and read timeouts are configured on `ClientConfig`; a single request can override the read timeout with `RequestBuilder::timeout`. The override is a *transport deadline* with the same meaning as the configured one, applied per attempt (a redirect chain gives every hop a full timeout) and restored afterwards, so a pooled connection never carries one caller's deadline into the next request.
+- **Request building** — `Client::request(url, method)` returns a `RequestBuilder`: headers, body, `query` / `form` (WHATWG `application/x-www-form-urlencoded`, in `courierust_http::form`), `basic_auth` / `bearer_auth`, an RFC 9218 `priority`, and a per-request `timeout`. `Client::{put, delete, head, patch, options}` are the shorthands. It builds the same `Request` a hand-written call sends and hands it to the same `execute` path, so redirects, pools and all three protocols behave identically either way.
+- **Default headers** — `ClientConfig::default_headers` are merged into the request the client initiates, with a field on the request itself always winning. They are merged on that first hop only: a cross-origin redirect drops `authorization`, `proxy-authorization` and `cookie` however they were set, and re-merging would put a default credential back on the hop the rule exists to protect.
 - **A WebSocket read deadline is a socket deadline.** `ClientConfig::read_timeout` (60 s by default) is the right liveness mechanism for interactive traffic, but on Windows it is charged on every blocking operation: a 256 KiB WebSocket bulk push runs roughly **2× slower** with it armed. A bulk-transfer client should set `read_timeout: None` and use application-level liveness instead — the server does exactly that (measurements: [`courierust_ws` README](../courierust_ws/README.md)).
 - **h2c prior knowledge** is opt-in (`cfg.http2 = true`); `h2c` Upgrade is supported on the server side.
 
@@ -47,4 +49,14 @@ let resp = client.get("http://127.0.0.1:8080/")?;
 println!("{}", String::from_utf8_lossy(&resp.body.collect()?));
 
 let resp = client.post("http://127.0.0.1:8080/submit", b"hello")?;
+
+let resp = client
+    .request("http://127.0.0.1:8080/api/items", courierust::courierust_http::Method::POST)
+    .query([("page", "2")])
+    .header("accept", "application/json")
+    .basic_auth("user", "secret")
+    .timeout(std::time::Duration::from_secs(5))
+    .body(r#"{"name":"widget"}"#)
+    .send()?;
+println!("{}", resp.text()?);
 ```

@@ -161,7 +161,7 @@ for msg in [ws.read_message()?] {
 ws.close(1000, "done")?;
 ```
 
-可运行版本见 [`examples/ws_echo.rs`](../../examples/ws_echo.rs) 与 [`examples/ws_client.rs`](../../examples/ws_client.rs)；[`tests/ws.rs`](../../tests/ws.rs) 中的 27 个端到端测试针对真实 socket 验证线上协议，包括跨驱动推送、Origin 拒绝、TLS 上的 `wss` 以及各类错误码。
+可运行版本见 [`examples/ws_echo.rs`](../../examples/ws_echo.rs) 与 [`examples/ws_client.rs`](../../examples/ws_client.rs)；[`tests/ws.rs`](../../tests/ws.rs) 中的 34 个端到端测试针对真实 socket 验证线上协议，包括跨驱动推送、Origin 拒绝、TLS 上的 `wss` 以及各类错误码。
 
 ## 接下来看哪里
 

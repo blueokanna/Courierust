@@ -4,7 +4,7 @@
 
 ## 模型
 
-- **HTTP/1.1**——按 authority 的 keep-alive 池，有界复用。取用池连接前先做一次活性探测（服务器在空转期间已关掉的连接不付出任何代价：还没写入任何字节，即便是 `POST` 也不会发到死连接上）；请求途中连接死亡则**一次**新连接重试，且仅限于可重放的幂等方法（RFC 9110 §9.2.2），绝不重放 `POST`。每条连接拥有自己的读写缓冲区和 `Scratch`，稳态 keep-alive 请求**零按请求分配**、零 socket 重配。
+- **HTTP/1.1**——按 authority 的 keep-alive 池，有界复用。取用池连接前先做一次活性探测（服务器在空转期间已关掉的连接不付出任何代价：还没写入任何字节，即便是 `POST` 也不会发到死连接上）；请求途中连接死亡则**一次**新连接重试，且仅限于可重放的幂等方法（RFC 9110 §9.2.2），绝不重放 `POST`。每条连接拥有自己的读写缓冲区和 `Scratch`，稳态 keep-alive 请求会复用它能复用的每一块缓冲区——头块、body 暂存、请求行都写在连接已有的内存里——并且不做任何 socket 重配。（`Url`、authority 与池键仍然是每次调用构造的：这里说的是缓冲区复用，不是“一次请求零分配”。）
 - **HTTP/2**——每条连接由专用 driver 线程驱动，串行化线上访问的同时多路复用流。请求经 channel 到达；响应经每流 channel 流回。`max_connections_per_host` 按 authority 封顶存活连接；h2 池按 authority 共享。
 - **HTTP/3**——`http3://`（以及 ALPN `h3`）路由进 H3 runtime 的 UDP reactor，支持池化连接复用。
 - **WebSocket**——`courierust_client::ws::WebSocket` 通过 `ws://` 或 TLS（`wss://`）升级，提供 `send_text` / `send_binary` / `send_ping` / `read_message` / `close`，并支持子协议、Origin 头、压缩偏好与读超时，全部沿用同一个 `ClientConfig`。它与服务端共用组帧/UTF-8/关闭握手引擎（`courierust_ws`），两端强制的是同一套规则。
@@ -15,7 +15,9 @@
 - **重定向**（301/302/303 → GET，307/308 保留方法与请求体）绝不跨 origin 转发 `Authorization` / `Cookie`（RFC 9110 §15.4）。
 - **优先级**——`execute_priority(url, req, Priority { urgency, incremental })` 驱动 WUCS 调度器（见 `blogs/01`）。
 - **worker 占用按连接而非按流**——一条带很多流的 h2 连接只占一个 worker，流永远不会把 worker 用量翻倍，也互不阻塞。
-- **超时**——连接、握手（TLS）、读、整请求超时，全部可配。
+- **超时**——连接、握手（TLS）、读超时都在 `ClientConfig` 上配置；单个请求可用 `RequestBuilder::timeout` 覆盖读超时。这个覆盖与配置项同义，是**传输层截止时间**，按每次尝试生效（重定向每一跳都有完整超时），用后恢复，因此池化连接不会把上一个调用者的截止时间带给下一个请求。
+- **请求构建**——`Client::request(url, method)` 返回 `RequestBuilder`：头、body、`query` / `form`（WHATWG `application/x-www-form-urlencoded`，实现在 `courierust_http::form`）、`basic_auth` / `bearer_auth`、RFC 9218 `priority`，以及每请求 `timeout`。`Client::{put, delete, head, patch, options}` 是快捷方法。它构造的就是手写调用所发的同一个 `Request`，交给同一条 `execute` 路径，重定向、连接池与三种协议都完全一致。
+- **默认头**——`ClientConfig::default_headers` 会合入客户端自己发起的那个请求，请求本身设置的同名字段永远优先。只在首跳合入：跨源重定向会剥掉 `authorization` / `proxy-authorization` / `cookie`（不论它们来自请求还是配置），再合一次就等于把默认凭据又放回这条规则要保护的那一跳。
 - **WebSocket 的读超时就是 socket 超时。** `ClientConfig::read_timeout`（默认 60 s）对交互式流量是正确的存活机制，但 Windows 会在每次阻塞操作上收费：armed 状态下 256 KiB 的 WebSocket 批量推送大约**慢 2 倍**。批量传输的客户端应设 `read_timeout: None`，改用应用层存活判断——服务端就是这么做的（实测见 [`courierust_ws` README](../courierust_ws/README_CN.md)）。
 - **h2c 前导知识**是选配（`cfg.http2 = true`）；服务端支持 `h2c` Upgrade。
 
@@ -47,4 +49,14 @@ let resp = client.get("http://127.0.0.1:8080/")?;
 println!("{}", String::from_utf8_lossy(&resp.body.collect()?));
 
 let resp = client.post("http://127.0.0.1:8080/submit", b"hello")?;
+
+let resp = client
+    .request("http://127.0.0.1:8080/api/items", courierust::courierust_http::Method::POST)
+    .query([("page", "2")])
+    .header("accept", "application/json")
+    .basic_auth("user", "secret")
+    .timeout(std::time::Duration::from_secs(5))
+    .body(r#"{"name":"widget"}"#)
+    .send()?;
+println!("{}", resp.text()?);
 ```

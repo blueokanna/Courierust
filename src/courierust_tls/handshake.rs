@@ -23,15 +23,10 @@ use alloc::vec::Vec;
 /// Handshake message types (RFC 8446 §4).
 pub(crate) const HS_CLIENT_HELLO: u8 = 1;
 pub(crate) const HS_SERVER_HELLO: u8 = 2;
+pub(crate) const HS_KEY_UPDATE: u8 = 24;
 pub(crate) const HS_NEW_SESSION_TICKET: u8 = 4;
-/// EndOfEarlyData (used in 0-RTT; recognized here for completeness).
-#[allow(dead_code)]
-pub(crate) const HS_END_OF_EARLY_DATA: u8 = 5;
 pub(crate) const HS_ENCRYPTED_EXTENSIONS: u8 = 8;
 pub(crate) const HS_CERTIFICATE: u8 = 11;
-/// CertificateRequest (used for client auth; not yet supported).
-#[allow(dead_code)]
-pub(crate) const HS_CERTIFICATE_REQUEST: u8 = 13;
 pub(crate) const HS_CERTIFICATE_VERIFY: u8 = 15;
 pub(crate) const HS_FINISHED: u8 = 20;
 /// Synthetic `message_hash` handshake type used after a HelloRetryRequest
@@ -223,11 +218,15 @@ pub(crate) struct HandshakeResult {
 }
 
 /// The application traffic keys (write = client, read = server and
-/// vice-versa), fully derived.
+/// vice-versa), fully derived, plus the traffic secrets behind them:
+/// RFC 8446 §7.2 derives a `KeyUpdate`'s next generation from the secret,
+/// which cannot be recovered from the key.
 #[derive(Debug, Clone)]
 pub(crate) struct AppKeys {
     pub(crate) write: TrafficKeys,
     pub(crate) read: TrafficKeys,
+    pub(crate) write_secret: Vec<u8>,
+    pub(crate) read_secret: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------
@@ -283,16 +282,9 @@ pub(crate) fn build_client_hello_negotiated(
     offer12: bool,
 ) -> Vec<u8> {
     let mut body = Vec::new();
-    // legacy_version = 0x0303
     body.extend_from_slice(&[0x03, 0x03]);
     body.extend_from_slice(random);
-    // legacy_session_id (empty for a non-resuming client)
     body.push(0);
-    // cipher_suites (big-endian u16 length): TLS 1.3 suites when
-    // offering TLS 1.3, then TLS 1.2 AEAD ECDHE suites when offering
-    // TLS 1.2. RFC 8446 §4.1.2: a client that supports TLS 1.3 MUST put
-    // the 1.3 suites in `cipher_suites` (they are identified by the
-    // 0x03 prefix) — TLS 1.2 servers simply ignore them.
     let mut suite_wires: Vec<u16> = Vec::new();
     if offer13 {
         suite_wires.extend(CLIENT_SUITES.iter().map(|s| s.wire()));
@@ -304,13 +296,11 @@ pub(crate) fn build_client_hello_negotiated(
     for s in &suite_wires {
         body.extend_from_slice(&s.to_be_bytes());
     }
-    // legacy_compression_methods
     body.extend_from_slice(&[1, 0]);
 
     // extensions
     let mut exts: Vec<(u16, Vec<u8>)> = Vec::new();
 
-    // server_name (RFC 6066): NameList { ServerNameList }
     if let Some(name) = server_name {
         let name_bytes = name.as_bytes();
         let mut server_name_ext = Vec::new();
@@ -323,11 +313,6 @@ pub(crate) fn build_client_hello_negotiated(
         exts.push((EXT_SERVER_NAME, server_name_ext));
     }
 
-    // supported_groups: only curves the client can actually complete ECDHE
-    // with in the versions it offers. The TLS 1.3 key share uses X25519;
-    // TLS 1.2 ECDHE uses secp256r1. A TLS 1.2-only client MUST NOT
-    // advertise X25519 — a TLS 1.2 server would select it and the client
-    // has no TLS 1.2 X25519 key exchange (OpenSSL does exactly this).
     let mut groups = Vec::new();
     if offer13 {
         groups.extend_from_slice(&[0x00, 0x04]); // 2 curves
@@ -352,11 +337,6 @@ pub(crate) fn build_client_hello_negotiated(
     // ec_point_formats (required by TLS 1.2 ECDHE): uncompressed only.
     if offer12 {
         exts.push((EXT_EC_POINT_FORMATS, vec![1, 0]));
-        // RFC 5746 §3.2 secure renegotiation indicator. A fresh
-        // handshake's `renegotiated_connection` is an empty vector, so
-        // the extension_data is a single 0x00 length byte. OpenSSL
-        // rejects a TLS 1.2 ClientHello without it ("unsafe legacy
-        // renegotiation disabled").
         exts.push((EXT_RENEGOTIATION_INFO, vec![0x00]));
     }
 
@@ -553,7 +533,6 @@ pub(crate) fn parse_server_hello(body: &[u8]) -> TlsResult<ServerHelloInfo> {
                 saw_supported_versions = true;
             }
             super::session::EXT_PRE_SHARED_KEY => {
-                // selected_identity must be 0 (we offer one identity).
                 let mut v = Cur::new(e.content);
                 let selected = v
                     .u16()
@@ -745,11 +724,6 @@ pub(crate) fn verify_cert_verify(
         let (n, e) = parse_rsa_public_key(&spki.key)
             .ok_or_else(|| TlsError::Certificate("bad RSA SPKI".into()))?;
         let key = RsaPublicKey { n, e };
-        // PSS verifies the *raw* certificate-verify content (RFC 8446
-        // §4.4.3 / RFC 8017 §9.1: mHash = Hash(M)); PKCS#1 v1.5 signs
-        // the digest of that content. Passing the pre-hashed digest to
-        // the PSS path would double-hash and reject every valid
-        // signature.
         let ok = match cv.scheme {
             0x0804 if suite.hash() == super::key_schedule::SuiteHash::Sha256 => {
                 let mut h = super::crypto::hash::Sha256::default();
@@ -775,11 +749,6 @@ pub(crate) fn verify_cert_verify(
             ))
         }
     } else if spki.oid == OID_EC_PUBLIC_KEY {
-        // TLS 1.3 fixes the ECDSA CertificateVerify scheme from the
-        // negotiated cipher-suite hash: SHA-256 → 0x0403 with a P-256
-        // key, SHA-384 → 0x0503 with a P-384 key. P-521 would require
-        // a SHA-512 suite, which this profile does not offer, so it can
-        // never appear here (identical to rustls).
         let (curve, expected_scheme) = match suite.hash() {
             super::key_schedule::SuiteHash::Sha256 => (ecdsa::Curve::P256, 0x0403),
             super::key_schedule::SuiteHash::Sha384 => (ecdsa::Curve::P384, 0x0503),
@@ -904,8 +873,6 @@ impl ClientHandshake {
         hrr: Option<(&[u8], &[u8], &[u8])>,
     ) -> TlsResult<HandshakeResult> {
         let sh = parse_server_hello(sh_body)?;
-        // RFC 8446 §4.1.3: the echoed session id must match the one we
-        // sent (we send an empty one).
         if !sh.session_id.is_empty() {
             return Err(TlsError::Protocol("ServerHello session id mismatch".into()));
         }
@@ -922,13 +889,10 @@ impl ClientHandshake {
         let sh_msg = encode_hs(HS_SERVER_HELLO, sh_body);
         transcript.update(&sh_msg);
 
-        // 3. ECDHE + key schedule
         let shared = x25519::x25519(priv_key, &sh.key_share);
         validate_shared_secret(&shared)?;
         let th = transcript.current_hash();
         let mut ks = if sh.resumed {
-            // The server accepted our resumption PSK (RFC 8446 §4.2.11);
-            // the negotiated suite must be the PSK's suite.
             let (psk, psk_suite) = self
                 .psk
                 .clone()
@@ -944,9 +908,6 @@ impl ClientHandshake {
         };
         let _ = sh.random;
 
-        // 4. Encrypted flight (EncryptedExtensions, Certificate,
-        //    CertificateVerify, Finished) — decrypted with the server
-        //    handshake keys.
         let s_hs_keys = ks.server_handshake_keys();
         let plaintext = io.read_encrypted_handshake(sh.suite, &s_hs_keys)?;
         let mut messages = Vec::new();
@@ -1008,8 +969,6 @@ impl ClientHandshake {
                 return Err(TlsError::Certificate("hostname mismatch".into()));
             }
             super::x509::validate_chain(roots, &peer_chain, now)?;
-            // RFC 5280 §4.2.1.12: a leaf with an EKU extension must
-            // permit TLS server authentication.
             if !super::x509::has_server_auth_eku(&leaf) {
                 return Err(TlsError::Certificate(
                     "leaf certificate lacks TLS serverAuth EKU".into(),
@@ -1038,12 +997,10 @@ impl ClientHandshake {
             });
         }
 
-        // Add server Finished to transcript; derive app secrets.
         transcript.update(&encode_hs(HS_FINISHED, &finished_body));
         let after_fin_hash = transcript.current_hash();
         ks.application(&after_fin_hash)?;
 
-        // 5. Client Finished (hash before client Finished).
         let client_fin_hash = transcript.current_hash();
         let client_fin = finished_verify_data(&ks, ks.client_handshake(), &client_fin_hash);
         let fin_msg = encode_hs(HS_FINISHED, &client_fin);
@@ -1051,17 +1008,18 @@ impl ClientHandshake {
         io.write_encrypted_record(sh.suite, &c_hs_keys, CONTENT_HANDSHAKE, &fin_msg)?;
         transcript.update(&fin_msg);
 
-        // The resumption master secret (transcript = CH..client Finished)
-        // lets the client derive the PSK of any NewSessionTicket it reads
-        // after the handshake (RFC 8446 §7.1).
         let resumption_master = Some(ks.resumption_master(&transcript.current_hash()));
 
-        // 6. Application keys.
         let write = ks.client_application_keys();
         let read = ks.server_application_keys();
         Ok(HandshakeResult {
             suite: sh.suite,
-            keys: AppKeys { write, read },
+            keys: AppKeys {
+                write,
+                read,
+                write_secret: ks.client_application_secret().to_vec(),
+                read_secret: ks.server_application_secret().to_vec(),
+            },
             alpn: negotiated_alpn,
             server_name: self.server_name.clone(),
             peer_cert: Some(peer_cert_der),
@@ -1364,21 +1322,22 @@ impl ServerHandshake {
             fill_entropy(&mut nonce)?;
             let psk = ks.resumption_psk(&transcript.current_hash(), &nonce);
             let ticket = super::session::encrypt_ticket(&key, ch.suite, &psk, self.now);
-            // Advertise 0-RTT for this ticket (RFC 8446 §4.6.1). The
-            // client may send up to this many bytes of early data on a
-            // future connection using the ticket.
-            let msg = super::session::build_new_session_ticket_with_early_data(
+            let msg = super::session::build_new_session_ticket(
                 super::session::SESSION_LIFETIME_SECS as u32,
                 &nonce,
                 &ticket,
-                super::session::MAX_EARLY_DATA_SIZE,
             );
             io.write_encrypted_record(ch.suite, &write, CONTENT_HANDSHAKE, &msg)?;
         }
 
         Ok(HandshakeResult {
             suite: ch.suite,
-            keys: AppKeys { write, read },
+            keys: AppKeys {
+                write,
+                read,
+                write_secret: ks.server_application_secret().to_vec(),
+                read_secret: ks.client_application_secret().to_vec(),
+            },
             alpn: negotiated_alpn,
             server_name: ch.server_name,
             peer_cert: None,

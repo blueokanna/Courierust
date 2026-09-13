@@ -11,22 +11,12 @@ use super::crypto::ecdsa::Curve;
 use super::crypto::hash::{Digest, Sha256, Sha384};
 use super::crypto::{ecdsa, ed25519, rsa};
 use super::key_schedule::{CipherSuite, SuiteHash};
-use super::x509::der::{expect_sequence, read_element};
+use super::x509::der::{
+    expect_sequence, read_element, OID_EC_PUBLIC_KEY, OID_ED25519, OID_P256, OID_P384, OID_P521,
+    OID_RSA_ENCRYPTION,
+};
 use super::{Identity, TlsError, TlsResult};
 use alloc::vec::Vec;
-
-/// DER OID: rsaEncryption (1.2.840.113549.1.1.1).
-const OID_RSA_ENCRYPTION: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
-/// DER OID: Ed25519 (1.3.101.112).
-const OID_ED25519: &[u8] = &[0x2b, 0x65, 0x70];
-/// DER OID: id-ecPublicKey (1.2.840.10045.2.1).
-const OID_EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
-/// DER OID: prime256v1 / secp256r1 (1.2.840.10045.3.1.7).
-const OID_P256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
-/// DER OID: secp384r1 (1.3.132.0.34).
-const OID_P384: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x22];
-/// DER OID: secp521r1 (1.3.132.0.35).
-const OID_P521: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x23];
 
 /// A parsed private key.
 enum ParsedKey {

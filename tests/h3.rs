@@ -348,3 +348,42 @@ fn h3_rejects_hostname_mismatch() {
         .expect_err("a hostname not covered by the certificate SAN must be rejected");
     assert!(!err.to_string().is_empty());
 }
+
+/// A HEAD response has no content, so the server must not sit on the
+/// handler's streaming body before answering: a producer that keeps
+/// streaming would otherwise hold that stream (and its response) open for
+/// as long as it likes.
+#[test]
+fn h3_head_response_does_not_wait_for_a_streaming_body() {
+    let base = spawn_h3_server(|req: Request<Body>| {
+        let (tx, body) = courierust::courierust_body::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(Bytes::from_static(b"chunk"));
+            // The server must never have waited for this to arrive.
+            std::thread::sleep(Duration::from_secs(5));
+            let _ = tx.send(Bytes::from_static(b"late"));
+        });
+        let mut resp =
+            courierust::courierust_http::response::Response::<Body>::with_status(200.into());
+        resp.headers.insert(
+            courierust::courierust_http::header::HeaderName::from_lowercase("x-method"),
+            courierust::courierust_http::header::HeaderValue::from_bytes(
+                req.method.as_str().as_bytes(),
+            )
+            .unwrap(),
+        );
+        resp.body = body;
+        resp
+    });
+    // Two seconds: draining the body would take five.
+    let client = h3_client(1 << 20, Duration::from_secs(2));
+
+    let resp = client
+        .head(&format!("{base}/stream"))
+        .expect("a HEAD response must not wait for the body");
+    assert_eq!(resp.status.as_u16(), 200);
+    assert!(
+        resp.body.collect().unwrap().is_empty(),
+        "a HEAD response has no content"
+    );
+}

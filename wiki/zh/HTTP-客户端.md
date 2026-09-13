@@ -6,6 +6,7 @@
 
 ```rust
 use courierust::courierust_client::{Client, ClientConfig};
+use courierust::courierust_http::header::HeaderMap;
 use std::time::Duration;
 
 let cfg = ClientConfig {
@@ -20,6 +21,9 @@ let cfg = ClientConfig {
     max_redirects: 10,
     // 请求携带的 User-Agent；None 则不发送。
     user_agent: Some("my-app/1.0".to_string()),
+    // 每条本客户端发起的请求都带上的字段。请求自身设置的字段永远优先；
+    // 跨源重定向会剥掉 authorization / proxy-authorization / cookie（两者都算）。
+    default_headers: HeaderMap::new(),
     // 防御性限制：接受的对端头列表与响应体大小上限。
     max_header_list: 1 << 20,
     max_body: 16 * 1024 * 1024,
@@ -50,6 +54,29 @@ println!("body: {}", body.to_str()?);
 let resp = client.post("http://127.0.0.1:8080/submit", "raw text payload")?;
 let resp = client.post("http://127.0.0.1:8080/submit", vec![1u8, 2, 3])?;
 ```
+
+## 请求构建器
+
+`Client::request(url, method)` 返回 `RequestBuilder`：它构造的就是下面手写形式所发的同一个 `Request`，交给同一条路径，所以重定向、连接池与三种协议的行为完全一致。`Client::{put, delete, head, patch, options}` 是一次调用就能用的快捷方法。
+
+```rust
+use courierust::courierust_http::Method;
+
+let resp = client
+    .request("http://127.0.0.1:8080/api/items", Method::POST)
+    .query([("page", "2")])          // 追加到 URL，做百分号转义
+    .form([("name", "widget")])      // body + content-type，urlencoded
+    .header("accept", "application/json")
+    .basic_auth("user", "secret")    // 或 .bearer_auth("token")
+    .timeout(std::time::Duration::from_secs(5))
+    .send()?;
+println!("{}", resp.text()?);
+```
+
+- `query` / `form` 使用 WHATWG `application/x-www-form-urlencoded` 编码（`courierust_http::form`）：空格变 `+`，`A-Za-z0-9*-._` 之外的字节变 `%XX`。
+- `timeout` **只对这一个请求**覆盖 `ClientConfig::read_timeout`：同义的传输层截止时间，按每次尝试生效、用后恢复，因此连接带着配置值回到池中。h1、h2、h3 都生效。
+- `priority` 是 RFC 9218 提示：HTTP/2 会读它（喂给 WUCS 调度器），HTTP/1.1 与 HTTP/3 没有可携带它的字段，原样发请求。
+- `resp.text()` / `resp.bytes()` 消费 body；`text` 遇到不是合法 UTF-8 的 body 会报错，而不是用 U+FFFD 代替。
 
 ## 带请求头的 Request 与响应检查
 

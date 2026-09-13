@@ -6,7 +6,7 @@ This page gets a client and a server talking over loopback in five minutes.
 
 ```toml
 [dependencies]
-courierust = "1.0.0"
+courierust = "1.0.6"
 ```
 
 The default `std` feature pulls in the client, server, pool, and gRPC layers (the WebSocket engine is in the protocol core, so `courierust_ws` is available either way; [WebSockets](WebSockets) shows the server hook and the client). If you only want the `no_std` protocol core, see [no_std](no_std).

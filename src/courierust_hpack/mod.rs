@@ -153,6 +153,21 @@ pub struct Decoder {
     max_string_size: usize,
 }
 
+/// Wrap raw field-value bytes without a character-class check.
+///
+/// RFC 9113 §8.2.1 makes a value containing NUL, CR or LF *malformed*, which
+/// §8.1.1 turns into a stream error — while §4.3 makes a *decoding* failure a
+/// connection error. Rejecting the value here would report the malformed
+/// message as the harsher of the two and kill every other stream on the
+/// connection, so the check belongs to the message layer
+/// (`courierust_h2::connection::validate_header_block`), which sees the whole
+/// field section and can reset just that stream.
+#[inline]
+fn raw_value(bytes: &[u8]) -> HeaderValue {
+    // `From<Vec<u8>>` deliberately skips validation; see above.
+    HeaderValue::from(bytes.to_vec())
+}
+
 impl Decoder {
     /// New decoder. `max_table_size` is what we advertised to the peer;
     /// `max_header_list_size` is our SETTINGS_MAX_HEADER_LIST_SIZE.
@@ -194,7 +209,7 @@ impl Decoder {
                     .get(idx)
                     .ok_or_else(|| Error::protocol("HPACK: index out of range"))?;
                 let name = HeaderName::from_hpack_bytes(n)?;
-                let value = HeaderValue::from_bytes(v)?;
+                let value = raw_value(v);
                 total = checked_add(total, FIELD_OVERHEAD + n.len() + v.len())?;
                 if total > self.max_header_list_size {
                     return Err(Error::overflow("HPACK: header list too large"));
@@ -218,7 +233,7 @@ impl Decoder {
                 let name = HeaderName::from_hpack_bytes(name_bytes.as_slice())?;
                 let value = read_string(input, &mut pos, self.max_string_size, &self.huff)?;
                 let vbytes = value.as_slice();
-                let value = HeaderValue::from_bytes(vbytes)?;
+                let value = raw_value(vbytes);
                 total = checked_add(total, FIELD_OVERHEAD + name_len + vbytes.len())?;
                 if total > self.max_header_list_size {
                     return Err(Error::overflow("HPACK: header list too large"));
@@ -259,7 +274,7 @@ impl Decoder {
                 let name = HeaderName::from_hpack_bytes(name_bytes.as_slice())?;
                 let value = read_string(input, &mut pos, self.max_string_size, &self.huff)?;
                 let vbytes = value.as_slice();
-                let value = HeaderValue::from_bytes(vbytes)?;
+                let value = raw_value(vbytes);
                 total = checked_add(total, FIELD_OVERHEAD + name_len + vbytes.len())?;
                 if total > self.max_header_list_size {
                     return Err(Error::overflow("HPACK: header list too large"));

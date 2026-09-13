@@ -1,11 +1,11 @@
 [package]
 name = "courierust"
-version = "1.0.5"
+version = "1.0.6"
 edition = "2021"
 rust-version = "1.78"
-license = "Apache-2.0"
+license-file = "LICENSE"
 authors = ["blueokanna", "HyphenTeam"]
-description = "no_std HTTP and gRPC engine with work-stealing, RFC 9218, and JA3/JA4 fingerprinting."
+description = "A bare-metal no_std HTTP and gRPC engine with work-stealing, RFC 9218, and JA3/JA4 fingerprinting."
 homepage = "https://github.com/blueokanna/Courierust"
 repository = "https://github.com/blueokanna/Courierust"
 readme = "README.md"

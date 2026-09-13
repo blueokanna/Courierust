@@ -1,9 +1,12 @@
 //! Multi-core HTTP client: HTTP/1.1 keep-alive pool + HTTP/2
 //! multiplexed connections distributed across worker threads.
 
+pub mod builder;
 pub mod h1;
 pub mod h2;
 pub mod ws;
+
+pub use builder::RequestBuilder;
 
 use crate::courierust_body::Body;
 use crate::courierust_client::h1::H1Connection;
@@ -11,6 +14,7 @@ use crate::courierust_client::h2::{H2Cmd, H2Conn};
 use crate::courierust_error::{Error, Result};
 use crate::courierust_h2::priority::Priority;
 use crate::courierust_h3::runtime::{H3Cmd, H3Conn};
+use crate::courierust_http::header::HeaderMap;
 use crate::courierust_http::method::Method;
 use crate::courierust_http::request::Request;
 use crate::courierust_http::response::Response;
@@ -109,6 +113,16 @@ pub struct ClientConfig {
     pub max_redirects: usize,
     /// Default `User-Agent`.
     pub user_agent: Option<String>,
+    /// Fields added to every request this client sends.
+    ///
+    /// Merged in when the request is dispatched, so a field of the same
+    /// name on the request itself always wins. A cross-origin redirect
+    /// drops `authorization`, `proxy-authorization` and `cookie`
+    /// wherever they came from — request or client — because a
+    /// credential that lives in the configuration is the one most
+    /// likely to be forgotten here: it is not visible at the call site
+    /// that moved the request to another origin.
+    pub default_headers: HeaderMap,
     /// Maximum accepted header-list size.
     pub max_header_list: usize,
     /// Maximum accepted body size.
@@ -155,6 +169,7 @@ impl Default for ClientConfig {
             handshake_timeout: Some(Duration::from_secs(10)),
             max_redirects: 10,
             user_agent: Some(format!("courierust/{}", env!("CARGO_PKG_VERSION"))),
+            default_headers: HeaderMap::new(),
             max_header_list: 1 << 20,
             max_body: 16 * 1024 * 1024,
             tls: None,
@@ -169,10 +184,34 @@ impl Default for ClientConfig {
     }
 }
 
+/// Key of the HTTP/1.1 keep-alive pool: scheme and authority together.
+///
+/// The scheme is part of the key because `http://host:8443` (plaintext)
+/// and `https://host:8443` (TLS) share an authority but must never reuse
+/// each other's connections — reusing the plaintext one for an `https`
+/// URL would silently downgrade the request. A pair rather than a
+/// `format!("{}://{authority}")` keeps that distinction without an
+/// allocation on every request.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct H1PoolKey {
+    secure: bool,
+    authority: String,
+}
+
+/// The pool key for a URL's scheme and authority. `secure` is `true` for
+/// `https` (TLS), `false` for `http` — the one place the string is turned
+/// into the flag the key stores, so a caller cannot mix the two up.
+fn h1_pool_key(secure: bool, authority: &str) -> H1PoolKey {
+    H1PoolKey {
+        secure,
+        authority: authority.to_string(),
+    }
+}
+
 struct ClientInner {
     config: ClientConfig,
     /// Idle h1 keep-alive connections per authority.
-    h1_pool: Mutex<HashMap<String, Vec<(SocketAddr, H1Connection)>>>,
+    h1_pool: Mutex<HashMap<H1PoolKey, Vec<(SocketAddr, H1Connection)>>>,
     /// Live h2 connections per authority, selected by dispatch reservations.
     h2_pool: Mutex<HashMap<String, Vec<H2Conn>>>,
     /// Signaled whenever an h2 connection open lands (or fails), so
@@ -287,11 +326,77 @@ impl Client {
         self.execute(url, req)
     }
 
+    /// Perform a PUT request with a body.
+    pub fn put(&self, url: &str, body: impl Into<Body>) -> Result<Response<Body>> {
+        let mut req = Request::<Body>::new(Method::PUT, "/");
+        req.body = body.into();
+        self.execute(url, req)
+    }
+
+    /// Perform a DELETE request.
+    ///
+    /// `DELETE` carries no body (RFC 9110 §9.3.5): a server that wants
+    /// one can be asked with [`Client::request`] and an explicit body.
+    pub fn delete(&self, url: &str) -> Result<Response<Body>> {
+        self.execute(url, Request::<Body>::new(Method::DELETE, "/"))
+    }
+
+    /// Perform a HEAD request. The response has no body by definition
+    /// (RFC 9110 §9.3.2), so the status and headers are the whole answer.
+    pub fn head(&self, url: &str) -> Result<Response<Body>> {
+        self.execute(url, Request::<Body>::new(Method::HEAD, "/"))
+    }
+
+    /// Perform a PATCH request with a body.
+    pub fn patch(&self, url: &str, body: impl Into<Body>) -> Result<Response<Body>> {
+        let mut req = Request::<Body>::new(Method::PATCH, "/");
+        req.body = body.into();
+        self.execute(url, req)
+    }
+
+    /// Perform an OPTIONS request.
+    pub fn options(&self, url: &str) -> Result<Response<Body>> {
+        self.execute(url, Request::<Body>::new(Method::OPTIONS, "/"))
+    }
+
+    /// Start building the request this builder chain will send.
+    ///
+    /// ```no_run
+    /// # use courierust::courierust_client::Client;
+    /// # use courierust::courierust_http::Method;
+    /// # fn main() -> courierust::Result<()> {
+    /// let client = Client::new();
+    /// let resp = client
+    ///     .request("http://127.0.0.1:8080/things", Method::POST)
+    ///     .query([("dry_run", "1")])
+    ///     .header("accept", "application/json")
+    ///     .body("{}")
+    ///     .send()?;
+    /// # let _ = resp;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn request(&self, url: &str, method: Method) -> RequestBuilder<'_> {
+        RequestBuilder::new(self, url.to_string(), method)
+    }
+
     /// Perform a request against `url`. The request's `uri` is used as the
     /// path; the URL supplies scheme/host/port.
     pub fn execute(&self, url: &str, req: Request<Body>) -> Result<Response<Body>> {
         let parsed = Url::parse(url)?;
-        self.execute_with_redirects(&parsed, req, 0)
+        self.execute_with_redirects(&parsed, req, Priority::default(), None, 0)
+    }
+
+    /// Dispatch a request assembled by [`RequestBuilder`].
+    pub(crate) fn execute_built(
+        &self,
+        url: &str,
+        req: Request<Body>,
+        priority: Priority,
+        timeout: Option<Duration>,
+    ) -> Result<Response<Body>> {
+        let parsed = Url::parse(url)?;
+        self.execute_with_redirects(&parsed, req, priority, timeout, 0)
     }
 
     /// Like [`Client::execute`] but signals an RFC 9218 priority for h2.
@@ -323,15 +428,29 @@ impl Client {
         let tls = self.tls_for_scheme(&url.scheme, &url.authority())?;
         let addr = resolve_addr(&url.host, url.port)?;
         let authority = url.authority();
-        self.execute_h2(url, &authority, addr, tls, req, priority)
+        self.execute_h2(url, &authority, addr, tls, req, priority, None)
     }
 
     fn execute_with_redirects(
         &self,
         url: &Url,
         req: Request<Body>,
+        priority: Priority,
+        timeout: Option<Duration>,
         depth: usize,
     ) -> Result<Response<Body>> {
+        // The client's default fields are merged into the request this
+        // call initiates — and only that one. A redirect hop is a new
+        // request *derived from* the original: its fields were merged
+        // already, and the credential stripping below removed the ones a
+        // cross-origin hop must not carry. Merging again here would put a
+        // default `authorization` back on that hop, which is precisely
+        // what the stripping exists to prevent.
+        let req = if depth == 0 {
+            self.with_default_headers(req)
+        } else {
+            req
+        };
         // Capture the head before the request is consumed by the network.
         let orig_method = req.method.clone();
         let orig_headers = req.headers.clone();
@@ -342,7 +461,7 @@ impl Client {
             Body::Bytes(b) => Some(Body::Bytes(b.clone())),
             Body::Channel(_) | Body::Stream(_) => None,
         };
-        let resp = self.execute_inner(url, req, Priority::default())?;
+        let resp = self.execute_inner(url, req, priority, timeout)?;
         if depth >= self.inner.config.max_redirects {
             return Ok(resp);
         }
@@ -390,7 +509,7 @@ impl Client {
                     };
                 new_req.headers = headers;
                 new_req.body = body;
-                return self.execute_with_redirects(&next, new_req, depth + 1);
+                return self.execute_with_redirects(&next, new_req, priority, timeout, depth + 1);
             }
         }
         Ok(resp)
@@ -401,6 +520,7 @@ impl Client {
         url: &Url,
         req: Request<Body>,
         priority: Priority,
+        timeout: Option<Duration>,
     ) -> Result<Response<Body>> {
         let req = if req.uri.as_str() == "/" && url.path_and_query.as_str() != "/" {
             let mut req = req;
@@ -420,13 +540,13 @@ impl Client {
             if self.inner.config.tls.is_none() {
                 return Err(Error::protocol("HTTP/3 requires TLS settings"));
             }
-            return self.execute_h3(url, &authority, addr, req);
+            return self.execute_h3(url, &authority, addr, req, timeout);
         }
         if self.inner.config.http2 {
             if self.inner.config.h2c_upgrade && url.scheme == "http" {
-                return self.execute_h2c_upgrade(url, &authority, addr, req);
+                return self.execute_h2c_upgrade(url, &authority, addr, req, timeout);
             }
-            let raw = self.execute_h2(url, &authority, addr, tls, req, priority)?;
+            let raw = self.execute_h2(url, &authority, addr, tls, req, priority, timeout)?;
             Ok(Response {
                 status: raw.head.status,
                 version: raw.head.version,
@@ -435,8 +555,25 @@ impl Client {
                 trailers: None,
             })
         } else {
-            self.execute_h1(url, &authority, addr, tls, req)
+            self.execute_h1(url, &authority, addr, tls, req, timeout)
         }
+    }
+
+    /// Merge [`ClientConfig::default_headers`] into `req`, leaving every
+    /// field the request already carries untouched.
+    ///
+    /// Merging here — once, before dispatch — is what keeps the three
+    /// protocols consistent: h1 assembles its own field list, h2 builds
+    /// HPACK fields from the request, and h3 hands the request to a
+    /// driver thread; only a request that already carries the defaults
+    /// reaches all three the same way.
+    fn with_default_headers(&self, mut req: Request<Body>) -> Request<Body> {
+        for (name, value) in self.inner.config.default_headers.iter() {
+            if !req.headers.contains_key(name.as_str()) {
+                req.headers.append(name.clone(), value.clone());
+            }
+        }
+        req
     }
 
     /// Resolve the TLS connector for a scheme, or reject unsupported /
@@ -487,12 +624,9 @@ impl Client {
         addr: SocketAddr,
         tls: Option<crate::courierust_tls::TlsConnector>,
         req: Request<Body>,
+        timeout: Option<Duration>,
     ) -> Result<Response<Body>> {
-        // Pool key includes the scheme: `http://host:8443` (plain) and
-        // `https://host:8443` (TLS) share an authority but must never
-        // reuse each other's connections — reusing the plaintext one for
-        // an https URL would silently downgrade the request.
-        let key = format!("{}://{authority}", url.scheme);
+        let key = h1_pool_key(url.scheme == "https", authority);
         let hostname = url.host.clone();
 
         // A pooled keep-alive connection can die while it sits idle (the
@@ -524,7 +658,20 @@ impl Client {
             }
         };
 
+        // A per-request deadline replaces the configured read timeout for
+        // this request only. The socket must end up with the configured
+        // value again — the connection goes back to the pool, where the
+        // next caller would otherwise inherit a stranger's deadline — so
+        // the override is applied only when there is one, which also
+        // keeps the steady state free of socket reconfiguration.
+        let deadline = timeout.filter(|d| Some(*d) != self.inner.config.read_timeout);
+        if let Some(d) = deadline {
+            let _ = owned.set_read_deadline(Some(d));
+        }
         let result = owned.send(&req, &self.inner.config, authority);
+        if deadline.is_some() {
+            let _ = owned.set_read_deadline(self.inner.config.read_timeout);
+        }
         match result {
             Ok(resp) => {
                 if owned.is_reusable() {
@@ -547,7 +694,14 @@ impl Client {
                 if reused && req.method.is_idempotent() && owned.is_stale_failure(&error) {
                     let mut retry =
                         H1Connection::connect(addr, tls.as_ref(), &hostname, &self.inner.config)?;
-                    let resp = retry.send(&req, &self.inner.config, authority)?;
+                    if let Some(d) = deadline {
+                        let _ = retry.set_read_deadline(Some(d));
+                    }
+                    let resp = retry.send(&req, &self.inner.config, authority);
+                    if deadline.is_some() {
+                        let _ = retry.set_read_deadline(self.inner.config.read_timeout);
+                    }
+                    let resp = resp?;
                     if retry.is_reusable() {
                         let mut pool = self.inner.h1_pool.lock().unwrap();
                         let entry = pool.entry(key).or_default();
@@ -575,9 +729,13 @@ impl Client {
         let tls = self.tls_for_scheme(&url.scheme, &url.authority())?;
         let addr = resolve_addr(&url.host, url.port)?;
         let authority = url.authority();
-        self.execute_h2(url, &authority, addr, tls, req, priority)
+        self.execute_h2(url, &authority, addr, tls, req, priority, None)
     }
 
+    // The `authority`/`addr`/`tls` bundle stays flat for the same reason
+    // as in `send_h2_cmd`: every retry path re-opens a connection with
+    // exactly these parameters.
+    #[allow(clippy::too_many_arguments)]
     fn execute_h2(
         &self,
         url: &Url,
@@ -586,7 +744,13 @@ impl Client {
         tls: Option<crate::courierust_tls::TlsConnector>,
         req: Request<Body>,
         priority: Priority,
+        timeout: Option<Duration>,
     ) -> Result<crate::courierust_client::h2::H2Response> {
+        // Both raw entry points (`execute_h2_raw`, `execute_h2_stream`)
+        // and the general path land here, so this is where a request
+        // picks up the client's default fields whichever one it came
+        // from.
+        let req = self.with_default_headers(req);
         // Body bytes feed the weighted connection-selection load: a
         // connection carrying a large upload is more expensive on the wire
         // than one carrying several header-only RPCs, so the pool weights
@@ -596,7 +760,7 @@ impl Client {
         let conn = self.get_h2_conn(authority, addr, tls.as_ref(), &url.host, body_bytes)?;
         let fields = h2::request_fields(&req, &url.scheme, authority);
         let (tx, rx) = std::sync::mpsc::channel();
-        let cmd = build_h2_cmd(fields, req.body, priority, tx);
+        let cmd = build_h2_cmd(fields, req.body, priority, timeout, tx);
         self.send_h2_cmd(
             conn,
             authority,
@@ -619,6 +783,7 @@ impl Client {
         authority: &str,
         addr: SocketAddr,
         req: Request<Body>,
+        timeout: Option<Duration>,
     ) -> Result<Response<Body>> {
         let tls = self
             .inner
@@ -640,6 +805,7 @@ impl Client {
         let cmd = H3Cmd::Request {
             request: req,
             reply: tx,
+            timeout,
         };
         self.send_h3_cmd(conn, authority, addr, &url.host, options, cmd, rx)
     }
@@ -783,9 +949,12 @@ impl Client {
                 let fresh = self.get_h3_conn(authority, addr, hostname, &options)?;
                 let (tx2, rx2) = std::sync::mpsc::channel();
                 let cmd2 = match cmd {
-                    H3Cmd::Request { request, .. } => H3Cmd::Request {
+                    H3Cmd::Request {
+                        request, timeout, ..
+                    } => H3Cmd::Request {
                         request,
                         reply: tx2,
+                        timeout,
                     },
                     H3Cmd::Shutdown => H3Cmd::Shutdown,
                 };
@@ -813,6 +982,7 @@ impl Client {
         authority: &str,
         addr: SocketAddr,
         req: Request<Body>,
+        timeout: Option<Duration>,
     ) -> Result<Response<Body>> {
         let req_method = req.method.clone();
         let body_bytes = req.body.len().unwrap_or(0);
@@ -845,7 +1015,7 @@ impl Client {
         if let Some(conn) = pooled {
             let fields = h2::request_fields(&req, &url.scheme, authority);
             let (tx, rx) = std::sync::mpsc::channel();
-            let cmd = build_h2_cmd(fields, req.body, Priority::default(), tx);
+            let cmd = build_h2_cmd(fields, req.body, Priority::default(), timeout, tx);
             return self
                 .send_h2_cmd(conn, authority, addr, None, &url.host, cmd, rx, body_bytes)
                 .map(|raw| Response {
@@ -858,7 +1028,7 @@ impl Client {
         }
 
         let stream = crate::courierust_net::connect(&addr, self.inner.config.connect_timeout)?;
-        crate::courierust_net::configure(&stream, self.inner.config.read_timeout)?;
+        crate::courierust_net::configure(&stream, timeout.or(self.inner.config.read_timeout))?;
         let settings_b64 = h2::upgrade_settings_b64(&self.inner.config);
         let wire = h2::build_upgrade_request(
             &req,
@@ -901,7 +1071,7 @@ impl Client {
                 let resp = owned.finish_response(&self.inner.config, &req_method, head)?;
                 if owned.is_reusable() {
                     let mut pool = self.inner.h1_pool.lock().unwrap();
-                    let entry = pool.entry(authority.to_string()).or_default();
+                    let entry = pool.entry(h1_pool_key(false, authority)).or_default();
                     if entry.len() < self.inner.config.max_connections_per_host {
                         entry.push((addr, owned));
                     }
@@ -1154,6 +1324,7 @@ fn build_h2_cmd(
     fields: Vec<crate::courierust_hpack::HeaderField>,
     body: Body,
     priority: Priority,
+    timeout: Option<Duration>,
     tx: std::sync::mpsc::Sender<Result<crate::courierust_client::h2::H2Response>>,
 ) -> H2Cmd {
     match body {
@@ -1161,12 +1332,14 @@ fn build_h2_cmd(
             fields,
             body: body_rx,
             priority,
+            timeout,
             reply: tx,
         },
         Body::Stream(stream) => H2Cmd::RequestStream {
             fields,
             body: stream.into_receiver(),
             priority,
+            timeout,
             reply: tx,
         },
         Body::Empty => H2Cmd::Request {
@@ -1174,6 +1347,7 @@ fn build_h2_cmd(
             body: None,
             end_stream: true,
             priority,
+            timeout,
             reply: tx,
         },
         Body::Bytes(b) => H2Cmd::Request {
@@ -1181,6 +1355,7 @@ fn build_h2_cmd(
             body: Some(b),
             end_stream: true,
             priority,
+            timeout,
             reply: tx,
         },
     }
@@ -1198,23 +1373,27 @@ fn retarget_reply(
             body,
             end_stream,
             priority,
+            timeout,
             ..
         } => H2Cmd::Request {
             fields,
             body,
             end_stream,
             priority,
+            timeout,
             reply,
         },
         H2Cmd::RequestStream {
             fields,
             body,
             priority,
+            timeout,
             ..
         } => H2Cmd::RequestStream {
             fields,
             body,
             priority,
+            timeout,
             reply,
         },
         H2Cmd::Shutdown => H2Cmd::Shutdown,

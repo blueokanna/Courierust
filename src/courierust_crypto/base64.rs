@@ -16,6 +16,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+/// RFC 4648 §5: same encoding, `-` and `_` instead of `+` and `/`, so the
+/// output is safe in a URL, a filename and an `HTTP2-Settings` value.
+const ALPHABET_URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 /// `decode_table[byte]` is the 6-bit value, or `0xff` when the byte is
 /// not a standard-alphabet character.
@@ -77,29 +80,52 @@ pub fn encode(data: &[u8]) -> String {
 /// Encode `data`, appending to `out` (reusable buffer; the hot path for
 /// per-message tokens avoids a fresh allocation per call).
 pub fn encode_into(data: &[u8], out: &mut String) {
+    encode_with(data, ALPHABET, true, out)
+}
+
+/// Encode `data` with the URL-safe alphabet and no padding.
+///
+/// This is what RFC 4648 §5 gives a protocol that has to carry base64 in a
+/// token rather than a line: QUIC's `HTTP2-Settings` value, a JWT segment,
+/// a `Sec-WebSocket-Key`-shaped nonce. The engine is the same one the
+/// standard alphabet uses — there is one implementation of the bit
+/// packing, so the two cannot disagree.
+pub fn encode_url_no_pad(data: &[u8]) -> String {
+    let mut out = String::with_capacity(encoded_len(data.len()));
+    encode_with(data, ALPHABET_URL, false, &mut out);
+    out
+}
+
+/// The encoder: `alphabet` selects the character set, `pad` whether the
+/// final quantum is padded with `=`.
+fn encode_with(data: &[u8], alphabet: &[u8; 64], pad: bool, out: &mut String) {
     let mut chunks = data.chunks_exact(3);
     for chunk in &mut chunks {
         let n = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | chunk[2] as u32;
-        out.push(ALPHABET[(n >> 18) as usize & 0x3f] as char);
-        out.push(ALPHABET[(n >> 12) as usize & 0x3f] as char);
-        out.push(ALPHABET[(n >> 6) as usize & 0x3f] as char);
-        out.push(ALPHABET[n as usize & 0x3f] as char);
+        out.push(alphabet[(n >> 18) as usize & 0x3f] as char);
+        out.push(alphabet[(n >> 12) as usize & 0x3f] as char);
+        out.push(alphabet[(n >> 6) as usize & 0x3f] as char);
+        out.push(alphabet[n as usize & 0x3f] as char);
     }
     match chunks.remainder() {
         [] => {}
         [a] => {
             let n = (*a as u32) << 16;
-            out.push(ALPHABET[(n >> 18) as usize & 0x3f] as char);
-            out.push(ALPHABET[(n >> 12) as usize & 0x3f] as char);
-            out.push('=');
-            out.push('=');
+            out.push(alphabet[(n >> 18) as usize & 0x3f] as char);
+            out.push(alphabet[(n >> 12) as usize & 0x3f] as char);
+            if pad {
+                out.push('=');
+                out.push('=');
+            }
         }
         [a, b] => {
             let n = ((*a as u32) << 16) | ((*b as u32) << 8);
-            out.push(ALPHABET[(n >> 18) as usize & 0x3f] as char);
-            out.push(ALPHABET[(n >> 12) as usize & 0x3f] as char);
-            out.push(ALPHABET[(n >> 6) as usize & 0x3f] as char);
-            out.push('=');
+            out.push(alphabet[(n >> 18) as usize & 0x3f] as char);
+            out.push(alphabet[(n >> 12) as usize & 0x3f] as char);
+            out.push(alphabet[(n >> 6) as usize & 0x3f] as char);
+            if pad {
+                out.push('=');
+            }
         }
         _ => unreachable!(),
     }
@@ -239,6 +265,29 @@ mod tests {
             assert_eq!(encode(raw), *encoded);
             assert_eq!(decode(encoded.as_bytes()).unwrap(), raw.to_vec());
             assert_eq!(encoded_len(raw.len()), encoded.len());
+        }
+    }
+
+    /// RFC 4648 §10 with the §5 alphabet and no padding: the same vectors,
+    /// minus the `=` a token cannot carry, and `-`/`_` where the standard
+    /// alphabet has `+`/`/`.
+    #[test]
+    fn url_alphabet_vectors_are_unpadded() {
+        let cases: &[(&[u8], &str)] = &[
+            (b"", ""),
+            (b"f", "Zg"),
+            (b"fo", "Zm8"),
+            (b"foo", "Zm9v"),
+            (b"foob", "Zm9vYg"),
+            (b"fooba", "Zm9vYmE"),
+            (b"foobar", "Zm9vYmFy"),
+            // 0xfb 0xef 0xff is "++//" in the standard alphabet.
+            (&[0xfb, 0xef, 0xff], "--__"),
+            // 0xff alone is "/w==" there.
+            (&[0xff], "_w"),
+        ];
+        for (raw, encoded) in cases {
+            assert_eq!(encode_url_no_pad(raw), *encoded, "raw={raw:?}");
         }
     }
 

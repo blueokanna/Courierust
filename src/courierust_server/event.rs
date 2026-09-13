@@ -24,7 +24,7 @@ use crate::courierust_body::{Body, ChannelStream};
 use crate::courierust_bytes::Bytes;
 use crate::courierust_error::{Error, Result};
 use crate::courierust_h1;
-use crate::courierust_http::header::{HeaderMap, HeaderName, HeaderValue};
+use crate::courierust_http::header::HeaderMap;
 use crate::courierust_http::request::Request;
 use crate::courierust_http::response::Response;
 use crate::courierust_http::version::Version;
@@ -404,6 +404,12 @@ impl IncrRequest {
                         self.parsed_req_line = Some(rl);
                         self.phase = match bl {
                             courierust_h1::BodyLen::None => Phase::Done,
+                            // A zero-length body is no body. Parking in
+                            // `BodyFixed { remaining: 0 }` waits for bytes
+                            // that cannot arrive, which hangs the
+                            // connection for any client that spells out
+                            // `Content-Length: 0`.
+                            courierust_h1::BodyLen::Length(0) => Phase::Done,
                             courierust_h1::BodyLen::Length(n) => {
                                 if n > self.body_limit {
                                     return Err(Error::overflow("request body too large"));
@@ -817,6 +823,10 @@ impl EventConn {
                         seg_end(&mut self.parse_us, parse);
                     }
                     let request_close = courierust_h1::wants_close(&req.headers);
+                    // RFC 9112 §6.3: the response to HEAD is the response
+                    // to GET with the content left out. `req` is moved into
+                    // the handler below, so the answer is taken here.
+                    let is_head = req.method == crate::courierust_http::method::Method::HEAD;
 
                     // RFC 9112 §3.2: an HTTP/1.1 request must carry
                     // exactly one non-empty `Host`. Refused before the
@@ -829,6 +839,7 @@ impl EventConn {
                         let (keep_alive, stream) = build_response(
                             crate::courierust_server::h1::error_response(400, reason),
                             request_close,
+                            is_head,
                             &mut self.out,
                         )?;
                         self.out_pos = 0;
@@ -849,7 +860,7 @@ impl EventConn {
                             seg_end(&mut self.handler_us, handle);
                             self.out.clear();
                             let (keep_alive, stream) =
-                                build_response(resp, request_close, &mut self.out)?;
+                                build_response(resp, request_close, is_head, &mut self.out)?;
                             self.out_pos = 0;
                             self.set_stream(stream);
                             self.keep_alive = keep_alive;
@@ -886,7 +897,8 @@ impl EventConn {
                     seg_end(&mut self.handler_us, handle);
                     self.out.clear();
                     let build = seg_start(trace);
-                    let (keep_alive, stream) = build_response(resp, request_close, &mut self.out)?;
+                    let (keep_alive, stream) =
+                        build_response(resp, request_close, is_head, &mut self.out)?;
                     seg_end(&mut self.build_us, build);
                     self.out_pos = 0;
                     self.set_stream(stream);
@@ -1080,51 +1092,17 @@ impl EventConn {
 fn build_response(
     resp: Response<Body>,
     request_close: bool,
+    is_head: bool,
     out: &mut Vec<u8>,
 ) -> Result<(bool, Option<ChannelStream>)> {
-    let keep_alive = !request_close
-        && courierust_h1::keep_alive_requested(resp.version, &resp.headers)
-        && resp.version != Version::HTTP_10;
-
-    let mut out_headers = HeaderMap::with_capacity(resp.headers.len() + 3);
-    for (n, v) in resp.headers.iter() {
-        if courierust_h1::is_hop_by_hop(n.as_str()) {
-            continue;
-        }
-        out_headers.append(n.clone(), v.clone());
-    }
-    let chunked = resp.body.is_stream();
-    let body_len = match &resp.body {
-        Body::Bytes(b) => Some(b.len()),
-        _ => None,
-    };
-    if chunked {
-        out_headers.insert(
-            HeaderName::from_lowercase("transfer-encoding"),
-            HeaderValue::from_static("chunked"),
-        );
-    } else if let Some(n) = body_len {
-        let cl = courierust_h1::IToA::new(n);
-        out_headers.insert(
-            HeaderName::from_lowercase("content-length"),
-            HeaderValue::from_bytes(cl.as_slice())?,
-        );
-    } else if !(resp.status.is_informational()
-        || resp.status == crate::courierust_http::status::StatusCode::NO_CONTENT
-        || resp.status == crate::courierust_http::status::StatusCode::NOT_MODIFIED)
-    {
-        out_headers.insert(
-            HeaderName::from_lowercase("content-length"),
-            HeaderValue::from_static("0"),
-        );
-    }
-    out_headers.insert(
-        HeaderName::from_lowercase("connection"),
-        HeaderValue::from_static(if keep_alive { "keep-alive" } else { "close" }),
-    );
-
-    courierust_h1::write_response_head(out, resp.status, Version::HTTP_11, &out_headers)?;
+    let keep_alive = crate::courierust_server::h1::response_wire_head(&resp, request_close, out)?;
     match resp.body {
+        // The header fields stay exactly what a GET would produce —
+        // including the `Content-Length` of the body that would have been
+        // sent, which is how a client learns the resource's size — and the
+        // body itself must not follow: a HEAD response body desynchronises
+        // every conforming client.
+        _ if is_head => Ok((keep_alive, None)),
         Body::Empty => Ok((keep_alive, None)),
         Body::Bytes(b) => {
             out.extend_from_slice(&b);

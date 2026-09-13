@@ -30,7 +30,7 @@ The connection is generic over `Read`/`Write`, which is what lets the blocking s
 
 ## The hardening
 
-This layer treats every peer byte as hostile: HPACK bombs (integer overflow, header-list cap, dynamic-table size, Huffman EOS/padding), flow-control window overflow (`FLOW_CONTROL_ERROR`), DATA on bodyless messages, `content-length` mismatch at stream end, RST on idle streams, `SETTINGS_TIMEOUT`, and keepalive dead-peer detection. There are 30 hardening tests for exactly this.
+This layer treats every peer byte as hostile: HPACK bombs (integer overflow, header-list cap, dynamic-table size, Huffman EOS/padding), flow-control window overflow (`FLOW_CONTROL_ERROR`), DATA on bodyless messages, `content-length` mismatch at stream end, RST on idle streams, `SETTINGS_TIMEOUT`, and keepalive dead-peer detection. There are 39 hardening tests for exactly this.
 
 ## Usage
 

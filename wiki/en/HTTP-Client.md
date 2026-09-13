@@ -6,6 +6,7 @@ The client shares bounded pools per authority. HTTP/2 requests are multiplexed b
 
 ```rust
 use courierust::courierust_client::{Client, ClientConfig};
+use courierust::courierust_http::header::HeaderMap;
 use std::time::Duration;
 
 let cfg = ClientConfig {
@@ -20,6 +21,10 @@ let cfg = ClientConfig {
     max_redirects: 10,
     // User-Agent sent on requests (None omits it).
     user_agent: Some("my-app/1.0".to_string()),
+    // Fields added to every request this client initiates. A field on the
+    // request itself always wins; a cross-origin redirect drops
+    // authorization / proxy-authorization / cookie from either source.
+    default_headers: HeaderMap::new(),
     // Defensive limits: header list and body size accepted from a peer.
     max_header_list: 1 << 20,
     max_body: 16 * 1024 * 1024,
@@ -50,6 +55,29 @@ println!("body: {}", body.to_str()?);
 let resp = client.post("http://127.0.0.1:8080/submit", "raw text payload")?;
 let resp = client.post("http://127.0.0.1:8080/submit", vec![1u8, 2, 3])?;
 ```
+
+## Request builder
+
+`Client::request(url, method)` returns a `RequestBuilder`: it builds the same `Request` the hand-written form below sends, and hands it to the same path, so redirects, pools and all three protocols behave identically. `Client::{put, delete, head, patch, options}` are the one-call shorthands.
+
+```rust
+use courierust::courierust_http::Method;
+
+let resp = client
+    .request("http://127.0.0.1:8080/api/items", Method::POST)
+    .query([("page", "2")])          // appended to the URL, percent-encoded
+    .form([("name", "widget")])      // body + content-type, urlencoded
+    .header("accept", "application/json")
+    .basic_auth("user", "secret")    // or .bearer_auth("token")
+    .timeout(std::time::Duration::from_secs(5))
+    .send()?;
+println!("{}", resp.text()?);
+```
+
+- `query` / `form` use the WHATWG `application/x-www-form-urlencoded` encoding (`courierust_http::form`): a space becomes `+`, anything outside `A-Za-z0-9*-._` becomes `%XX`.
+- `timeout` overrides `ClientConfig::read_timeout` **for this request**: a transport deadline with the same meaning, applied per attempt and restored afterwards, so the connection returns to the pool with the configured value. It applies to h1, h2 and h3 alike.
+- `priority` is an RFC 9218 hint: HTTP/2 reads it (it feeds the WUCS scheduler), HTTP/1.1 and HTTP/3 have no field to carry it and send the request unchanged.
+- `resp.text()` / `resp.bytes()` consume the body; `text` refuses a body that is not valid UTF-8 rather than substituting U+FFFD.
 
 ## Request with headers, and inspect the response
 

@@ -65,19 +65,22 @@ pub(crate) fn serve(
         s.h2_connections.fetch_add(1, Ordering::Relaxed);
         s.h2_connections_active.fetch_add(1, Ordering::Relaxed);
     }
-    let result = serve_inner(stream, handler, config, None, stats);
+    let result = serve_inner(stream, handler, config, None, false, stats);
     if let Some(s) = stats {
         Stats::decrement(&s.h2_connections_active, 1);
     }
     result
 }
 
-/// Serve the HTTP/2 side of an RFC 7540 §3.2 `h2c` Upgrade.
+/// Serve the HTTP/2 side of an RFC 7540 §3.2 `h2c` Upgrade. `is_head`
+/// is the upgrade request's own method: the response to that request is
+/// delivered on stream 1 and obeys the same no-content rule as any other.
 pub(crate) fn serve_upgraded(
     stream: &ConnStream,
     handler: &dyn Handler,
     config: &ServerConfig,
     resp: Response<Body>,
+    is_head: bool,
 ) -> Result<()> {
     read_preface(stream)?;
     configure_read_timeout(stream);
@@ -87,7 +90,7 @@ pub(crate) fn serve_upgraded(
         s.h2_connections.fetch_add(1, Ordering::Relaxed);
         s.h2_connections_active.fetch_add(1, Ordering::Relaxed);
     }
-    let result = serve_inner(stream, handler, config, Some(resp), stats);
+    let result = serve_inner(stream, handler, config, Some(resp), is_head, stats);
     if let Some(s) = stats {
         Stats::decrement(&s.h2_connections_active, 1);
     }
@@ -101,6 +104,7 @@ fn serve_inner(
     handler: &dyn Handler,
     config: &ServerConfig,
     upgrade_resp: Option<Response<Body>>,
+    upgrade_is_head: bool,
     stats: Option<&Stats>,
 ) -> Result<()> {
     // Transport call counters: real ones when stats are attached, inert
@@ -118,7 +122,7 @@ fn serve_inner(
         conn.register_upgrade_stream()?;
         let mut req_bodies: HashMap<u32, RequestBuilder> = HashMap::new();
         let mut deferred: HashMap<u32, Deferred> = HashMap::new();
-        send_response(&mut conn, 1, resp, &mut deferred)?;
+        send_response(&mut conn, 1, resp, upgrade_is_head, &mut deferred)?;
         return serve_loop(
             &mut conn,
             stream,
@@ -193,8 +197,11 @@ fn serve_loop(
                         s.h2_streams_total.fetch_add(1, Ordering::Relaxed);
                     }
                     if end_stream {
-                        let resp = handler.handle(build_request(&headers, Body::Empty)?);
-                        send_response(conn, stream_id, resp, deferred)?;
+                        let request = build_request(&headers, Body::Empty)?;
+                        let is_head =
+                            request.method == crate::courierust_http::method::Method::HEAD;
+                        let resp = handler.handle(request);
+                        send_response(conn, stream_id, resp, is_head, deferred)?;
                     } else {
                         req_bodies.insert(
                             stream_id,
@@ -224,8 +231,11 @@ fn serve_loop(
                                 } else {
                                     Body::Bytes(Bytes::from(rb.body))
                                 };
-                                let resp = handler.handle(build_request(&rb.headers, body)?);
-                                send_response(conn, stream_id, resp, deferred)?;
+                                let request = build_request(&rb.headers, body)?;
+                                let is_head =
+                                    request.method == crate::courierust_http::method::Method::HEAD;
+                                let resp = handler.handle(request);
+                                send_response(conn, stream_id, resp, is_head, deferred)?;
                             }
                         }
                     }
@@ -400,6 +410,7 @@ fn send_response(
     conn: &mut Connection<Counting<&ConnStream>, Counting<&ConnStream>>,
     sid: u32,
     resp: Response<Body>,
+    is_head: bool,
     deferred: &mut HashMap<u32, Deferred>,
 ) -> Result<()> {
     let fields = response_fields(&resp);
@@ -410,6 +421,9 @@ fn send_response(
         Channel(ChannelStream),
     }
     let kind = match resp.body {
+        // RFC 9113 §8.1: a response to HEAD has the header fields a GET
+        // would and no content, so the stream ends at the header block.
+        _ if is_head => K::Empty,
         Body::Empty => K::Empty,
         Body::Bytes(b) if b.is_empty() => K::Empty,
         Body::Bytes(b) => K::Bytes(b),

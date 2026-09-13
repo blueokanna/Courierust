@@ -400,6 +400,18 @@ enum RecState {
     },
 }
 
+/// RFC 8446 §5.5: how many records one key may protect before a
+/// `KeyUpdate` is owed. AES-GCM is bounded by the AEAD analysis (2^24.5;
+/// this implementation rekeys at 2^24, before the limit), while
+/// ChaCha20-Poly1305 is bounded only by the sequence number, which §5.3
+/// forbids wrapping.
+fn key_use_limit(suite: key_schedule::CipherSuite) -> u64 {
+    match suite {
+        key_schedule::CipherSuite::TlsChaCha20Poly1305Sha256 => u64::MAX,
+        _ => 1 << 24,
+    }
+}
+
 /// A completed TLS 1.2 / 1.3 connection. Implements the crate's `Read`
 /// and `Write` traits for encrypted application data. The record layer
 /// branches on [`TlsVersion`]: TLS 1.3 uses the inner content-type
@@ -442,12 +454,111 @@ pub struct TlsStream<R, W> {
     hostname: String,
     /// Current Unix time (stamps issued sessions).
     now: i64,
+    /// TLS 1.3 application traffic secrets (write/read). A `KeyUpdate`
+    /// derives the next generation from these (RFC 8446 §7.2); `None` on
+    /// TLS 1.2, which has no key update.
+    write_app_secret: Option<Vec<u8>>,
+    read_app_secret: Option<Vec<u8>>,
+    /// A `KeyUpdate` is owed to the peer (it asked, RFC 8446 §4.6.3) and
+    /// must be sent before the next application record.
+    pending_key_update: bool,
+    /// Records written under the current write key, against
+    /// [`Self::key_use_limit`] (RFC 8446 §5.5).
+    write_records: u64,
+    key_use_limit: u64,
+    /// Key generations in use per direction (RFC 8446 §7.2).
+    key_read_gen: u64,
+    key_write_gen: u64,
 }
 
 impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R, W> {
     /// The negotiated ALPN protocol, if any.
     pub fn alpn(&self) -> Option<&[u8]> {
         self.negotiated_alpn.as_deref()
+    }
+
+    /// Key generations in use, `(read, write)`. Each counts the updates
+    /// applied to that direction since the handshake (RFC 8446 §7.2).
+    pub fn key_generations(&self) -> (u64, u64) {
+        (self.key_read_gen, self.key_write_gen)
+    }
+
+    /// Ask the peer to rekey (RFC 8446 §4.6.3): sends a `KeyUpdate` with
+    /// `update_requested`, switches this side's write direction to the
+    /// next generation, and flushes. The peer answers with its own
+    /// update, so the read direction follows on the next record.
+    pub fn request_key_update(&mut self) -> TlsResult<()> {
+        if self.version != TlsVersion::Tls13 {
+            return Err(TlsError::Protocol("KeyUpdate requires TLS 1.3".into()));
+        }
+        if self.closed {
+            return Err(TlsError::Protocol("connection closed".into()));
+        }
+        self.send_key_update(true)?;
+        self.io.writer.flush().map_err(TlsError::from)
+    }
+
+    /// Send a `KeyUpdate` under the current write key, then adopt the next
+    /// generation for writing (RFC 8446 §4.6.3/§7.2).
+    fn send_key_update(&mut self, request: bool) -> TlsResult<()> {
+        let Some(secret) = self.write_app_secret.clone() else {
+            return Err(TlsError::Protocol(
+                "KeyUpdate without application keys".into(),
+            ));
+        };
+        let msg = [handshake::HS_KEY_UPDATE, 0, 0, 1, u8::from(request)];
+        self.io.write_encrypted_record_buffered(
+            self.suite,
+            &self.write_keys,
+            record::CONTENT_HANDSHAKE,
+            &msg,
+        )?;
+        let next = key_schedule::update_traffic_secret(self.suite.hash(), &secret);
+        self.write_keys = key_schedule::TrafficKeys::from_secret(self.suite, &next);
+        self.write_app_secret = Some(next);
+        self.io.write_seq = Sequence::default();
+        self.write_records = 0;
+        self.key_write_gen += 1;
+        Ok(())
+    }
+
+    /// The peer rekeyed its send direction: adopt the next generation for
+    /// reading, and owe it an update of our own when one was requested.
+    fn apply_key_update(&mut self, body: &[u8]) -> TlsResult<()> {
+        let request = match body {
+            [0] => false,
+            [1] => true,
+            // RFC 8446 §4.6.3: any other value is illegal_parameter.
+            _ => {
+                return Err(TlsError::Alert {
+                    level: 2,
+                    description: 47,
+                })
+            }
+        };
+        let Some(secret) = self.read_app_secret.clone() else {
+            return Err(TlsError::Protocol(
+                "KeyUpdate without application keys".into(),
+            ));
+        };
+        let next = key_schedule::update_traffic_secret(self.suite.hash(), &secret);
+        self.read_keys = key_schedule::TrafficKeys::from_secret(self.suite, &next);
+        self.read_app_secret = Some(next);
+        self.io.read_seq = Sequence::default();
+        self.key_read_gen += 1;
+        if request {
+            // "MUST send a KeyUpdate of its own ... prior to sending its
+            // next Application Data record."
+            self.pending_key_update = true;
+        }
+        Ok(())
+    }
+
+    /// Test hook: shrink the per-key record budget so a proactive update
+    /// can be observed without sending 2^24 records.
+    #[cfg(test)]
+    pub(crate) fn set_key_use_limit(&mut self, limit: u64) {
+        self.key_use_limit = limit;
     }
 
     /// The underlying reader transport (used to reconfigure socket
@@ -484,6 +595,17 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
         if self.closed {
             return Err(TlsError::Protocol("connection closed".into()));
         }
+        if self.version == TlsVersion::Tls13 {
+            // An answer owed to the peer goes out before the next
+            // application record (§4.6.3), and a key that has spent its
+            // record budget is replaced before it exceeds it (§5.5).
+            if self.pending_key_update {
+                self.pending_key_update = false;
+                self.send_key_update(false)?;
+            } else if self.write_records >= self.key_use_limit {
+                self.send_key_update(false)?;
+            }
+        }
         let mut off = 0;
         while off < data.len() {
             let take = core::cmp::min(data.len() - off, record::MAX_RECORD_PAYLOAD - 2);
@@ -506,6 +628,7 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
                     )?
                 }
             }
+            self.write_records = self.write_records.saturating_add(1);
             off += take;
         }
         self.io.writer.flush().map_err(TlsError::from)?;
@@ -543,13 +666,25 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
                             });
                         }
                         record::CONTENT_HANDSHAKE => {
-                            if let Some(m) = handshake::peek_complete_hs(&payload) {
-                                if m.msg_type != handshake::HS_NEW_SESSION_TICKET {
-                                    return Err(TlsError::Protocol(
-                                        "unexpected handshake after handshake".into(),
-                                    ));
+                            // A post-handshake record may carry several
+                            // messages, so every one is processed
+                            // (RFC 8446 §5.1).
+                            let mut rest = &payload[..];
+                            while let Some(m) = handshake::peek_complete_hs(rest) {
+                                match m.msg_type {
+                                    handshake::HS_NEW_SESSION_TICKET => {
+                                        self.capture_ticket(rest)?;
+                                    }
+                                    handshake::HS_KEY_UPDATE => {
+                                        self.apply_key_update(m.body)?;
+                                    }
+                                    _ => {
+                                        return Err(TlsError::Protocol(
+                                            "unexpected handshake after handshake".into(),
+                                        ))
+                                    }
                                 }
-                                self.capture_ticket(&payload)?;
+                                rest = &rest[4 + m.body.len()..];
                             }
                         }
                         record::CONTENT_CHANGE_CIPHER_SPEC => continue,
@@ -666,7 +801,6 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
                         // Honor the server's lifetime, capped at 7 days.
                         lifetime: (ticket.lifetime as i64).min(session::SESSION_LIFETIME_SECS),
                         // 0-RTT allowance the ticket carries (0 = none).
-                        max_early_data_size: ticket.max_early_data_size,
                     };
                     if let Some(store) = &self.session_store {
                         cache_session(&mut store.lock().unwrap(), sess);
@@ -982,7 +1116,6 @@ impl TlsConnector {
                 s.suite,
                 &s.psk,
                 &s.ticket,
-                false, // TCP-TLS path: no 0-RTT in this synchronous model
             )?,
             None => handshake::build_client_hello_negotiated(
                 &random,
@@ -1076,6 +1209,13 @@ impl TlsConnector {
                 session_store: Some(self.sessions.clone()),
                 hostname: hostname.to_string(),
                 now: self.config.now,
+                write_app_secret: Some(result.keys.write_secret),
+                read_app_secret: Some(result.keys.read_secret),
+                pending_key_update: false,
+                write_records: 0,
+                key_use_limit: key_use_limit(result.suite),
+                key_read_gen: 0,
+                key_write_gen: 0,
             };
             // Tickets are captured lazily as records are read and cached
             // in the shared store; connect() never blocks waiting for a
@@ -1120,6 +1260,13 @@ impl TlsConnector {
                 session_store: None,
                 hostname: hostname.to_string(),
                 now: self.config.now,
+                write_app_secret: None,
+                read_app_secret: None,
+                pending_key_update: false,
+                write_records: 0,
+                key_use_limit: u64::MAX,
+                key_read_gen: 0,
+                key_write_gen: 0,
             })
         }
     }
@@ -1256,6 +1403,13 @@ impl TlsAcceptor {
                 session_store: None,
                 hostname: String::new(),
                 now: 0,
+                write_app_secret: Some(result.keys.write_secret),
+                read_app_secret: Some(result.keys.read_secret),
+                pending_key_update: false,
+                write_records: 0,
+                key_use_limit: key_use_limit(result.suite),
+                key_read_gen: 0,
+                key_write_gen: 0,
             })
         } else if allow12 {
             let result = match tls12::server_handshake(
@@ -1292,6 +1446,13 @@ impl TlsAcceptor {
                 session_store: None,
                 hostname: String::new(),
                 now: 0,
+                write_app_secret: None,
+                read_app_secret: None,
+                pending_key_update: false,
+                write_records: 0,
+                key_use_limit: u64::MAX,
+                key_read_gen: 0,
+                key_write_gen: 0,
             })
         } else {
             let _ = io.write_plaintext_record(
@@ -1363,6 +1524,109 @@ mod tests {
         tls.write_all(b"ping").unwrap();
         let data = tls.read_record().unwrap();
         assert_eq!(data, b"pong");
+        tls.close_notify().unwrap();
+
+        server.join().unwrap();
+    }
+
+    /// RFC 8446 §4.6.3: a `KeyUpdate` rekeys the *sender's* direction, the
+    /// receiver adopts the next generation for reading, and a request is
+    /// answered with an update of the peer's own — after which data still
+    /// flows both ways under the new keys.
+    #[test]
+    fn tls13_key_update_rekeys_both_directions() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let acceptor = TlsAcceptor::new(ServerConfig {
+                identity: testdata::server_identity(),
+                alpn: Vec::new(),
+                min_version: TlsVersion::Tls13,
+                max_version: TlsVersion::Tls13,
+                session_ticket_key: None,
+            });
+            let mut tls = acceptor.accept(&stream, &stream).unwrap();
+            assert_eq!(tls.read_record().unwrap(), b"before");
+            tls.write_all(b"after").unwrap();
+            // This read processes the client's KeyUpdate (answering it is
+            // owed before the next application record).
+            assert_eq!(tls.read_record().unwrap(), b"again");
+            tls.write_all(b"end").unwrap();
+            assert_eq!(tls.key_generations(), (1, 1));
+            tls.close_notify().unwrap();
+        });
+
+        let stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let connector = TlsConnector::new(ClientConfig {
+            roots: testdata::root_store(),
+            verify: true,
+            alpn: Vec::new(),
+            now: testdata::NOW,
+            min_version: TlsVersion::Tls13,
+            max_version: TlsVersion::Tls13,
+        });
+        let mut tls = connector.connect("localhost", &stream, &stream).unwrap();
+        tls.write_all(b"before").unwrap();
+        tls.request_key_update().unwrap();
+        tls.write_all(b"again").unwrap();
+        assert_eq!(tls.read_record().unwrap(), b"after");
+        // The server's own update rides in front of `end`.
+        assert_eq!(tls.read_record().unwrap(), b"end");
+        assert_eq!(tls.key_generations(), (1, 1));
+        tls.close_notify().unwrap();
+
+        server.join().unwrap();
+    }
+
+    /// RFC 8446 §5.5: a key that has spent its record budget is replaced
+    /// before the next record goes out, without the peer asking.
+    #[test]
+    fn tls13_key_update_record_budget_forces_a_rekey() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let acceptor = TlsAcceptor::new(ServerConfig {
+                identity: testdata::server_identity(),
+                alpn: Vec::new(),
+                min_version: TlsVersion::Tls13,
+                max_version: TlsVersion::Tls13,
+                session_ticket_key: None,
+            });
+            let mut tls = acceptor.accept(&stream, &stream).unwrap();
+            for expected in [&b"one"[..], b"two", b"three"] {
+                assert_eq!(tls.read_record().unwrap(), expected);
+            }
+            // One update was received; this side never sent one.
+            assert_eq!(tls.key_generations(), (1, 0));
+            tls.close_notify().unwrap();
+        });
+
+        let stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let connector = TlsConnector::new(ClientConfig {
+            roots: testdata::root_store(),
+            verify: true,
+            alpn: Vec::new(),
+            now: testdata::NOW,
+            min_version: TlsVersion::Tls13,
+            max_version: TlsVersion::Tls13,
+        });
+        let mut tls = connector.connect("localhost", &stream, &stream).unwrap();
+        tls.set_key_use_limit(2);
+        tls.write_all(b"one").unwrap();
+        tls.write_all(b"two").unwrap();
+        // The budget is spent: the third record is preceded by an update.
+        tls.write_all(b"three").unwrap();
+        assert_eq!(tls.key_generations(), (0, 1));
         tls.close_notify().unwrap();
 
         server.join().unwrap();
@@ -2054,6 +2318,13 @@ mod tests {
             session_store: None,
             hostname: "localhost".to_string(),
             now: testdata::NOW,
+            write_app_secret: Some(result.keys.write_secret),
+            read_app_secret: Some(result.keys.read_secret),
+            pending_key_update: false,
+            write_records: 0,
+            key_use_limit: key_use_limit(result.suite),
+            key_read_gen: 0,
+            key_write_gen: 0,
         };
         tls.write_all(b"ping").unwrap();
         assert_eq!(tls.read_record().unwrap(), b"pong");

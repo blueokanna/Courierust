@@ -151,6 +151,10 @@ pub(crate) fn serve(
             }
         }
 
+        // RFC 9112 §6.3: the response to HEAD is the response to GET
+        // with the content left out, and `req` is moved into the handler
+        // below.
+        let is_head = req.method == crate::courierust_http::method::Method::HEAD;
         let resp = match early {
             Some(resp) => resp,
             None => handler.handle(req),
@@ -173,61 +177,17 @@ pub(crate) fn serve(
                 handler,
                 config,
                 resp,
+                is_head,
             );
         }
-
-        // `keep_alive_requested` applies exact-token `Connection`
-        // semantics (a `closex` token does not close) and already
-        // returns false for a close token; no separate substring check
-        // here, or this path and the event path would disagree.
-        let keep_alive = !request_close
-            && courierust_h1::keep_alive_requested(resp.version, &resp.headers)
-            && resp.version != Version::HTTP_10;
-
-        // Build wire headers (drop hop-by-hop, add framing).
-        let mut out_headers = HeaderMap::with_capacity(resp.headers.len() + 2);
-        for (n, v) in resp.headers.iter() {
-            if courierust_h1::is_hop_by_hop(n.as_str()) {
-                continue;
-            }
-            out_headers.append(n.clone(), v.clone());
-        }
-        let chunked = resp.body.is_stream();
-        let body_len = match &resp.body {
-            Body::Bytes(b) => Some(b.len()),
-            _ => None,
-        };
-        if chunked {
-            out_headers.insert(
-                HeaderName::from_lowercase("transfer-encoding"),
-                HeaderValue::from_static("chunked"),
-            );
-        } else if let Some(n) = body_len {
-            let cl = courierust_h1::IToA::new(n);
-            out_headers.insert(
-                HeaderName::from_lowercase("content-length"),
-                HeaderValue::from_bytes(cl.as_slice())?,
-            );
-        } else if !(resp.status.is_informational()
-            || resp.status == crate::courierust_http::status::StatusCode::NO_CONTENT
-            || resp.status == crate::courierust_http::status::StatusCode::NOT_MODIFIED)
-        {
-            // Empty body: pin Content-Length: 0 so the response framing is
-            // unambiguous for the peer.
-            out_headers.insert(
-                HeaderName::from_lowercase("content-length"),
-                HeaderValue::from_static("0"),
-            );
-        }
-        out_headers.insert(
-            HeaderName::from_lowercase("connection"),
-            HeaderValue::from_static(if keep_alive { "keep-alive" } else { "close" }),
-        );
 
         let head = scratch.body();
-        courierust_h1::write_response_head(head, resp.status, Version::HTTP_11, &out_headers)?;
+        let keep_alive = response_wire_head(&resp, request_close, head)?;
         writer.write_all(head)?;
         match resp.body {
+            // RFC 9112 §6.3: the header fields above are what a GET would
+            // send; the content is not sent at all.
+            _ if is_head => {}
             Body::Empty => {}
             Body::Bytes(b) => {
                 writer.write_all(&b)?;
@@ -255,6 +215,69 @@ pub(crate) fn serve(
         }
     }
     Ok(())
+}
+
+/// Write the wire head of an HTTP/1.1 response and report how the
+/// connection continues.
+///
+/// Hop-by-hop fields are dropped, framing fields are added, the keep-alive
+/// decision is made, and the head is serialized into `out` (the caller's
+/// buffer, so a steady state allocates nothing).
+///
+/// The *body* stays the caller's business — the blocking pool writes it
+/// through a `BufWriter`, the event loop appends it and parks on a channel
+/// — but what the head announces is decided here, once. A streamed body
+/// announced as `content-length`, or a close-delimited one announced as
+/// keep-alive, is a framing bug that would otherwise only appear on the
+/// driver that was not tested.
+pub(crate) fn response_wire_head(
+    resp: &Response<Body>,
+    request_close: bool,
+    out: &mut Vec<u8>,
+) -> Result<bool> {
+    let keep_alive = !request_close
+        && courierust_h1::keep_alive_requested(resp.version, &resp.headers)
+        && resp.version != Version::HTTP_10;
+
+    let mut out_headers = HeaderMap::with_capacity(resp.headers.len() + 3);
+    for (n, v) in resp.headers.iter() {
+        if courierust_h1::is_hop_by_hop(n.as_str()) {
+            continue;
+        }
+        out_headers.append(n.clone(), v.clone());
+    }
+    let body_len = match &resp.body {
+        Body::Bytes(b) => Some(b.len()),
+        _ => None,
+    };
+    if resp.body.is_stream() {
+        out_headers.insert(
+            HeaderName::from_lowercase("transfer-encoding"),
+            HeaderValue::from_static("chunked"),
+        );
+    } else if let Some(n) = body_len {
+        let cl = courierust_h1::IToA::new(n);
+        out_headers.insert(
+            HeaderName::from_lowercase("content-length"),
+            HeaderValue::from_bytes(cl.as_slice())?,
+        );
+    } else if !(resp.status.is_informational()
+        || resp.status == StatusCode::NO_CONTENT
+        || resp.status == StatusCode::NOT_MODIFIED)
+    {
+        // Empty body: pin `Content-Length: 0` so the framing is
+        // unambiguous for the peer.
+        out_headers.insert(
+            HeaderName::from_lowercase("content-length"),
+            HeaderValue::from_static("0"),
+        );
+    }
+    out_headers.insert(
+        HeaderName::from_lowercase("connection"),
+        HeaderValue::from_static(if keep_alive { "keep-alive" } else { "close" }),
+    );
+    courierust_h1::write_response_head(out, resp.status, Version::HTTP_11, &out_headers)?;
+    Ok(keep_alive)
 }
 
 /// RFC 9112 §3.2: an HTTP/1.1 request carries exactly one `Host` field,

@@ -1,6 +1,7 @@
 //! HTTP message model: methods, status, versions, headers, URIs, bodies.
 
 pub mod body;
+pub mod form;
 pub mod header;
 pub mod method;
 pub mod request;

@@ -280,6 +280,19 @@ impl WebSocket {
         for (name, value) in &opts.headers {
             push(&mut headers, name, value)?;
         }
+        // The client's default fields belong on this request too: it is a
+        // request from the same client to the authority the URL names, and
+        // a handshake that silently drops a tracing header — or an
+        // authorization the caller configured once — is the inconsistency
+        // `default_headers` exists to remove. The handshake's own fields
+        // (host, upgrade, connection, sec-websocket-*) are already set
+        // above, so a default can never displace them, and a field passed
+        // through `WsOptions` wins as it does on the HTTP path.
+        for (name, value) in cfg.default_headers.iter() {
+            if !headers.contains_key(name.as_str()) {
+                headers.append(name.clone(), value.clone());
+            }
+        }
         if !headers.contains_key("user-agent") {
             if let Some(ua) = &cfg.user_agent {
                 push(&mut headers, "user-agent", ua)?;

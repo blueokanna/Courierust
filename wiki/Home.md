@@ -46,4 +46,4 @@ Every code sample below is real, runnable API usage.
 ## Repository
 
 - Source: `https://github.com/blueokanna/Courierust`
-- License: Apache-2.0
+- License: [PolyForm Perimeter 1.0.1](../LICENSE) — source-available, free for any purpose except a competing product; no warranty, no liability

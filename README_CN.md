@@ -293,7 +293,7 @@ let ordered = fp.order_headers_chrome(&fields); // 按 Chrome 的头序重排
 
 ```toml
 [dependencies]
-courierust = { version = "0.1", default-features = false }
+courierust = { version = "1.0.6", default-features = false }
 ```
 
 `--no-default-features` 构建只编译协议核心，可用于嵌入式 / 内核态。网络层需要 `std` feature（默认开启）。
@@ -389,11 +389,11 @@ cargo fuzz run h2_frame --fuzz-dir fuzz -- -runs=10000
 
 下面的数量按测试二进制区分，可与一次实际运行一一对应：
 
-- **单元测试 388 个**（`cargo test --lib`）：覆盖 HPACK 全部 RFC 向量（C.2/C.3/C.4/C.6）、Huffman 编解码（含解码输出上限）、帧编解码、状态机、流控、WUCS 调度、JA3/JA4 公开记录比对、指纹解析、TLS 1.3 握手与 RFC 8448 密钥调度、TLS 1.2 握手（ECDHE-RSA/ECDSA AEAD 套件、PRF、RFC 5746 重协商回显、Ed25519 ServerKeyExchange 签名/验证）、X.25519/Ed25519/ECDSA/RSA 原语、DEFLATE/gzip 编解码（往返、CRC-32 向量、损坏拒绝、输出上限、与 Python zlib 输出交叉验证，以及覆盖距离码 22-29 的远距离向量）、**WebSocket 引擎**（掩码相位表、最短长度编码、控制帧规则、增量 UTF-8 校验、握手解析、共享关闭标志、RFC 7692 协商）、轮询器 self-pipe（唤醒描述符）语义与「已关闭描述符」契约，以及 h2 池的加权负载记账。
-- **集成测试 52 个**（`tests/integration.rs`）：真实 TCP 环回上的 h1/h2/HTTPS 请求往返、keep-alive 复用、chunked、重定向、h2 并发多路复用、流式响应、大体积流控往返、gRPC unary/服务端流/客户端流/双向流与错误状态/trailers/deadline 执行、gzip 往返、`grpc.health.v1.Health` `Check` + `Watch`、RFC 7540 §3.2 `h2c` Upgrade、并发证明（慢流不阻塞同连接其他流；大量空闲流按连接而非按流占 worker；空闲连接羊群不阻塞新请求；事件调度器回收 slow-loris 并执行 `max_connections`；服务端流式响应按短节奏冲刷；单条 h2 连接并发突发不饥饿），以及 **TLS 策略/加固**（信任拒绝、过期证书、不可信签发链、自签名但显式信任、主机名不匹配、ALPN 一致、TLS 1.2 与 TLS 1.3 分别用 RSA / P-384 / Ed25519 身份的完整往返、纯 TLS 1.3 客户端拒绝 TLS 1.2 服务器——绝不静默降级——与 RFC 8446 降级哨兵、握手中断失败、畸形 TLS 输入存活、`verify:false`）。
-- **HTTP/3 测试 13 个**（`tests/h3.rs` + `tests/h3_key_update.rs`）：QUIC v1 + TLS 1.3 真实 UDP 套接字、走公共 `Client`/`Server`：GET/POST 往返、池化连接复用、双向 256 KiB 请求/响应流控、并发多路复用、每请求 deadline 执行、双向 key update，以及 H3 TLS 安全（不信任 / 过期 / 错误证书链 / 主机名不匹配证书均在握手阶段拒绝）。
-- **HTTP/2 加固测试 38 个**（`tests/h2_hardening.rs`）：恶意帧输入（超长帧、畸形 SETTINGS/PING/WINDOW_UPDATE、填充越界的 PADDED HEADERS、流级零增量 `WINDOW_UPDATE` 必须停留在流级错误、空闲流上的 `WINDOW_UPDATE`、流控窗口溢出、HPACK 头表与 Huffman 炸弹、截断/EOS Huffman、伪头顺序、`content-length` 不一致、非法 `transfer-encoding`/`connection` 系头、两端 `SETTINGS_MAX_CONCURRENT_STREAMS` 强制、`h2c` 存活检测：SETTINGS_TIMEOUT 与 keepalive 死对端检测）。
-- **WebSocket 端到端测试 28 个**（`tests/ws.rs`）：真实服务端 + 真实客户端 + 真实 socket，覆盖升级握手（含 RFC 6455 accept-key 官方向量）、双向掩码、带交错控制帧的分片重组、`permessage-deflate` 协商与 RFC 7692 互操作、UTF-8 失败码、关闭握手的干净性、本 crate TLS 上的 `wss://`、其他线程推送、Origin / 子协议策略、帧/消息/队列上限，以及 reactor 回归（一条连接关闭后仍打开的连接必须继续被服务；健康 reactor 的等待自愈次数为 0）。
+- **单元测试 416 个**（`cargo test --lib`）：覆盖 HPACK 全部 RFC 向量（C.2/C.3/C.4/C.6）、Huffman 编解码（含解码输出上限）、帧编解码、状态机、流控、WUCS 调度、JA3/JA4 公开记录比对、指纹解析、TLS 1.3 握手与 RFC 8448 密钥调度、TLS 1.2 握手（ECDHE-RSA/ECDSA AEAD 套件、PRF、RFC 5746 重协商回显、Ed25519 ServerKeyExchange 签名/验证）、X.25519/Ed25519/ECDSA/RSA 原语、DEFLATE/gzip 编解码（往返、CRC-32 向量、损坏拒绝、输出上限、与 Python zlib 输出交叉验证，以及覆盖距离码 22-29 的远距离向量）、**WebSocket 引擎**（掩码相位表、最短长度编码、控制帧规则、增量 UTF-8 校验、握手解析、共享关闭标志、RFC 7692 协商）、轮询器 self-pipe（唤醒描述符）语义与「已关闭描述符」契约、h2 池的加权负载记账、`application/x-www-form-urlencoded` 编解码（WHATWG 透传集、`+`/`%XX` 往返、拒绝畸形转义与非 UTF-8），以及 h1/h2/h3 共用的字段值字符类。
+- **集成测试 69 个**（`tests/integration.rs`）：真实 TCP 环回上的 h1/h2/HTTPS 请求往返、keep-alive 复用、chunked、重定向、h2 并发多路复用、流式响应、大体积流控往返、gRPC unary/服务端流/客户端流/双向流与错误状态/trailers/deadline 执行、gzip 往返、`grpc.health.v1.Health` `Check` + `Watch`、RFC 7540 §3.2 `h2c` Upgrade、并发证明（慢流不阻塞同连接其他流；大量空闲流按连接而非按流占 worker；空闲连接羊群不阻塞新请求；事件调度器回收 slow-loris 并执行 `max_connections`；服务端流式响应按短节奏冲刷；单条 h2 连接并发突发不饥饿）、**请求构建**（`Client::request` 与快捷方法发全部动词、`query`/`form` 编码、basic/bearer 认证、客户端默认头与请求自身字段的优先级、跨源重定向不被带回默认凭据、h1 与 h2 上的每请求截止时间且连接仍可复用、含 CR/LF 的头值在 h1/h2 均被拒绝）、**h1 分帧回归**（`Content-Length: 0` 必须被应答而不是挂起；HEAD 响应到头部块就结束），以及 **TLS 策略/加固**（信任拒绝、过期证书、不可信签发链、自签名但显式信任、主机名不匹配、ALPN 一致、TLS 1.2 与 TLS 1.3 分别用 RSA / P-384 / Ed25519 身份的完整往返、纯 TLS 1.3 客户端拒绝 TLS 1.2 服务器——绝不静默降级——与 RFC 8446 降级哨兵、握手中断失败、畸形 TLS 输入存活、`verify:false`）。
+- **HTTP/3 测试 14 个**（`tests/h3.rs` + `tests/h3_key_update.rs`）：QUIC v1 + TLS 1.3 真实 UDP 套接字、走公共 `Client`/`Server`：GET/POST 往返、池化连接复用、双向 256 KiB 请求/响应流控、并发多路复用、每请求 deadline 执行、HEAD 响应不等 handler 的流式 body、双向 key update，以及 H3 TLS 安全（不信任 / 过期 / 错误证书链 / 主机名不匹配证书均在握手阶段拒绝）。
+- **HTTP/2 加固测试 39 个**（`tests/h2_hardening.rs`）：恶意帧输入（超长帧、畸形 SETTINGS/PING/WINDOW_UPDATE、填充越界的 PADDED HEADERS、流级零增量 `WINDOW_UPDATE` 必须停留在流级错误、空闲流上的 `WINDOW_UPDATE`、流控窗口溢出、HPACK 头表与 Huffman 炸弹、截断/EOS Huffman、伪头顺序、`content-length` 不一致、非法 `transfer-encoding`/`connection` 系头、含 NUL/CR/LF 的字段值报流错误而非连接错误、两端 `SETTINGS_MAX_CONCURRENT_STREAMS` 强制、`h2c` 存活检测：SETTINGS_TIMEOUT 与 keepalive 死对端检测）。
+- **WebSocket 端到端测试 34 个**（`tests/ws.rs`）：真实服务端 + 真实客户端 + 真实 socket，覆盖升级握手（含 RFC 6455 accept-key 官方向量）、双向掩码、带交错控制帧的分片重组、`permessage-deflate` 协商与 RFC 7692 互操作、UTF-8 失败码、关闭握手的干净性、本 crate TLS 上的 `wss://`、其他线程推送、握手上携带客户端默认头、Origin / 子协议策略、帧/消息/队列上限，以及 reactor 回归（一条连接关闭后仍打开的连接必须继续被服务；健康 reactor 的等待自愈次数为 0）。
 - **4 个 fuzz 目标**（`cargo-fuzz`）：`h2_frame`、`hpack_block`，加上 **`h1_request`**（两个服务端解析器共用 的 request/header/chunked 路径）与 **`h2_connection`**（用恶意帧流在两种角色下驱动完整 h2 状态机）。nightly 长跑工作流给每个目标一个墙钟预算；PR 期在 `benchmark.yml` 里跑同一批目标的冒烟运行。
 
 ```bash
@@ -403,4 +403,15 @@ cargo build --no-default-features   # 验证协议核心零警告编译
 
 ## 许可
 
-Apache-2.0。
+**PolyForm Perimeter License 1.0.1**——见 [`LICENSE`](LICENSE)：正文是官方 [PolyForm Perimeter
+1.0.1](https://polyformproject.org/licenses/perimeter/1.0.1)，末尾多出一段由许可人自己增加的附加条款。
+
+实际含义：
+
+- **可免费用于除「竞争产品」之外的任何目的。** 阅读、构建、修改、自托管、内嵌进公司内部或客户系统、教学使用、随非竞争软件分发：都允许。不允许的是向他人提供替代本软件功能或价值的产品——包括以服务接口形式提供，也包括移植到其它语言（见
+  [Noncompete](https://polyformproject.org/licenses/perimeter/1.0.1/#noncompete) 与
+  [Competition](https://polyformproject.org/licenses/perimeter/1.0.1/#competition)）。
+- **不是 OSI 认可的开源许可**，而是 *source-available（源码可获取）* 许可：源码可以按上面的条款阅读和修改，而且你转发出去的副本，接收方也同时得到这份条款（见 *Notices*：分发时保留本文件）。
+- **无担保、无责任**（在法律允许范围内），并且末尾那段附加条款把同样的限制延伸到「他人用本软件（或其改动/衍生作品）从事违法行为」的情形（见 `LICENSE` 末尾
+  *Additional Term Adopted by the Licensor*）。
+

@@ -346,6 +346,23 @@ fn h2_rejects_request_missing_pseudo_headers() {
 }
 
 #[test]
+fn h2_rejects_control_characters_in_field_values() {
+    let addr = spawn_h2_server(1 << 20);
+    let mut peer = RawH2Peer::connect(addr).unwrap();
+    peer.send_preface_and_settings();
+    let block = hpack(&[
+        hdr(":method", "GET"),
+        hdr(":path", "/"),
+        hdr(":scheme", "http"),
+        hdr("x-injected", "ok\r\nx-evil: 1"),
+    ]);
+    peer.send_frame(0x1, 0x4, 1, &block);
+    let rst = wait_rst(&mut peer, 1, Duration::from_secs(5));
+    assert_eq!(rst, Some(0x1), "expected PROTOCOL_ERROR RST_STREAM");
+    assert_connection_survives(&mut peer, 3);
+}
+
+#[test]
 fn h2_rejects_hpack_header_list_bomb() {
     // A server that advertises a tiny max header list size must reject an
     // oversized header block with COMPRESSION_ERROR.
@@ -386,15 +403,6 @@ fn h2_rejects_unknown_pseudo_header() {
 
 #[test]
 fn h2_rejects_rfc8441_extended_connect_as_stream_error() {
-    // RFC 8441 extended CONNECT: `:method = CONNECT` plus
-    // `:protocol = websocket`. This stack does not implement WebSocket over
-    // HTTP/2 and never advertises SETTINGS_ENABLE_CONNECT_PROTOCOL, so the
-    // request is malformed (an undefined pseudo-header, RFC 9113 §8.3) —
-    // and RFC 8441 §3 names the outcome for exactly this case: a *stream*
-    // error. What must never happen is the other two behaviours: a 200 that
-    // leaves the caller with a tunnel that carries no frames, or a
-    // connection-wide failure for a request a conforming peer would not
-    // send. The connection and its other streams stay usable.
     let addr = spawn_h2_server(1 << 20);
     let mut peer = RawH2Peer::connect(addr).unwrap();
     peer.send_preface_and_settings();
@@ -418,13 +426,6 @@ fn h2_rejects_rfc8441_extended_connect_as_stream_error() {
 
 #[test]
 fn h2_rejects_websocket_upgrade_header_over_h2() {
-    // A client that tries the RFC 6455 upgrade on an established HTTP/2
-    // connection sends `upgrade` and `connection`: both are
-    // connection-specific fields and therefore malformed in HTTP/2
-    // (RFC 9113 §8.2.2), and HTTP/2 has no 101 to answer with (§8.6).
-    // Resetting the stream is what stops a misdirected WebSocket client
-    // from holding a connection that looks established and never carries a
-    // frame; the connection itself keeps serving other streams.
     let addr = spawn_h2_server(1 << 20);
     let mut peer = RawH2Peer::connect(addr).unwrap();
     peer.send_preface_and_settings();
@@ -448,10 +449,6 @@ fn h2_rejects_websocket_upgrade_header_over_h2() {
 
 #[test]
 fn h2_client_rejects_pseudo_after_regular_response() {
-    // A raw server sends a response whose header block has a regular
-    // field before :status — a malformed response, which is a *stream*
-    // error (RFC 9113 §8.1.1): the client must never accept it, and one
-    // bad response must not take down the connection's other streams.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {

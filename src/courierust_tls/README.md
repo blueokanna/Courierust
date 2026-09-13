@@ -12,7 +12,7 @@ TLS 1.2 + TLS 1.3, **from scratch, zero dependencies**, running over the crate's
 
 **TLS 1.2 (RFC 5246 / RFC 8422):** AEAD ECDHE suites only — the three `ECDHE-ECDSA-*` and three `ECDHE-RSA-*` (AES-128/256-GCM, CHACHA20-POLY1305, secp256r1). No CBC/HMAC, no RC4, no static RSA, ever. RFC 5746 `renegotiation_info` is sent and echoed.
 
-All primitives live in `crypto/` — ChaCha20, Poly1305, ChaCha20-Poly1305, AES, GCM, SHA-256/384, HMAC, HKDF, X25519, Ed25519, ECDSA, RSA, and an OS-seeded ChaCha20 DRBG — implemented from the public specifications, **no unsafe code**.
+All primitives live in `crypto/` — ChaCha20, Poly1305, ChaCha20-Poly1305, AES, GCM, SHA-256/384, HMAC, HKDF, X25519, Ed25519, ECDSA, RSA, and an OS-seeded ChaCha20 DRBG — implemented from the public specifications. The module is safe Rust apart from two scoped exceptions: the AES-NI intrinsic wrapper and the Windows system entropy call, each behind its own `#[allow(unsafe_code)]`.
 
 ## The verification you don't see
 
@@ -24,9 +24,9 @@ All primitives live in `crypto/` — ChaCha20, Poly1305, ChaCha20-Poly1305, AES,
 - A 16 MiB cap on the decrypted handshake buffer, so a peer streaming endless handshake records can't grow memory without bound.
 - `handshake_timeout` (10 s default) on both sides — a peer that connects and stalls mid-handshake releases its worker/caller.
 
-## Honest scope
+## Remote session resumption and key updates
 
-No 0-RTT / early data. TLS 1.3 session resumption is implemented — server-issued session tickets, 1-RTT PSK via `psk_dhe_ke`, client-side session store keyed by hostname (bounded to 8 sessions) — and unit-tested; the pooled client currently builds a fresh connector per request, so cross-connection resumption is not yet exercised in practice. QUIC key updates are handled at the transport layer via the key-phase bit (RFC 9001 §6); the record-layer TLS 1.3 KeyUpdate message is not sent. No mTLS — the server never requests a client certificate. `verify: false` exists for testing/untrusted peers and still verifies `CertificateVerify` + `Finished`, so the handshake stays cryptographically sound.
+No 0-RTT / early data. TLS 1.3 session resumption is implemented — server-issued session tickets, 1-RTT PSK via `psk_dhe_ke`, a client-side session store keyed by hostname (bounded to 8 sessions) — and the pooled client caches one connector per authority, so a ticket captured on one connection is offered on the next (`tls_session_resumption_across_client_connections` proves it end to end). `KeyUpdate` (RFC 8446 §4.6.3) is implemented in both directions: an inbound update rekeys the read direction and is answered when the peer asked for one, the write direction is rekeyed before it spends its per-key record budget (§5.5), and `request_key_update()` forces one. QUIC key updates still ride the transport's key-phase bit (RFC 9001 §6). No mTLS — the server never requests a client certificate. `verify: false` exists for testing/untrusted peers and still verifies `CertificateVerify` + `Finished`, so the handshake stays cryptographically sound.
 
 ## Usage
 

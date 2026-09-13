@@ -1245,3 +1245,80 @@ fn client_sends_a_bracketed_ipv6_host_header() {
         "IPv6 authorities need brackets, got {host:?}"
     );
 }
+
+/// `ClientConfig::default_headers` belong to the client, not to one
+/// transport: a WebSocket handshake is a request from the same client, so
+/// it carries them too — and a default can never displace a field the
+/// handshake itself defines (host, upgrade, connection, sec-websocket-*).
+#[test]
+fn client_default_headers_reach_the_handshake() {
+    use courierust::courierust_http::header::{HeaderMap, HeaderName, HeaderValue};
+
+    #[derive(Default)]
+    struct Probe {
+        seen: Mutex<Vec<(String, String)>>,
+    }
+    struct ProbeHandler {
+        probe: Arc<Probe>,
+        service: Arc<dyn WsService>,
+    }
+    impl Handler for ProbeHandler {
+        fn handle(&self, _req: Request<Body>) -> Response<Body> {
+            Response::with_status(StatusCode::from_u16(404))
+        }
+        fn websocket(&self, req: &Request<Body>) -> WsUpgradeReply {
+            let mut seen = self.probe.seen.lock().unwrap();
+            for (name, value) in req.headers.iter() {
+                seen.push((
+                    name.as_str().to_string(),
+                    value.to_str().unwrap_or("<binary>").to_string(),
+                ));
+            }
+            WsUpgradeReply::Accept(self.service.clone())
+        }
+    }
+
+    let probe = Arc::new(Probe::default());
+    let server = Server::bind_with_config("127.0.0.1:0", ServerConfig::default()).expect("bind");
+    let addr = server.local_addr().expect("addr");
+    let handle = server
+        .serve_background(ProbeHandler {
+            probe: probe.clone(),
+            service: Arc::new(EchoService::default()),
+        })
+        .expect("serve");
+    std::mem::forget(handle);
+
+    let mut defaults = HeaderMap::new();
+    defaults.insert(
+        HeaderName::from_lowercase("x-client"),
+        HeaderValue::from_static("courierust-test"),
+    );
+    // A default that would break the handshake if it could displace the
+    // handshake's own field.
+    defaults.insert(
+        HeaderName::from_lowercase("upgrade"),
+        HeaderValue::from_static("bogus"),
+    );
+    let cfg = ClientConfig {
+        default_headers: defaults,
+        ..ClientConfig::default()
+    };
+
+    let mut ws = WebSocket::connect(&format!("ws://{addr}/echo"), &cfg).expect("handshake");
+    ws.send_text("hi").unwrap();
+    assert_eq!(ws.read_message().unwrap(), Event::Text(String::from("hi")));
+
+    let seen = probe.seen.lock().unwrap().clone();
+    let find = |name: &str| {
+        seen.iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, value)| value.clone())
+    };
+    assert_eq!(find("x-client").as_deref(), Some("courierust-test"));
+    assert_eq!(
+        find("upgrade").as_deref(),
+        Some("websocket"),
+        "a default must not displace the handshake's own fields"
+    );
+}

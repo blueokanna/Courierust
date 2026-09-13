@@ -162,7 +162,7 @@ for msg in [ws.read_message()?] {
 ws.close(1000, "done")?;
 ```
 
-See [`examples/ws_echo.rs`](../../examples/ws_echo.rs) and [`examples/ws_client.rs`](../../examples/ws_client.rs) for runnable versions, and [`tests/ws.rs`](../../tests/ws.rs) for 27 end-to-end tests that exercise the wire protocol against a real socket, including cross-driver push, origin rejection, wss over TLS, and the error codes.
+See [`examples/ws_echo.rs`](../../examples/ws_echo.rs) and [`examples/ws_client.rs`](../../examples/ws_client.rs) for runnable versions, and [`tests/ws.rs`](../../tests/ws.rs) for 34 end-to-end tests that exercise the wire protocol against a real socket, including cross-driver push, origin rejection, wss over TLS, and the error codes.
 
 ## Where to go next
 

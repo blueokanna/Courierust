@@ -21,7 +21,7 @@ use crate::courierust_http::request::Request;
 use crate::courierust_http::response::Response;
 use crate::courierust_net::stats::Stats;
 use crate::courierust_pool::ThreadPool;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -214,17 +214,77 @@ where
     }
 }
 
+/// Upper bound on the port draws made when an HTTP/3 server asks for an
+/// ephemeral port: every draw has to satisfy both stacks, and Windows
+/// reserves its UDP and TCP ranges independently.
+const H3_PORT_ATTEMPTS: usize = 16;
+
+/// Bind the TCP listener, plus the HTTP/3 UDP socket when it is enabled.
+///
+/// The two sockets must share a port number: a client that validated a
+/// certificate for `host:port` sends its QUIC packets to that same port,
+/// and nothing else would reach the identity it trusted. Windows keeps a
+/// *separate* excluded range for UDP (Hyper-V / WinNAT), so a port the TCP
+/// stack hands out can come back `PermissionDenied` — WSAEACCES, 10013 —
+/// from UDP: a failure with nothing to fix and no port to report. With an
+/// ephemeral request that leaves exactly one recovery, which is to draw
+/// again. A caller that named a port gets that port or the error; a
+/// silently different port would break the authority the client validated.
+fn bind_listeners(
+    addr: impl ToSocketAddrs,
+    http3: bool,
+) -> std::io::Result<(TcpListener, Option<UdpSocket>)> {
+    let addrs: Vec<SocketAddr> = addr.to_socket_addrs()?.collect();
+    let ephemeral = addrs.iter().any(|a| a.port() == 0);
+    let attempts = if http3 && ephemeral {
+        H3_PORT_ATTEMPTS
+    } else {
+        1
+    };
+    let mut last: Option<std::io::Error> = None;
+    for _ in 0..attempts {
+        for resolved in &addrs {
+            match bind_pair(*resolved, http3) {
+                Ok(pair) => return Ok(pair),
+                Err(error) => last = Some(error),
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no address to bind")
+    }))
+}
+
+/// One binding attempt: UDP first when HTTP/3 is on, so the port is one
+/// UDP can actually take and TCP has to agree with it, rather than the
+/// other way round.
+fn bind_pair(addr: SocketAddr, http3: bool) -> std::io::Result<(TcpListener, Option<UdpSocket>)> {
+    if !http3 {
+        return Ok((TcpListener::bind(addr)?, None));
+    }
+    let udp = crate::courierust_net::udp::bind_udp(addr)?;
+    let mut tcp_addr = addr;
+    tcp_addr.set_port(udp.local_addr()?.port());
+    let listener = TcpListener::bind(tcp_addr)?;
+    Ok((listener, Some(udp)))
+}
+
 /// An HTTP server.
 pub struct Server {
     listener: TcpListener,
     pool: Arc<ThreadPool>,
     config: ServerConfig,
+    /// The HTTP/3 UDP socket, bound here rather than inside the serve
+    /// thread. The two sockets must share a port number, and binding both
+    /// before either is advertised is what makes that share a promise
+    /// instead of a race (see [`bind_listeners`]).
+    h3_socket: Option<UdpSocket>,
 }
 
 impl Server {
     /// Bind to `addr`.
     pub fn bind(addr: impl std::net::ToSocketAddrs) -> std::io::Result<Self> {
-        let listener = TcpListener::bind(addr)?;
+        let (listener, h3_socket) = bind_listeners(addr, false)?;
         Ok(Self {
             listener,
             pool: Arc::new(
@@ -232,6 +292,7 @@ impl Server {
                     .unwrap_or_else(|_| ThreadPool::with_size(2).expect("pool")),
             ),
             config: ServerConfig::default(),
+            h3_socket,
         })
     }
 
@@ -240,7 +301,7 @@ impl Server {
         addr: impl std::net::ToSocketAddrs,
         config: ServerConfig,
     ) -> std::io::Result<Self> {
-        let listener = TcpListener::bind(addr)?;
+        let (listener, h3_socket) = bind_listeners(addr, config.http3)?;
         let size = if config.threads == 0 {
             recommended_workers()
         } else {
@@ -253,6 +314,7 @@ impl Server {
                     .unwrap_or_else(|_| ThreadPool::with_size(2).expect("pool")),
             ),
             config,
+            h3_socket,
         })
     }
 
@@ -272,12 +334,12 @@ impl Server {
     }
 
     /// Shared serve implementation. When `ready` is supplied, it receives
-    /// the transport-setup outcome once every socket is bound, so a
-    /// background caller can start connecting without racing the reactor
-    /// thread. This matters for HTTP/3: the UDP socket is bound inside
-    /// `spawn_server`, which runs in this thread — a caller that connects
-    /// before that bind lands observes `Connection refused` on a freshly
-    /// bound TCP listener that has no UDP peer yet.
+    /// the transport-setup outcome once the reactor is running, so a
+    /// background caller can start connecting without racing it. The
+    /// HTTP/3 socket is already bound by then: both sockets are bound
+    /// together in [`Server::bind_with_config`], so the address
+    /// `local_addr` reports is one a client can use over TCP and UDP
+    /// alike.
     fn serve_inner<H: Handler>(
         self,
         handler: H,
@@ -286,6 +348,7 @@ impl Server {
         let handler = Arc::new(handler);
         let config = self.config;
         let pool = self.pool;
+        let h3_socket = self.h3_socket;
         let setup: std::io::Result<Option<_>> = (|| {
             if !config.http3 {
                 return Ok(None);
@@ -296,12 +359,20 @@ impl Server {
                     "ServerConfig.http3 requires a TLS identity",
                 )
             })?;
-            Ok(Some(crate::courierust_h3::runtime::spawn_server(
-                self.listener.local_addr()?,
-                tls,
-                handler.clone(),
-                config.clone(),
-            )?))
+            let socket = h3_socket.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "HTTP/3 was enabled after bind; rebuild the server with ServerConfig.http3",
+                )
+            })?;
+            Ok(Some(
+                crate::courierust_h3::runtime::spawn_server_with_socket(
+                    socket,
+                    tls,
+                    handler.clone(),
+                    config.clone(),
+                )?,
+            ))
         })();
         if let Some(ready) = ready {
             // Propagate a setup failure (e.g. an un-bindable HTTP/3 UDP

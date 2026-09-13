@@ -2555,3 +2555,523 @@ fn h1_client_probes_a_pooled_connection_before_reusing_it() {
     assert_eq!(second.body.as_bytes(), Some(&b"second"[..]));
     assert_eq!(accepts.load(Ordering::SeqCst), 2);
 }
+
+// ---------------------------------------------------------------------
+// Request building: Client::request, the verb shorthands, per-request
+// deadlines and client default headers.
+// ---------------------------------------------------------------------
+
+/// Report back what the server saw: method, request target, a few headers
+/// and the body.
+fn meta_handler(
+    req: courierust::courierust_http::request::Request<Body>,
+) -> courierust::courierust_http::response::Response<Body> {
+    use courierust::courierust_http::header::{HeaderName, HeaderValue};
+    let mut resp = courierust::courierust_http::response::Response::<Body>::with_status(200.into());
+    resp.headers.insert(
+        HeaderName::from_lowercase("x-method"),
+        HeaderValue::from_bytes(req.method.as_str().as_bytes()).unwrap(),
+    );
+    resp.headers.insert(
+        HeaderName::from_lowercase("x-target"),
+        HeaderValue::from_bytes(req.uri.as_str().as_bytes()).unwrap(),
+    );
+    for name in [
+        "authorization",
+        "cookie",
+        "content-type",
+        "accept",
+        "x-client",
+    ] {
+        if let Some(value) = req.headers.get(name) {
+            resp.headers.insert(
+                HeaderName::from_bytes(format!("x-seen-{name}").as_bytes()).unwrap(),
+                value.clone(),
+            );
+        }
+    }
+    resp.body = Body::Bytes(req.body.collect().unwrap());
+    resp
+}
+
+#[test]
+fn builder_and_verb_shorthands_send_every_method() {
+    let base = spawn_server(ServerConfig::default(), meta_handler);
+    let client = Client::new();
+
+    for (method, expected) in [
+        (Method::GET, "GET"),
+        (Method::PUT, "PUT"),
+        (Method::PATCH, "PATCH"),
+        (Method::DELETE, "DELETE"),
+        (Method::HEAD, "HEAD"),
+        (Method::OPTIONS, "OPTIONS"),
+    ] {
+        // RFC 9110 gives a content to PUT and PATCH (and POST); a HEAD
+        // or GET carrying one would be a different test.
+        let builder = client.request(&format!("{base}/thing"), method.clone());
+        let builder = if matches!(method, Method::PUT | Method::PATCH) {
+            builder.body("payload")
+        } else {
+            builder
+        };
+        let resp = builder
+            .send()
+            .unwrap_or_else(|e| panic!("{method:?} failed: {e}"));
+        assert_eq!(resp.status.as_u16(), 200);
+        assert_eq!(
+            resp.headers.get("x-method").unwrap().to_str().unwrap(),
+            expected
+        );
+    }
+
+    // The shorthands cover the same verbs without a builder chain.
+    assert_eq!(
+        client
+            .put(&format!("{base}/a"), "p")
+            .unwrap()
+            .headers
+            .get("x-method")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "PUT"
+    );
+    assert_eq!(
+        client
+            .delete(&format!("{base}/a"))
+            .unwrap()
+            .headers
+            .get("x-method")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "DELETE"
+    );
+    assert_eq!(
+        client
+            .patch(&format!("{base}/a"), "p")
+            .unwrap()
+            .headers
+            .get("x-method")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "PATCH"
+    );
+    assert_eq!(
+        client
+            .head(&format!("{base}/a"))
+            .unwrap()
+            .headers
+            .get("x-method")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "HEAD"
+    );
+    assert_eq!(
+        client
+            .options(&format!("{base}/a"))
+            .unwrap()
+            .headers
+            .get("x-method")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "OPTIONS"
+    );
+}
+
+#[test]
+fn builder_encodes_query_and_form_fields() {
+    let base = spawn_server(ServerConfig::default(), meta_handler);
+    let client = Client::new();
+
+    let resp = client
+        .request(&format!("{base}/search"), Method::GET)
+        .query([("q", "a b&c"), ("page", "2")])
+        .send()
+        .unwrap();
+    assert_eq!(
+        resp.headers.get("x-target").unwrap().to_str().unwrap(),
+        "/search?q=a+b%26c&page=2"
+    );
+
+    let resp = client
+        .request(&format!("{base}/submit"), Method::POST)
+        .form([("name", "中文 值"), ("flag", "1")])
+        .send()
+        .unwrap();
+    assert_eq!(
+        resp.headers
+            .get("x-seen-content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "application/x-www-form-urlencoded"
+    );
+    assert_eq!(
+        resp.text().unwrap(),
+        "name=%E4%B8%AD%E6%96%87+%E5%80%BC&flag=1"
+    );
+}
+
+#[test]
+fn builder_auth_headers_are_the_expected_field_values() {
+    let base = spawn_server(ServerConfig::default(), meta_handler);
+    let client = Client::new();
+
+    let resp = client
+        .request(&format!("{base}/a"), Method::GET)
+        .basic_auth("user", "secret")
+        .send()
+        .unwrap();
+    assert_eq!(
+        resp.headers
+            .get("x-seen-authorization")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "Basic dXNlcjpzZWNyZXQ="
+    );
+
+    let resp = client
+        .request(&format!("{base}/a"), Method::GET)
+        .bearer_auth("tok en")
+        .send()
+        .unwrap();
+    assert_eq!(
+        resp.headers
+            .get("x-seen-authorization")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "Bearer tok en"
+    );
+}
+
+#[test]
+fn client_default_headers_apply_but_a_request_field_wins() {
+    use courierust::courierust_http::header::{HeaderName, HeaderValue};
+
+    let base = spawn_server(ServerConfig::default(), meta_handler);
+    let mut default_headers = courierust::courierust_http::header::HeaderMap::new();
+    default_headers.insert(
+        HeaderName::from_lowercase("x-client"),
+        HeaderValue::from_static("courierust-test"),
+    );
+    default_headers.insert(
+        HeaderName::from_lowercase("accept"),
+        HeaderValue::from_static("application/json"),
+    );
+    let client = Client::with_config(ClientConfig {
+        default_headers,
+        ..Default::default()
+    });
+
+    let resp = client.get(&format!("{base}/a")).unwrap();
+    assert_eq!(
+        resp.headers
+            .get("x-seen-x-client")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "courierust-test"
+    );
+    assert_eq!(
+        resp.headers.get("x-seen-accept").unwrap().to_str().unwrap(),
+        "application/json"
+    );
+
+    let resp = client
+        .request(&format!("{base}/a"), Method::GET)
+        .header("accept", "text/plain")
+        .send()
+        .unwrap();
+    assert_eq!(
+        resp.headers.get("x-seen-accept").unwrap().to_str().unwrap(),
+        "text/plain",
+        "a field on the request itself must not be replaced by a default"
+    );
+}
+
+/// A default credential is the one most easily forgotten about: it is not
+/// visible at the call site that follows a redirect to another origin.
+#[test]
+fn default_credentials_do_not_cross_origins() {
+    use courierust::courierust_http::header::{HeaderMap, HeaderName, HeaderValue};
+
+    let base_b = spawn_server(ServerConfig::default(), meta_handler);
+    let location = base_b.to_string();
+    let base_a = spawn_server(ServerConfig::default(), move |_req| {
+        let mut resp =
+            courierust::courierust_http::response::Response::<Body>::with_status(302.into());
+        resp.headers.insert(
+            HeaderName::from_lowercase("location"),
+            HeaderValue::from_bytes(location.as_bytes()).unwrap(),
+        );
+        resp
+    });
+
+    let mut default_headers = HeaderMap::new();
+    default_headers.insert(
+        HeaderName::from_lowercase("authorization"),
+        HeaderValue::from_static("Bearer config-secret"),
+    );
+    default_headers.insert(
+        HeaderName::from_lowercase("cookie"),
+        HeaderValue::from_static("session=1"),
+    );
+    default_headers.insert(
+        HeaderName::from_lowercase("x-client"),
+        HeaderValue::from_static("courierust-test"),
+    );
+    let client = Client::with_config(ClientConfig {
+        default_headers,
+        ..Default::default()
+    });
+
+    let resp = client.get(&format!("{base_a}/start")).unwrap();
+    assert_eq!(resp.status.as_u16(), 200);
+    assert!(resp.headers.get("x-seen-authorization").is_none());
+    assert!(resp.headers.get("x-seen-cookie").is_none());
+    assert_eq!(
+        resp.headers
+            .get("x-seen-x-client")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "courierust-test",
+        "a non-credential default still applies on the redirected hop"
+    );
+}
+
+#[test]
+fn per_request_timeout_bounds_one_request_only() {
+    let base = spawn_server(ServerConfig::default(), |req| {
+        if req.uri.as_str() == "/slow" {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        }
+        let mut resp =
+            courierust::courierust_http::response::Response::<Body>::with_status(200.into());
+        resp.body = Body::Bytes(Bytes::from_static(b"ok"));
+        resp
+    });
+    let client = Client::new();
+
+    let err = client
+        .request(&format!("{base}/slow"), Method::GET)
+        .timeout(std::time::Duration::from_millis(50))
+        .send()
+        .expect_err("the request must not outlive its own deadline");
+    assert_eq!(err.kind, courierust::ErrorKind::Timeout, "{err:?}");
+
+    // The connection went back to the pool: it must carry the configured
+    // deadline again, not the one that just expired.
+    let resp = client.get(&format!("{base}/fast")).unwrap();
+    assert_eq!(resp.status.as_u16(), 200);
+    assert_eq!(resp.text().unwrap(), "ok");
+}
+
+#[test]
+fn per_request_timeout_applies_over_h2() {
+    let server_cfg = ServerConfig {
+        http2: true,
+        threads: 2,
+        h2_settings_timeout: Some(std::time::Duration::from_secs(60)),
+        h2_ping_interval: None,
+        h2_ping_timeout: None,
+        h2_idle_timeout: None,
+        ..Default::default()
+    };
+    let base = spawn_server(server_cfg, |req| {
+        if req.uri.as_str() == "/slow" {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        }
+        let mut resp =
+            courierust::courierust_http::response::Response::<Body>::with_status(200.into());
+        resp.body = Body::Bytes(Bytes::from_static(b"ok"));
+        resp
+    });
+
+    let client = Client::with_config(ClientConfig {
+        http2: true,
+        h2_settings_timeout: Some(std::time::Duration::from_secs(60)),
+        h2_ping_interval: None,
+        h2_ping_timeout: None,
+        h2_idle_timeout: None,
+        ..Default::default()
+    });
+
+    let err = client
+        .request(&format!("{base}/slow"), Method::GET)
+        .timeout(std::time::Duration::from_millis(50))
+        .send()
+        .expect_err("the h2 stream must be abandoned at its deadline");
+    assert_eq!(err.kind, courierust::ErrorKind::Timeout, "{err:?}");
+
+    // Only that stream was abandoned; the connection is still usable.
+    let resp = client.get(&format!("{base}/fast")).unwrap();
+    assert_eq!(resp.text().unwrap(), "ok");
+}
+
+/// A field value with CR, LF or NUL in it must be refused before it goes
+/// on the wire, and the error must name the field: over h1 it would split
+/// the message, and over h2/h3 it is the value an intermediary would
+/// translate into a second message later.
+#[test]
+fn injected_header_value_is_refused_over_h1_and_h2() {
+    let h1_base = spawn_server(ServerConfig::default(), meta_handler);
+    let h1 = Client::new();
+    let err = h1
+        .request(&format!("{h1_base}/a"), Method::GET)
+        .header("x-injected", "ok\r\nx-evil: 1")
+        .send()
+        .expect_err("a CR/LF in a value must be refused");
+    assert!(
+        err.to_string().contains("header") || err.to_string().contains("x-injected"),
+        "the error must point at the field: {err}"
+    );
+
+    let server_cfg = ServerConfig {
+        http2: true,
+        threads: 2,
+        h2_settings_timeout: Some(std::time::Duration::from_secs(60)),
+        h2_ping_interval: None,
+        h2_ping_timeout: None,
+        h2_idle_timeout: None,
+        ..Default::default()
+    };
+    let h2_base = spawn_server(server_cfg, meta_handler);
+    let h2 = Client::with_config(ClientConfig {
+        http2: true,
+        h2_settings_timeout: Some(std::time::Duration::from_secs(60)),
+        h2_ping_interval: None,
+        h2_ping_timeout: None,
+        h2_idle_timeout: None,
+        ..Default::default()
+    });
+    let err = h2
+        .request(&format!("{h2_base}/a"), Method::GET)
+        .header("x-injected", "ok\r\nx-evil: 1")
+        .send()
+        .expect_err("a CR/LF in a value must be refused over h2 too");
+    assert!(
+        err.to_string().contains("x-injected"),
+        "the error must name the field: {err}"
+    );
+
+    // The same field with a legal value still works.
+    let resp = h2
+        .request(&format!("{h2_base}/a"), Method::GET)
+        .header("x-injected", "ok")
+        .send()
+        .unwrap();
+    assert_eq!(resp.status.as_u16(), 200);
+}
+
+#[test]
+fn response_text_and_bytes_consume_the_body() {
+    let base = spawn_server(ServerConfig::default(), |req| {
+        let mut resp =
+            courierust::courierust_http::response::Response::<Body>::with_status(200.into());
+        resp.body = if req.uri.as_str() == "/binary" {
+            Body::Bytes(Bytes::from_static(&[0xff, 0xfe]))
+        } else {
+            Body::Bytes(Bytes::from_static(b"plain text"))
+        };
+        resp
+    });
+    let client = Client::new();
+
+    assert_eq!(
+        client.get(&format!("{base}/text")).unwrap().text().unwrap(),
+        "plain text"
+    );
+    assert_eq!(
+        client
+            .get(&format!("{base}/binary"))
+            .unwrap()
+            .bytes()
+            .unwrap(),
+        Bytes::from_static(&[0xff, 0xfe])
+    );
+    let err = client
+        .get(&format!("{base}/binary"))
+        .unwrap()
+        .text()
+        .expect_err("a body that is not UTF-8 must not read as text");
+    assert_eq!(err.kind, courierust::ErrorKind::Other, "{err:?}");
+}
+
+// ---------------------------------------------------------------------
+// h1 framing regressions found while building the request-builder tests:
+// a HEAD response must carry no content (RFC 9112 §6.3), and an explicit
+// `Content-Length: 0` request is complete the moment its headers are.
+// ---------------------------------------------------------------------
+
+/// Send raw bytes to a server and return everything it writes back before
+/// closing (the caller asks for `Connection: close`).
+fn raw_exchange(addr: &str, request: &str) -> String {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+        .unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut out = Vec::new();
+    let _ = stream.read_to_end(&mut out);
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[test]
+fn h1_request_with_explicit_zero_content_length_is_answered() {
+    let base = spawn_server(ServerConfig::default(), meta_handler);
+    let addr = base.trim_start_matches("http://");
+    let resp = raw_exchange(
+        addr,
+        &format!(
+            "GET /a HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+        ),
+    );
+    assert!(
+        resp.starts_with("HTTP/1.1 200"),
+        "a zero-length body is no body; the request must be answered: {resp:?}"
+    );
+}
+
+#[test]
+fn h1_head_response_carries_headers_but_no_body() {
+    let base = spawn_server(ServerConfig::default(), meta_handler);
+    let addr = base.trim_start_matches("http://");
+    let resp = raw_exchange(
+        addr,
+        &format!("HEAD /a HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp:?}");
+    assert!(
+        resp.contains("x-method: HEAD"),
+        "the header fields stay those of the GET response: {resp:?}"
+    );
+    assert!(
+        resp.ends_with("\r\n\r\n"),
+        "a HEAD response must end at its header block: {resp:?}"
+    );
+}
+
+#[test]
+fn builder_query_goes_before_the_fragment() {
+    let base = spawn_server(ServerConfig::default(), meta_handler);
+    let client = Client::new();
+    let resp = client
+        .request(&format!("{base}/p#section"), Method::GET)
+        .query([("page", "2")])
+        .send()
+        .unwrap();
+    assert_eq!(
+        resp.headers.get("x-target").unwrap().to_str().unwrap(),
+        "/p?page=2",
+        "a fragment must not swallow the query string"
+    );
+}

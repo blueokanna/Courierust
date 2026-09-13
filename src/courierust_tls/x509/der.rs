@@ -17,13 +17,6 @@ pub(crate) struct Element<'a> {
     pub content: &'a [u8],
 }
 
-/// Whether a tag byte denotes a constructed element.
-#[inline]
-#[allow(dead_code)]
-pub(crate) fn is_constructed(tag: u8) -> bool {
-    tag & 0x20 != 0
-}
-
 /// Read the next TLV from `der` starting at `pos`. Returns the element
 /// and advances `pos` past the complete element.
 pub(crate) fn read_element<'a>(der: &'a [u8], pos: &mut usize) -> Option<Element<'a>> {
@@ -67,30 +60,6 @@ pub(crate) fn expect_sequence<'a>(der: &'a [u8], pos: &mut usize) -> Option<&'a 
         return None;
     }
     Some(e.content)
-}
-
-/// Parse an OBJECT IDENTIFIER from its DER content into the canonical
-/// dotted-decimal string (for debugging) — but the exact DER bytes are
-/// the comparison key, so this is only informational.
-#[allow(dead_code)] // used by the TLS handshake certificate validation
-pub(crate) fn oid_to_string(oid: &[u8]) -> String {
-    let mut out = String::new();
-    if oid.is_empty() {
-        return out;
-    }
-    let first = core::cmp::min(oid[0] / 40, 2);
-    let second = oid[0] - first * 40;
-    out.push_str(&format!("{first}.{second}"));
-    let mut value: u64 = 0;
-    for &b in &oid[1..] {
-        value = (value << 7) | (b & 0x7f) as u64;
-        if b & 0x80 == 0 {
-            out.push('.');
-            out.push_str(&value.to_string());
-            value = 0;
-        }
-    }
-    out
 }
 
 /// Parse a UTCTime / GeneralizedTime value into a Unix timestamp.
@@ -163,13 +132,11 @@ fn to_unix(year: i64, month: i64, day: i64, hour: i64, min: i64, sec: i64) -> Op
 
 // ---- OID constants (DER content bytes) ----
 
-#[allow(dead_code)] // used by the TLS handshake certificate validation
 pub(crate) const OID_RSA_ENCRYPTION: &[u8] =
     &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
 pub(crate) const OID_RSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
 pub(crate) const OID_RSA_SHA384: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c];
 pub(crate) const OID_RSA_SHA512: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0d];
-#[allow(dead_code)] // used by the TLS handshake certificate validation
 pub(crate) const OID_EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
 pub(crate) const OID_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
 pub(crate) const OID_ECDSA_SHA384: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03];
@@ -190,9 +157,6 @@ pub(crate) const OID_NAME_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x1e];
 #[allow(dead_code)] // used by the TLS handshake certificate validation
 pub(crate) const OID_KEY_USAGE_SERVER_AUTH: &[u8] =
     &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
-#[allow(dead_code)] // used by the TLS handshake certificate validation
-pub(crate) const OID_KEY_USAGE_CLIENT_AUTH: &[u8] =
-    &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
 
 fn sig_alg_from_oid(oid: &[u8]) -> SigAlg {
     if oid == OID_RSA_SHA256 {

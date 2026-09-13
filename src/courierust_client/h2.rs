@@ -10,7 +10,7 @@ use crate::courierust_h2::connection::{Config as H2Config, Connection, Event};
 use crate::courierust_h2::error::ErrorCode;
 use crate::courierust_h2::priority::Priority;
 use crate::courierust_hpack::HeaderField;
-use crate::courierust_http::header::{HeaderMap, HeaderName, HeaderValue};
+use crate::courierust_http::header::HeaderMap;
 use crate::courierust_http::response::ResponseHead;
 use crate::courierust_http::status::StatusCode;
 use crate::courierust_http::version::Version;
@@ -50,6 +50,9 @@ pub enum H2Cmd {
         end_stream: bool,
         /// RFC 9218 priority to signal.
         priority: Priority,
+        /// Per-request deadline override; `None` uses the driver's
+        /// configured `read_timeout`.
+        timeout: Option<std::time::Duration>,
         /// Reply carrying the response head + streaming body.
         reply: Sender<Result<H2Response>>,
     },
@@ -63,6 +66,9 @@ pub enum H2Cmd {
         body: Receiver<Result<Bytes>>,
         /// RFC 9218 priority to signal.
         priority: Priority,
+        /// Per-request deadline override; `None` uses the driver's
+        /// configured `read_timeout`.
+        timeout: Option<std::time::Duration>,
         /// Reply carrying the response head + streaming body.
         reply: Sender<Result<H2Response>>,
     },
@@ -634,6 +640,7 @@ fn handle_cmd(
             body,
             end_stream,
             priority,
+            timeout: request_timeout,
             reply,
         } => {
             if *goaway {
@@ -647,6 +654,7 @@ fn handle_cmd(
                         body,
                         end_stream,
                         priority,
+                        timeout: request_timeout,
                         reply,
                     });
                 } else {
@@ -683,7 +691,7 @@ fn handle_cmd(
                             body_rx: Some(body_rx),
                             trailers,
                             body_len: 0,
-                            deadline: deadline_from(timeout),
+                            deadline: deadline_from(request_timeout.or(timeout)),
                         },
                     );
                 }
@@ -697,6 +705,7 @@ fn handle_cmd(
             fields,
             body,
             priority,
+            timeout: request_timeout,
             reply,
         } => {
             if *goaway {
@@ -709,6 +718,7 @@ fn handle_cmd(
                         fields,
                         body,
                         priority,
+                        timeout: request_timeout,
                         reply,
                     });
                 } else {
@@ -746,7 +756,7 @@ fn handle_cmd(
                             body_rx: Some(body_rx),
                             trailers,
                             body_len: 0,
-                            deadline: deadline_from(timeout),
+                            deadline: deadline_from(request_timeout.or(timeout)),
                         },
                     );
                 }
@@ -1093,7 +1103,7 @@ fn h2_config(cfg: &ClientConfig) -> H2Config {
 /// driver will advertise once the connection switches.
 pub(crate) fn upgrade_settings_b64(cfg: &ClientConfig) -> String {
     let c = h2_config(cfg);
-    base64url_encode(&c.local_settings.to_wire())
+    crate::courierust_crypto::base64::encode_url_no_pad(&c.local_settings.to_wire())
 }
 
 /// The outcome of an RFC 7540 §3.2 `h2c` Upgrade handshake.
@@ -1254,26 +1264,6 @@ fn parse_head_headers(head: &[u8]) -> Result<(StatusCode, Version, HeaderMap)> {
     Ok((status, version, map))
 }
 
-/// RFC 4648 base64url (no padding).
-pub(crate) fn base64url_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = chunk.get(1).copied().unwrap_or(0);
-        let b2 = chunk.get(2).copied().unwrap_or(0);
-        out.push(ALPHABET[(b0 >> 2) as usize] as char);
-        out.push(ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(ALPHABET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(ALPHABET[(b2 & 0x3f) as usize] as char);
-        }
-    }
-    out
-}
-
 /// Locate `needle` in `haystack`.
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
@@ -1315,15 +1305,6 @@ pub fn request_fields(
         headers: req.headers.clone(),
     };
     head.to_h2_fields(scheme, Some(authority))
-}
-
-/// A helper for the driver: build the pseudo-header set manually if needed.
-#[allow(dead_code)]
-fn _field(name: &str, value: &str) -> HeaderField {
-    HeaderField::new(
-        HeaderName::from_hpack_bytes(name.as_bytes()).unwrap(),
-        HeaderValue::from_bytes(value.as_bytes()).unwrap(),
-    )
 }
 
 #[cfg(test)]

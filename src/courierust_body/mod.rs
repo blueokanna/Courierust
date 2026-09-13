@@ -6,7 +6,7 @@
 //! thread).
 
 use crate::courierust_bytes::Bytes;
-use crate::courierust_error::Error;
+use crate::courierust_error::{Error, ErrorKind};
 use crate::Result;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -111,6 +111,32 @@ impl Body {
             Self::Bytes(b) => Some(b.len()),
             Self::Channel(_) | Self::Stream(_) => None,
         }
+    }
+}
+
+/// Reading a response in the threaded layer: the two accessors every
+/// caller otherwise writes by hand around `collect`.
+impl crate::courierust_http::response::Response<Body> {
+    /// Consume the response and return its body bytes.
+    ///
+    /// A body from this crate's transports is usually already
+    /// materialized (a move); a streaming one is drained to its end.
+    pub fn bytes(self) -> Result<Bytes> {
+        self.body.collect()
+    }
+
+    /// Consume the response and return its body as text.
+    ///
+    /// Refuses a body that is not valid UTF-8 rather than substituting
+    /// U+FFFD for the offending bytes: an answer mangled in transit must
+    /// not be able to read as a legitimate one. A caller that wants
+    /// substitution can spell it out —
+    /// `String::from_utf8_lossy(&resp.bytes()?)`.
+    pub fn text(self) -> Result<String> {
+        let bytes = self.body.collect()?;
+        core::str::from_utf8(&bytes)
+            .map(Into::into)
+            .map_err(|_| Error::with_message(ErrorKind::Other, "response body is not valid UTF-8"))
     }
 }
 

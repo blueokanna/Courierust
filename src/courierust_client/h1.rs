@@ -21,6 +21,7 @@ use crate::courierust_net::poller::Poller;
 use crate::courierust_net::{self, ConnStream};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// One HTTP/1 connection with persistent buffers.
 pub struct H1Connection {
@@ -109,6 +110,18 @@ impl H1Connection {
     /// Whether the connection can be returned to the pool.
     pub fn is_reusable(&self) -> bool {
         self.reusable
+    }
+
+    /// Re-arm the socket deadline for the request in flight.
+    ///
+    /// The pool configures each connection once, at connect time; this is
+    /// the only reason a request would touch it again. The caller that
+    /// overrides the deadline owns restoring it: the connection returns to
+    /// the pool afterwards, where the configured value must be in force
+    /// again — a pooled connection may not carry one caller's deadline
+    /// into another's request.
+    pub fn set_read_deadline(&self, timeout: Option<Duration>) -> Result<()> {
+        self.stream.configure(timeout)
     }
 
     /// Whether the peer has closed this connection while it sat idle.

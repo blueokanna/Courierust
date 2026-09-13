@@ -492,21 +492,6 @@ pub(crate) struct Http3Handle {
     _join: thread::JoinHandle<()>,
 }
 
-/// Start the UDP HTTP/3 reactor on the UDP port corresponding to the TCP
-/// listener. TCP and UDP may legally share a numeric port.
-pub(crate) fn spawn_server(
-    addr: SocketAddr,
-    tls: &TlsSettings,
-    handler: Arc<dyn Handler>,
-    config: ServerConfig,
-) -> std::io::Result<Http3Handle> {
-    // macOS (BSD) requires `SO_REUSEADDR` on the UDP socket before it
-    // may share its numeric port with the TCP listener; other platforms
-    // bind directly (see `courierust_net::udp`).
-    let socket = crate::courierust_net::udp::bind_udp(addr)?;
-    spawn_server_with_socket(socket, tls, handler, config)
-}
-
 /// Start the reactor on an already-bound UDP socket.
 ///
 /// Callers that can choose their own port (tests) use this to sidestep
@@ -606,6 +591,9 @@ pub(crate) enum H3Cmd {
     Request {
         request: Request<Body>,
         reply: mpsc::Sender<Result<Response<Body>>>,
+        /// Per-request deadline override; `None` uses the connection's
+        /// configured timeout.
+        timeout: Option<Duration>,
     },
     Shutdown,
 }
@@ -739,14 +727,20 @@ fn run_client_driver(
         let mut shutdown = false;
         while let Ok(cmd) = commands.try_recv() {
             match cmd {
-                H3Cmd::Request { request, reply } => {
+                H3Cmd::Request {
+                    request,
+                    reply,
+                    timeout,
+                } => {
                     if conn.peer_goaway.is_some() {
                         let _ =
                             reply.send(Err(Error::canceled("HTTP/3 connection received GOAWAY")));
                         continue;
                     }
-                    let deadline =
-                        Instant::now() + options.timeout.unwrap_or(Duration::from_secs(60));
+                    let deadline = Instant::now()
+                        + timeout
+                            .or(options.timeout)
+                            .unwrap_or(Duration::from_secs(60));
                     conn.queue_request(request, reply, deadline);
                     last_activity = Instant::now();
                 }
@@ -1137,12 +1131,14 @@ fn run_server(
                 let connection_id = connection_id.clone();
                 let wake = wake_writer.clone();
                 let received_at = request.received_at;
+                let is_head =
+                    request.request.method == crate::courierust_http::method::Method::HEAD;
                 pool.spawn(move || {
                     // clippy::blocks_in_conditions: bind the catch_unwind
                     // result before matching on it.
                     let caught = panic::catch_unwind(AssertUnwindSafe(|| {
                         let response = handler.handle(request.request);
-                        materialize_response(response, max_body)
+                        materialize_response(response, max_body, is_head)
                     }));
                     let response = match caught {
                         Ok(response) => response,
@@ -3087,9 +3083,17 @@ impl ServerConnection {
             }
         };
         let outbound_limit = self.max_header_list.min(self.peer_max_header_list);
-        if let Ok(wire) =
-            build_response_wire(response, &mut self.qpack, outbound_limit, self.max_body)
-        {
+        // No HEAD flag: the response body was already emptied where the
+        // request's method was still known (the worker's
+        // `materialize_response`), so this layer only re-materialises what
+        // it is handed.
+        if let Ok(wire) = build_response_wire(
+            response,
+            &mut self.qpack,
+            outbound_limit,
+            self.max_body,
+            false,
+        ) {
             let _ = self.transport.queue_stream_wire(stream_id, wire);
         } else {
             self.queue_service_unavailable(stream_id);
@@ -3103,9 +3107,13 @@ impl ServerConnection {
             HeaderValue::from_static("0"),
         );
         let outbound_limit = self.max_header_list.min(self.peer_max_header_list);
-        if let Ok(wire) =
-            build_response_wire(response, &mut self.qpack, outbound_limit, self.max_body)
-        {
+        if let Ok(wire) = build_response_wire(
+            response,
+            &mut self.qpack,
+            outbound_limit,
+            self.max_body,
+            false,
+        ) {
             let _ = self.transport.queue_stream_wire(stream_id, wire);
         }
     }
@@ -3132,7 +3140,21 @@ impl ServerConnection {
     }
 }
 
-fn materialize_response(response: Response<Body>, max_body: usize) -> Result<Response<Body>> {
+fn materialize_response(
+    response: Response<Body>,
+    max_body: usize,
+    is_head: bool,
+) -> Result<Response<Body>> {
+    // A HEAD response has no content, so the handler's body is not
+    // materialized at all: draining a streaming body to do nothing with it
+    // would hold a worker for as long as the producer keeps sending, and
+    // that producer is entitled to stream forever.
+    if is_head {
+        return Ok(Response {
+            body: Body::Empty,
+            ..response
+        });
+    }
     let Response {
         status,
         version,
@@ -3150,7 +3172,13 @@ fn materialize_response(response: Response<Body>, max_body: usize) -> Result<Res
         status,
         version,
         headers,
-        body: Body::from(bytes),
+        // RFC 9113 §8.1: the fields stay those of the GET response;
+        // the content is what a HEAD response leaves out.
+        body: if is_head {
+            Body::Empty
+        } else {
+            Body::from(bytes)
+        },
         trailers,
     })
 }
@@ -4180,8 +4208,9 @@ fn build_response_wire(
     qpack: &mut QpackConnection,
     max_header_list: usize,
     max_body: usize,
+    is_head: bool,
 ) -> Result<Vec<u8>> {
-    let response = materialize_response(response, max_body)?;
+    let response = materialize_response(response, max_body, is_head)?;
     let body = response.body.as_bytes().unwrap_or(&[]).to_vec();
     let mut fields = vec![(
         ":status".to_string(),

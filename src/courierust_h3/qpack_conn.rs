@@ -20,6 +20,7 @@
 use super::qpack::{self, DecoderInstruction, DynamicTable, EncoderInstruction, FieldLine};
 use crate::courierust_error::{Error, ErrorKind, Result};
 use crate::courierust_hpack::huffman::HuffmanDecoder;
+use crate::courierust_http::header::is_valid_field_value;
 use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -225,6 +226,11 @@ impl QpackConnection {
                 })
             {
                 return Err(Error::protocol("invalid HTTP/3 header field"));
+            }
+            if !is_valid_field_value(value) {
+                return Err(Error::protocol(
+                    "invalid HTTP/3 header field value (RFC 9114 §10.3)",
+                ));
             }
             // QPACK field *values* are opaque octets (RFC 9204), but
             // dynamic-table entries and encoder-stream inserts are
@@ -531,6 +537,35 @@ impl QpackConnection {
 mod tests {
     use super::*;
     use alloc::vec;
+
+    /// RFC 9114 §10.3: a field value carrying NUL, CR or LF must make the
+    /// message malformed, because translating it verbatim to HTTP/1.1 is
+    /// how such a value becomes a second message. On the send side that
+    /// means refusing to encode it at all.
+    #[test]
+    fn encode_refuses_control_characters_in_values() {
+        let mut client = QpackConnection::new(4096, 100);
+        client.set_peer_capacity(4096);
+
+        let fields = vec![
+            (":method".to_string(), b"GET".to_vec()),
+            ("x-injected".to_string(), b"ok\r\nx-evil: 1".to_vec()),
+        ];
+        let err = client
+            .encode(&fields, 4096)
+            .expect_err("a value with CR/LF must not be encoded");
+        assert!(
+            err.to_string().contains("field value"),
+            "the error must identify the value: {err}"
+        );
+
+        // The same field section without the injection still encodes.
+        let clean = vec![
+            (":method".to_string(), b"GET".to_vec()),
+            ("x-injected".to_string(), b"ok".to_vec()),
+        ];
+        assert!(client.encode(&clean, 4096).is_ok());
+    }
 
     /// Drive one full encode → encoder-stream → decode round trip between
     /// two endpoints, including the decoder-stream acknowledgments.

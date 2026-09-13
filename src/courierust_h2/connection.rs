@@ -16,6 +16,7 @@ use crate::courierust_h2::priority::{Priority, Scheduler};
 use crate::courierust_h2::settings::{Setting, Settings, SETTINGS_ENABLE_PUSH};
 use crate::courierust_h2::stream::{Stream, StreamMap, StreamState};
 use crate::courierust_hpack::{Decoder, Encoder, HeaderList};
+use crate::courierust_http::header::is_valid_field_value;
 use crate::courierust_io::{BufReader, BufWriter, Read, Write};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::ToString;
@@ -522,6 +523,11 @@ impl<R: Read, W: Write> Connection<R, W> {
                     "refusing to send a TE header other than `trailers` in HTTP/2 (RFC 9113 §8.2.2)",
                 ));
             }
+            if !is_valid_field_value(f.value.as_bytes()) {
+                return Err(Error::protocol(alloc::format!(
+                    "refusing to send field `{name}` with CR, LF or NUL in its value (RFC 9113 §8.2.1)"
+                )));
+            }
         }
         if self.goaway_sent || self.closed {
             return Err(Error::canceled("connection closing"));
@@ -678,7 +684,25 @@ impl<R: Read, W: Write> Connection<R, W> {
     /// the stream has been emitted (they ride in the same flow-controlled
     /// send queue), and they end the stream. Trailer fields must not
     /// contain pseudo-headers.
+    ///
+    /// The block is checked here rather than where it is encoded: by then
+    /// the DATA has gone out and the stream is past its last body byte,
+    /// so a rejected trailer could only be reported as a reset stream —
+    /// the caller gets an error naming the field instead.
     pub fn send_trailers(&mut self, stream_id: u32, fields: &HeaderList) -> Result<()> {
+        for f in fields.iter() {
+            let name = f.name.as_str();
+            if f.name.is_pseudo() {
+                return Err(Error::protocol(alloc::format!(
+                    "refusing to send pseudo-header `{name}` in trailers (RFC 9113 §8.1)"
+                )));
+            }
+            if !is_valid_field_value(f.value.as_bytes()) {
+                return Err(Error::protocol(alloc::format!(
+                    "refusing to send trailer `{name}` with CR, LF or NUL in its value (RFC 9113 §8.2.1)"
+                )));
+            }
+        }
         if self.goaway_sent || self.closed {
             return Err(Error::canceled("connection closing"));
         }
@@ -1619,6 +1643,18 @@ impl<R: Read, W: Write> Connection<R, W> {
         let mut saw_authority = false;
 
         for f in fields.iter() {
+            // RFC 9113 §8.2.1: NUL, LF or CR anywhere in a field value
+            // makes the message malformed — a stream error under
+            // §8.1.1, never a connection error. A value that is invalid
+            // only to a *byte class* (a control character such as 0x01)
+            // is caught by the same check.
+            if !is_valid_field_value(f.value.as_bytes()) {
+                self.reject_malformed(
+                    stream_id,
+                    "field value contains a control character (RFC 9113 §8.2.1)",
+                );
+                return Ok(false);
+            }
             if !f.name.is_pseudo() {
                 saw_regular = true;
                 let n = f.name.as_str();
@@ -2283,6 +2319,78 @@ mod tests {
         let mut conn = Connection::new(reader, writer, Config::default());
 
         assert!(conn.poll_available(64).unwrap());
+    }
+
+    /// RFC 9113 §8.2.1: a field value carrying NUL, LF or CR is malformed
+    /// for HTTP/2 too, even though no frame can be split by one. The
+    /// value never leaves this stack, so the check has to happen on the
+    /// way out; `HeaderValue`'s `From<&str>` skips validation, which is
+    /// exactly how such a value gets this far.
+    #[test]
+    fn send_headers_refuses_control_characters_in_values() {
+        let reader = OneRead {
+            data: Vec::new(),
+            used: false,
+        };
+        let writer = crate::courierust_io::VecWriter(Vec::new());
+        let mut conn = Connection::new(reader, writer, Config::default());
+        let stream = conn.open_request(Priority::default()).unwrap();
+        let mut fields = request_prefix();
+        fields.push(HeaderField::new(
+            HeaderName::from_lowercase("x-injected"),
+            HeaderValue::from("ok\r\nx-evil: 1"),
+        ));
+        let err = conn
+            .send_headers(stream, &fields, true)
+            .expect_err("a value with CR/LF must not be sent");
+        assert!(
+            err.to_string().contains("x-injected"),
+            "the error must name the offending field: {err}"
+        );
+    }
+
+    /// The trailer block is written after the last body byte, so a
+    /// malformed one is checked where it is queued — otherwise the only
+    /// way to report it would be a reset stream.
+    #[test]
+    fn send_trailers_refuses_malformed_fields() {
+        let reader = OneRead {
+            data: Vec::new(),
+            used: false,
+        };
+        let writer = crate::courierust_io::VecWriter(Vec::new());
+        let mut conn = Connection::new(reader, writer, Config::default());
+        let stream = conn.open_request(Priority::default()).unwrap();
+        conn.send_headers(stream, &request_prefix(), false).unwrap();
+
+        // RFC 9113 §8.1: trailers must not carry pseudo-headers.
+        let pseudo = vec![hf(":status", "200")];
+        assert!(
+            conn.send_trailers(stream, &pseudo).is_err(),
+            "a pseudo-header in trailers must be refused"
+        );
+
+        let injected = vec![HeaderField::new(
+            HeaderName::from_lowercase("x-trailer"),
+            HeaderValue::from("done\r\n"),
+        )];
+        assert!(
+            conn.send_trailers(stream, &injected).is_err(),
+            "a trailer value with CR/LF must be refused"
+        );
+
+        // A well-formed block still goes through.
+        let ok = vec![hf("x-trailer", "done")];
+        assert!(conn.send_trailers(stream, &ok).is_ok());
+    }
+
+    fn request_prefix() -> Vec<HeaderField> {
+        vec![
+            hf(":method", "GET"),
+            hf(":scheme", "http"),
+            hf(":path", "/"),
+            hf(":authority", "example.test"),
+        ]
     }
 
     /// RFC 9113 §8.2.2 forbids *generating* connection-specific fields.

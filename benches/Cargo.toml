@@ -2,7 +2,9 @@
 name = "courierust_benchmark"
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0"
+# Never published: this workspace exists to measure and compare, not to ship.
+publish = false
+license-file = "../LICENSE"
 authors = ["blueokanna", "HyphenTeam"]
 description = "no_std HTTP/1+2/gRPC engine with work-stealing, RFC 9218, and JA3/JA4 fingerprinting benchmark"
 readme = "README.md"
