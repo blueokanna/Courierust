@@ -42,7 +42,10 @@ pub struct TlsSettings {
     /// randomly when these settings are built (once per server process),
     /// so a ticket issued on one connection is accepted on the next —
     /// that is what makes resumption real across pooled clients. Set a
-    /// fixed key to share tickets across server instances.
+    /// fixed key to share tickets across server instances; an all-zero
+    /// key (including the one left behind when the OS entropy source
+    /// fails) disables resumption rather than sealing tickets with a
+    /// public constant.
     pub session_ticket_key: [u8; 32],
 }
 

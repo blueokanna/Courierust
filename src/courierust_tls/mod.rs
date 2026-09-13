@@ -1188,19 +1188,20 @@ impl Default for ServerConfig {
 /// A TLS 1.2 / 1.3 server acceptor.
 pub struct TlsAcceptor {
     config: ServerConfig,
-    /// The session-ticket encryption key (shared across accepts).
-    ticket_key: [u8; 32],
+    /// The session-ticket encryption key (shared across accepts). `None`
+    /// disables resumption.
+    ticket_key: Option<[u8; 32]>,
 }
 
 impl TlsAcceptor {
     /// Create an acceptor from a configuration.
     pub fn new(config: ServerConfig) -> Self {
         let ticket_key = match config.session_ticket_key {
-            Some(k) => k,
+            Some(k) if k != [0u8; 32] => Some(k),
+            Some(_) => None,
             None => {
                 let mut k = [0u8; 32];
-                let _ = crypto::rng::fill_random(&mut k);
-                k
+                crypto::rng::fill_random(&mut k).then_some(k)
             }
         };
         Self { config, ticket_key }
@@ -1232,13 +1233,10 @@ impl TlsAcceptor {
             let hs = handshake::ServerHandshake {
                 identity: self.config.identity.clone(),
                 alpn: self.config.alpn.clone(),
-                ticket_key: Some(self.ticket_key),
+                ticket_key: self.ticket_key,
                 now: unix_now(),
             };
             let result = hs.run_from_client_hello(&mut io, &ch_body)?;
-            // The sequence was already reset at the application-key change
-            // inside the handshake; the ticket (if any) and the first
-            // application record share one continuous sequence.
             Ok(TlsStream {
                 io,
                 version: TlsVersion::Tls13,
@@ -1260,10 +1258,6 @@ impl TlsAcceptor {
                 now: 0,
             })
         } else if allow12 {
-            // A TLS 1.2 handshake failure (e.g. an Ed25519 identity or a
-            // client that offered no TLS 1.2 suite) is reported with a
-            // fatal `handshake_failure` alert rather than a bare close,
-            // so the peer sees a protocol error, not a timeout.
             let result = match tls12::server_handshake(
                 &mut io,
                 &self.config.identity,
@@ -1300,8 +1294,6 @@ impl TlsAcceptor {
                 now: 0,
             })
         } else {
-            // No common version: the server MUST NOT answer with a lower
-            // version than it supports (RFC 5246 §E.1 / RFC 8446 §4.1.3).
             let _ = io.write_plaintext_record(
                 record::CONTENT_ALERT,
                 &[2, 70], // fatal, protocol_version

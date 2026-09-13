@@ -532,19 +532,26 @@ pub(crate) fn mod_pow_blinded(m: &BigInt, d: &BigInt, n: &BigInt, e: &BigInt) ->
         return None;
     }
     let mut buf = alloc::vec![0u8; bytes];
-    let r = loop {
-        if !super::rng::fill_random(&mut buf) {
-            // No entropy available: refuse to sign rather than fall back to
-            // an unblinded exponentiation.
-            return None;
-        }
-        buf[0] |= 0x80; // keep the factor large
-        let candidate = BigInt::from_be_bytes(&buf).rem(n);
-        if candidate.cmp(&BigInt::from_u64(1)) == core::cmp::Ordering::Greater {
-            break candidate;
+    const MAX_FACTOR_ATTEMPTS: u32 = 32;
+    let (r, r_inv) = {
+        let mut attempts = 0u32;
+        loop {
+            if !super::rng::fill_random(&mut buf) {
+                return None;
+            }
+            buf[0] |= 0x80; // keep the factor large
+            let candidate = BigInt::from_be_bytes(&buf).rem(n);
+            if candidate.cmp(&BigInt::from_u64(1)) == core::cmp::Ordering::Greater {
+                if let Some(inv) = mod_inv(&candidate, n) {
+                    break (candidate, inv);
+                }
+            }
+            attempts += 1;
+            if attempts >= MAX_FACTOR_ATTEMPTS {
+                return None;
+            }
         }
     };
-    let r_inv = mod_inv(&r, n)?;
     let blinded = m.mul(&r.mod_pow(e, n)).rem(n);
     let s = blinded.mod_pow(d, n).mul(&r_inv).rem(n);
     Some(s)
@@ -964,8 +971,30 @@ mod tests {
         for m in [2u64, 3, 42, 100, 1000, 3232] {
             let v = BigInt::from_u64(m);
             let plain = v.mod_pow(&d, &n);
-            let blinded = mod_pow_blinded(&v, &d, &n, &e).expect("blinding needs entropy");
+            let blinded = mod_pow_blinded(&v, &d, &n, &e).expect("blinding must produce a factor");
             assert_eq!(plain, blinded, "m = {m}");
+        }
+    }
+
+    /// A random factor that shares a prime with `n` cannot be inverted, so
+    /// it has to be *re-drawn* — not reported as a failure. `n = 15` makes
+    /// that happen nearly half the time, which is exactly what a real
+    /// modulus makes vanishingly rare and a test has to force.
+    #[test]
+    fn blinding_redraws_a_non_coprime_factor() {
+        // n = 15 = 3 * 5, lambda(n) = 4, so e = d = 3 is a valid pair.
+        let n = BigInt::from_u64(15);
+        let e = BigInt::from_u64(3);
+        let d = BigInt::from_u64(3);
+        for m in [2u64, 4, 7, 8, 11, 13, 14] {
+            let v = BigInt::from_u64(m);
+            let plain = v.mod_pow(&d, &n);
+            for attempt in 0..400 {
+                let blinded = mod_pow_blinded(&v, &d, &n, &e).unwrap_or_else(|| {
+                    panic!("m = {m}, attempt = {attempt}: a shared factor must be re-drawn")
+                });
+                assert_eq!(plain, blinded, "m = {m}, attempt = {attempt}");
+            }
         }
     }
 
