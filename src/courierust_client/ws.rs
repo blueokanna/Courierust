@@ -221,7 +221,7 @@ impl WebSocket {
             net::configure(&stream, cfg.read_timeout)?;
             ConnStream::plain(stream)
         };
-        let _ = conn.configure(cfg.read_timeout);
+        let _ = conn.set_deadline(cfg.read_timeout);
         let stream = Arc::new(conn);
 
         // ---- handshake ------------------------------------------------
@@ -465,7 +465,7 @@ impl WebSocket {
         self.session.close(code, reason)?;
         self.session.flush()?;
         let deadline = std::time::Instant::now() + self.close_timeout;
-        let _ = self.stream.configure(Some(self.close_timeout));
+        let _ = self.stream.set_deadline(Some(self.close_timeout));
         loop {
             if std::time::Instant::now() >= deadline {
                 return Ok(());
@@ -494,9 +494,11 @@ impl WebSocket {
     }
 
     /// Change the transport's read timeout (bounds how long
-    /// [`WebSocket::read_message`] blocks).
+    /// [`WebSocket::read_message`] blocks) with deadline semantics, so
+    /// its expiry reaches the caller as [`ErrorKind::Timeout`] on every
+    /// platform rather than as a POSIX-only `WouldBlock`.
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<()> {
-        self.stream.configure(timeout)
+        self.stream.set_deadline(timeout)
     }
 }
 

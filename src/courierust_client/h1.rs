@@ -68,7 +68,7 @@ impl H1Connection {
                 ConnStream::plain(stream)
             }
         };
-        let _ = conn.configure(cfg.read_timeout);
+        let _ = conn.set_deadline(cfg.read_timeout);
         let conn = Arc::new(conn);
         Ok(Self {
             reader: BufReader::new(conn.clone(), 16 * 1024),
@@ -90,7 +90,7 @@ impl H1Connection {
         cfg: &ClientConfig,
         seed: &[u8],
     ) -> Result<Self> {
-        let _ = stream.configure(cfg.read_timeout);
+        let _ = stream.set_deadline(cfg.read_timeout);
         let conn = Arc::new(stream);
         let mut reader = BufReader::new(conn.clone(), 16 * 1024);
         if !seed.is_empty() {
@@ -120,8 +120,12 @@ impl H1Connection {
     /// the pool afterwards, where the configured value must be in force
     /// again — a pooled connection may not carry one caller's deadline
     /// into another's request.
+    ///
+    /// The deadline is armed with deadline semantics, so its expiry
+    /// surfaces as [`ErrorKind::Timeout`] on every platform rather than
+    /// as the POSIX-only `WouldBlock` a raw `EAGAIN` would produce.
     pub fn set_read_deadline(&self, timeout: Option<Duration>) -> Result<()> {
-        self.stream.configure(timeout)
+        self.stream.set_deadline(timeout)
     }
 
     /// Whether the peer has closed this connection while it sat idle.
@@ -304,11 +308,12 @@ impl H1Connection {
 /// Read a body delimited by connection close into the scratch body
 /// buffer.
 ///
-/// Only a clean EOF (or a WouldBlock on a non-blocking transport) ends
+/// Only a clean EOF (or a `WouldBlock` on a non-blocking transport) ends
 /// the body. Timeouts and transport resets mid-body are propagated as
 /// errors — previously every read error was treated as EOF, silently
 /// returning a truncated body as a successful response when a server
-/// reset/aborted mid-stream.
+/// reset/aborted mid-stream. A request deadline that expires mid-body is
+/// such an error: it must not be mistaken for the end of the message.
 fn read_until_eof_scratch(
     reader: &mut BufReader<Arc<ConnStream>>,
     max: usize,
@@ -321,7 +326,7 @@ fn read_until_eof_scratch(
             Ok(b) => b,
             Err(e) => match e.kind {
                 ErrorKind::UnexpectedEof => break, // clean close ends the body
-                ErrorKind::WouldBlock => break,    // never on a blocking socket
+                ErrorKind::WouldBlock => break,    // non-blocking transports only
                 _ => return Err(e),
             },
         };

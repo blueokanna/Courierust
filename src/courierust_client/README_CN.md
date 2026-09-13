@@ -15,7 +15,7 @@
 - **重定向**（301/302/303 → GET，307/308 保留方法与请求体）绝不跨 origin 转发 `Authorization` / `Cookie`（RFC 9110 §15.4）。
 - **优先级**——`execute_priority(url, req, Priority { urgency, incremental })` 驱动 WUCS 调度器（见 `blogs/01`）。
 - **worker 占用按连接而非按流**——一条带很多流的 h2 连接只占一个 worker，流永远不会把 worker 用量翻倍，也互不阻塞。
-- **超时**——连接、握手（TLS）、读超时都在 `ClientConfig` 上配置；单个请求可用 `RequestBuilder::timeout` 覆盖读超时。这个覆盖与配置项同义，是**传输层截止时间**，按每次尝试生效（重定向每一跳都有完整超时），用后恢复，因此池化连接不会把上一个调用者的截止时间带给下一个请求。
+- **超时**——连接、握手（TLS）、读超时都在 `ClientConfig` 上配置；单个请求可用 `RequestBuilder::timeout` 覆盖读超时。这个覆盖与配置项同义，是**传输层截止时间**，按每次尝试生效（重定向每一跳都有完整超时），用后恢复，因此池化连接不会把上一个调用者的截止时间带给下一个请求。它的到期在每个平台上都表现为 `ErrorKind::Timeout`。
 - **请求构建**——`Client::request(url, method)` 返回 `RequestBuilder`：头、body、`query` / `form`（WHATWG `application/x-www-form-urlencoded`，实现在 `courierust_http::form`）、`basic_auth` / `bearer_auth`、RFC 9218 `priority`，以及每请求 `timeout`。`Client::{put, delete, head, patch, options}` 是快捷方法。它构造的就是手写调用所发的同一个 `Request`，交给同一条 `execute` 路径，重定向、连接池与三种协议都完全一致。
 - **默认头**——`ClientConfig::default_headers` 会合入客户端自己发起的那个请求，请求本身设置的同名字段永远优先。只在首跳合入：跨源重定向会剥掉 `authorization` / `proxy-authorization` / `cookie`（不论它们来自请求还是配置），再合一次就等于把默认凭据又放回这条规则要保护的那一跳。
 - **WebSocket 的读超时就是 socket 超时。** `ClientConfig::read_timeout`（默认 60 s）对交互式流量是正确的存活机制，但 Windows 会在每次阻塞操作上收费：armed 状态下 256 KiB 的 WebSocket 批量推送大约**慢 2 倍**。批量传输的客户端应设 `read_timeout: None`，改用应用层存活判断——服务端就是这么做的（实测见 [`courierust_ws` README](../courierust_ws/README_CN.md)）。

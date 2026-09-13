@@ -65,10 +65,12 @@ pub(crate) fn parse_new_session_ticket(body: &[u8]) -> Result<NewSessionTicket, 
         return Err(TlsError::Protocol("empty session ticket".into()));
     }
     let ticket = take(body, &mut p, ticket_len, "ticket")?.to_vec();
-    // Extensions are optional, and none is consumed: a ticket from this
-    // build carries no `early_data`, so there is nothing in the block to
-    // act on. It is still walked, because a malformed block is a protocol
-    // error rather than something to skip past and mis-slice.
+    // RFC 8446 §4.6.1 makes the extension block a mandatory field, so a
+    // conforming peer always sends the two-byte length prefix even when
+    // it carries nothing. A peer that omits it entirely is tolerated here
+    // (the block is walked for structure, never consumed); a *truncated*
+    // one is still a protocol error rather than something to skip past
+    // and mis-slice.
     if p != body.len() {
         let ext_len = take_u16(body, &mut p, "ticket extensions")? as usize;
         let ext_bytes = take(body, &mut p, ext_len, "ticket extensions")?;
@@ -94,18 +96,26 @@ pub(crate) fn parse_new_session_ticket(body: &[u8]) -> Result<NewSessionTicket, 
 
 /// Build a `NewSessionTicket` handshake message.
 ///
-/// It carries no extensions: the only one this stack could send is
-/// `early_data` (RFC 8446 §4.6.1), and advertising an allowance is a
-/// promise to accept 0-RTT records — which this build does not implement,
-/// so it does not make the promise.
+/// The message ends with the mandatory `Extension extensions<0..2^16-2>`
+/// field of RFC 8446 §4.6.1 — an empty block, but the field is a vector
+/// and a vector carries its two-byte length prefix whether or not it has
+/// elements. Dropping those two bytes truncates the message by exactly
+/// that much, which strict parsers reject outright (OpenSSL reports a
+/// length mismatch on the post-handshake flight).
+///
+/// The block is *empty* rather than absent-therefore-irrelevant: the only
+/// extension this stack could put in a ticket is `early_data`, and
+/// advertising an allowance is a promise to accept 0-RTT records — which
+/// this build does not implement, so it does not make the promise.
 pub(crate) fn build_new_session_ticket(lifetime: u32, nonce: &[u8], ticket: &[u8]) -> Vec<u8> {
-    let mut body = Vec::with_capacity(16 + nonce.len() + ticket.len());
+    let mut body = Vec::with_capacity(18 + nonce.len() + ticket.len());
     body.extend_from_slice(&lifetime.to_be_bytes());
     body.extend_from_slice(&0u32.to_be_bytes()); // ticket_age_add
     body.push(nonce.len() as u8);
     body.extend_from_slice(nonce);
     body.extend_from_slice(&(ticket.len() as u16).to_be_bytes());
     body.extend_from_slice(ticket);
+    body.extend_from_slice(&0u16.to_be_bytes()); // Extension extensions<0..2^16-2>
     let mut msg = Vec::with_capacity(4 + body.len());
     msg.push(HS_NEW_SESSION_TICKET);
     msg.extend_from_slice(&[
@@ -676,12 +686,36 @@ mod tests {
     fn new_session_ticket_roundtrip() {
         let ticket = build_new_session_ticket(3600, &[1, 2, 3], &[0xdd; 40]);
         // 4-byte handshake header + body: lifetime + age_add + nonce +
-        // ticket, and no extension block.
-        assert_eq!(ticket.len(), 4 + 4 + 4 + 1 + 3 + 2 + 40);
+        // ticket + the mandatory (empty) extension vector.
+        assert_eq!(ticket.len(), 4 + 4 + 4 + 1 + 3 + 2 + 40 + 2);
         let parsed = parse_new_session_ticket(&ticket[4..]).unwrap();
         assert_eq!(parsed.lifetime, 3600);
         assert_eq!(parsed.nonce, vec![1, 2, 3]);
         assert_eq!(parsed.ticket, vec![0xdd; 40]);
+    }
+
+    /// The wire format is walked field by field: a self-consistent
+    /// encoder/decoder pair proves nothing about a third-party parser,
+    /// and "the extension block is empty" is not the same message as
+    /// "there is no extension block".
+    #[test]
+    fn new_session_ticket_wire_format_matches_rfc_8446() {
+        let msg = build_new_session_ticket(7, &[9, 9], &[0xaa, 0xbb]);
+        assert_eq!(msg[0], HS_NEW_SESSION_TICKET);
+        let body = &msg[4..];
+        assert_eq!(u32::from_be_bytes([body[0], body[1], body[2], body[3]]), 7);
+        // ticket_age_add is present and zero (this client sends age 0).
+        assert_eq!(u32::from_be_bytes([body[4], body[5], body[6], body[7]]), 0);
+        let nonce_len = body[8] as usize;
+        assert_eq!(nonce_len, 2);
+        let mut p = 9 + nonce_len;
+        let ticket_len = u16::from_be_bytes([body[p], body[p + 1]]) as usize;
+        assert_eq!(ticket_len, 2);
+        p += 2 + ticket_len;
+        // RFC 8446 §4.6.1: `Extension extensions<0..2^16-2>` is the last
+        // field, always present, empty here — and the body ends there.
+        assert_eq!(body.len() - p, 2, "extension vector must be serialized");
+        assert_eq!(&body[p..], &[0x00, 0x00]);
     }
 
     #[test]
