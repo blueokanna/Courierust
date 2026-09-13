@@ -164,9 +164,12 @@ impl<S: FrameSink> FrameWriter<S> {
     /// Install (or replace) the negotiated compression parameters.
     pub fn set_compression(&mut self, params: Option<CompressionParams>) {
         self.compression = params;
-        self.deflater = params.map(|_| {
+        self.deflater = params.map(|p| {
             let mut d = Deflater::new();
             d.set_threshold(64);
+            // RFC 7692 §7.2.1: what we send must fit the window the peer
+            // agreed to, which is the *send* direction of our role.
+            d.set_window_bits(p.send_window_bits);
             d
         });
     }

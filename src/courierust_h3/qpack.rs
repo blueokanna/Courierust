@@ -360,12 +360,15 @@ impl DynamicTable {
 
     /// Insert a (name, value) pair at the newest end, evicting from the
     /// oldest end as needed. Returns `false` when the entry is larger
-    /// than the capacity (dropped per §3.2.2).
+    /// than the capacity.
+    ///
+    /// The refusal deliberately leaves the table untouched: RFC 9204
+    /// §3.2.2 makes an oversized *encoder* insert a stream error, and a
+    /// decoder that answered the peer's mistake by wiping its own table
+    /// would only add a second desynchronisation on top of the first.
     pub fn insert(&mut self, name: &str, value: &str) -> bool {
         let entry_size = Self::entry_size(name, value);
         if entry_size > self.capacity {
-            self.entries.clear();
-            self.size = 0;
             return false;
         }
         while self.size.saturating_add(entry_size) > self.capacity {
@@ -735,7 +738,7 @@ pub fn decode_encoder_instruction(
                 .name
                 .clone()
         };
-        dyn_table.insert(&name, &value_str);
+        insert_checked(dyn_table, &name, &value_str)?;
         return Ok(());
     }
     if first & 0xc0 == 0x40 {
@@ -747,7 +750,7 @@ pub fn decode_encoder_instruction(
         let value = decode_string(buf, 8, pos, huff)?;
         let value_str =
             String::from_utf8(value).map_err(|_| Error::protocol("QPACK value is not UTF-8"))?;
-        dyn_table.insert(&name, &value_str);
+        insert_checked(dyn_table, &name, &value_str)?;
         return Ok(());
     }
     if first & 0xe0 == 0x20 {
@@ -775,7 +778,19 @@ pub fn decode_encoder_instruction(
         .get(abs)
         .ok_or_else(|| Error::protocol("QPACK dynamic table entry missing"))?
         .clone();
-    dyn_table.insert(&entry.name, &entry.value);
+    insert_checked(dyn_table, &entry.name, &entry.value)?;
+    Ok(())
+}
+
+/// Insert one entry from the peer's encoder stream, enforcing RFC 9204
+/// §3.2.2: an entry larger than the table capacity is a
+/// QPACK_ENCODER_STREAM_ERROR, not something to silently drop.
+fn insert_checked(table: &mut DynamicTable, name: &str, value: &str) -> Result<()> {
+    if !table.insert(name, value) {
+        return Err(Error::protocol(
+            "QPACK insert exceeds the dynamic table capacity",
+        ));
+    }
     Ok(())
 }
 

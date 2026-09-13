@@ -83,7 +83,7 @@ Notes:
 
 ## Redirects
 
-Redirects are on by default and capped by `max_redirects`. `301`, `302`, and `303` switch the method to `GET` (RFC 9110); the request body is dropped. Absolute, protocol-relative (`//host/...`), and relative `Location` values are all handled:
+Redirects are on by default and capped by `max_redirects`. `301`, `302`, and `303` switch the method to `GET` (RFC 9110) and drop the request body; `307` and `308` keep both the method and the body, and a body that only existed as a stream (so it cannot be replayed) fails the hop with an explicit error rather than being sent empty. Absolute, protocol-relative (`//host/...`), and relative `Location` values are all handled:
 
 ```rust
 // Follows up to 10 hops automatically; the final response comes back.

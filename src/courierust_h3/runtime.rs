@@ -39,6 +39,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_DATAGRAM: usize = 65_527;
 const MIN_INITIAL_DATAGRAM: usize = 1200;
+/// Smallest datagram that can be a valid QUIC packet: RFC 9000 §10.3
+/// makes a short-header packet below 21 bytes unconditionally invalid,
+/// so such a datagram must be discarded rather than answered.
+const MIN_SHORT_DATAGRAM: usize = 21;
 const MAX_PACKET_FRAMES: usize = 1024;
 // Keep protected packets below the smallest practical UDP path MTU. A TLS
 // flight is split into multiple CRYPTO frames; QUIC retransmits each packet
@@ -901,26 +905,41 @@ fn stateless_reset_token(reset_key: &[u8; 32], cid: &[u8]) -> [u8; 16] {
 }
 
 /// Build a stateless reset datagram (RFC 9000 §10.3): a short-header
-/// packet addressed to `dcid` with a random payload whose final 16 bytes
-/// are the connection's stateless reset token. The datagram is padded so
-/// the receiver can read the token without risking the packet being
-/// confused with a valid short packet.
-fn build_stateless_reset(dcid: &[u8], token: &[u8; 16]) -> Result<Vec<u8>> {
+/// packet addressed to `dcid`, with a random body whose final 16 bytes
+/// are the connection's stateless reset token.
+///
+/// `max_len` is the largest datagram the caller may send. RFC 9000 §10.3.3
+/// requires a Stateless Reset to be *smaller* than the packet that
+/// triggered it unless the endpoint keeps state about that packet, and
+/// §10.3 forbids a reset three times larger than the trigger: an
+/// unauthenticated datagram must not be an amplifier. `Ok(None)` means the
+/// triggering packet is too small for a well-formed reset, in which case
+/// the correct action is to send nothing.
+fn build_stateless_reset(dcid: &[u8], token: &[u8; 16], max_len: usize) -> Result<Option<Vec<u8>>> {
     if dcid.is_empty() || dcid.len() > 20 {
         return Err(protocol("invalid connection ID for stateless reset"));
     }
-    let mut out = Vec::with_capacity(1 + dcid.len() + 21 + 16);
+    let head = 1 + dcid.len();
+    // A short-header packet needs at least 21 bytes to be valid at all
+    // (RFC 9000 §10.3), and the token has to sit at the tail.
+    let min_len = (head + 1 + token.len()).max(MIN_SHORT_DATAGRAM);
+    if max_len < min_len {
+        return Ok(None);
+    }
+    let total = (head + 21 + token.len()).min(max_len);
+    let random_len = total - head - token.len();
+    let mut out = Vec::with_capacity(total);
     // Short header with the destination connection ID length in the low
     // 6 bits (RFC 9000 §17.3).
     out.push(0x40 | ((dcid.len() as u8).saturating_sub(1) & 0x3f));
     out.extend_from_slice(dcid);
-    let mut random = [0u8; 21];
+    let mut random = alloc::vec![0u8; random_len];
     if !crate::courierust_tls::crypto::rng::fill_random(&mut random) {
         return Err(protocol("OS randomness unavailable for stateless reset"));
     }
     out.extend_from_slice(&random);
     out.extend_from_slice(token);
-    Ok(out)
+    Ok(Some(out))
 }
 
 fn run_server(
@@ -1219,10 +1238,10 @@ fn handle_server_datagram(
             }
         }
     }
-    if !datagram.is_empty() && datagram[0] & 0x80 == 0 && datagram[0] & 0x40 != 0 {
+    if n >= MIN_SHORT_DATAGRAM && datagram[0] & 0x80 == 0 && datagram[0] & 0x40 != 0 {
         if let Some(dcid) = packet_destination_cid(datagram) {
             let token = stateless_reset_token(reset_key, dcid);
-            if let Ok(reset) = build_stateless_reset(dcid, &token) {
+            if let Ok(Some(reset)) = build_stateless_reset(dcid, &token, n - 1) {
                 if reset.len() <= MAX_DATAGRAM {
                     if let Some(stats) = config.stats.as_deref() {
                         stats.h3_udp_send_syscalls.fetch_add(1, Ordering::Relaxed);
@@ -1784,8 +1803,13 @@ impl ClientConnection {
         if self.goaway_sent || !self.control_sent {
             return Ok(());
         }
-        let last = 4u64.saturating_mul(self.next_stream_index.saturating_sub(1));
-        let goaway = h3frame::Frame::GoAway(last).to_bytes();
+        // RFC 9114 §5.2 / §7.2.6: in the client-to-server direction the
+        // GOAWAY field is a *Push ID*, not a stream ID — the two number
+        // spaces are unrelated, and a server reading a stream ID here
+        // would refuse requests that were never in question. This
+        // endpoint never accepts a push (it never sends MAX_PUSH_ID), so
+        // "no push id is acceptable" is the honest value.
+        let goaway = h3frame::Frame::GoAway(0).to_bytes();
         match self
             .transport
             .send_stream_append(socket, APPLICATION, 2, &goaway)
@@ -2099,6 +2123,7 @@ impl ClientConnection {
                     max_header_list: self.max_header_list,
                     max_body: self.max_body,
                 },
+                true,
             )?
             .unwrap_or_default();
             self.unblock_streams(unblocked)?;
@@ -2935,6 +2960,11 @@ struct ReceiveStream {
     completed: bool,
     stream_type: Option<u64>,
     control_started: bool,
+    /// True once this stream's type has been registered with the
+    /// connection (the per-type "only one of each" bookkeeping): the
+    /// handler runs again for every arriving chunk of the same stream, and
+    /// the registration must happen exactly once.
+    type_registered: bool,
     /// True while a HEADERS frame waits for the QPACK encoder stream
     /// (Required Insert Count not yet met). The stream's remaining frames
     /// stay buffered and are drained once the section is decoded.
@@ -3245,6 +3275,7 @@ fn process_unidirectional_stream(
     peer_max_header_list: &mut usize,
     qpack: &mut QpackConnection,
     limits: H3Limits,
+    client_side: bool,
 ) -> Result<Option<Vec<UnblockedSection>>> {
     if stream.stream_type.is_none() && stream_id::is_unidirectional(stream_id_of(stream)) {
         let (kind, used) = match varint::decode(&stream.frame_buf) {
@@ -3269,6 +3300,7 @@ fn process_unidirectional_stream(
     let Some(kind) = stream.stream_type else {
         return Ok(None);
     };
+    let first_time = !core::mem::replace(&mut stream.type_registered, true);
     match kind {
         H3_CONTROL_STREAM => {
             let mut pos = 0;
@@ -3294,7 +3326,7 @@ fn process_unidirectional_stream(
                             return Err(protocol("duplicate HTTP/3 SETTINGS"));
                         }
                         h3frame::Frame::GoAway(id) => {
-                            validate_goaway_id(id, *peer_goaway)?;
+                            validate_goaway_id(id, *peer_goaway, client_side)?;
                             *peer_goaway =
                                 Some(peer_goaway.map_or(id, |previous| previous.min(id)));
                         }
@@ -3312,6 +3344,10 @@ fn process_unidirectional_stream(
             Ok(Some(Vec::new()))
         }
         H3_QPACK_ENCODER_STREAM => {
+            // RFC 9204 §4.2: only one encoder stream per peer.
+            if first_time {
+                qpack.mark_encoder_stream()?;
+            }
             // Apply the peer's encoder-stream instructions (Set Capacity,
             // inserts, duplicates) and retry any field sections that were
             // waiting on the entries they define.
@@ -3327,6 +3363,10 @@ fn process_unidirectional_stream(
             Ok(Some(unblocked))
         }
         H3_QPACK_DECODER_STREAM => {
+            // RFC 9204 §4.2: only one decoder stream per peer.
+            if first_time {
+                qpack.mark_decoder_stream()?;
+            }
             // Apply the peer's decoder-stream instructions: Insert Count
             // Increment raises our encoder-side Known Received Count.
             let consumed = qpack.on_decoder_stream(&stream.frame_buf)?;
@@ -3371,6 +3411,7 @@ fn process_server_stream(
         peer_max_header_list,
         qpack,
         limits,
+        false,
     )? {
         return Ok(unblocked);
     }
@@ -3380,7 +3421,6 @@ fn process_server_stream(
     drain_request_frames(
         stream,
         control_received,
-        peer_goaway,
         qpack,
         limits.max_header_list,
         limits.max_body,
@@ -3405,6 +3445,7 @@ fn process_client_stream(
         peer_max_header_list,
         qpack,
         limits,
+        true,
     )? {
         return Ok(unblocked);
     }
@@ -3429,7 +3470,6 @@ fn stream_id_of(stream: &ReceiveStream) -> u64 {
 fn drain_request_frames(
     stream: &mut ReceiveStream,
     control_received: &bool,
-    peer_goaway: &Option<u64>,
     qpack: &mut QpackConnection,
     max_header_list: usize,
     max_body: usize,
@@ -3493,9 +3533,10 @@ fn drain_request_frames(
             stream.completed = true;
             return Ok(());
         }
-        if peer_goaway.is_some_and(|last| stream.id > last) {
-            return Err(protocol("HTTP/3 request is beyond peer GOAWAY"));
-        }
+        // A client's GOAWAY carries a Push ID, not a request stream ID
+        // (RFC 9114 §5.2), so it says nothing about which requests this
+        // server may accept. Refusing `stream.id > push_id` here would
+        // break every connection whose client greeted it with GOAWAY(0).
         if !*control_received {
             return Err(protocol("HTTP/3 request arrived before peer SETTINGS"));
         }
@@ -3694,8 +3735,12 @@ fn validate_content_length(headers: &HeaderMap, actual: usize) -> Result<()> {
     Ok(())
 }
 
-fn validate_goaway_id(id: u64, previous: Option<u64>) -> Result<()> {
-    if id & 0x03 != 0 {
+fn validate_goaway_id(id: u64, previous: Option<u64>, client_side: bool) -> Result<()> {
+    // RFC 9114 §5.2/§7.2.6: a server's GOAWAY names a client-initiated
+    // bidirectional stream; a client's GOAWAY names a Push ID, which has
+    // no stream-id shape at all — requiring `id % 4 == 0` there would
+    // reject a compliant peer's push id 1.
+    if client_side && id & 0x03 != 0 {
         return Err(protocol("HTTP/3 GOAWAY contains an invalid stream id"));
     }
     if previous.is_some_and(|last| id > last) {
@@ -4667,6 +4712,16 @@ impl QuicTransport {
             }
         }
         let adaptive_delay = self.current_ack_delay();
+        // Snapshotted before `self.spaces` is mutably borrowed for the
+        // frame loop: a MAX_STREAM_DATA must not shadow the transport
+        // parameter's initial limit with a smaller one, and the defaults
+        // are per direction (RFC 9000 §4.1).
+        let server_side = self.server;
+        let stream_data_defaults = (
+            self.peer_max_stream_data_uni,
+            self.peer_max_stream_data_bidi_remote,
+            self.peer_max_stream_data_bidi_local,
+        );
         let space = &mut self.spaces[level];
         if !space.received.insert(pn) {
             space.ack_pending = true;
@@ -4727,6 +4782,13 @@ impl QuicTransport {
                     unidirectional,
                     max,
                 } => {
+                    // RFC 9000 §4.6/§19.11: the count can never exceed 2^60
+                    // (no stream id above 2^62-1 can be encoded), and a
+                    // frame that permits opening more is a connection
+                    // error of type FRAME_ENCODING_ERROR.
+                    if *max > (1u64 << 60) {
+                        return Err(protocol("MAX_STREAMS exceeds the stream id space"));
+                    }
                     if *unidirectional {
                         self.peer_max_streams_uni = self.peer_max_streams_uni.max(*max);
                     } else {
@@ -4740,8 +4802,21 @@ impl QuicTransport {
                             h3_role(self.server)
                         );
                     }
-                    let limit = self.peer_stream_limits.entry(*stream_id).or_insert(0);
-                    *limit = (*limit).max(*max);
+                    // MAX_STREAM_DATA only ever raises the limit: it
+                    // cannot go below the transport parameter's initial
+                    // value, so the map entry must not shadow that value
+                    // with a smaller one (RFC 9000 §4.1).
+                    let (uni_default, bidi_remote_default, bidi_local_default) =
+                        stream_data_defaults;
+                    let floor = if stream_id::is_unidirectional(*stream_id) {
+                        uni_default
+                    } else if stream_id::is_client_initiated(*stream_id) != server_side {
+                        bidi_remote_default
+                    } else {
+                        bidi_local_default
+                    };
+                    let entry = self.peer_stream_limits.entry(*stream_id).or_insert(floor);
+                    *entry = (*entry).max(*max);
                 }
                 _ => {}
             }
@@ -5608,6 +5683,15 @@ impl QuicTransport {
         if ack_eliciting
             && self.unacknowledged_bytes().saturating_add(wire.len()) > self.congestion_window
         {
+            // The packet was not sent, so everything it carried is still
+            // pending — including a piggybacked ACK that the code above
+            // has already marked consumed. Dropping it would look like
+            // loss to the peer and trigger a retransmission of data we
+            // already hold.
+            if due_ack {
+                self.spaces[level].ack_pending = true;
+                self.spaces[level].ack_deadline = Some(Instant::now());
+            }
             if let Some(stats) = self.stats.as_deref() {
                 stats.h3_credit_stalls.fetch_add(1, Ordering::Relaxed);
             }
@@ -5912,7 +5996,15 @@ fn acknowledge(
         for pn in acknowledged {
             if let Some(packet) = sent.remove(&pn) {
                 acknowledged_bytes = acknowledged_bytes.saturating_add(packet.size);
-                rtt_sample = rtt_sample.or_else(|| now.checked_duration_since(packet.sent_at));
+                // RFC 9002 §5.1: the sample is the time to the *largest*
+                // packet number newly acknowledged — here the high end of
+                // the first range, and only when this ACK is what
+                // acknowledged it. Timing the oldest packet of a burst
+                // inflates the RTT (and with it PTO and every deadline
+                // derived from it) by the spread of the burst.
+                if index == 0 && pn == high && rtt_sample.is_none() {
+                    rtt_sample = now.checked_duration_since(packet.sent_at);
+                }
             }
         }
         if index + 1 < ranges.len() {
@@ -5930,6 +6022,13 @@ fn acknowledge(
 }
 
 fn decode_quic_frames(buf: &[u8]) -> Result<Vec<QFrame>> {
+    if buf.is_empty() {
+        // RFC 9000 §12.4: "An endpoint MUST treat receipt of a packet
+        // containing no frames as a connection error of type
+        // PROTOCOL_VIOLATION." A sender that pads writes at least four
+        // zero bytes, so an empty plaintext is always malformed.
+        return Err(protocol("QUIC packet contains no frames"));
+    }
     let mut pos = 0usize;
     let mut frames = Vec::new();
     while pos < buf.len() {
@@ -6416,6 +6515,7 @@ mod tests {
             &mut peer_max_header_list,
             &mut qpack,
             limits,
+            false,
         )
         .unwrap();
         assert!(
@@ -6456,6 +6556,7 @@ mod tests {
             &mut peer_max_header_list,
             &mut qpack,
             limits,
+            false,
         )
         .is_ok());
     }

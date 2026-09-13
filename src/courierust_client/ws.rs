@@ -411,11 +411,16 @@ impl WebSocket {
 
     /// A push handle usable from another thread while this one reads.
     pub fn writer(&self) -> WsClientWriter {
+        // The push handle must share the connection's Close flag with the
+        // session: RFC 6455 §5.5.1 — nothing may follow a Close frame — is
+        // a property of the connection, not of one writer.
+        let close_flag = self.session.writer().close_flag();
         WsClientWriter {
-            inner: Arc::new(std::sync::Mutex::new(FrameWriter::new(
+            inner: Arc::new(std::sync::Mutex::new(FrameWriter::with_close_flag(
                 self.sink.clone(),
                 MaskSource::Random,
                 self.session.compression(),
+                close_flag,
             ))),
         }
     }

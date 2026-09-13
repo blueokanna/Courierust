@@ -217,7 +217,10 @@ impl crate::courierust_io::Read for &ConnStream {
                 crate::courierust_io::Read::read(&mut r, buf)
             }
             ConnStreamKind::Tls { tls, .. } => {
-                let mut g = tls.lock().unwrap();
+                // A poisoned TLS lock would otherwise turn one panicking
+                // handler into a connection that can never be read or
+                // written again.
+                let mut g = tls.lock().unwrap_or_else(|e| e.into_inner());
                 crate::courierust_io::Read::read(&mut *g, buf)
             }
         }
@@ -232,7 +235,7 @@ impl crate::courierust_io::Write for &ConnStream {
                 crate::courierust_io::Write::write(&mut w, buf)
             }
             ConnStreamKind::Tls { tls, .. } => {
-                let mut g = tls.lock().unwrap();
+                let mut g = tls.lock().unwrap_or_else(|e| e.into_inner());
                 crate::courierust_io::Write::write(&mut *g, buf)
             }
         }
@@ -245,7 +248,7 @@ impl crate::courierust_io::Write for &ConnStream {
                 crate::courierust_io::Write::flush(&mut w)
             }
             ConnStreamKind::Tls { tls, .. } => {
-                let mut g = tls.lock().unwrap();
+                let mut g = tls.lock().unwrap_or_else(|e| e.into_inner());
                 crate::courierust_io::Write::flush(&mut *g)
             }
         }
@@ -300,6 +303,15 @@ pub fn configure(stream: &TcpStream, read_timeout: Option<Duration>) -> Result<(
         .map_err(|e| Error::io(e.to_string()))?;
     stream
         .set_read_timeout(read_timeout)
+        .map_err(|e| Error::io(e.to_string()))?;
+    // A blocking `write` on a socket whose peer has stopped reading parks
+    // until the kernel gives up — minutes, or never. Every driver loop
+    // here is built around a bounded wait (it has to service timeouts,
+    // ACKs and shutdown while a body is being sent), so the write side
+    // gets the same deadline as the read side: a peer that stops reading
+    // is a liveness failure, not a reason to freeze the thread.
+    stream
+        .set_write_timeout(read_timeout)
         .map_err(|e| Error::io(e.to_string()))?;
     Ok(())
 }

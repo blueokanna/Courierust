@@ -458,7 +458,14 @@ impl<R: Read, S: frame::FrameSink> Session<R, S> {
 
         if header.opcode.is_control() {
             // Control frames are validated by the parser (a 125-byte maximum,
-            // never fragmented) and may interleave anywhere.
+            // never fragmented) and may interleave anywhere. They still have to
+            // respect the configured frame cap, though, or `max_frame` would not
+            // mean what it says for a session that sets it below 125.
+            if header.payload_len > self.cfg.max_frame as u64 {
+                return Err(self.fatal(Error::overflow(
+                    "websocket: control frame exceeds the size limit",
+                )));
+            }
             self.ctl.clear();
             self.phase = Phase::Payload { header, got: 0 };
             self.stats.frames_read += 1;

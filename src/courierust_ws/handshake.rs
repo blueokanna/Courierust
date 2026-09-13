@@ -103,11 +103,7 @@ pub fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
     if headers.get_all("sec-websocket-version").count() != 1 {
         return false;
     }
-    let upgrade_ok = headers.get_all("upgrade").any(|v| {
-        v.to_str()
-            .map(|s| s.trim().eq_ignore_ascii_case("websocket"))
-            .unwrap_or(false)
-    });
+    let upgrade_ok = header_has_token(headers, "upgrade", "websocket");
     upgrade_ok && header_has_token(headers, "connection", "upgrade")
 }
 
@@ -128,12 +124,17 @@ impl IpNet {
     /// Parse `addr`, `addr/len` or a bare address (host route).
     pub fn parse(s: &str) -> Option<Self> {
         let (addr, prefix) = match s.split_once('/') {
-            Some((a, p)) => (a.trim(), p.trim().parse::<u8>().ok()?),
-            None => (s.trim(), u8::MAX),
+            Some((a, p)) => (a.trim(), Some(p.trim().parse::<u8>().ok()?)),
+            None => (s.trim(), None),
         };
         let addr: IpAddr = addr.parse().ok()?;
         let max = if addr.is_ipv4() { 32 } else { 128 };
-        let prefix = if prefix == u8::MAX { 32 } else { prefix };
+        // A bare address is a host route, so its prefix length follows the
+        // address family. Defaulting it to /32 would turn `::1` into a
+        // network that also contains every `::x`, including the IPv4-
+        // mapped addresses a dual-stack listener reports — and a trusted
+        // proxy match is what makes the forwarded headers believed.
+        let prefix = prefix.unwrap_or(max);
         if prefix > max {
             return None;
         }
@@ -142,7 +143,10 @@ impl IpNet {
 
     /// A single-host network.
     pub fn host(addr: IpAddr) -> Self {
-        Self { addr, prefix: 32 }
+        Self {
+            addr,
+            prefix: if addr.is_ipv4() { 32 } else { 128 },
+        }
     }
 
     /// Whether `ip` falls inside the network.
@@ -723,6 +727,11 @@ impl PerMessageDeflate {
                 }
                 "server_max_window_bits" => {
                     let bits = parse_window_bits(value.as_deref(), "server_max_window_bits")?;
+                    // RFC 7692 §7.1.2.1: a server MAY include this parameter
+                    // even when the offer did not carry it, so an unoffered
+                    // value is accepted — it is still capped at 15 by
+                    // `parse_window_bits`, so it cannot widen our window.
+                    // Only a value *larger than offered* is a failure.
                     if let Some(Some(offered)) = offer.param("server_max_window_bits") {
                         let offered: u8 = offered
                             .parse()
@@ -732,10 +741,6 @@ impl PerMessageDeflate {
                                 "websocket: server window larger than offered",
                             ));
                         }
-                    } else {
-                        return Err(Error::protocol(
-                            "websocket: server_max_window_bits was not offered",
-                        ));
                     }
                     out.server_max_window_bits = bits;
                 }
@@ -1256,6 +1261,17 @@ mod tests {
         assert!(!host.contains("127.0.0.2".parse().unwrap()));
         assert!(IpNet::parse("10.0.0.0/33").is_none());
         assert!(IpNet::parse("not-an-ip").is_none());
+        // A bare IPv6 address is a host route too: defaulting it to /32
+        // (the IPv4 width) would make `::1` match `::2` and every
+        // IPv4-mapped address, and a trusted-proxy match is what makes the
+        // X-Forwarded-* headers believed.
+        assert_eq!(IpNet::parse("::1").unwrap().prefix, 128);
+        assert_eq!(IpNet::host("::1".parse().unwrap()).prefix, 128);
+        let v6_host = IpNet::parse("::1").unwrap();
+        assert!(v6_host.contains("::1".parse().unwrap()));
+        assert!(!v6_host.contains("::2".parse().unwrap()));
+        assert!(!v6_host.contains("::ffff:10.0.0.1".parse().unwrap()));
+        assert!(!IpNet::host("::1".parse().unwrap()).contains("2001:db8::1".parse().unwrap()));
         // v4 and v6 never mix.
         assert!(!IpNet::parse("0.0.0.0/0")
             .unwrap()
@@ -1309,15 +1325,30 @@ mod tests {
         let offer = parse_extensions(&headers).unwrap().remove(0);
         let policy = PmDeflatePolicy::default();
 
-        // A response the client never opened the door for.
-        let mut bad = HeaderMap::new();
-        bad.append(
+        // RFC 7692 §7.1.2.1: a server MAY answer with
+        // server_max_window_bits even though the offer did not carry it,
+        // and refusing that rejects an otherwise compliant server.
+        let mut ok = HeaderMap::new();
+        ok.append(
             HeaderName::from_lowercase("sec-websocket-extensions"),
             HeaderValue::from_static("permessage-deflate; server_max_window_bits=10"),
         );
-        let resp = parse_extensions(&bad).unwrap().remove(0);
-        assert!(PerMessageDeflate::from_response(&offer, &resp, &policy).is_err());
+        let resp = parse_extensions(&ok).unwrap().remove(0);
+        let selected = PerMessageDeflate::from_response(&offer, &resp, &policy).unwrap();
+        assert_eq!(selected.server_max_window_bits, 10);
+        assert_eq!(selected.client_max_window_bits, 15);
 
+        // ...but a value *larger than offered* is a failure (§7.1.2.1).
+        let mut offered = HeaderMap::new();
+        offered.append(
+            HeaderName::from_lowercase("sec-websocket-extensions"),
+            HeaderValue::from_static("permessage-deflate; server_max_window_bits=8"),
+        );
+        let offer_8 = parse_extensions(&offered).unwrap().remove(0);
+        assert!(PerMessageDeflate::from_response(&offer_8, &resp, &policy).is_err());
+
+        // client_max_window_bits is the other way round (§7.1.2.2): the
+        // server may only pick it when the client offered it.
         let mut bad = HeaderMap::new();
         bad.append(
             HeaderName::from_lowercase("sec-websocket-extensions"),

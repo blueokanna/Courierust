@@ -97,14 +97,14 @@ const DIST_BASE: [(u16, u8); 30] = [
     (769, 8), // 16-19
     (1025, 9),
     (1537, 9),
-    (2049, 9),
-    (3073, 9), // 20-23
-    (4097, 10),
-    (6145, 10),
-    (8193, 11),
-    (12289, 11), // 24-27
-    (16385, 12),
-    (24577, 12), // 28-29
+    (2049, 10),
+    (3073, 10), // 20-23
+    (4097, 11),
+    (6145, 11),
+    (8193, 12),
+    (12289, 12), // 24-27
+    (16385, 13),
+    (24577, 13), // 28-29
 ];
 
 /// Length symbol for a match length in `3..=258`.
@@ -148,6 +148,10 @@ struct BitReader<'a> {
     pos: usize,
     acc: u64,
     nbits: u32,
+    /// Set when a read needed bits that the input no longer had; the
+    /// RFC 7692 tail tolerance keys off this rather than off “no input
+    /// left”, which is also true after a data error at the last byte.
+    hit_eof: bool,
 }
 
 impl<'a> BitReader<'a> {
@@ -157,6 +161,7 @@ impl<'a> BitReader<'a> {
             pos: 0,
             acc: 0,
             nbits: 0,
+            hit_eof: false,
         }
     }
 
@@ -165,6 +170,7 @@ impl<'a> BitReader<'a> {
     fn ensure(&mut self, n: u32) -> Result<()> {
         while self.nbits < n {
             if self.pos >= self.data.len() {
+                self.hit_eof = true;
                 return Err(Error::protocol("deflate: truncated bit stream"));
             }
             self.acc |= u64::from(self.data[self.pos]) << self.nbits;
@@ -237,6 +243,12 @@ impl<'a> BitReader<'a> {
     #[inline]
     fn exhausted(&self) -> bool {
         self.pos >= self.data.len() && self.nbits < 8
+    }
+
+    /// Whether a read has already run past the end of the input.
+    #[inline]
+    fn hit_eof(&self) -> bool {
+        self.hit_eof
     }
 }
 
@@ -736,10 +748,18 @@ fn inflate_blocks(
             _ => Err(Error::protocol("deflate: reserved block type 3")),
         };
         if let Err(e) = block {
-            // With the RFC 7692 tail stripped, the stream simply stops at
-            // a byte boundary once the appended marker is consumed; that
-            // is a complete message, not a truncated one.
-            if truncated_ok && br.exhausted() {
+            // With the RFC 7692 tail stripped, the stream can stop at a
+            // byte boundary once the appended marker is consumed; that is
+            // a complete message, not a truncated one.
+            //
+            // The tolerance is deliberately narrow: only a read that ran
+            // out of *input* is accepted. A stream whose available bits
+            // decode to an invalid code, a back-reference before the
+            // window, or output past `max_out` is an error no matter how
+            // close to the end it is — `exhausted()` alone would swallow
+            // those (and a truncated permessage-deflate message has no
+            // checksum to notice it for us).
+            if truncated_ok && br.hit_eof() {
                 return Ok(());
             }
             return Err(e);
@@ -768,8 +788,9 @@ pub fn inflate_into(data: &[u8], out: &mut Vec<u8>, max_out: usize) -> Result<()
 // DEFLATE compression (fixed Huffman + LZ77)
 // ---------------------------------------------------------------------
 
-/// Hash chain match finder capped just under DEFLATE's 32 KiB window.
-const WINDOW: usize = 28_672;
+/// The largest LZ77 window DEFLATE allows (RFC 1951 §3.2.5: distances
+/// reach 32768 bytes back).
+const MAX_WINDOW: usize = 32_768;
 const HASH_BITS: u32 = 15;
 const HASH_SIZE: usize = 1 << HASH_BITS;
 const MAX_CHAIN: usize = 64;
@@ -855,10 +876,15 @@ fn fixed_length_code(code: u16) -> (u32, u32) {
 /// end-of-block symbol is written by the caller so the same encoder
 /// serves standalone and permessage-deflate framing.
 ///
+/// `window` bounds how far back a match may reach. DEFLATE itself allows
+/// 32 KiB, but RFC 7692 §7.2.1 makes the negotiated `*_max_window_bits`
+/// binding on the compressor: a peer that agreed to, say, 8 bits will
+/// reject (or mis-decode as “distance too far back”) anything longer.
+///
 /// `mf` carries the hash tables across calls: [`MatchFinder::prepare`]
 /// must be called first (once per message), and it is what makes
 /// per-message compression cheap enough to run on small payloads.
-fn encode_lz77(w: &mut BitWriter, data: &[u8], mf: &mut MatchFinder) {
+fn encode_lz77(w: &mut BitWriter, data: &[u8], mf: &mut MatchFinder, window: usize) {
     let mut i = 0usize;
     while i < data.len() {
         let mut best_len = 0usize;
@@ -866,7 +892,7 @@ fn encode_lz77(w: &mut BitWriter, data: &[u8], mf: &mut MatchFinder) {
         if i + MIN_MATCH <= data.len() {
             let h = hash3(data[i], data[i + 1], data[i + 2]);
             let mut candidate = mf.head[h];
-            let limit = i.saturating_sub(WINDOW) as u32;
+            let limit = i.saturating_sub(window) as u32;
             let mut steps = 0usize;
             while candidate != EMPTY && candidate >= limit && steps < MAX_CHAIN {
                 steps += 1;
@@ -921,7 +947,7 @@ pub fn deflate(data: &[u8]) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.write_bits(1, 1); // BFINAL
     w.write_bits(1, 2); // BTYPE = fixed Huffman
-    encode_lz77(&mut w, data, &mut mf);
+    encode_lz77(&mut w, data, &mut mf, MAX_WINDOW);
     w.write_bits(0, 7); // end-of-block (symbol 256, 7-bit code 0)
     w.finish()
 }
@@ -940,17 +966,17 @@ pub fn deflate_sync(data: &[u8]) -> Vec<u8> {
     let mut mf = MatchFinder::default();
     mf.prepare(data.len());
     let mut w = BitWriter::new();
-    deflate_sync_into(data, &mut mf, &mut w);
+    deflate_sync_into(data, &mut mf, &mut w, MAX_WINDOW);
     w.finish_permessage()
 }
 
 /// [`deflate_sync`] writing into a caller-owned writer, so a context that
 /// already owns the match finder *and* the bit writer (see [`Deflater`])
 /// performs no per-message allocation or table rebuild at all.
-fn deflate_sync_into(data: &[u8], mf: &mut MatchFinder, w: &mut BitWriter) {
+fn deflate_sync_into(data: &[u8], mf: &mut MatchFinder, w: &mut BitWriter, window: usize) {
     w.write_bits(0, 1); // BFINAL=0: the stream continues
     w.write_bits(1, 2); // BTYPE = fixed Huffman
-    encode_lz77(w, data, mf);
+    encode_lz77(w, data, mf, window);
     w.write_bits(0, 7); // end-of-block
 }
 
@@ -1233,7 +1259,6 @@ impl Inflater {
 /// are reset in time proportional to the message length. That is what
 /// makes `permessage-deflate` affordable for small messages instead of a
 /// 128 KiB memory sweep per frame.
-#[derive(Default)]
 pub struct Deflater {
     /// Minimum payload size worth compressing: below this the DEFLATE
     /// framing overhead exceeds the savings, so the caller is told to
@@ -1244,6 +1269,15 @@ pub struct Deflater {
     /// state compression allocates nothing (not even on the
     /// "compression did not pay" path).
     writer: BitWriter,
+    /// LZ77 window bound in bits (8..=15). Zero never survives:
+    /// [`Deflater::default`] forwards to [`Deflater::new`].
+    window_bits: u8,
+}
+
+impl Default for Deflater {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Deflater {
@@ -1259,12 +1293,29 @@ impl Deflater {
             threshold: 128,
             finder: MatchFinder::default(),
             writer: BitWriter::new(),
+            window_bits: MAX_WINDOW_BITS,
         }
     }
 
     /// Set the minimum payload size that is worth compressing.
     pub fn set_threshold(&mut self, bytes: usize) {
         self.threshold = bytes;
+    }
+
+    /// Bound the compressor's LZ77 window.
+    ///
+    /// RFC 7692 §7.2.1 requires the window to stay within the negotiated
+    /// `server_max_window_bits` / `client_max_window_bits` of the
+    /// direction being written; a longer match is not merely a poor
+    /// choice, it is undecodable by the peer.
+    pub fn set_window_bits(&mut self, bits: u8) {
+        self.window_bits = bits.clamp(MIN_WINDOW_BITS, MAX_WINDOW_BITS);
+    }
+
+    /// The window bound in bits.
+    #[inline]
+    pub fn window_bits(&self) -> u8 {
+        self.window_bits
     }
 
     /// Drop history (no-op for this encoder; present so the API mirrors
@@ -1285,7 +1336,12 @@ impl Deflater {
         }
         self.writer.reset();
         self.finder.prepare(data.len());
-        deflate_sync_into(data, &mut self.finder, &mut self.writer);
+        deflate_sync_into(
+            data,
+            &mut self.finder,
+            &mut self.writer,
+            1usize << self.window_bits,
+        );
         self.writer.sync_flush();
         let encoded = self.writer.encoded();
         if encoded.len() >= data.len() {
@@ -1372,11 +1428,112 @@ mod tests {
         assert_eq!(length_code(258), Some((285, 0, 258)));
         assert_eq!(length_code(11), Some((265, 1, 11)));
         assert_eq!(distance_code(1), Some((0, 0, 1)));
-        assert_eq!(distance_code(28672), Some((29, 12, 24577)));
-        assert_eq!(distance_code(24577), Some((29, 12, 24577)));
-        assert_eq!(distance_code(16385), Some((28, 12, 16385)));
-        assert_eq!(distance_code(32768), None);
-        assert_eq!(distance_code(5121), None);
+        assert_eq!(distance_code(2049), Some((22, 10, 2049)));
+        assert_eq!(distance_code(5121), Some((24, 11, 4097)));
+        assert_eq!(distance_code(28672), Some((29, 13, 24577)));
+        assert_eq!(distance_code(24577), Some((29, 13, 24577)));
+        assert_eq!(distance_code(16385), Some((28, 13, 16385)));
+        assert_eq!(distance_code(32768), Some((29, 13, 24577)));
+        assert_eq!(distance_code(32769), None);
+    }
+
+    /// Every `(base, extra)` pair must equal RFC 1951 §3.2.5. The extra-bit
+    /// counts are the part that is easy to get wrong by one, and a wrong
+    /// count does not fail a round-trip against our own decoder — it
+    /// desynchronises the bit stream from the first long match onwards for
+    /// every other DEFLATE implementation (zlib, browsers, gRPC peers).
+    #[test]
+    fn distance_table_matches_rfc1951() {
+        let rfc: [(u16, u8); 30] = [
+            (1, 0),
+            (2, 0),
+            (3, 0),
+            (4, 0),
+            (5, 1),
+            (7, 1),
+            (9, 2),
+            (13, 2),
+            (17, 3),
+            (25, 3),
+            (33, 4),
+            (49, 4),
+            (65, 5),
+            (97, 5),
+            (129, 6),
+            (193, 6),
+            (257, 7),
+            (385, 7),
+            (513, 8),
+            (769, 8),
+            (1025, 9),
+            (1537, 9),
+            (2049, 10),
+            (3073, 10),
+            (4097, 11),
+            (6145, 11),
+            (8193, 12),
+            (12289, 12),
+            (16385, 13),
+            (24577, 13),
+        ];
+        assert_eq!(DIST_BASE, rfc);
+    }
+
+    /// zlib-compressed payloads whose back-references reach past 2048 bytes
+    /// (distance codes 22-29). The inline vectors above are all small enough
+    /// that zlib stays below that range. Generated by
+    /// `scripts/gen_deflate_far_vectors.py`.
+    #[test]
+    fn zlib_far_distance_vectors() {
+        const PLAIN: &[u8] = include_bytes!("vectors/far.plain");
+        const DEFLATE_STREAM: &[u8] = include_bytes!("vectors/far.deflate");
+        const GZIP_STREAM: &[u8] = include_bytes!("vectors/far.gzip");
+
+        assert_eq!(inflate(DEFLATE_STREAM, 1 << 20).unwrap(), PLAIN);
+        assert_eq!(gunzip(GZIP_STREAM, 1 << 20).unwrap(), PLAIN);
+
+        // The decoder is now pinned to zlib's bit stream, so running our
+        // own encoder's output back through it proves the encoder writes
+        // the extra bits the RFC asks for — a self-consistent pair of
+        // wrong tables would still pass a plain round-trip.
+        assert_eq!(inflate(&deflate(PLAIN), 1 << 20).unwrap(), PLAIN);
+        assert_eq!(gunzip(&gzip(PLAIN), 1 << 20).unwrap(), PLAIN);
+    }
+
+    /// RFC 7692 §7.2.1: the compressor must stay inside the negotiated
+    /// window, which `Deflater::set_window_bits` is the only knob for.
+    #[test]
+    fn deflater_respects_the_negotiated_window() {
+        // 300 bytes of noise followed by a verbatim copy: the only useful
+        // match is 300 bytes back.
+        let mut seed = 0x1234_5678u32;
+        let mut data = Vec::new();
+        for _ in 0..300 {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            data.push((seed >> 24) as u8);
+        }
+        let head = data.clone();
+        data.extend_from_slice(&head);
+
+        let mut wide = Deflater::new();
+        wide.set_threshold(0);
+        let mut out = Vec::new();
+        assert!(wide.deflate_message(&data, &mut out).is_some());
+        assert!(out.len() < data.len());
+        let mut back = Vec::new();
+        Inflater::new(MAX_WINDOW_BITS)
+            .inflate_message(&out, &mut back, 1 << 20)
+            .unwrap();
+        assert_eq!(back, data);
+
+        let mut narrow = Deflater::new();
+        narrow.set_threshold(0);
+        narrow.set_window_bits(8);
+        let mut out = Vec::new();
+        assert!(
+            narrow.deflate_message(&data, &mut out).is_none(),
+            "a 8-bit window cannot take the 300-byte match, so nothing is worth sending"
+        );
     }
 
     #[test]

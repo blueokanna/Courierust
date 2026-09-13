@@ -198,11 +198,15 @@ impl H1Connection {
         let mut close_delimited = false;
         let body = match courierust_h1::body_length(&head.headers, Some(method), Some(status))? {
             courierust_h1::BodyLen::None => {
+                // RFC 9112 §6.3 lists exactly HEAD, 1xx, 204 and 304 as
+                // bodyless. Treating *any* 3xx as empty used to leave a
+                // close-delimited redirect body unread and mark the
+                // connection reusable, so those bytes were parsed as the
+                // next response's status line.
                 if *method == Method::HEAD
                     || status == StatusCode::NO_CONTENT
                     || status == StatusCode::NOT_MODIFIED
                     || status.is_informational()
-                    || status.is_redirection()
                 {
                     Body::Empty
                 } else {

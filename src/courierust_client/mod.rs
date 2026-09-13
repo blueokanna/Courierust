@@ -335,6 +335,13 @@ impl Client {
         // Capture the head before the request is consumed by the network.
         let orig_method = req.method.clone();
         let orig_headers = req.headers.clone();
+        // A body can be replayed only if it is still in memory; a streamed
+        // body has already been consumed by the first attempt.
+        let replay_body = match &req.body {
+            Body::Empty => Some(Body::Empty),
+            Body::Bytes(b) => Some(Body::Bytes(b.clone())),
+            Body::Channel(_) => None,
+        };
         let resp = self.execute_inner(url, req, Priority::default())?;
         if depth >= self.inner.config.max_redirects {
             return Ok(resp);
@@ -348,7 +355,7 @@ impl Client {
                     301 | 302 if orig_method == Method::POST => Method::GET,
                     _ => orig_method,
                 };
-                let mut new_req = Request::new(method, next.path_and_query.clone());
+                let mut new_req = Request::new(method.clone(), next.path_and_query.clone());
                 let mut headers = orig_headers;
                 // Strip credentials on any cross-origin hop — either an
                 // authority change OR a scheme downgrade (https→http even
@@ -360,8 +367,29 @@ impl Client {
                         headers.remove(name);
                     }
                 }
+                // RFC 9110 §15.4: 303 always becomes GET, 301/302 may turn
+                // a POST into GET, and 307/308 MUST keep the method *and*
+                // the content. Dropping the body while keeping the method
+                // turned a redirected PUT (or a 307 POST) into a
+                // different request that the origin is entitled to act on.
+                let body =
+                    if method == Method::GET {
+                        // A GET carries no content: leaving `content-length`
+                        // behind would make the peer wait for a body that is
+                        // never sent.
+                        headers.remove("content-length");
+                        headers.remove("transfer-encoding");
+                        Body::Empty
+                    } else {
+                        match replay_body {
+                            Some(b) => b,
+                            None => return Err(Error::protocol(
+                                "cannot follow a redirect that must replay a streamed request body",
+                            )),
+                        }
+                    };
                 new_req.headers = headers;
-                new_req.body = Body::Empty;
+                new_req.body = body;
                 return self.execute_with_redirects(&next, new_req, depth + 1);
             }
         }

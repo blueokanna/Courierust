@@ -34,7 +34,7 @@ use crate::courierust_server::{Handler, ServerConfig};
 use std::collections::{HashMap, HashSet};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -555,6 +555,10 @@ struct EventConn {
     out: Vec<u8>,
     /// Write cursor into `out`.
     out_pos: usize,
+    /// Body of a `Body::Channel` response that is still being produced.
+    /// The head has already been written; each chunk is written as it
+    /// arrives, so `out` never holds more than one chunk.
+    stream_rx: Option<Receiver<Result<Bytes>>>,
     keep_alive: bool,
     /// Transport read-call counter (h1 syscall evidence), when attached.
     reads: Option<Arc<AtomicUsize>>,
@@ -606,6 +610,7 @@ impl EventConn {
             reader: IncrRequest::new(body_limit, trace),
             out: Vec::new(),
             out_pos: 0,
+            stream_rx: None,
             keep_alive: true,
             reads,
             writes,
@@ -639,6 +644,12 @@ impl EventConn {
         loop {
             if self.out_pos < self.out.len() {
                 let outcome = self.write_more()?;
+                if !matches!(outcome, StepOutcome::Idle) {
+                    return Ok(outcome);
+                }
+            }
+            if self.stream_rx.is_some() {
+                let outcome = self.pump_body(config)?;
                 if !matches!(outcome, StepOutcome::Idle) {
                     return Ok(outcome);
                 }
@@ -693,13 +704,13 @@ impl EventConn {
                         courierust_h1::host_header_error(req.version, &req.headers)
                     {
                         self.out.clear();
-                        let keep_alive = build_response(
+                        let (keep_alive, stream) = build_response(
                             crate::courierust_server::h1::error_response(400, reason),
-                            config,
                             request_close,
                             &mut self.out,
                         )?;
                         self.out_pos = 0;
+                        self.stream_rx = stream;
                         self.keep_alive = keep_alive;
                         let outcome = self.write_more()?;
                         match outcome {
@@ -715,9 +726,10 @@ impl EventConn {
                             let handle = seg_start(trace);
                             seg_end(&mut self.handler_us, handle);
                             self.out.clear();
-                            let keep_alive =
-                                build_response(resp, config, request_close, &mut self.out)?;
+                            let (keep_alive, stream) =
+                                build_response(resp, request_close, &mut self.out)?;
                             self.out_pos = 0;
+                            self.stream_rx = stream;
                             self.keep_alive = keep_alive;
                             let outcome = self.write_more()?;
                             match outcome {
@@ -746,9 +758,10 @@ impl EventConn {
                     seg_end(&mut self.handler_us, handle);
                     self.out.clear();
                     let build = seg_start(trace);
-                    let keep_alive = build_response(resp, config, request_close, &mut self.out)?;
+                    let (keep_alive, stream) = build_response(resp, request_close, &mut self.out)?;
                     seg_end(&mut self.build_us, build);
                     self.out_pos = 0;
+                    self.stream_rx = stream;
                     self.keep_alive = keep_alive;
                     let write = seg_start(trace);
                     let outcome = self.write_more()?;
@@ -772,6 +785,53 @@ impl EventConn {
                 }
             }
         }
+    }
+
+    /// Pump a channel response body as chunked encoding.
+    ///
+    /// Each chunk is written as far as the socket allows before the next
+    /// one is pulled, so a long — even endless — stream costs one chunk
+    /// of memory rather than the whole body, and the client sees the
+    /// head immediately instead of after the stream ends. A producer
+    /// that stalls past the read timeout fails the connection *without*
+    /// the terminating chunk, so a truncated body is detectable; that
+    /// matches the blocking driver.
+    fn pump_body(&mut self, config: &ServerConfig) -> Result<StepOutcome> {
+        let Some(rx) = self.stream_rx.take() else {
+            return Ok(StepOutcome::Idle);
+        };
+        loop {
+            let chunk = match config.read_timeout {
+                Some(t) => match rx.recv_timeout(t) {
+                    Ok(c) => c?,
+                    Err(RecvTimeoutError::Timeout) => {
+                        return Err(Error::timeout("body stream timed out"));
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
+                },
+                None => match rx.recv() {
+                    Ok(c) => c?,
+                    Err(_) => break,
+                },
+            };
+            if chunk.is_empty() {
+                continue;
+            }
+            self.out.clear();
+            self.out_pos = 0;
+            courierust_h1::encode_chunk(&chunk, &mut self.out);
+            if matches!(self.write_more()?, StepOutcome::NeedWrite) {
+                // The socket is full: keep the receiver so the reactor's
+                // writability wake-up resumes where we left off.
+                self.stream_rx = Some(rx);
+                return Ok(StepOutcome::NeedWrite);
+            }
+        }
+        // The producer finished: terminate the chunked body.
+        self.out.clear();
+        self.out_pos = 0;
+        self.out.extend_from_slice(courierust_h1::CHUNKED_END);
+        self.write_more()
     }
 
     /// Write pending output; returns the continuation.
@@ -852,18 +912,24 @@ impl EventConn {
     }
 }
 
-/// Serialize a response (head + body, chunked for channel bodies) into
-/// `out` and decide keep-alive. The caller owns the buffer (`out` is the
-/// connection's write buffer), so steady-state responses perform no
-/// per-request allocation. `request_close` reflects a request
-/// `Connection: close` token, which forces the connection closed (RFC
-/// 7230 §6.3).
+/// Serialize the response head (and any in-memory body) into `out`,
+/// returning the keep-alive decision and, for a channel body, the stream
+/// the caller must pump.
+///
+/// The caller owns the buffer (`out` is the connection's write buffer),
+/// so steady-state responses perform no per-request allocation.
+/// `request_close` reflects a request `Connection: close` token, which
+/// forces the connection closed (RFC 7230 §6.3).
+///
+/// A channel body is deliberately *not* buffered here: collecting it
+/// would hold a whole (possibly endless) stream in memory before the
+/// first byte reaches the client, and a producer that stalls would end
+/// up closing the connection as if the response were complete.
 fn build_response(
     resp: Response<Body>,
-    config: &ServerConfig,
     request_close: bool,
     out: &mut Vec<u8>,
-) -> Result<bool> {
+) -> Result<(bool, Option<Receiver<Result<Bytes>>>)> {
     let keep_alive = !request_close
         && courierust_h1::keep_alive_requested(resp.version, &resp.headers)
         && resp.version != Version::HTTP_10;
@@ -907,34 +973,13 @@ fn build_response(
 
     courierust_h1::write_response_head(out, resp.status, Version::HTTP_11, &out_headers)?;
     match resp.body {
-        Body::Empty => {}
-        Body::Bytes(b) => out.extend_from_slice(&b),
-        Body::Channel(rx) => {
-            let timeout = config.read_timeout;
-            loop {
-                let chunk = match timeout {
-                    Some(t) => rx.recv_timeout(t).map_err(|_| ()),
-                    None => rx.recv().map_err(|_| ()),
-                };
-                match chunk {
-                    Ok(c) => {
-                        let b = c?;
-                        if b.is_empty() {
-                            continue;
-                        }
-                        let sz = courierust_h1::IToA::new(b.len());
-                        out.extend_from_slice(sz.as_slice());
-                        out.extend_from_slice(b"\r\n");
-                        out.extend_from_slice(&b);
-                        out.extend_from_slice(b"\r\n");
-                    }
-                    Err(()) => break,
-                }
-            }
-            out.extend_from_slice(b"0\r\n\r\n");
+        Body::Empty => Ok((keep_alive, None)),
+        Body::Bytes(b) => {
+            out.extend_from_slice(&b);
+            Ok((keep_alive, None))
         }
+        Body::Channel(rx) => Ok((keep_alive, Some(rx))),
     }
-    Ok(keep_alive)
 }
 
 // ---------------------------------------------------------------------
@@ -1059,6 +1104,31 @@ pub(crate) fn drain_wake(r: &TcpStream) {
     }
 }
 
+/// The WebSocket connections whose keepalive or close-handshake deadline
+/// has elapsed.
+///
+/// Nothing a silent peer does makes a descriptor ready, so these
+/// connections are dispatched on the clock rather than on readiness.
+fn ws_due_ids(registries: &Registries, now: Instant) -> Vec<usize> {
+    let ws = registries.ws.lock().unwrap();
+    ws.iter()
+        .filter(|(_, conn)| conn.next_deadline().is_some_and(|d| d <= now))
+        .map(|(&id, _)| id)
+        .collect()
+}
+
+/// The earliest keepalive/close deadline across the live WebSocket
+/// connections, so the reactor's wait can end when the first one is due.
+fn ws_next_deadline(registries: &Registries) -> Option<Instant> {
+    registries
+        .ws
+        .lock()
+        .unwrap()
+        .values()
+        .filter_map(|conn| conn.next_deadline())
+        .min()
+}
+
 /// Rebuild the reactor's wait set from the live connections.
 ///
 /// The registries are the source of truth: sockets still being
@@ -1096,6 +1166,7 @@ fn handle_msg(
     poller: &mut Poller,
     pending: &mut HashMap<usize, TcpStream>,
     activity: &mut HashMap<usize, Instant>,
+    registries: &Registries,
     max_connections: usize,
     stats: Option<&Stats>,
 ) {
@@ -1128,6 +1199,21 @@ fn handle_msg(
             }
         }
         EventMsg::Register { id, fd, want_write } => {
+            // A `Register` is a hint, not the truth: between a worker's
+            // `step()` and this message reaching the reactor, an
+            // application thread can queue a frame on the same WebSocket
+            // (its own `Register { want_write: true }` is sent first) —
+            // and the worker's message would then park the socket without
+            // write interest, stranding the frame until the peer happens
+            // to speak. Re-derive the direction from the connection
+            // itself, the same way `rebuild_wait_set` does.
+            let want_write = registries
+                .ws
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|c| c.has_queued_output())
+                .unwrap_or(want_write);
             activity.insert(id, Instant::now());
             poller.register(id, fd, want_write);
         }
@@ -1177,6 +1263,7 @@ fn event_loop(
                         &mut poller,
                         &mut pending,
                         &mut activity,
+                        &registries,
                         config.max_connections,
                         stats,
                     );
@@ -1198,6 +1285,7 @@ fn event_loop(
                     &mut poller,
                     &mut pending,
                     &mut activity,
+                    &registries,
                     config.max_connections,
                     stats,
                 ),
@@ -1220,6 +1308,14 @@ fn event_loop(
         let wait_ms = match next_idle {
             Some(next) => next.as_millis().min(poll_timeout as u128).max(1) as i32,
             None => poll_timeout,
+        };
+        // Wake up for the earliest WebSocket keepalive/close deadline too.
+        let wait_ms = match ws_next_deadline(&registries) {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(now).as_millis();
+                wait_ms.min(remaining.min(poll_timeout as u128).max(1) as i32)
+            }
+            None => wait_ms,
         };
         let ready = match poller.wait(wait_ms, Some(wake_fd)) {
             Ok(r) => {
@@ -1257,6 +1353,7 @@ fn event_loop(
                             &mut poller,
                             &mut pending,
                             &mut activity,
+                            &registries,
                             config.max_connections,
                             stats,
                         );
@@ -1364,12 +1461,21 @@ fn event_loop(
                 to_dispatch.push(id);
             }
         }
+        // Keepalive and the close-handshake timeout are the two events a
+        // silent peer can never deliver; dispatch the WebSocket
+        // connections whose deadline elapsed while we waited, so a
+        // half-open connection cannot hold a slot forever.
+        let now = Instant::now();
+        for id in ws_due_ids(&registries, now) {
+            poller.unregister(id);
+            activity.insert(id, now);
+            to_dispatch.push(id);
+        }
         if !to_dispatch.is_empty() {
             for chunk in to_dispatch.chunks(DISPATCH_BATCH) {
                 let _ = ready_tx.send(chunk.to_vec());
             }
         }
-
         if let Some(t) = idle_timeout {
             let near_idle = next_idle
                 .map(|next| next <= Duration::from_millis(poll_timeout as u64))
@@ -1377,8 +1483,14 @@ fn event_loop(
             if near_idle {
                 let now = Instant::now();
                 let mut expired = Vec::new();
-                let registered: HashSet<usize> =
-                    registries.h1.lock().unwrap().keys().copied().collect();
+                let registered: HashSet<usize> = registries
+                    .h1
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .chain(registries.ws.lock().unwrap().keys())
+                    .copied()
+                    .collect();
                 for (&id, &at) in &activity {
                     if now.duration_since(at) < t {
                         continue;
@@ -1391,6 +1503,7 @@ fn event_loop(
                     poller.unregister(id);
                     pending.remove(&id);
                     registries.h1.lock().unwrap().remove(&id);
+                    registries.ws.lock().unwrap().remove(&id);
                     if activity.remove(&id).is_some() {
                         if let Some(s) = stats {
                             Stats::decrement(&s.connections_active, 1);
@@ -1447,25 +1560,40 @@ fn refuse_malformed(conn: &EventConn, e: &Error) {
 }
 
 /// Write `bytes` to a raw accepted socket and linger briefly before the
-/// close, so the answer is not destroyed by the RST Linux sends when a
-/// socket with unread data is closed.
+/// close, so the answer is not destroyed by the RST the kernel sends when
+/// a socket with unread data is closed.
+///
+/// Both phases poll against a deadline because the socket is
+/// non-blocking — that is how the reactor owns it. A plain `write_all`
+/// can lose the entire response to a single would-block, and
+/// `set_read_timeout` has no effect on a non-blocking descriptor (the
+/// linger loop used to exit on its first iteration for that reason).
 fn write_and_linger(socket: &std::net::TcpStream, bytes: &[u8]) {
     use std::io::{Read, Write};
-    {
+    let deadline = Instant::now() + crate::courierust_server::h1::LINGER_DEADLINE;
+    let mut sent = 0usize;
+    while sent < bytes.len() && Instant::now() < deadline {
         let mut writer: &std::net::TcpStream = socket;
-        if writer.write_all(bytes).is_err() || writer.flush().is_err() {
-            return;
+        match writer.write(&bytes[sent..]) {
+            Ok(0) => return,
+            Ok(n) => sent += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(_) => return,
         }
     }
-    let _ = socket.set_read_timeout(Some(crate::courierust_server::h1::LINGER_DEADLINE));
     let mut sink = [0u8; 8 * 1024];
     let mut left = crate::courierust_server::h1::LINGER_BUDGET;
-    let mut reader: &std::net::TcpStream = socket;
-    while left > 0 {
+    while left > 0 && Instant::now() < deadline {
+        let mut reader: &std::net::TcpStream = socket;
         let want = core::cmp::min(left, sink.len());
         match reader.read(&mut sink[..want]) {
             Ok(0) => break,
             Ok(n) => left = left.saturating_sub(n),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(1));
+            }
             Err(_) => break,
         }
     }

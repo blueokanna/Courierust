@@ -50,6 +50,23 @@ pub struct Config {
 /// the ceiling are a connection error of type FLOW_CONTROL_ERROR.
 pub(crate) const MAX_FLOW_WINDOW: i64 = 0x7fff_ffff;
 
+/// The header-list size actually enforced for an advertised
+/// `SETTINGS_MAX_HEADER_LIST_SIZE`.
+///
+/// `0` advertises "no limit", but an unbounded header list is a memory
+/// commitment chosen entirely by the peer, so the enforced cap stays
+/// finite — and, more importantly, must not be *zero*: the decoder treats
+/// its argument as a byte limit, so a configuration that left the
+/// default in place could never decode a single header block.
+pub(crate) fn header_list_cap(advertised: u32) -> usize {
+    const UNLIMITED_CAP: usize = 16 * 1024 * 1024;
+    if advertised == 0 {
+        UNLIMITED_CAP
+    } else {
+        advertised as usize
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -239,6 +256,11 @@ pub struct Connection<R, W> {
     // lets us distinguish those from truly idle/never-opened streams.
     recently_closed: VecDeque<u32>,
 
+    /// The header-list cap actually enforced on inbound header blocks,
+    /// derived from our advertised `SETTINGS_MAX_HEADER_LIST_SIZE` (`0`
+    /// advertises "no limit", which still needs a bound).
+    local_header_cap: usize,
+
     // Lifecycle
     goaway_sent: bool,
     goaway_received: bool,
@@ -259,16 +281,15 @@ impl<R: Read, W: Write> Connection<R, W> {
         let quantum = config.scheduler_quantum;
         let peer = Settings::default();
         let local = config.local_settings.clone();
+        let local_header_cap = header_list_cap(local.max_header_list_size);
         let conn_window = 65535i64;
         Self {
             reader: BufReader::new(reader, 16 * 1024),
             writer: BufWriter::new(writer, 16 * 1024),
             config,
             encoder: Encoder::new(),
-            decoder: Decoder::new(
-                local.header_table_size as usize,
-                local.max_header_list_size as usize,
-            ),
+            decoder: Decoder::new(local.header_table_size as usize, local_header_cap),
+            local_header_cap,
             preface_pending: is_client,
             local,
             peer,
@@ -505,29 +526,40 @@ impl<R: Read, W: Write> Connection<R, W> {
         if self.goaway_sent || self.closed {
             return Err(Error::canceled("connection closing"));
         }
-        let mut block = BytesMut::with_capacity(64);
-        self.encoder.encode(fields, &mut block);
-        // Respect the peer's SETTINGS_MAX_HEADER_LIST_SIZE (0 = unlimited,
-        // RFC 7540 §6.5.2): an oversized block would otherwise be rejected
-        // by the peer with COMPRESSION_ERROR, so fail the call up front.
-        let peer_limit = self.peer.max_header_list_size as usize;
-        if peer_limit != 0 && block.len() > peer_limit {
-            return Err(Error::overflow(
-                "header block exceeds peer SETTINGS_MAX_HEADER_LIST_SIZE",
-            ));
+        // Everything that can fail is checked *before* the HPACK encoder
+        // runs. Encoding inserts into the dynamic table, so a block that
+        // is abandoned afterwards leaves the peer's table one step behind
+        // ours and every later block it decodes fails with
+        // COMPRESSION_ERROR — the caller would see one failed request and
+        // the connection would be dead for everyone.
+        if !self.streams.contains(&stream_id) {
+            return Err(Error::protocol("send_headers: unknown stream"));
         }
-        let max = self.peer.max_frame_size as usize;
+        // RFC 9113 §6.5.2 sizes a field list by its *uncompressed* fields
+        // (name + value + 32 bytes each).
+        let peer_limit = self.peer.max_header_list_size as usize;
+        if peer_limit != 0 {
+            let list_size: usize = fields
+                .iter()
+                .map(|f| f.name.as_str().len() + f.value.len() + 32)
+                .sum();
+            if list_size > peer_limit {
+                return Err(Error::overflow(
+                    "header list exceeds peer SETTINGS_MAX_HEADER_LIST_SIZE",
+                ));
+            }
+        }
         let method = fields
             .iter()
             .find(|f| f.name.as_str() == ":method")
             .and_then(|f| f.value.to_str().ok())
             .unwrap_or("");
+        let max = self.peer.max_frame_size as usize;
+        let mut block = BytesMut::with_capacity(64);
+        self.encoder.encode(fields, &mut block);
 
         let now_closed = {
-            let stream = self
-                .streams
-                .get_mut(&stream_id)
-                .ok_or_else(|| Error::protocol("send_headers: unknown stream"))?;
+            let stream = self.streams.get_mut(&stream_id).unwrap();
             stream.body_expected = method != "HEAD" && method != "CONNECT";
             if stream.state == StreamState::Idle {
                 stream.state = if end_stream {
@@ -886,6 +918,7 @@ impl<R: Read, W: Write> Connection<R, W> {
                     stream_id: sid,
                     data: payload,
                     end_stream,
+                    padding: 0,
                 });
             }
 
@@ -1037,6 +1070,56 @@ impl<R: Read, W: Write> Connection<R, W> {
         }
 
         let header = self.frame.header.take().unwrap();
+        // RFC 9113 §6.3 and §6.9 scope two malformed frames to the stream
+        // rather than the connection: a PRIORITY whose length is not 5
+        // (stream error of type FRAME_SIZE_ERROR) and a stream-level
+        // WINDOW_UPDATE with a zero increment (stream error of type
+        // PROTOCOL_ERROR). `Frame::parse` reports every malformed frame
+        // the same way, and the connection-error path below would GOAWAY
+        // the whole multiplex — failing every unrelated in-flight request
+        // over one bad frame.
+        let stream_scoped: Option<(u32, ErrorCode, &'static str)> =
+            if header.kind == frame::kind::PRIORITY {
+                if header.stream_id == 0 {
+                    Some((0, ErrorCode::ProtocolError, "PRIORITY on stream 0"))
+                } else if header.len != 5 {
+                    Some((
+                        header.stream_id,
+                        ErrorCode::FrameSizeError,
+                        "PRIORITY length != 5",
+                    ))
+                } else {
+                    None
+                }
+            } else if header.kind == frame::kind::WINDOW_UPDATE
+                && header.stream_id != 0
+                && header.len == 4
+            {
+                let p = self.frame.payload.as_slice();
+                let inc = u32::from_be_bytes([p[0] & 0x7f, p[1], p[2], p[3]]);
+                if inc == 0 {
+                    Some((
+                        header.stream_id,
+                        ErrorCode::ProtocolError,
+                        "WINDOW_UPDATE increment 0 on a stream",
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+        self.frame.header = None;
+        self.frame.hdr_len = 0;
+        self.frame.payload_len = 0;
+        self.frame.payload_filled = 0;
+        if let Some((sid, code, msg)) = stream_scoped {
+            if sid == 0 {
+                return self.conn_error(code, msg).map(|_| false);
+            }
+            self.stream_error(sid, code, msg);
+            return Ok(true);
+        }
         let frame = match Frame::parse(
             header,
             self.frame.payload.as_slice(),
@@ -1051,10 +1134,6 @@ impl<R: Read, W: Write> Connection<R, W> {
                 return self.conn_error(code, &e.to_string()).map(|_| false);
             }
         };
-        self.frame.header = None;
-        self.frame.hdr_len = 0;
-        self.frame.payload_len = 0;
-        self.frame.payload_filled = 0;
         self.process_frame(frame)?;
         Ok(true)
     }
@@ -1074,8 +1153,7 @@ impl<R: Read, W: Write> Connection<R, W> {
                             "CONTINUATION on different stream",
                         );
                     }
-                    if pending.block.len() + block.len() > self.local.max_header_list_size as usize
-                    {
+                    if pending.block.len() + block.len() > self.local_header_cap {
                         return self.conn_error(
                             ErrorCode::CompressionError,
                             "header block exceeds advertised limit",
@@ -1121,16 +1199,28 @@ impl<R: Read, W: Write> Connection<R, W> {
                 stream_id,
                 data,
                 end_stream,
-            } => self.on_data(stream_id, data, end_stream),
+                padding,
+            } => self.on_data(stream_id, data, end_stream, padding),
             Frame::RstStream {
                 stream_id,
                 error_code,
             } => {
                 if !self.streams.contains(&stream_id) {
                     // RFC 9113 §5.1: RST_STREAM on an idle stream (one
-                    // that was never opened) is a PROTOCOL_ERROR, but
-                    // RST_STREAM for a stream we already closed is a
-                    // normal race and MUST be ignored.
+                    // that was never opened) is a PROTOCOL_ERROR;
+                    // RST_STREAM for a stream that has already closed is
+                    // a normal race and MUST be ignored.
+                    //
+                    // The `last_peer_id` test only sees *peer-initiated*
+                    // streams, which on a client connection is none of
+                    // them — so a server that resets a stream we already
+                    // finished (§8.1: it may send RST_STREAM(NO_ERROR)
+                    // to tell us to stop sending) used to look like an
+                    // idle-stream error and killed the whole connection.
+                    // `recently_closed` is the record that knows better.
+                    if self.recently_closed.iter().any(|&c| c == stream_id) {
+                        return Ok(());
+                    }
                     if stream_id > self.streams.last_peer_id() {
                         return self
                             .conn_error(ErrorCode::ProtocolError, "RST_STREAM on idle stream");
@@ -1278,6 +1368,15 @@ impl<R: Read, W: Write> Connection<R, W> {
                     return Ok(());
                 }
                 return self.conn_error(ErrorCode::ProtocolError, "response on unknown stream");
+            }
+            if self.goaway_sent && sid > self.streams.last_peer_id() {
+                // RFC 9113 §6.8/§8.7: our GOAWAY promised that streams
+                // above the id it carried were not processed, which is what
+                // lets the client safely retry them on another connection.
+                // Running one anyway would execute a non-idempotent request
+                // twice.
+                self.stream_error(sid, ErrorCode::RefusedStream, "stream opened after GOAWAY");
+                return Ok(());
             }
             if !self.streams.accept_peer_id(sid) {
                 return self.conn_error(ErrorCode::ProtocolError, "non-monotonic stream id");
@@ -1695,7 +1794,13 @@ impl<R: Read, W: Write> Connection<R, W> {
         Ok(true)
     }
 
-    fn on_data(&mut self, stream_id: u32, data: Bytes, end_stream: bool) -> Result<()> {
+    fn on_data(
+        &mut self,
+        stream_id: u32,
+        data: Bytes,
+        end_stream: bool,
+        padding: usize,
+    ) -> Result<()> {
         if !self.streams.contains(&stream_id) {
             if self.recently_closed.iter().any(|&c| c == stream_id) {
                 // The stream was open and has since closed — most commonly
@@ -1712,7 +1817,9 @@ impl<R: Read, W: Write> Connection<R, W> {
             }
             return self.conn_error(ErrorCode::ProtocolError, "DATA on unknown stream");
         }
-        let len = data.len() as i64;
+        // RFC 9113 §6.1: padding is flow controlled too, so the window
+        // is spent on `data.len() + padding` while only `data` is body.
+        let len = (data.len() + padding) as i64;
         let bodyless = self
             .streams
             .get(&stream_id)
@@ -1730,10 +1837,15 @@ impl<R: Read, W: Write> Connection<R, W> {
         {
             let s = self.streams.get_mut(&stream_id).unwrap();
             if !s.can_recv() {
-                self.pending_frames.push_back(Frame::RstStream {
+                // The peer sent DATA after its own END_STREAM (or after we
+                // reset it): a stream error, and the stream really has to
+                // close — leaving the record alive would let the
+                // application queue a response on a stream we just reset.
+                self.stream_error(
                     stream_id,
-                    error_code: ErrorCode::StreamClosed,
-                });
+                    ErrorCode::StreamClosed,
+                    "DATA after the stream was closed",
+                );
                 return Ok(());
             }
             if s.recv_window < len {
@@ -1800,6 +1912,23 @@ impl<R: Read, W: Write> Connection<R, W> {
         if let Err(e) = new_settings.apply(&entries) {
             return self.conn_error(ErrorCode::ProtocolError, &e.to_string());
         }
+        // RFC 9113 §6.5.2: a server MUST NOT *explicitly* set
+        // SETTINGS_ENABLE_PUSH to 1 — "if a server does include a value, it
+        // MUST be 0" — and a client MUST treat receipt of one as a
+        // connection error of type PROTOCOL_ERROR. The peer's *effective*
+        // value is 1 either way (that is the protocol default, and the
+        // merged settings start there), so the check has to look at what
+        // the frame actually carried.
+        if self.config.client
+            && entries
+                .iter()
+                .any(|s| s.id == SETTINGS_ENABLE_PUSH && s.value == 1)
+        {
+            return self.conn_error(
+                ErrorCode::ProtocolError,
+                "server sent SETTINGS_ENABLE_PUSH=1",
+            );
+        }
 
         if self.peer.no_rfc7540_priorities != new_settings.no_rfc7540_priorities
             && self.peer.no_rfc7540_priorities != 0
@@ -1815,14 +1944,26 @@ impl<R: Read, W: Write> Connection<R, W> {
         let delta = new_settings.initial_window_size as i64 - self.peer.initial_window_size as i64;
         if delta != 0 {
             let ids: Vec<u32> = self.streams.iter().map(|s| s.id).collect();
+            // RFC 9113 §6.5.2: a change that would push *any* window past
+            // the maximum is a connection error of type FLOW_CONTROL_ERROR.
+            // The old `next < i64::MIN` test could never be true (the
+            // window never goes negative by more than its own value), so a
+            // peer could first raise a stream window to the 2^31-1 limit
+            // with WINDOW_UPDATE and then raise INITIAL_WINDOW_SIZE to add
+            // it a second time, after which every send exceeds what the
+            // peer thinks our window is.
+            for id in &ids {
+                let window = self.streams.get(id).map(|s| s.send_window).unwrap_or(0);
+                if window.saturating_add(delta) > MAX_FLOW_WINDOW {
+                    return self.conn_error(
+                        ErrorCode::FlowControlError,
+                        "SETTINGS_INITIAL_WINDOW_SIZE overflows a stream window",
+                    );
+                }
+            }
             for id in ids {
                 let s = self.streams.get_mut(&id).unwrap();
-                let next = s.send_window.saturating_add(delta);
-                if next < i64::from(i32::MIN) {
-                    return self
-                        .conn_error(ErrorCode::FlowControlError, "initial window delta overflow");
-                }
-                s.send_window = next;
+                s.send_window = s.send_window.saturating_add(delta);
             }
         }
         self.peer = new_settings;
@@ -1862,7 +2003,24 @@ impl<R: Read, W: Write> Connection<R, W> {
         } else {
             let s = match self.streams.get_mut(&stream_id) {
                 Some(s) => s,
-                None => return Ok(()), // late update on a closed stream
+                None => {
+                    // RFC 9113 §5.1: WINDOW_UPDATE on an *idle* stream is a
+                    // connection error, on a closed one it is ignored. A
+                    // stream that was allocated (ours) or accepted (the
+                    // peer's) already existed, so only an id beyond that
+                    // range can be idle; the recently-closed ring covers
+                    // the rest.
+                    let ever_opened = if self.config.client {
+                        stream_id < self.streams.peek_client_id()
+                    } else {
+                        stream_id <= self.streams.last_peer_id()
+                    };
+                    if ever_opened || self.recently_closed.iter().any(|&c| c == stream_id) {
+                        return Ok(());
+                    }
+                    return self
+                        .conn_error(ErrorCode::ProtocolError, "WINDOW_UPDATE on an idle stream");
+                }
             };
             let next = s.send_window.saturating_add(increment as i64);
             if next > MAX_FLOW_WINDOW {
@@ -1968,15 +2126,18 @@ impl<R: Read, W: Write> Connection<R, W> {
 
     /// Enforce RFC 9113 §8.1.2.6: a message whose `content-length` does
     /// not match the octets actually received (at stream end) is a
-    /// stream error. Also enforces that bodyless messages carry no body
-    /// and a zero `content-length`.
+    /// stream error. Also enforces that bodyless messages carry no body.
     fn verify_content_length(&mut self, stream_id: u32) {
         let bad = match self.streams.get(&stream_id) {
             Some(s) if s.body_expected => match s.content_length {
                 Some(expected) => s.recv_body_len != expected,
                 None => false,
             },
-            Some(s) => s.content_length.is_some_and(|c| c != 0),
+            // A response that is defined to have no content MAY carry a
+            // non-zero `content-length` (RFC 9113 §8.1.1, RFC 9110 §8.6
+            // for HEAD): every server answers HEAD with the entity length
+            // and no DATA. Only DATA actually received is a mismatch.
+            Some(s) => s.recv_body_len != 0,
             None => false,
         };
         if bad {

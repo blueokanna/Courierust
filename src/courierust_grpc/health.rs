@@ -240,10 +240,17 @@ impl StreamingService for HealthService {
 impl HealthService {
     /// Server-streaming `Watch`: send the current status immediately,
     /// then push a fresh status on every change, until the client
-    /// disconnects (detected when the response channel closes).
+    /// disconnects (detected through the response channel).
     fn watch(&self, service: &str, tx: &BodySender) -> Result<()> {
         let mut last_version = u64::MAX; // force the first send
         loop {
+            if tx.is_cancelled() {
+                // The call was abandoned — client gone, deadline passed,
+                // response dropped. Returning here is what keeps a watch
+                // from parking its thread forever after the response is
+                // no longer being read.
+                return Ok(());
+            }
             let (st, version) = {
                 let state = self.state.0.lock().unwrap();
                 let st = if service.is_empty() {

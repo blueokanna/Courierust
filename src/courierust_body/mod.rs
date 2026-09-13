@@ -8,7 +8,9 @@
 use crate::courierust_bytes::Bytes;
 use crate::courierust_error::Error;
 use crate::Result;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::Arc;
 
 /// A message body in the threaded layer.
 #[derive(Default)]
@@ -147,22 +149,58 @@ impl std::fmt::Debug for Body {
 }
 
 /// A sender-side helper for streaming bodies.
+///
+/// Besides delivering chunks it carries a *cancellation* signal: the
+/// transport sets it when the response is no longer wanted (the peer
+/// disconnected, the deadline passed, the connection closed). A handler
+/// that can block indefinitely — a server-streaming subscription, a
+/// watch loop — should poll [`BodySender::is_cancelled`] between waits,
+/// which is what lets its thread end instead of outliving the client.
 pub struct BodySender {
     tx: std::sync::mpsc::Sender<Result<Bytes>>,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl BodySender {
     /// Build a sender from a raw channel (used by adapters that
     /// transform the stream before it reaches the transport).
     pub fn from_sender(tx: std::sync::mpsc::Sender<Result<Bytes>>) -> Self {
-        Self { tx }
+        Self {
+            tx,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Whether the response has been abandoned.
+    ///
+    /// True once the receiving end is gone (or was told to stop). It is
+    /// sticky, so a handler may test it at any point and return.
+    #[inline]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Mark the call abandoned. The transport calls this when it stops
+    /// consuming the body; an adapter that observes cancellation (a
+    /// deadline timer, a disconnecting peer) may set it too.
+    #[inline]
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// The shared cancellation flag, so a relay can set it from the place
+    /// that actually notices the loss.
+    #[inline]
+    pub fn cancel_flag(&self) -> Arc<AtomicBool> {
+        self.cancelled.clone()
     }
 
     /// Send a chunk.
     pub fn send(&self, chunk: Bytes) -> Result<()> {
-        self.tx
-            .send(Ok(chunk))
-            .map_err(|_| Error::canceled("body receiver dropped"))
+        self.tx.send(Ok(chunk)).map_err(|_| {
+            self.cancel();
+            Error::canceled("body receiver dropped")
+        })
     }
 
     /// Send a chunk from a slice.
@@ -172,9 +210,10 @@ impl BodySender {
 
     /// Send a raw result (a chunk or a transport error) to the receiver.
     pub fn send_result(&self, result: Result<Bytes>) -> Result<()> {
-        self.tx
-            .send(result)
-            .map_err(|_| Error::canceled("body receiver dropped"))
+        self.tx.send(result).map_err(|_| {
+            self.cancel();
+            Error::canceled("body receiver dropped")
+        })
     }
 
     /// Send an error to the receiver.
@@ -187,5 +226,5 @@ impl BodySender {
 /// is the [`Body::Channel`].
 pub fn channel() -> (BodySender, Body) {
     let (tx, rx) = std::sync::mpsc::channel::<Result<Bytes>>();
-    (BodySender { tx }, Body::Channel(rx))
+    (BodySender::from_sender(tx), Body::Channel(rx))
 }

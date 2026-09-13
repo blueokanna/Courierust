@@ -43,6 +43,7 @@ use crate::courierust_http::method::Method;
 use crate::courierust_http::request::Request;
 use crate::courierust_http::response::Response;
 use crate::courierust_http::status::StatusCode;
+use crate::courierust_http::version::Version;
 use crate::courierust_io::BufReader;
 use crate::courierust_net::ConnStream;
 use crate::courierust_server::Handler;
@@ -642,6 +643,13 @@ pub fn plan(
     if req.method != Method::GET {
         return Err(WsRefusal::new(405, "websocket: upgrade requires GET"));
     }
+    // RFC 6455 §4.1/§4.2.1: the opening handshake is an HTTP/1.1 (or
+    // later) GET. Accepting an HTTP/1.0 upgrade would answer 101 to a
+    // peer that has no defined meaning for what follows, and a proxy on
+    // the path may disagree about whether frames or a body come next.
+    if req.version != Version::HTTP_11 {
+        return Err(WsRefusal::new(400, "websocket: upgrade requires HTTP/1.1"));
+    }
     let versions: Vec<&HeaderValue> = req.headers.get_all("sec-websocket-version").collect();
     if versions.len() != 1 {
         // Not an upgrade, or an ambiguous set of versions.
@@ -797,6 +805,11 @@ pub(crate) struct WsEventConn {
     ping_interval: Option<Duration>,
     close_timeout: Option<Duration>,
     last_recv: Instant,
+    /// When the last keepalive Ping went out. Separate from `last_recv`
+    /// so the Ping cadence does not have to lie about when the peer was
+    /// last heard from (which is what makes the “two intervals of
+    /// silence” cutoff below reachable).
+    last_ping: Instant,
     /// When the closing handshake started (our side sent or queued a
     /// close frame).
     closing_at: Option<Instant>,
@@ -862,6 +875,7 @@ impl WsEventConn {
             ping_interval: ws.ping_interval,
             close_timeout: ws.close_timeout,
             last_recv: Instant::now(),
+            last_ping: Instant::now(),
             closing_at: None,
             reported: false,
             wake,
@@ -882,6 +896,27 @@ impl WsEventConn {
     /// Whether anything is queued for writing.
     pub(crate) fn has_queued_output(&self) -> bool {
         !lock(&self.queue).is_empty()
+    }
+
+    /// The next instant at which [`WsEventConn::step`] must run even
+    /// though the socket stays silent.
+    ///
+    /// Keepalive and the closing handshake are time-driven, and a peer
+    /// that goes quiet produces no readiness event to hang them off: a
+    /// half-open connection would otherwise keep its poller slot and
+    /// buffers until the process exits. The reactor folds this into its
+    /// wait timeout and dispatches the connection when it elapses.
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        if let Some(started) = self.closing_at {
+            return Some(started + self.close_timeout.unwrap_or(Duration::from_secs(5)));
+        }
+        let interval = self.ping_interval?;
+        let close_due = self.last_recv + interval.saturating_mul(2);
+        // One Ping per interval, measured from the last Ping as well as
+        // from the last inbound frame, so a connection that is already
+        // overdue is not dispatched on every reactor tick.
+        let ping_due = core::cmp::max(self.last_recv + interval, self.last_ping + interval);
+        Some(core::cmp::min(ping_due, close_due))
     }
 
     /// Push queued frames to the socket.
@@ -979,13 +1014,18 @@ impl WsEventConn {
                         let (code, reason) = protocol_close(&e);
                         self.request_close(code, reason);
                         self.report_close(Some(code), false);
-                    } else {
-                        self.report_close(None, false);
+                        // Fall through: the queued close frame (if any)
+                        // still has to reach the peer, so the return
+                        // below flushes first.
+                        break;
                     }
-                    // Fall through: the queued close frame (if any) still
-                    // has to reach the peer, so the return below flushes
-                    // first.
-                    break;
+                    // EOF or a reset: there is no peer left to flush a
+                    // close frame to, and staying registered would spin
+                    // the reactor on a socket that reports readable
+                    // forever (a half-closed peer is permanently
+                    // “ready”).
+                    self.report_close(None, false);
+                    return WsStep::Close;
                 }
             }
         }
@@ -1015,9 +1055,10 @@ impl WsEventConn {
             }
             if idle >= interval {
                 let _ = self.conn.send_ping(b"");
-                // Restart the window so one Ping goes out per interval
-                // rather than one per reactor wake.
-                self.last_recv = Instant::now() - interval / 2;
+                // One Ping per interval rather than one per reactor wake:
+                // the deadline is measured against `last_ping`, not by
+                // pretending the peer just spoke.
+                self.last_ping = Instant::now();
                 self.service.on_idle(&mut self.conn);
             }
         }

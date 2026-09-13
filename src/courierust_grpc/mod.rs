@@ -994,6 +994,12 @@ impl Handler for GrpcHandler {
         // any of this.
         let (msg_tx, msg_rx) = std::sync::mpsc::channel();
         let msg_sender = crate::courierust_body::BodySender::from_sender(msg_tx);
+        // Cancellation: set when nobody is reading the response any more
+        // (the peer went away) or when `handle()` gives up on it (deadline
+        // exceeded). A long-lived handler such as health `Watch` polls it
+        // between waits; without it both threads below outlived the
+        // response and leaked — one per timed-out streaming call.
+        let cancel = msg_sender.cancel_flag();
         let (body_tx, body) = crate::courierust_body::channel();
         let max = self.max_message_size;
         // Signals `Started` on the first forwarded message. Both threads
@@ -1005,11 +1011,22 @@ impl Handler for GrpcHandler {
             std::sync::mpsc::channel::<std::result::Result<(), (u32, String)>>();
 
         let started_tx2 = started_tx.clone();
+        let cancel_framing = cancel.clone();
         let _ = std::thread::Builder::new()
             .name("courierust-grpc-frame".into())
             .spawn(move || {
                 let mut first = true;
-                while let Ok(m) = msg_rx.recv() {
+                loop {
+                    let m = match msg_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                        Ok(m) => m,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            if cancel_framing.load(std::sync::atomic::Ordering::Acquire) {
+                                break;
+                            }
+                            continue;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
                     if first {
                         let _ = started_tx2.send(());
                         first = false;
@@ -1019,6 +1036,10 @@ impl Handler for GrpcHandler {
                         Err(e) => Err(e),
                     };
                     if body_tx.send_result(frame.map(Bytes::from)).is_err() {
+                        // The response body was dropped: stop consuming and
+                        // tell the handler, which is what lets a service
+                        // blocked on its own logic return.
+                        cancel_framing.store(true, std::sync::atomic::Ordering::Release);
                         break;
                     }
                 }
@@ -1115,6 +1136,10 @@ impl Handler for GrpcHandler {
                 Err(_) => grpc_error_response(status::INTERNAL, "service thread exited"),
             },
             WaitOutcome::DeadlineExceeded => {
+                // Tell the handler the response is no longer wanted before
+                // answering: the serving thread and its channels end
+                // instead of running out the call in the background.
+                cancel.store(true, std::sync::atomic::Ordering::Release);
                 grpc_error_response(status::DEADLINE_EXCEEDED, "deadline exceeded")
             }
         }

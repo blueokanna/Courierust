@@ -12,7 +12,7 @@
 
 ## 重要的细节
 
-- **重定向**（301/302/303 → GET）绝不跨 origin 转发 `Authorization` / `Cookie`（RFC 9110 §15.4）。
+- **重定向**（301/302/303 → GET，307/308 保留方法与请求体）绝不跨 origin 转发 `Authorization` / `Cookie`（RFC 9110 §15.4）。
 - **优先级**——`execute_priority(url, req, Priority { urgency, incremental })` 驱动 WUCS 调度器（见 `blogs/01`）。
 - **worker 占用按连接而非按流**——一条带很多流的 h2 连接只占一个 worker，流永远不会把 worker 用量翻倍，也互不阻塞。
 - **超时**——连接、握手（TLS）、读、整请求超时，全部可配。

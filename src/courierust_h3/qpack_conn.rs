@@ -83,6 +83,10 @@ pub(crate) struct QpackConnection {
     /// per string literal — the H3 hot path decodes many literals per
     /// connection).
     huff: HuffmanDecoder,
+    /// Whether the peer's QPACK encoder stream has already been opened.
+    encoder_stream_seen: bool,
+    /// Whether the peer's QPACK decoder stream has already been opened.
+    decoder_stream_seen: bool,
 }
 
 impl QpackConnection {
@@ -100,7 +104,32 @@ impl QpackConnection {
             decoder_out: Vec::new(),
             blocked: VecDeque::new(),
             huff: HuffmanDecoder::new(),
+            encoder_stream_seen: false,
+            decoder_stream_seen: false,
         }
+    }
+
+    /// Record the peer's QPACK encoder stream.
+    ///
+    /// RFC 9204 §4.2: each endpoint opens at most one of each QPACK
+    /// stream type, and "an endpoint MUST treat receipt of a second
+    /// instance of the same unidirectional stream type as a connection
+    /// error of type H3_STREAM_CREATION_ERROR".
+    pub(crate) fn mark_encoder_stream(&mut self) -> Result<()> {
+        if self.encoder_stream_seen {
+            return Err(Error::protocol("duplicate QPACK encoder stream"));
+        }
+        self.encoder_stream_seen = true;
+        Ok(())
+    }
+
+    /// Record the peer's QPACK decoder stream (RFC 9204 §4.2).
+    pub(crate) fn mark_decoder_stream(&mut self) -> Result<()> {
+        if self.decoder_stream_seen {
+            return Err(Error::protocol("duplicate QPACK decoder stream"));
+        }
+        self.decoder_stream_seen = true;
+        Ok(())
     }
 
     /// The capacity we advertise.

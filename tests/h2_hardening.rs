@@ -215,6 +215,69 @@ fn h2_rejects_window_update_zero_increment() {
     assert_eq!(code, Some(0x1), "expected PROTOCOL_ERROR GOAWAY");
 }
 
+/// RFC 9113 §6.9: a zero increment on the *connection* window is a
+/// connection error, but the same frame on a stream is a stream error —
+/// answering it with GOAWAY would kill every unrelated in-flight request.
+#[test]
+fn h2_zero_increment_window_update_on_a_stream_is_a_stream_error() {
+    let addr = spawn_h2_server(1 << 20);
+    let mut peer = RawH2Peer::connect(addr).unwrap();
+    peer.send_preface_and_settings();
+    // Open stream 1 with a valid request so the stream is not idle.
+    let block = hpack(&[
+        hdr(":method", "GET"),
+        hdr(":scheme", "http"),
+        hdr(":authority", "localhost"),
+        hdr(":path", "/"),
+    ]);
+    peer.send_frame(0x1, 0x4 | 0x1, 1, &block); // END_HEADERS | END_STREAM
+    peer.send_frame(0x8, 0, 1, &[0u8; 4]); // WINDOW_UPDATE increment 0
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let Some((kind, _flags, _sid, payload)) = peer.read_frame() else {
+            break;
+        };
+        assert_ne!(
+            kind, 0x7,
+            "a stream-scoped error must not become a connection error"
+        );
+        if kind == 0x3 {
+            let code = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            assert_eq!(code, 0x1, "RST_STREAM must carry PROTOCOL_ERROR");
+            return;
+        }
+    }
+    panic!("expected RST_STREAM(PROTOCOL_ERROR) for a zero increment on a stream");
+}
+
+/// RFC 9113 §5.1: WINDOW_UPDATE on a stream that was never opened is a
+/// connection error (it used to be ignored, so the frame was accepted and
+/// the peer's accounting went unchecked).
+#[test]
+fn h2_window_update_on_an_idle_stream_is_a_connection_error() {
+    let addr = spawn_h2_server(1 << 20);
+    let mut peer = RawH2Peer::connect(addr).unwrap();
+    peer.send_preface_and_settings();
+    peer.send_frame(0x8, 0, 99, &1u32.to_be_bytes());
+    let code = peer.wait_goaway(Duration::from_secs(5));
+    assert_eq!(code, Some(0x1), "expected PROTOCOL_ERROR GOAWAY");
+}
+
+/// RFC 9113 §6.2: padding that leaves no room for the field block is a
+/// connection error. The old bound could never fire, so the frame was
+/// accepted as an empty block and answered with a *stream* error.
+#[test]
+fn h2_padded_headers_with_overlong_padding_is_rejected() {
+    let addr = spawn_h2_server(1 << 20);
+    let mut peer = RawH2Peer::connect(addr).unwrap();
+    peer.send_preface_and_settings();
+    // PADDED | END_HEADERS, Pad Length 4, but only two bytes follow it.
+    peer.send_frame(0x1, 0x4 | 0x8, 1, &[0x04, 0x82, 0x86]);
+    let code = peer.wait_goaway(Duration::from_secs(5));
+    assert_eq!(code, Some(0x1), "expected PROTOCOL_ERROR GOAWAY");
+}
+
 #[test]
 fn h2_rejects_data_on_stream_zero() {
     let addr = spawn_h2_server(1 << 20);

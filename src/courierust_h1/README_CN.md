@@ -14,7 +14,7 @@
 - `read_headers_scratch`——带上限（行/头数/块大小）的头块读取，复用 `Scratch`，keep-alive 稳态零按请求分配。
 - `body_length`——按 method + headers 判定 `None` / `Content-Length` / `chunked`。
 - `read_body_fixed_scratch` / `read_body_chunked_scratch`——有界 body 读取（巨大的声明长度当场拒绝，而不是干等）。
-- `parse_chunk_size`——块大小的唯一权威，阻塞与事件驱动两条路径共享。
+- `parse_chunk_size`——块大小的唯一权威，阻塞与事件驱动两条路径共享。大小严格按 `1*HEXDIG`（RFC 9112 §7.1）解析：符号、前导空格或非十六进制字符一律拒绝，而不是宽松地解析。
 - `write_request_head` / `write_response_head`——序列化。
 - `keep_alive_requested` / `wants_close`——精确 token 的 `Connection` 语义（`closex` token *不会*关闭），两条服务器路径永不分歧。
 - `is_hop_by_hop`——RFC 9110 逐跳字段表。

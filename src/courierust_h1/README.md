@@ -14,7 +14,7 @@ HTTP/1.x wire helpers shared by the client and the server: request-line parsing,
 - `read_headers_scratch` — header block reading against caps (line/header-count/block-size), reusing a `Scratch` so keep-alive steady state does zero per-request allocation.
 - `body_length` — decides `None` / `Content-Length` / `chunked` from the method + headers.
 - `read_body_fixed_scratch` / `read_body_chunked_scratch` — bounded body reads (a huge advertised length is rejected up front, not waited for).
-- `parse_chunk_size` — the single authority for chunk sizes, shared by the blocking and event-driven paths.
+- `parse_chunk_size` — the single authority for chunk sizes, shared by the blocking and event-driven paths. The size is strictly `1*HEXDIG` (RFC 9112 §7.1): a sign, leading space, or a non-hex digit in the size is rejected instead of being parsed leniently.
 - `write_request_head` / `write_response_head` — serialization.
 - `keep_alive_requested` / `wants_close` — exact-token `Connection` semantics (a `closex` token does *not* close), so the two server paths never disagree.
 - `is_hop_by_hop` — the RFC 9110 hop-by-hop field list.

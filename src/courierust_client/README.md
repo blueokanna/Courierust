@@ -12,7 +12,7 @@ The multi-core HTTP client: an HTTP/1.1 keep-alive pool grouped by authority, HT
 
 ## The details that matter
 
-- **Redirects** (301/302/303 → GET) never forward `Authorization` / `Cookie` across origins (RFC 9110 §15.4).
+- **Redirects** (301/302/303 → GET, 307/308 keep method and body) never forward `Authorization` / `Cookie` across origins (RFC 9110 §15.4).
 - **Priorities** — `execute_priority(url, req, Priority { urgency, incremental })` drives the WUCS scheduler (see `blogs/01`).
 - **Worker occupancy is per connection, not per stream** — a single h2 connection with many streams holds exactly one worker, so streams never multiply worker usage and never block each other.
 - **Timeouts** — connect, handshake (TLS), read, and total request timeouts, all configurable.
