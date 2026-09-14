@@ -12,7 +12,7 @@
 
 - `parse_request_line`——严格三 token 请求行。
 - `read_headers_scratch`——带上限（行/头数/块大小）的头块读取，复用 `Scratch`，因此 keep-alive 稳态不会为暂存再分配缓冲区（字段本身仍然会进入 `HeaderMap`）。
-- `body_length`——按 method + headers 判定 `None` / `Content-Length` / `chunked`。
+- `body_length`——按 method + headers 判定 `None` / `Content-Length` / `chunked`。同时带**两种分帧**的消息会被**拒绝**而不是被裁决（RFC 9112 §6.1，CWE-444）：两个对端把同一串字节读成两条不同的消息，正是请求走私 desync 的构造方式，所以这一层绝不替邻居选一个它可能不选的赢家。数值不一致的重复 `Content-Length`、重复的 `chunked`、以及不是最后一个编码的 `chunked` 出于同样理由被拒绝。`HTTP/2` 与 `HTTP/3` 直接禁止 `transfer-encoding`，在那里按连接/流错误拒绝。
 - `read_body_fixed_scratch` / `read_body_chunked_scratch`——有界 body 读取（巨大的声明长度当场拒绝，而不是干等）。
 - `parse_chunk_size`——块大小的唯一权威，阻塞与事件驱动两条路径共享。大小严格按 `1*HEXDIG`（RFC 9112 §7.1）解析：符号、前导空格或非十六进制字符一律拒绝，而不是宽松地解析。
 - `write_request_head` / `write_response_head`——序列化。

@@ -58,7 +58,7 @@ use crate::courierust_ws::handshake::{
 use crate::courierust_ws::session::{MaskSource, Role, Session, SessionConfig, Stats};
 use crate::courierust_ws::writer::FrameWriter;
 use crate::courierust_ws::Event;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -190,6 +190,7 @@ impl WebSocket {
     ) -> Result<Self> {
         let (secure, http_url) = normalise_url(url)?;
         let parsed = Url::parse(&http_url)?;
+        crate::courierust_client::reject_url_credentials(&parsed)?;
         let host = parsed.host.clone();
         let port = parsed.port;
         let (addr, stream) = connect_to(&host, port, cfg)?;
@@ -518,34 +519,29 @@ fn normalise_url(url: &str) -> Result<(bool, String)> {
     }
 }
 
-/// Connect to the first address that accepts.
+/// Connect to the origin, directly or through the configured proxy.
 ///
 /// A host name that resolves to several addresses (the usual `localhost`
 /// case: `::1` and `127.0.0.1`) must not fail just because the first one
-/// in the list is not the one the server bound. Each attempt keeps its
-/// own connect timeout, and the last failure is reported.
+/// in the list is not the one the server bound: every address is tried,
+/// each with its own connect timeout, and the last failure is reported.
 fn connect_to(
     host: &str,
     port: u16,
     cfg: &crate::courierust_client::ClientConfig,
 ) -> Result<(SocketAddr, std::net::TcpStream)> {
-    let addresses: Vec<SocketAddr> = (host, port)
-        .to_socket_addrs()
-        .map_err(|e| Error::io(alloc::format!("ws: cannot resolve {host}:{port}: {e}")))?
-        .collect();
-    if addresses.is_empty() {
-        return Err(Error::io(alloc::format!(
-            "ws: {host}:{port} resolved to no address"
-        )));
+    match &cfg.proxy {
+        // A proxy is tunnelled to the origin authority with `CONNECT`
+        // (RFC 9110 §9.3.6). The handshake that follows is the same for
+        // `ws://` and `wss://` — the tunnel is byte-transparent, so only
+        // the origin's own protocol differs.
+        Some(proxy) => crate::courierust_client::proxy::connect_through(
+            proxy,
+            &crate::courierust_client::proxy::authority(host, port),
+            cfg.connect_timeout,
+        ),
+        None => crate::courierust_client::proxy::connect_direct(host, port, cfg.connect_timeout),
     }
-    let mut last: Option<Error> = None;
-    for addr in addresses {
-        match net::connect(&addr, cfg.connect_timeout) {
-            Ok(stream) => return Ok((addr, stream)),
-            Err(e) => last = Some(e),
-        }
-    }
-    Err(last.unwrap_or_else(|| Error::io("ws: connect failed")))
 }
 
 fn push(headers: &mut HeaderMap, name: &str, value: &str) -> Result<()> {

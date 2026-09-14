@@ -27,6 +27,7 @@ pub(crate) const HS_KEY_UPDATE: u8 = 24;
 pub(crate) const HS_NEW_SESSION_TICKET: u8 = 4;
 pub(crate) const HS_ENCRYPTED_EXTENSIONS: u8 = 8;
 pub(crate) const HS_CERTIFICATE: u8 = 11;
+pub(crate) const HS_CERTIFICATE_REQUEST: u8 = 13;
 pub(crate) const HS_CERTIFICATE_VERIFY: u8 = 15;
 pub(crate) const HS_FINISHED: u8 = 20;
 /// Synthetic `message_hash` handshake type used after a HelloRetryRequest
@@ -625,38 +626,140 @@ pub(crate) fn parse_encrypted_extensions(
 // Certificate parsing
 // ---------------------------------------------------------------------
 
-/// Parse a TLS 1.3 Certificate message and return all certificate
-/// DER entries (leaf first).
-pub(crate) fn parse_certificate_list(body: &[u8]) -> TlsResult<Vec<Vec<u8>>> {
+/// Parse a TLS 1.3 Certificate message into its request context and DER
+/// entries (leaf first).
+///
+/// `certificate_request_context` must be echoed by the responder, and
+/// RFC 8446 §4.4.2 allows no entry extensions in this version: both are
+/// enforced here so a peer cannot smuggle data past the handshake.
+pub(crate) fn parse_certificate(body: &[u8]) -> TlsResult<(Vec<u8>, Vec<Vec<u8>>)> {
     let mut c = Cur::new(body);
-    let ctx_len = c
-        .u8()
-        .ok_or_else(|| TlsError::Protocol("bad cert".into()))? as usize;
-    c.take(ctx_len)
-        .ok_or_else(|| TlsError::Protocol("bad cert".into()))?;
-    let list_len = c
-        .u24()
-        .ok_or_else(|| TlsError::Protocol("bad cert".into()))?;
-    let list = c
-        .take(list_len)
-        .ok_or_else(|| TlsError::Protocol("bad cert".into()))?;
+    let bad = || TlsError::Protocol("bad cert".into());
+    let ctx_len = c.u8().ok_or_else(bad)? as usize;
+    let ctx = c.take(ctx_len).ok_or_else(bad)?.to_vec();
+    let list_len = c.u24().ok_or_else(bad)?;
+    let list = c.take(list_len).ok_or_else(bad)?;
     let mut lc = Cur::new(list);
     let mut out = Vec::new();
     while !lc.done() {
-        let cert_len = lc
-            .u24()
-            .ok_or_else(|| TlsError::Protocol("bad cert".into()))?;
-        let cert = lc
-            .take(cert_len)
-            .ok_or_else(|| TlsError::Protocol("bad cert".into()))?;
+        let cert_len = lc.u24().ok_or_else(bad)?;
+        let cert = lc.take(cert_len).ok_or_else(bad)?;
         out.push(cert.to_vec());
-        let ext_len = lc
-            .u16()
-            .ok_or_else(|| TlsError::Protocol("bad cert".into()))? as usize;
-        lc.take(ext_len)
-            .ok_or_else(|| TlsError::Protocol("bad cert".into()))?;
+        let ext_len = lc.u16().ok_or_else(bad)? as usize;
+        if ext_len != 0 {
+            return Err(TlsError::Protocol(
+                "Certificate entry extensions are not defined in TLS 1.3".into(),
+            ));
+        }
     }
-    Ok(out)
+    Ok((ctx, out))
+}
+
+/// Parse a TLS 1.3 Certificate message and return all certificate DER
+/// entries (leaf first).
+pub(crate) fn parse_certificate_list(body: &[u8]) -> TlsResult<Vec<Vec<u8>>> {
+    parse_certificate(body).map(|(_, entries)| entries)
+}
+
+/// Build a TLS 1.3 Certificate message (RFC 8446 §4.4.2).
+pub(crate) fn build_certificate(context: &[u8], chain: &[Vec<u8>]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.push(context.len() as u8);
+    body.extend_from_slice(context);
+    let mut entries = Vec::new();
+    for der in chain {
+        entries.extend_from_slice(&[
+            (der.len() >> 16) as u8,
+            (der.len() >> 8) as u8,
+            der.len() as u8,
+        ]);
+        entries.extend_from_slice(der);
+        entries.extend_from_slice(&[0x00, 0x00]); // entry extensions
+    }
+    body.extend_from_slice(&[
+        (entries.len() >> 16) as u8,
+        (entries.len() >> 8) as u8,
+        entries.len() as u8,
+    ]);
+    body.extend_from_slice(&entries);
+    encode_hs(HS_CERTIFICATE, &body)
+}
+
+/// The signature schemes this stack can *produce* for a CertificateVerify.
+/// RSA uses PKCS#1 v1.5 (the PSS schemes are verification-only here),
+/// ECDSA follows the suite hash, Ed25519 is RFC 8032.
+pub(crate) const CERT_VERIFY_SCHEMES: [u16; 7] = [
+    0x0403, // ecdsa_secp256r1_sha256
+    0x0503, // ecdsa_secp384r1_sha384
+    0x0603, // ecdsa_secp521r1_sha512
+    0x0807, // ed25519
+    0x0401, // rsa_pkcs1_sha256
+    0x0501, // rsa_pkcs1_sha384
+    0x0601, // rsa_pkcs1_sha512
+];
+
+/// Build a CertificateRequest message (RFC 8446 §4.4.2).
+///
+/// The main-handshake context is empty, and `signature_algorithms` is the
+/// one extension the RFC makes mandatory here — a client that is asked to
+/// authenticate has to know which schemes will be accepted.
+pub(crate) fn build_certificate_request(context: &[u8]) -> Vec<u8> {
+    let mut alg_list = Vec::new();
+    for scheme in CERT_VERIFY_SCHEMES {
+        alg_list.extend_from_slice(&scheme.to_be_bytes());
+    }
+    let mut algs = Vec::new();
+    algs.extend_from_slice(&(alg_list.len() as u16).to_be_bytes());
+    algs.extend_from_slice(&alg_list);
+    let mut exts = Vec::new();
+    exts.extend_from_slice(&EXT_SIGNATURE_ALGORITHMS.to_be_bytes());
+    exts.extend_from_slice(&(algs.len() as u16).to_be_bytes());
+    exts.extend_from_slice(&algs);
+    let mut body = Vec::new();
+    body.push(context.len() as u8);
+    body.extend_from_slice(context);
+    body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+    body.extend_from_slice(&exts);
+    encode_hs(HS_CERTIFICATE_REQUEST, &body)
+}
+
+/// Parse a CertificateRequest: the request context and the offered
+/// signature schemes.
+///
+/// A non-empty context means post-handshake authentication, which this
+/// stack does not implement — refusing it is the only honest answer, and
+/// it also keeps the transcript unambiguous.
+pub(crate) fn parse_certificate_request(body: &[u8]) -> TlsResult<(Vec<u8>, Vec<u16>)> {
+    let mut c = Cur::new(body);
+    let bad = || TlsError::Protocol("bad CertificateRequest".into());
+    let ctx_len = c.u8().ok_or_else(bad)? as usize;
+    let ctx = c.take(ctx_len).ok_or_else(bad)?.to_vec();
+    if !ctx.is_empty() {
+        return Err(TlsError::Protocol(
+            "post-handshake CertificateRequest is not supported".into(),
+        ));
+    }
+    let ext_len = c.u16().ok_or_else(bad)? as usize;
+    let exts = c.take(ext_len).ok_or_else(bad)?;
+    let mut ec = Cur::new(exts);
+    let mut schemes = Vec::new();
+    while !ec.done() {
+        let ext_type = ec.u16().ok_or_else(bad)?;
+        let len = ec.u16().ok_or_else(bad)? as usize;
+        let ext = ec.take(len).ok_or_else(bad)?;
+        if ext_type == EXT_SIGNATURE_ALGORITHMS {
+            let mut sc = Cur::new(ext);
+            let total = sc.u16().ok_or_else(bad)? as usize;
+            let list = sc.take(total).ok_or_else(bad)?;
+            if list.len() % 2 != 0 {
+                return Err(TlsError::Protocol("bad signature_algorithms".into()));
+            }
+            for pair in list.chunks(2) {
+                schemes.push(u16::from_be_bytes([pair[0], pair[1]]));
+            }
+        }
+    }
+    Ok((ctx, schemes))
 }
 
 // ---------------------------------------------------------------------
@@ -845,6 +948,11 @@ pub(crate) struct ClientHandshake {
     pub(crate) verify: bool,
     /// A resumption PSK to offer (RFC 8446 §4.2.11), with its suite.
     pub(crate) psk: Option<(Vec<u8>, CipherSuite)>,
+    /// The client certificate to present when the server asks for one
+    /// (mTLS). `None` answers a CertificateRequest with an empty
+    /// Certificate — which a server that *requires* authentication
+    /// rejects, as it should.
+    pub(crate) identity: Option<super::Identity>,
 }
 
 impl ClientHandshake {
@@ -924,6 +1032,11 @@ impl ClientHandshake {
         let mut cv = None;
         let mut negotiated_alpn = None;
         let mut saw_ee = false;
+        // A CertificateRequest (mTLS, RFC 8446 §4.4.2) arrives after
+        // EncryptedExtensions and before the server's Certificate; the
+        // schemes it offers bound what this client may sign with.
+        let mut client_auth: Option<Vec<u16>> = None;
+        let mut saw_certificate = false;
         for (t, body) in &messages {
             match *t {
                 HS_ENCRYPTED_EXTENSIONS => {
@@ -931,7 +1044,15 @@ impl ClientHandshake {
                     negotiated_alpn = alpn;
                     saw_ee = true;
                 }
+                HS_CERTIFICATE_REQUEST => {
+                    if client_auth.is_some() || saw_certificate {
+                        return Err(TlsError::Protocol("CertificateRequest out of order".into()));
+                    }
+                    let (_context, schemes) = parse_certificate_request(body)?;
+                    client_auth = Some(schemes);
+                }
                 HS_CERTIFICATE => {
+                    saw_certificate = true;
                     peer_chain = Some(parse_certificate_list(body)?);
                 }
                 HS_CERTIFICATE_VERIFY => {
@@ -955,7 +1076,8 @@ impl ClientHandshake {
         let cv = cv.ok_or_else(|| TlsError::Protocol("missing CertificateVerify".into()))?;
 
         for (t, body) in &messages {
-            if *t == HS_ENCRYPTED_EXTENSIONS || *t == HS_CERTIFICATE {
+            if *t == HS_ENCRYPTED_EXTENSIONS || *t == HS_CERTIFICATE_REQUEST || *t == HS_CERTIFICATE
+            {
                 transcript.update(&encode_hs(*t, body));
             }
         }
@@ -1001,12 +1123,55 @@ impl ClientHandshake {
         let after_fin_hash = transcript.current_hash();
         ks.application(&after_fin_hash)?;
 
+        // mTLS (RFC 8446 §4.4.2): answer a CertificateRequest with the
+        // client certificate and a CertificateVerify over the transcript
+        // that now ends at the server's Finished. With no suitable
+        // certificate the mandated answer is an *empty* Certificate, not
+        // silence — the server decides whether that is acceptable.
+        let mut client_flight = Vec::new();
+        if let Some(schemes) = client_auth {
+            client_flight = match &self.identity {
+                Some(identity) => {
+                    let cert = build_certificate(&[], &identity.cert_chain);
+                    transcript.update(&cert);
+                    let cv_hash = transcript.current_hash();
+                    let content = cert_verify_message(&cv_hash, true);
+                    let (scheme, signature) = super::sign::sign_cert_verify(
+                        identity, &content, sh.suite,
+                    )?
+                    .ok_or_else(|| TlsError::Certificate("client identity cannot sign".into()))?;
+                    if !schemes.is_empty() && !schemes.contains(&scheme) {
+                        return Err(TlsError::Certificate(
+                            "the server does not accept the scheme this client certificate \
+                             signs with"
+                                .into(),
+                        ));
+                    }
+                    let mut cv_body = Vec::new();
+                    cv_body.extend_from_slice(&scheme.to_be_bytes());
+                    cv_body.extend_from_slice(&(signature.len() as u16).to_be_bytes());
+                    cv_body.extend_from_slice(&signature);
+                    let cv = encode_hs(HS_CERTIFICATE_VERIFY, &cv_body);
+                    transcript.update(&cv);
+                    let mut flight = cert;
+                    flight.extend_from_slice(&cv);
+                    flight
+                }
+                None => {
+                    let cert = build_certificate(&[], &[]);
+                    transcript.update(&cert);
+                    cert
+                }
+            };
+        }
+
         let client_fin_hash = transcript.current_hash();
         let client_fin = finished_verify_data(&ks, ks.client_handshake(), &client_fin_hash);
-        let fin_msg = encode_hs(HS_FINISHED, &client_fin);
+        let client_fin_msg = encode_hs(HS_FINISHED, &client_fin);
+        client_flight.extend_from_slice(&client_fin_msg);
         let c_hs_keys = ks.client_handshake_keys();
-        io.write_encrypted_record(sh.suite, &c_hs_keys, CONTENT_HANDSHAKE, &fin_msg)?;
-        transcript.update(&fin_msg);
+        io.write_encrypted_record(sh.suite, &c_hs_keys, CONTENT_HANDSHAKE, &client_flight)?;
+        transcript.update(&client_fin_msg);
 
         let resumption_master = Some(ks.resumption_master(&transcript.current_hash()));
 
@@ -1064,6 +1229,11 @@ pub(crate) struct ServerHandshake {
     pub(crate) ticket_key: Option<[u8; 32]>,
     /// Current Unix time (used to validate ticket age).
     pub(crate) now: i64,
+    /// Client authentication (mTLS). `None` sends no CertificateRequest,
+    /// which is what a plain server does; when set, the client's chain is
+    /// validated against its roots, and an anonymous client is rejected
+    /// if the configuration requires one.
+    pub(crate) client_auth: Option<super::ClientAuth>,
 }
 
 impl ServerHandshake {
@@ -1219,28 +1389,18 @@ impl ServerHandshake {
         let ee = encode_hs(HS_ENCRYPTED_EXTENSIONS, &ee_body);
 
         // Certificate message.
-        let mut cert_body = Vec::new();
-        cert_body.push(0); // certificate_request_context (empty)
-        let mut entry_list = Vec::new();
-        for c in &self.identity.cert_chain {
-            entry_list.extend_from_slice(&[
-                (c.len() >> 16) as u8,
-                (c.len() >> 8) as u8,
-                c.len() as u8,
-            ]);
-            entry_list.extend_from_slice(c);
-            entry_list.extend_from_slice(&[0x00, 0x00]); // entry extensions
-        }
-        cert_body.extend_from_slice(&[
-            (entry_list.len() >> 16) as u8,
-            (entry_list.len() >> 8) as u8,
-            entry_list.len() as u8,
-        ]);
-        cert_body.extend_from_slice(&entry_list);
-        let cert = encode_hs(HS_CERTIFICATE, &cert_body);
+        let cert = build_certificate(&[], &self.identity.cert_chain);
 
-        // Update transcript with EE + Certificate.
+        // mTLS: the CertificateRequest goes between EncryptedExtensions
+        // and Certificate, and the transcript follows the wire order.
+        let cr = self
+            .client_auth
+            .as_ref()
+            .map(|_| build_certificate_request(&[]));
         transcript.update(&ee);
+        if let Some(cr) = &cr {
+            transcript.update(cr);
+        }
         transcript.update(&cert);
 
         // CertificateVerify: sign the transcript hash. Per RFC 8446
@@ -1281,29 +1441,134 @@ impl ServerHandshake {
         // Send the encrypted flight.
         let s_hs_keys = ks.server_handshake_keys();
         let mut flight = ee;
+        if let Some(cr) = &cr {
+            flight.extend_from_slice(cr);
+        }
         flight.extend_from_slice(&cert);
         flight.extend_from_slice(&cv);
         flight.extend_from_slice(&fin_msg);
         io.write_encrypted_record(ch.suite, &s_hs_keys, CONTENT_HANDSHAKE, &flight)?;
 
-        // 4. Read client Finished.
+        // 4. Read the client flight: [Certificate, CertificateVerify,]
+        //    Finished (RFC 8446 §4.4.2).
         let c_hs_keys = ks.client_handshake_keys();
         let plaintext = io.read_encrypted_handshake(ch.suite, &c_hs_keys)?;
-        // Parse the (single) Finished message.
-        let m =
-            parse_hs(&plaintext).ok_or_else(|| TlsError::Protocol("bad client flight".into()))?;
-        if m.msg_type != HS_FINISHED {
-            return Err(TlsError::Protocol("expected client Finished".into()));
+        let mut off = 0usize;
+        let mut client_cert: Option<(Vec<u8>, Vec<Vec<u8>>)> = None;
+        let mut client_cv: Option<CertVerify> = None;
+        let mut finished_body: Option<Vec<u8>> = None;
+        while off + 4 <= plaintext.len() {
+            let m = parse_hs(&plaintext[off..])
+                .ok_or_else(|| TlsError::Protocol("bad client flight".into()))?;
+            let total = 4 + m.body.len();
+            match m.msg_type {
+                HS_CERTIFICATE if client_cert.is_none() && client_cv.is_none() => {
+                    let parsed = parse_certificate(m.body)?;
+                    if !parsed.0.is_empty() {
+                        return Err(TlsError::Protocol(
+                            "client certificate request context mismatch".into(),
+                        ));
+                    }
+                    transcript.update(&plaintext[off..off + total]);
+                    client_cert = Some(parsed);
+                }
+                HS_CERTIFICATE_VERIFY if client_cert.is_some() && client_cv.is_none() => {
+                    let cv = parse_cert_verify(m.body)?;
+                    let entries = &client_cert.as_ref().expect("checked above").1;
+                    if entries.is_empty() {
+                        return Err(TlsError::Protocol(
+                            "CertificateVerify without a client certificate".into(),
+                        ));
+                    }
+                    let cv_hash = transcript.current_hash();
+                    let leaf = super::x509::parse_certificate(&entries[0])?;
+                    if let Err(e) = verify_cert_verify(&cv, &leaf.spki, &cv_hash, true, ch.suite) {
+                        // bad_certificate (42): the signature does not
+                        // prove possession of the offered certificate.
+                        send_alert(io, ch.suite, &ks.server_application_keys(), 2, 42)?;
+                        return Err(e);
+                    }
+                    transcript.update(&plaintext[off..off + total]);
+                    client_cv = Some(cv);
+                }
+                HS_FINISHED if finished_body.is_none() => {
+                    finished_body = Some(m.body.to_vec());
+                }
+                _ => return Err(TlsError::Protocol("unexpected client message".into())),
+            }
+            off += total;
         }
+        if off != plaintext.len() {
+            return Err(TlsError::Protocol(
+                "trailing bytes in the client flight".into(),
+            ));
+        }
+
+        // mTLS policy. An empty certificate list is the mandated way to
+        // decline (RFC 8446 §4.4.2) — accepted only when this server
+        // asked for authentication without requiring it. A certificate
+        // that *is* offered is always validated: chain against the
+        // configured roots, validity window, and the clientAuth EKU.
+        let client_cert = match client_cert {
+            Some((_, entries)) if entries.is_empty() => None,
+            other => other,
+        };
+        match (&self.client_auth, &client_cert) {
+            (None, Some(_)) => {
+                send_alert(io, ch.suite, &ks.server_application_keys(), 2, 10)?;
+                return Err(TlsError::Protocol(
+                    "client sent a certificate that was not requested".into(),
+                ));
+            }
+            (Some(auth), Some((_, entries))) => {
+                let leaf = super::x509::parse_certificate(&entries[0])?;
+                let refused = super::x509::validate_chain(auth.roots(), entries, self.now)
+                    .and_then(|()| {
+                        if super::x509::has_client_auth_eku(&leaf) {
+                            Ok(())
+                        } else {
+                            Err(TlsError::Certificate(
+                                "client certificate does not carry the clientAuth EKU".into(),
+                            ))
+                        }
+                    });
+                if let Err(e) = refused {
+                    // bad_certificate (42): the chain or its key usage
+                    // does not qualify.
+                    send_alert(io, ch.suite, &ks.server_application_keys(), 2, 42)?;
+                    return Err(e);
+                }
+                if client_cv.is_none() {
+                    send_alert(io, ch.suite, &ks.server_application_keys(), 2, 47)?;
+                    return Err(TlsError::Protocol(
+                        "client certificate without a CertificateVerify".into(),
+                    ));
+                }
+            }
+            (Some(auth), None) => {
+                if auth.is_required() {
+                    // RFC 8446 §6.2: `certificate_required` (116).
+                    send_alert(io, ch.suite, &ks.server_application_keys(), 2, 116)?;
+                    return Err(TlsError::Alert {
+                        level: 2,
+                        description: 116,
+                    });
+                }
+            }
+            (None, None) => {}
+        }
+
+        let finished_body =
+            finished_body.ok_or_else(|| TlsError::Protocol("missing client Finished".into()))?;
         let client_fin_hash = transcript.current_hash();
         let expected = finished_verify_data(&ks, ks.client_handshake(), &client_fin_hash);
-        if !constant_time_eq(&expected, m.body) {
+        if !constant_time_eq(&expected, &finished_body) {
             return Err(TlsError::Alert {
                 level: 2,
                 description: 51,
             });
         }
-        transcript.update(&plaintext);
+        transcript.update(&encode_hs(HS_FINISHED, &finished_body));
 
         let write = ks.server_application_keys();
         let read = ks.client_application_keys();
@@ -1340,11 +1605,30 @@ impl ServerHandshake {
             },
             alpn: negotiated_alpn,
             server_name: ch.server_name,
-            peer_cert: None,
+            // The authenticated peer's leaf, for the layer above to
+            // authorize on (mTLS): `None` when no certificate was asked
+            // for, or when the client declined an optional request.
+            peer_cert: client_cert.map(|(_, entries)| entries[0].clone()),
             resumed,
             resumption_master: None,
         })
     }
+}
+
+/// Send an alert to the peer (RFC 8446 §6.2). A refusal has to be
+/// *signalled*, not just implied by a closed stream. The record is
+/// protected with the application keys: once the server's Finished is on
+/// the wire that is the epoch the peer reads from, and where its read
+/// sequence numbers restart.
+fn send_alert<R: crate::courierust_io::Read, W: crate::courierust_io::Write>(
+    io: &mut super::TlsIo<R, W>,
+    suite: CipherSuite,
+    keys: &TrafficKeys,
+    level: u8,
+    description: u8,
+) -> TlsResult<()> {
+    io.reset_sequences();
+    io.write_encrypted_record(suite, keys, CONTENT_ALERT, &[level, description])
 }
 
 /// Parsed ClientHello essentials.

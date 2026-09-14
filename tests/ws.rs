@@ -958,6 +958,8 @@ fn wss_round_trip_over_tls() {
             now: common::NOW,
             min_version: courierust::courierust_tls::TlsVersion::Tls12,
             max_version: courierust::courierust_tls::TlsVersion::Tls13,
+
+            identity: None,
         }),
         ..Default::default()
     };

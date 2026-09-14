@@ -221,18 +221,17 @@ Since 0.1, the crate ships a from-scratch, zero-dependency TLS stack —
 use courierust::courierust_client::{Client, ClientConfig, TlsSettings as ClientTls};
 use courierust::courierust_server::{Server, ServerConfig, TlsSettings as ServerTls};
 
-// Server: serve HTTPS with your certificate chain + private key.
-let identity = courierust::courierust_tls::Identity {
-    cert_chain: vec![cert_der],        // leaf first (DER)
-    private_key: key_der,              // PKCS#8 or PKCS#1 (DER)
-    is_rsa: false,                     // false for Ed25519/ECDSA
-};
+// Server: serve HTTPS from your certificate chain + private key.
+// `from_pem_file` parses the chain and the key (PKCS#8, PKCS#1 or SEC1)
+// and proves they belong together — a mismatched pair fails here, at
+// startup, not on every handshake. Use `Identity::from_pem(cert, key)`
+// or `Identity::from_der(chain, key)` when the pair comes from memory.
 let server_cfg = ServerConfig {
     http2: true,                        // h2 + HTTP/1.1 over TLS (ALPN)
-    tls: Some(ServerTls {
-        identity,
-        alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-    }),
+    tls: Some(ServerTls::from_pem_file(
+        "cert.pem",                     // chain, leaf first
+        "key.pem",                      // PKCS#8, PKCS#1 or SEC1
+    )?),
     ..Default::default()
 };
 
@@ -331,7 +330,7 @@ Building with `--no-default-features` compiles only the protocol core, suitable 
 Things this crate deliberately does not do:
 
 - **HTTP/3 / QUIC has a dependency-free built-in path, with a declared protocol boundary.** `courierust_h3` runs HTTP/3 request/response over a std UDP reactor with QUIC v1 packet protection, the built-in TLS 1.3 adapter, ALPN `h3`, bounded CRYPTO/stream reassembly, Retry integrity and token-bound address validation, Version Negotiation, pre-validation 3x anti-amplification, ACK ranges, fresh-packet-number retransmission, RTT/RTO sampling, a bounded congestion window, control/QPACK streams, trailers, and GOAWAY validation. It is not yet a complete Internet QUIC implementation in the sense that 0-RTT and independent interop remain open, but the transport long tail is implemented and exercised: full PTO/time-threshold loss recovery, dynamic local `MAX_DATA`/`MAX_STREAM_DATA`/`MAX_STREAMS` credit updates, connection migration and path validation (PATH_CHALLENGE/RESPONSE), stateless reset (generation and validation), automatic bidirectional key update with the one-at-a-time guard, and QPACK blocked-stream acknowledgements (Section Acknowledgment / Stream Cancellation / Insert Count Increment on the decoder stream). Deliberately out of scope: 0-RTT / early data (replay protection is not taken on), and independent implementation interoperability — the quinn+h3 handshake interop gap is reported honestly in the benchmark suite rather than faked. Those two are the remaining items before advertising broad external interop.
-- **TLS: no 0-RTT, no mutual TLS.** TLS 1.3 session resumption is implemented at the TLS layer (server-issued session tickets, 1-RTT PSK via `psk_dhe_ke`, client-side session store keyed by hostname) and unit-tested; the pooled client currently builds a fresh connector per request, so cross-connection resumption is not yet exercised in the benchmark rows (which report `session_resumption=n/a` honestly). 0-RTT / early data are never offered. TLS 1.2 session ids are carried but never resumed. The server does not request client certificates.
+- **TLS: no 0-RTT; mutual TLS is TLS 1.3 over TCP only.** TLS 1.3 session resumption is implemented at the TLS layer (server-issued session tickets, 1-RTT PSK via `psk_dhe_ke`, client-side session store keyed by hostname) and the pooled client caches one connector per authority, so a ticket captured on one connection is offered on the next (the benchmark rows still report `session_resumption=n/a`, which is about the benchmark, not the implementation). 0-RTT / early data are never offered. TLS 1.2 session ids are carried but never resumed. Client authentication **is** implemented, for TLS 1.3 over TCP: `ClientAuth::required`/`optional` on the server, `TlsSettings::identity` on the client, the chain validated against the client-auth roots together with its validity window and `clientAuth` EKU, possession proven by `CertificateVerify`, and `certificate_required` sent when a required client declines — the refusal is an alert on the wire, not a dropped socket. Combining it with TLS 1.2 (handshake setup) or with HTTP/3 (startup) is refused rather than half-served, and post-handshake authentication is out of scope. Both directions are covered by unit tests and by an integration test through the public `TlsSettings`/`client_auth` surface.
 - **Event-driven server is default on every platform and HTTP/1.1-only.** `ServerConfig::event_driven` (default `true`) parks idle plain-HTTP connections on a readiness poller so a small worker pool serves many idle keep-alive / SSE / long-poll connections; TLS and HTTP/2 connections still use the blocking pool model (bounded by `handshake_timeout`, `h2_idle_timeout`, and worker count). Setting it to `false` restores the legacy **one-pool-job-per-connection** model; that path is deprecated for production use — it lets a herd of idle/slow connections exhaust the pool — and exists only for comparison and debugging. The default event path bounds resource use with `max_connections` (connection cap) and `idle_timeout`.
 - **Streaming request bodies are only reliable over HTTP/2** (h2 frames naturally). Over HTTP/1.1, either send the whole body at once (`Body::Bytes`) or build chunked framing yourself.
 - **gRPC does not include protobuf, `.proto` code generation, or `grpc.reflection`.** You implement the codec traits or wire in your own protobuf-generated code; reflection needs a protobuf schema inventory, which is external by design.
@@ -346,28 +345,99 @@ Every public module is prefixed with the crate's name (`courierust_`) so no
 module path collides with a third-party crate (e.g. `h2`, `http`, `bytes`,
 `grpc`, `tls`):
 
-```
-src/
-├── courierust_http/        # HTTP/1.1 message model (request/response/headers/URI/status)  [no_std]
-├── courierust_hpack/       # HPACK: table-driven Huffman + static/dynamic index tables      [no_std]
-├── courierust_h2/          # HTTP/2 frames, SETTINGS, stream state machine, flow control, WUCS, PRIORITY_UPDATE  [no_std]
-├── courierust_quic/        # QUIC v1 packet/frame codecs, varint, connection ids, crypto tags [no_std]
-├── courierust_h3/          # HTTP/3: QPACK static/dynamic tables + H3 framing/stream roles   [no_std]
-├── courierust_fingerprint/ # JA3 / JA4 / Chrome HTTP/2 fingerprints                        [no_std]
-├── courierust_crypto/      # self-contained MD5 / SHA-256 / SHA-1 / base64 (fingerprints, RFC 6455)  [no_std]
-├── courierust_deflate/     # DEFLATE/gzip with a reusable per-message context (RFC 7692)     [no_std]
-├── courierust_ws/          # RFC 6455 framing + masking + handshake + permessage-deflate      [no_std]
-├── courierust_bytes/       # byte buffers (BytesMut)                                        [no_std]
-├── courierust_io/          # Read/Write traits (no_std flavor)                              [no_std]
-├── courierust_error/       # unified error type
-├── courierust_tls/         # TLS 1.2 + 1.3 (RFC 5246/8446): handshake, record layer, X.509, HTTPS  [std]
-├── courierust_pool/        # work-stealing thread pool                                      [std]
-├── courierust_net/         # TCP → io trait adapters, poller, optional stats instrumentation  [std]
-├── courierust_body/        # streaming response bodies (channel)                            [std]
-├── courierust_h1/          # HTTP/1.1 on-the-wire codec                                      [std]
-├── courierust_client/      # h1 pool + h2 driver                                            [std]
-├── courierust_server/      # work-stealing-pool-backed server                               [std]
-└── courierust_grpc/        # gRPC framing + status + codec traits                           [std]
+```mermaid
+flowchart TB
+
+    %% ==================================================
+    %% Protocol Layer
+    %% ==================================================
+    subgraph PROTOCOL["Protocol & Wire Layer"]
+        direction LR
+
+        H1M["HTTP/1.1<br/>courierust_http"]
+        H2M["HTTP/2<br/>courierust_h2"]
+        H3M["HTTP/3<br/>courierust_h3"]
+        QUIC["QUIC v1<br/>courierust_quic"]
+        WS["WebSocket<br/>courierust_ws"]
+        GRPC["gRPC<br/>courierust_grpc"]
+
+        H1M --> H2M
+        QUIC --> H3M
+        H2M --> GRPC
+    end
+
+
+    %% ==================================================
+    %% Core Layer
+    %% ==================================================
+    subgraph CORE["no_std Core"]
+        direction LR
+
+        HPACK["HPACK<br/>courierust_hpack"]
+        CRYPTO["Crypto<br/>courierust_crypto"]
+        DEFLATE["DEFLATE<br/>courierust_deflate"]
+        FP["Fingerprint<br/>courierust_fingerprint"]
+        BYTES["Buffers<br/>courierust_bytes"]
+        IO["I/O Traits<br/>courierust_io"]
+        ERR["Error<br/>courierust_error"]
+    end
+
+
+    %% ==================================================
+    %% Runtime Layer
+    %% ==================================================
+    subgraph RUNTIME["std Runtime"]
+        direction LR
+
+        TLS["TLS 1.2 / 1.3<br/>courierust_tls"]
+        NET["Network<br/>courierust_net"]
+        POOL["Work-Stealing<br/>courierust_pool"]
+
+        CLIENT["HTTP Client<br/>courierust_client"]
+        SERVER["HTTP Server<br/>courierust_server"]
+        BODY["Streaming Body<br/>courierust_body"]
+        H1["HTTP/1.1 Wire<br/>courierust_h1"]
+    end
+
+
+    %% ==================================================
+    %% Dependencies
+    %% ==================================================
+
+    HPACK -.-> H2M
+    CRYPTO -.-> FP
+    DEFLATE -.-> WS
+
+    BYTES -.-> H1M
+    BYTES -.-> H2M
+    BYTES -.-> H3M
+
+    IO -.-> NET
+
+    TLS --> CLIENT
+    NET --> CLIENT
+    NET --> SERVER
+    POOL --> SERVER
+
+    H1 --> CLIENT
+    H2M --> CLIENT
+    H3M --> CLIENT
+    BODY --> CLIENT
+
+    H2M --> GRPC
+
+
+    %% ==================================================
+    %% Styling
+    %% ==================================================
+
+    classDef protocol font-weight:bold;
+    classDef core font-weight:bold;
+    classDef runtime font-weight:bold;
+
+    class H1M,H2M,H3M,QUIC,WS,GRPC protocol;
+    class HPACK,CRYPTO,DEFLATE,FP,BYTES,IO,ERR core;
+    class TLS,NET,POOL,CLIENT,SERVER,BODY,H1 runtime;
 ```
 
 ## Benchmarks
@@ -461,11 +531,12 @@ protocol stack.
 
 Counts below are per test binary, so they can be checked one-to-one against a run:
 
-- **418 unit tests** (`cargo test --lib`): all HPACK RFC vectors (C.2/C.3/C.4/C.6), Huffman encode/decode (plus a decode output cap), frame codec, state machine, flow control, WUCS scheduling, JA3/JA4 comparison against published records, fingerprint parsing, TLS 1.3 handshake + RFC 8448 key schedule, TLS 1.2 handshake (ECDHE-RSA/ECDSA AEAD suites, PRF, RFC 5746 renegotiation echo, Ed25519 ServerKeyExchange signing/verification), X.25519/Ed25519/ECDSA/RSA primitives, the DEFLATE/gzip codec (round-trips, CRC-32 vectors, corruption rejection, output-cap enforcement, cross-checked against Python zlib output, and the far-distance vectors that exercise distance codes 22-29), the **WebSocket engine** (mask phase tables, minimal-length encodings, control-frame rules, incremental UTF-8 validation, handshake parsing, the shared close flag, RFC 7692 negotiation), the poller's wake-descriptor (self-pipe) semantics and its closed-descriptor contract, the h2 pool's weighted-load accounting, the `application/x-www-form-urlencoded` codec (the WHATWG passthrough set, `+`/`%XX` round trips, refusal of malformed escapes and non-UTF-8), the field-value character class that h1/h2/h3 share, the `NewSessionTicket` wire format walked field by field against RFC 8446 §4.6.1 (the empty extension vector is still a vector), and the rule that an armed read deadline surfaces as `Timeout` on every platform.
-- **69 integration tests** (`tests/integration.rs`): real loopback TCP round trips for h1/h2/HTTPS, keep-alive reuse, chunked, redirects, h2 concurrent multiplexing, streaming responses, large-body flow-control round trips, gRPC unary/server/client/bidi streaming + error status + trailers + deadline enforcement + gzip round-trip, `grpc.health.v1.Health` `Check` + `Watch`, RFC 7540 §3.2 `h2c` Upgrade, concurrency proofs (a slow stream does not block its connection's other streams; many idle streams consume one worker; an idle-connection herd does not block fresh requests; the event scheduler reaps slow-loris connections and enforces `max_connections`; server-streaming responses flush on a short cadence; one h2 connection serves a concurrent burst without command starvation), **request building** (every verb through `Client::request` and the shorthands, `query`/`form` encoding, basic/bearer auth, client default headers and the field that overrides them, default credentials stripped on a cross-origin redirect, per-request deadlines over h1 and h2 that leave the connection reusable, and a CR/LF-carrying header value refused by h1 and h2 alike), **h1 framing regressions** (a `Content-Length: 0` request is answered instead of parked; a HEAD response ends at its header block), and **TLS policy / hardening** (trust rejection, expired certificate, untrusted-issuer chain, self-signed-but-explicitly-trusted, hostname mismatch, ALPN agreement, TLS 1.2 + TLS 1.3 round trips with RSA / P-384 / Ed25519 identities, a TLS 1.3-only client refusing a TLS 1.2 server — no silent downgrade — and the RFC 8446 downgrade sentinel, interrupted-handshake failure, malformed-TLS-input survival, `verify:false`).
+- **439 unit tests** (`cargo test --lib`): all HPACK RFC vectors (C.2/C.3/C.4/C.6), Huffman encode/decode (plus a decode output cap), frame codec, state machine, flow control, WUCS scheduling, JA3/JA4 comparison against published records, fingerprint parsing, TLS 1.3 handshake + RFC 8448 key schedule, TLS 1.2 handshake (ECDHE-RSA/ECDSA AEAD suites, PRF, RFC 5746 renegotiation echo, Ed25519 ServerKeyExchange signing/verification), X.25519/Ed25519/ECDSA/RSA primitives, the DEFLATE/gzip codec (round-trips, CRC-32 vectors, corruption rejection, output-cap enforcement, cross-checked against Python zlib output, and the far-distance vectors that exercise distance codes 22-29), the **WebSocket engine** (mask phase tables, minimal-length encodings, control-frame rules, incremental UTF-8 validation, handshake parsing, the shared close flag, RFC 7692 negotiation), the poller's wake-descriptor (self-pipe) semantics and its closed-descriptor contract, the h2 pool's weighted-load accounting, the `application/x-www-form-urlencoded` codec (the WHATWG passthrough set, `+`/`%XX` round trips, refusal of malformed escapes and non-UTF-8), the field-value character class that h1/h2/h3 share, the `NewSessionTicket` wire format walked field by field against RFC 8446 §4.6.1 (the empty extension vector is still a vector), and the rule that an armed read deadline surfaces as `Timeout` on every platform, the PEM reader (armour rules, the three private-key containers), `Identity` loading (PEM/DER validation, a key that does not match its certificate, `Debug` printing the key's length instead of its bytes), the body-framing guard that refuses a message carrying both `Transfer-Encoding` and `Content-Length` (RFC 9112 §6.1 / CWE-444), and redirect resolution against the RFC 3986 §5.4 reference vectors.
+- **76 integration tests** (`tests/integration.rs`): real loopback TCP round trips for h1/h2/HTTPS, keep-alive reuse, chunked, redirects, h2 concurrent multiplexing, streaming responses, large-body flow-control round trips, gRPC unary/server/client/bidi streaming + error status + trailers + deadline enforcement + gzip round-trip, `grpc.health.v1.Health` `Check` + `Watch`, RFC 7540 §3.2 `h2c` Upgrade, concurrency proofs (a slow stream does not block its connection's other streams; many idle streams consume one worker; an idle-connection herd does not block fresh requests; the event scheduler reaps slow-loris connections and enforces `max_connections`; server-streaming responses flush on a short cadence; one h2 connection serves a concurrent burst without command starvation), **request building** (every verb through `Client::request` and the shorthands, `query`/`form` encoding, basic/bearer auth, client default headers and the field that overrides them, default credentials stripped on a cross-origin redirect, per-request deadlines over h1 and h2 that leave the connection reusable, and a CR/LF-carrying header value refused by h1 and h2 alike), **h1 framing regressions** (a `Content-Length: 0` request is answered instead of parked; a HEAD response ends at its header block), and **TLS policy / hardening** (trust rejection, expired certificate, untrusted-issuer chain, self-signed-but-explicitly-trusted, hostname mismatch, ALPN agreement, TLS 1.2 + TLS 1.3 round trips with RSA / P-384 / Ed25519 identities, a TLS 1.3-only client refusing a TLS 1.2 server — no silent downgrade — and the RFC 8446 downgrade sentinel, interrupted-handshake failure, malformed-TLS-input survival, `verify:false`), and **PEM identity loading** (a server booted from the OpenSSL `tests/certs/*.pem` fixtures serves a request; a chain with an intermediate loads as two certificates; a key taken from another certificate is refused at load time), and the **request-smuggling guard** (a request carrying both framings is answered `400` by *both* drivers, with the bytes pipelined behind it never parsed as a second request) together with relative `Location` resolution against the request path (RFC 3986 §5.2).
 - **14 HTTP/3 tests** (`tests/h3.rs` + `tests/h3_key_update.rs`): QUIC v1 + TLS 1.3 over real UDP sockets through the public `Client`/`Server` — GET/POST round trips, pooled connection reuse, 256 KiB request/response flow control in both directions, concurrent multiplexing, per-request deadline enforcement, a HEAD response that does not wait for the handler's streaming body, bidirectional key update, and H3 TLS security (untrusted / expired / wrong-chain / hostname-mismatch certificates all rejected at the handshake).
 - **39 HTTP/2 hardening tests** (`tests/h2_hardening.rs`): hostile-frame inputs (oversized frames, malformed SETTINGS/PING/WINDOW_UPDATE, padding that overruns a field block, a stream-level zero-increment `WINDOW_UPDATE` staying a stream error, `WINDOW_UPDATE` on an idle stream, flow-control window overflow, HPACK header-list and Huffman bombs, truncated/EOS Huffman, pseudo-header ordering, `content-length` mismatches, forbidden `transfer-encoding`/`connection`-specific headers, a field value carrying NUL/CR/LF reported as a stream error rather than a connection error, `SETTINGS_MAX_CONCURRENT_STREAMS` enforcement on both ends, `h2c` liveness: SETTINGS_TIMEOUT and keepalive dead-peer detection).
 - **34 WebSocket end-to-end tests** (`tests/ws.rs`): the real server, the real client and a real socket, covering the upgrade handshake (including the RFC 6455 accept-key vector), masking in both directions, fragmentation with interleaved control frames, `permessage-deflate` negotiation and RFC 7692 interop, UTF-8 failure codes, close-handshake cleanliness, `wss://` over the crate's TLS, push from another thread, client default headers on the handshake, Origin / subprotocol policy, the frame/message/queue limits, and the reactor regressions (a closed connection must not park the connections that are still open; a healthy reactor reports zero wait recoveries).
+- **6 proxy tests** (`tests/proxy.rs`): the client against an HTTP proxy written with the standard library alone, so the client is the only implementation under test — a `CONNECT` tunnel for `https://` with the credentials visible to the proxy and absent at the origin, the absolute request form for `http://` (including `OPTIONS *` travelling as the empty-path absolute form, RFC 9110 §9.3.7), a request's own `Proxy-Authorization` winning over the configured one with exactly one field on that hop, a refused `CONNECT` surfacing the proxy's `403`, and `http3`/`h2c` + proxy refused before a socket is opened.
 - **4 fuzz targets** (`cargo-fuzz`): `h2_frame`, `hpack_block`, plus **`h1_request`** (the shared request/header/chunked path used by both server parsers) and **`h2_connection`** (the full h2 state machine driven by hostile frame streams in both roles). A nightly long-fuzz workflow runs each with a wall-clock budget; a PR-time smoke run covers the same targets in `benchmark.yml`.
 
 ```bash

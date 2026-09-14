@@ -263,6 +263,15 @@ pub fn body_length(
             te_count += 1;
         }
     }
+    if any_te && headers.contains_key("content-length") {
+        // RFC 9112 §6.1: a message carrying *both* framings "might
+        // indicate an attempt to perform request smuggling ... and ought
+        // to be handled as an error". Two peers can read the same bytes
+        // as two different messages — that is the whole mechanism of a
+        // desync (CWE-444) — so this stack refuses the message instead
+        // of picking a winner that a neighbour might not pick.
+        return Err(Error::protocol("both transfer-encoding and content-length"));
+    }
     if any_te {
         match chunked_pos {
             Some(i) if i == te_count - 1 => return Ok(BodyLen::Chunked),
@@ -666,13 +675,18 @@ mod tests {
         );
     }
 
+    /// RFC 9112 §6.1 / CWE-444: a message carrying both framings is a
+    /// smuggling attempt, not a precedence question — it is refused in
+    /// either field order, for requests and responses alike.
     #[test]
-    fn transfer_encoding_wins_over_content_length() {
+    fn both_framings_rejected_as_smuggling() {
         let h = headers(&[("transfer-encoding", "chunked"), ("content-length", "5")]);
-        assert_eq!(
-            body_length(&h, Some(&Method::POST), None).unwrap(),
-            BodyLen::Chunked
-        );
+        assert!(body_length(&h, Some(&Method::POST), None).is_err());
+        let h = headers(&[("content-length", "5"), ("transfer-encoding", "chunked")]);
+        assert!(body_length(&h, Some(&Method::POST), None).is_err());
+        // A response with both is the same desync in the other direction.
+        let h = headers(&[("transfer-encoding", "chunked"), ("content-length", "5")]);
+        assert!(body_length(&h, None, Some(StatusCode::OK)).is_err());
     }
 
     /// A chunk-size line too large for `usize` must be rejected with

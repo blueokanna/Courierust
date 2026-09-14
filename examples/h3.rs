@@ -27,20 +27,15 @@ use courierust::courierust_server::{Server, ServerConfig, TlsSettings as ServerT
 use std::time::{Duration, Instant};
 
 const CERT_DER: &[u8] = include_bytes!("../tests/certs/server_cert.der");
-const KEY_DER: &[u8] = include_bytes!("../tests/certs/server_key.der");
 
 fn main() -> courierust::Result<()> {
-    let identity = courierust::courierust_tls::Identity {
-        cert_chain: vec![CERT_DER.to_vec()],
-        private_key: KEY_DER.to_vec(),
-        is_rsa: false, // Ed25519
-    };
+    // The server identity is the PEM pair from the fixtures; only the
+    // ALPN list differs from the HTTPS example (QUIC requires `h3`).
     let server_cfg = ServerConfig {
         http3: true,
         tls: Some(ServerTls {
-            identity,
             alpn: vec![b"h3".to_vec()],
-            ..Default::default()
+            ..ServerTls::from_pem_file("tests/certs/server_cert.pem", "tests/certs/server_key.pem")?
         }),
         ..Default::default()
     };

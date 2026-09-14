@@ -44,13 +44,15 @@ fn load_identity() -> courierust::courierust_tls::Identity {
         .expect("COURIERUST_NETWORK_CERT_DER is required for TLS server mode");
     let key_path = std::env::var("COURIERUST_NETWORK_KEY_DER")
         .expect("COURIERUST_NETWORK_KEY_DER is required for TLS server mode");
-    courierust::courierust_tls::Identity {
-        cert_chain: vec![std::fs::read(&cert_path)
-            .unwrap_or_else(|e| panic!("read certificate {cert_path}: {e}"))],
-        private_key: std::fs::read(&key_path)
-            .unwrap_or_else(|e| panic!("read private key {key_path}: {e}")),
-        is_rsa: env_bool("COURIERUST_NETWORK_CERT_RSA"),
-    }
+    let cert = std::fs::read(&cert_path)
+        .unwrap_or_else(|e| panic!("read certificate {cert_path}: {e}"));
+    let key = std::fs::read(&key_path)
+        .unwrap_or_else(|e| panic!("read private key {key_path}: {e}"));
+    // `from_der` proves the pair belongs together; the key type (RSA or
+    // not) is read off the key instead of being declared by the caller.
+    courierust::courierust_tls::Identity::from_der(vec![cert], key).unwrap_or_else(|e| {
+        panic!("{cert_path} and {key_path} are not a usable certificate/key pair: {e}")
+    })
 }
 
 fn now_unix() -> i64 {

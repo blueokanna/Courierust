@@ -12,7 +12,7 @@ HTTP/1.x wire helpers shared by the client and the server: request-line parsing,
 
 - `parse_request_line` — strict three-token request line.
 - `read_headers_scratch` — header block reading against caps (line/header-count/block-size), reusing a `Scratch` so a keep-alive steady state allocates no *scratch* buffer per request (the fields themselves still land in the `HeaderMap`).
-- `body_length` — decides `None` / `Content-Length` / `chunked` from the method + headers.
+- `body_length` — decides `None` / `Content-Length` / `chunked` from the method + headers. A message carrying **both** framings is *refused*, not resolved (RFC 9112 §6.1, CWE-444): two peers reading the same bytes as two different messages is exactly how a request-smuggling desync is built, so this layer never picks a winner a neighbour might not pick. Duplicate `Content-Length` fields with differing values, a repeated `chunked`, and a `chunked` that is not the final coding are refused for the same reason. `HTTP/2` and `HTTP/3` forbid `transfer-encoding` outright and are rejected there.
 - `read_body_fixed_scratch` / `read_body_chunked_scratch` — bounded body reads (a huge advertised length is rejected up front, not waited for).
 - `parse_chunk_size` — the single authority for chunk sizes, shared by the blocking and event-driven paths. The size is strictly `1*HEXDIG` (RFC 9112 §7.1): a sign, leading space, or a non-hex digit in the size is rejected instead of being parsed leniently.
 - `write_request_head` / `write_response_head` — serialization.

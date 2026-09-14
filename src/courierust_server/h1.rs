@@ -44,23 +44,22 @@ pub(crate) fn serve(
         let rl = match courierust_h1::parse_request_line(line) {
             Ok(rl) => rl,
             Err(e) => {
-                // A malformed request line gets an answer, not a silent
+                // A malformed request gets an answer, not a silent
                 // disconnect: a client (or a proxy in front) that sends a
                 // bad request should learn that, and a silent close is
                 // indistinguishable from a network failure.
-                write_early_error(&mut writer, 400, "bad request")?;
-                let _ = writer.flush();
-                stream.linger_close(LINGER_BUDGET, LINGER_DEADLINE);
+                refuse(&mut writer, stream, &e)?;
                 return Err(e);
             }
         };
-        let headers = courierust_h1::read_headers_scratch(&mut reader, &mut scratch)?;
+        let headers = match courierust_h1::read_headers_scratch(&mut reader, &mut scratch) {
+            Ok(headers) => headers,
+            Err(e) => {
+                refuse(&mut writer, stream, &e)?;
+                return Err(e);
+            }
+        };
 
-        // RFC 9112 §3.2: an HTTP/1.1 request must carry exactly one,
-        // non-empty `Host` field. Checking it *before* the body is read
-        // means an ambiguous request cannot reach a handler or pin a body
-        // buffer, and a proxy in front never has to guess which authority
-        // the request meant.
         let mut early = courierust_h1::host_header_error(rl.version, &headers)
             .map(|reason| error_response(400, reason));
         let refuses_early = early.is_some();
@@ -69,28 +68,37 @@ pub(crate) fn serve(
         let body = if early.is_some() {
             Body::Empty
         } else {
-            match courierust_h1::body_length(&headers, Some(&rl.method), None)? {
-                courierust_h1::BodyLen::None => Body::Empty,
-                courierust_h1::BodyLen::Length(n) => {
-                    Body::Bytes(courierust_h1::read_body_fixed_scratch(
-                        &mut reader,
-                        n,
-                        config.max_body,
-                        &mut scratch,
-                    )?)
+            let framed = match courierust_h1::body_length(&headers, Some(&rl.method), None) {
+                Ok(framed) => framed,
+                Err(e) => {
+                    refuse(&mut writer, stream, &e)?;
+                    return Err(e);
                 }
-                courierust_h1::BodyLen::Chunked => {
-                    Body::Bytes(courierust_h1::read_body_chunked_scratch(
-                        &mut reader,
-                        config.max_body,
-                        &mut scratch,
-                    )?)
+            };
+            let read = match framed {
+                courierust_h1::BodyLen::None => Ok(Body::Empty),
+                courierust_h1::BodyLen::Length(n) => courierust_h1::read_body_fixed_scratch(
+                    &mut reader,
+                    n,
+                    config.max_body,
+                    &mut scratch,
+                )
+                .map(Body::Bytes),
+                courierust_h1::BodyLen::Chunked => courierust_h1::read_body_chunked_scratch(
+                    &mut reader,
+                    config.max_body,
+                    &mut scratch,
+                )
+                .map(Body::Bytes),
+            };
+            match read {
+                Ok(body) => body,
+                Err(e) => {
+                    refuse(&mut writer, stream, &e)?;
+                    return Err(e);
                 }
             }
         };
-        // RFC 7230 §6.3: a request carrying `Connection: close` forces the
-        // connection closed after this response, regardless of the
-        // response's own keep-alive hints.
         let request_close = courierust_h1::wants_close(&headers);
         let req = Request {
             method: rl.method,
@@ -100,11 +108,6 @@ pub(crate) fn serve(
             body,
         };
 
-        // ---- WebSocket upgrade -------------------------------------
-        // Decided *before* the normal handler runs, so the policy checks
-        // (origin, subprotocol, extensions, version) can inspect the very
-        // request the client sent. When the upgrade is accepted this call
-        // never returns: the connection becomes a framed byte stream.
         if early.is_none()
             && config.websocket.enabled
             && crate::courierust_ws::is_websocket_upgrade(&req.headers)
@@ -130,11 +133,6 @@ pub(crate) fn serve(
                             )?;
                             writer.write_all(bytes)?;
                             writer.flush()?;
-                            // The reader still holds any bytes the client
-                            // pipelined behind the handshake — hand it to
-                            // the session so none are lost. Frame traffic
-                            // is read in much larger chunks than a request
-                            // head, so the buffer grows first.
                             let mut reader = reader;
                             reader.ensure_capacity(config.websocket.read_buffer);
                             return ws::serve_blocking(
@@ -151,20 +149,36 @@ pub(crate) fn serve(
             }
         }
 
-        // RFC 9112 §6.3: the response to HEAD is the response to GET
-        // with the content left out, and `req` is moved into the handler
-        // below.
+        if early.is_none() {
+            match handler.tunnel(&req) {
+                crate::courierust_server::TunnelReply::Pass => {}
+                crate::courierust_server::TunnelReply::Refuse(resp) => early = Some(resp),
+                crate::courierust_server::TunnelReply::Accept(plan) => {
+                    let head = scratch.body();
+                    courierust_h1::write_response_head(
+                        head,
+                        plan.status,
+                        Version::HTTP_11,
+                        &plan.headers,
+                    )?;
+                    writer.write_all(head)?;
+                    writer.flush()?;
+                    drop(writer);
+                    let secure = config.tls.is_some();
+                    let conn =
+                        crate::courierust_server::TunnelConn::new(stream.clone(), reader, secure);
+                    plan.service.run(conn);
+                    return Ok(());
+                }
+            }
+        }
+
         let is_head = req.method == crate::courierust_http::method::Method::HEAD;
         let resp = match early {
             Some(resp) => resp,
             None => handler.handle(req),
         };
 
-        // RFC 7540 §3.2: an `h2c` Upgrade request switches this connection
-        // to HTTP/2 (when the server is configured to speak h2). The
-        // handler's response to the upgrade request is delivered on h2
-        // stream 1. An h1-only server ignores the Upgrade and answers
-        // normally.
         if upgrade && config.http2 {
             let out =
                 b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n";
@@ -185,8 +199,6 @@ pub(crate) fn serve(
         let keep_alive = response_wire_head(&resp, request_close, head)?;
         writer.write_all(head)?;
         match resp.body {
-            // RFC 9112 §6.3: the header fields above are what a GET would
-            // send; the content is not sent at all.
             _ if is_head => {}
             Body::Empty => {}
             Body::Bytes(b) => {
@@ -196,17 +208,11 @@ pub(crate) fn serve(
                 stream_response(&mut writer, rx, config.read_timeout)?;
             }
             Body::Stream(stream) => {
-                // The blocking driver waits on the channel itself (one
-                // thread per connection is this model's contract), so the
-                // wake handle is not installed here.
                 stream_response(&mut writer, stream.into_receiver(), config.read_timeout)?;
             }
         }
         writer.flush()?;
         if refuses_early {
-            // The peer is likely still sending a body we chose not to
-            // read; draining a bounded amount keeps the response from
-            // being destroyed by a RST on Linux.
             stream.linger_close(LINGER_BUDGET, LINGER_DEADLINE);
         }
 
@@ -299,6 +305,51 @@ pub(crate) fn error_response(status: u16, message: &str) -> Response<Body> {
     resp
 }
 
+/// The status a malformed request deserves, or `None` when the failure is
+/// not the client's to fix (and the connection is simply closed).
+///
+/// The status is the honest one: a protocol error is a `400`, a header
+/// block or request line over the limit is a `431`, and a body over the
+/// limit is a `413`. Both drivers use this mapping — which one runs
+/// depends on `ServerConfig::event_driven`, and a client must not be able
+/// to tell the difference by the *absence* of a `400`.
+pub(crate) fn refusal_status(e: &Error) -> Option<u16> {
+    use crate::courierust_error::ErrorKind;
+    match e.kind {
+        ErrorKind::Protocol => Some(400),
+        ErrorKind::Overflow => {
+            let header = e
+                .message
+                .as_deref()
+                .map(|m| m.contains("header") || m.contains("line"))
+                .unwrap_or(false);
+            Some(if header { 431 } else { 413 })
+        }
+        _ => None,
+    }
+}
+
+/// Answer a request that could not be parsed, then linger briefly before
+/// the connection is dropped, and hand the error back for the caller to
+/// propagate.
+///
+/// A silent close is indistinguishable from a network failure, so a peer
+/// that sent something malformed is told; what it is *not* given is the
+/// chance to have the unread tail of its bytes parsed as a second request
+/// — the response says `Connection: close` and the connection is gone.
+fn refuse(
+    writer: &mut BufWriter<Arc<ConnStream>>,
+    stream: &Arc<ConnStream>,
+    error: &Error,
+) -> Result<()> {
+    if let Some(status) = refusal_status(error) {
+        write_early_error(writer, status, "bad request")?;
+        let _ = writer.flush();
+        stream.linger_close(LINGER_BUDGET, LINGER_DEADLINE);
+    }
+    Ok(())
+}
+
 /// Write an error response for a request that failed to parse, where the
 /// normal response path (which needs a parsed `Request`) cannot be used.
 ///
@@ -325,8 +376,6 @@ fn write_early_error(
         HeaderValue::from_static("close"),
     );
     let mut scratch = Scratch::new();
-    // `Scratch::body()` clears the buffer on every call, so the slice must
-    // be taken once and used for both the write and the send.
     let head = scratch.body();
     courierust_h1::write_response_head(
         head,

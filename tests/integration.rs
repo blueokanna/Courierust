@@ -89,6 +89,68 @@ fn echo_handler(
     resp
 }
 
+/// The embedder path: the caller binds, accepts, and hands each socket to
+/// `serve_connection` — the shape a proxy needs when it has to decide on a
+/// connection (peer address, limits, its own accounting) before the engine
+/// sees it. The engine's behaviour must not depend on who owns the loop,
+/// so this drives a plain HTTP/1.1 request through an accept loop written
+/// right here.
+#[test]
+fn serve_connection_drives_a_caller_owned_accept_loop() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = ServerConfig {
+        threads: 1,
+        ..Default::default()
+    };
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            let config = config.clone();
+            std::thread::spawn(move || {
+                let _ =
+                    courierust::courierust_server::serve_connection(stream, &echo_handler, &config);
+            });
+        }
+    });
+
+    let client = Client::new();
+    let resp = client.get(&format!("http://{addr}/embedded")).unwrap();
+    assert_eq!(resp.status.as_u16(), 200);
+    assert_eq!(
+        resp.headers.get("x-method").unwrap().to_str().unwrap(),
+        "GET"
+    );
+}
+
+/// The other half of the same handle: a listener bound by the caller is
+/// adopted with `Server::from_listener`, and everything after that —
+/// background serving, the reported `local_addr`, the request loop — is
+/// the same server `bind_with_config` would have produced.
+#[test]
+fn server_adopts_a_caller_bound_listener() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = Server::from_listener(
+        listener,
+        ServerConfig {
+            threads: 1,
+            ..Default::default()
+        },
+    )
+    .expect("adopt the bound listener");
+    assert_eq!(server.local_addr().unwrap(), addr);
+    let handle = server.serve_background(echo_handler).unwrap();
+    std::mem::forget(handle); // keep serving for the test process
+
+    let client = Client::new();
+    let resp = client
+        .post(&format!("http://{addr}/adopted"), "hi")
+        .unwrap();
+    assert_eq!(resp.status.as_u16(), 200);
+    assert_eq!(resp.body.collect().unwrap().to_str().unwrap(), "hi");
+}
+
 #[test]
 fn h1_get_and_post_roundtrip() {
     let base = spawn_server(ServerConfig::default(), echo_handler);
@@ -859,6 +921,112 @@ fn https_client_config(http2: bool) -> ClientConfig {
     }
 }
 
+/// The PEM loader against the real OpenSSL fixtures: a server booted from
+/// `server_cert.pem` + `server_key.pem` completes a handshake and serves
+/// a request. Parsing alone would not prove this — the pair has to
+/// *serve*, and it does so to the same client that validates the DER twin
+/// against `common::root_store()`.
+#[test]
+fn https_server_boots_from_openssl_pem_fixtures() {
+    let config = ServerConfig {
+        threads: 1,
+        tls: Some(
+            ServerTls::from_pem_file("tests/certs/server_cert.pem", "tests/certs/server_key.pem")
+                .expect("the fixture PEM pair must load"),
+        ),
+        ..Default::default()
+    };
+    let base = spawn_tls_server(config, echo_handler);
+    let client = Client::with_config(https_client_config(false));
+    let resp = client.get(&format!("{base}/pem")).unwrap();
+    assert_eq!(resp.status.as_u16(), 200);
+    assert_eq!(
+        resp.headers.get("x-method").unwrap().to_str().unwrap(),
+        "GET"
+    );
+}
+
+/// A PEM chain file with an intermediate loads as a two-certificate
+/// chain, and a key from a different certificate is refused when it is
+/// loaded — the failure a deployment wants at startup, not once per
+/// client. The P-384 key is what OpenSSL writes for `EC PRIVATE KEY`
+/// (SEC1), so this is also the fixture that exercises that container.
+#[test]
+fn pem_identity_loads_a_chain_and_refuses_a_mismatched_key() {
+    let leaf = std::fs::read_to_string("tests/certs/p384_leaf_cert.pem").unwrap();
+    let intermediate = std::fs::read_to_string("tests/certs/p384_intermediate_cert.pem").unwrap();
+    let key = std::fs::read_to_string("tests/certs/p384_leaf_key.pem").unwrap();
+    let identity =
+        courierust::courierust_tls::Identity::from_pem(&format!("{leaf}{intermediate}"), &key)
+            .expect("leaf + intermediate + key");
+    assert_eq!(identity.cert_chain().len(), 2);
+    assert!(!identity.is_rsa());
+
+    let err = courierust::courierust_tls::Identity::from_pem(
+        &std::fs::read_to_string("tests/certs/server_cert.pem").unwrap(),
+        &key,
+    )
+    .expect_err("an Ed25519 certificate with a P-384 key must be refused");
+    assert!(err.to_string().contains("does not match"), "{err}");
+
+    // The trust side of the same story: roots come from files too.
+    let mut roots = courierust::courierust_tls::RootStore::new();
+    assert_eq!(
+        roots.add_pem_file("tests/certs/server_cert.pem").unwrap(),
+        1
+    );
+    assert!(roots
+        .add_pem_file("tests/certs/does-not-exist.pem")
+        .is_err());
+}
+
+/// mTLS through the public configuration surface. The server requires a
+/// client certificate and the client presents one, so the request is
+/// served; the same server refuses a client that offers none. This is the
+/// wiring test: `ServerTls::client_auth` on one side, `ClientTls::identity`
+/// on the other, with the handshake policy in between.
+#[test]
+fn https_server_requires_a_client_certificate() {
+    let config = ServerConfig {
+        threads: 1,
+        tls: Some(ServerTls {
+            identity: common::server_identity(),
+            alpn: vec![b"http/1.1".to_vec()],
+            client_auth: Some(courierust::courierust_tls::ClientAuth::required(
+                common::root_store(),
+            )),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let base = spawn_tls_server(config, echo_handler);
+
+    let authenticated = Client::with_config(ClientConfig {
+        tls: Some(ClientTls {
+            roots: common::root_store(),
+            verify: true,
+            alpn: vec![b"http/1.1".to_vec()],
+            now: common::NOW,
+            identity: Some(common::server_identity()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let resp = authenticated.get(&format!("{base}/mtls")).unwrap();
+    assert_eq!(resp.status.as_u16(), 200);
+
+    // The anonymous client is refused: `certificate_required` may surface
+    // as an error, and must never become a served response.
+    let anonymous = Client::with_config(https_client_config(false));
+    if let Ok(resp) = anonymous.get(&format!("{base}/mtls")) {
+        assert_ne!(
+            resp.status.as_u16(),
+            200,
+            "a client without a certificate must not be served"
+        );
+    }
+}
+
 #[test]
 fn https_h1_get_and_post_roundtrip() {
     let base = spawn_tls_server(https_server_config(false), echo_handler);
@@ -1128,11 +1296,11 @@ fn root_store_from_der(cert_der: &[u8]) -> courierust::courierust_tls::RootStore
 /// client explicitly trusts it.
 #[test]
 fn tls_rejects_expired_certificate() {
-    let expired_identity = courierust::courierust_tls::Identity {
-        cert_chain: vec![include_bytes!("certs/expired_cert.der").to_vec()],
-        private_key: include_bytes!("certs/expired_key.der").to_vec(),
-        is_rsa: false,
-    };
+    let expired_identity = courierust::courierust_tls::Identity::from_der(
+        vec![include_bytes!("certs/expired_cert.der").to_vec()],
+        include_bytes!("certs/expired_key.der").to_vec(),
+    )
+    .expect("valid test identity");
     let base = spawn_tls_server_with_identity(expired_identity, vec![b"http/1.1".to_vec()]);
     let client = Client::with_config(ClientConfig {
         http2: false,
@@ -1161,17 +1329,14 @@ fn tls_rejects_expired_certificate() {
 /// chain does not anchor to any trusted root.
 #[test]
 fn tls_rejects_untrusted_issuer_chain() {
-    let wrong_chain_identity = courierust::courierust_tls::Identity {
-        // Leaf signed by `ca_other` (NOT in the client's trust store);
-        // the presented chain is leaf + its issuer so the chain walk is
-        // exercised, not just the anchor fallback.
-        cert_chain: vec![
+    let wrong_chain_identity = courierust::courierust_tls::Identity::from_der(
+        vec![
             include_bytes!("certs/wrong_chain_cert.der").to_vec(),
             include_bytes!("certs/ca_other_cert.der").to_vec(),
         ],
-        private_key: include_bytes!("certs/wrong_chain_key.der").to_vec(),
-        is_rsa: false,
-    };
+        include_bytes!("certs/wrong_chain_key.der").to_vec(),
+    )
+    .expect("valid test identity");
     let base = spawn_tls_server_with_identity(wrong_chain_identity, vec![b"http/1.1".to_vec()]);
     // The client trusts only the real test root; the leaf's issuer is a
     // different, untrusted CA, so chain building must fail.
@@ -2847,6 +3012,51 @@ fn default_credentials_do_not_cross_origins() {
     );
 }
 
+/// A `Location` is a URI-reference, not necessarily an absolute URL: a
+/// relative one resolves against the *request path's directory*, and dot
+/// segments are removed before the target is sent. This drives both cases
+/// through a real server, because a client that retries the wrong
+/// resource is indistinguishable from a working one until it matters.
+#[test]
+fn client_resolves_relative_redirect_locations() {
+    fn handler(
+        req: courierust::courierust_http::request::Request<Body>,
+    ) -> courierust::courierust_http::response::Response<Body> {
+        let target = match req.uri.as_str() {
+            "/dir/start" => "next?q=1", // relative path + query
+            "/a/b/start" => "../other", // dot segments
+            _ => return meta_handler(req),
+        };
+        let mut resp =
+            courierust::courierust_http::response::Response::<Body>::with_status(302.into());
+        resp.headers.insert(
+            courierust::courierust_http::header::HeaderName::from_lowercase("location"),
+            courierust::courierust_http::header::HeaderValue::from_bytes(target.as_bytes())
+                .unwrap(),
+        );
+        resp
+    }
+
+    let base = spawn_server(ServerConfig::default(), handler);
+    let client = Client::new();
+
+    let resp = client.get(&format!("{base}/dir/start")).unwrap();
+    assert_eq!(resp.status.as_u16(), 200);
+    assert_eq!(
+        resp.headers.get("x-target").unwrap().to_str().unwrap(),
+        "/dir/next?q=1",
+        "a relative location resolves inside the current directory"
+    );
+
+    let resp = client.get(&format!("{base}/a/b/start")).unwrap();
+    assert_eq!(resp.status.as_u16(), 200);
+    assert_eq!(
+        resp.headers.get("x-target").unwrap().to_str().unwrap(),
+        "/a/other",
+        "dot segments are removed before the target is used"
+    );
+}
+
 #[test]
 fn per_request_timeout_bounds_one_request_only() {
     let base = spawn_server(ServerConfig::default(), |req| {
@@ -3058,6 +3268,48 @@ fn h1_head_response_carries_headers_but_no_body() {
         resp.ends_with("\r\n\r\n"),
         "a HEAD response must end at its header block: {resp:?}"
     );
+}
+
+/// RFC 9112 §6.1 / CWE-444: a request carrying both `Transfer-Encoding:
+/// chunked` and `Content-Length` is refused with a `400`, and the bytes
+/// pipelined behind it are never parsed as a second request — that desync
+/// is the whole mechanism of a request-smuggling attack, so the server
+/// answers and then drops the connection instead of choosing a framing
+/// that a neighbour might not choose.
+#[test]
+fn h1_rejects_a_request_with_both_framings() {
+    let smuggled = "GET /smuggled HTTP/1.1\r\nHost: x\r\n\r\n";
+    let request = format!(
+        "POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 6\r\n\r\n\
+         0\r\n\r\n{smuggled}"
+    );
+
+    // Both drivers must answer the same way: which one runs depends only
+    // on `ServerConfig::event_driven`.
+    for event_driven in [true, false] {
+        let base = spawn_server(
+            ServerConfig {
+                event_driven,
+                threads: 1,
+                ..Default::default()
+            },
+            meta_handler,
+        );
+        let addr = base.trim_start_matches("http://");
+        let resp = raw_exchange(addr, &request);
+        assert!(
+            resp.starts_with("HTTP/1.1 400"),
+            "both framings must be refused (event_driven={event_driven}): {resp:?}"
+        );
+        assert!(
+            !resp.contains("x-target: /smuggled"),
+            "the pipelined bytes must not be served (event_driven={event_driven}): {resp:?}"
+        );
+        assert!(
+            !resp.contains("HTTP/1.1 200"),
+            "no request may be answered from that connection (event_driven={event_driven}): {resp:?}"
+        );
+    }
 }
 
 #[test]

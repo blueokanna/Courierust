@@ -700,11 +700,7 @@ fn compare_servers(
 
 /// A Courierust HTTP/3 (QUIC v1 + TLS 1.3, ALPN `h3`) server.
 fn h3_server(payload: Payload) -> SocketAddr {
-    let identity = courierust::courierust_tls::Identity {
-        cert_chain: vec![H3_SERVER_CERT_DER.to_vec()],
-        private_key: H3_SERVER_KEY_DER.to_vec(),
-        is_rsa: false,
-    };
+    let identity = courierust::courierust_tls::Identity::from_der(vec![H3_SERVER_CERT_DER.to_vec()], H3_SERVER_KEY_DER.to_vec()).expect("valid test identity");
     serve_courierust(
         ServerConfig {
             http3: true,

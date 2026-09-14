@@ -9,12 +9,28 @@
 //! loops. Setting [`ServerConfig::event_driven`] to `false` restores the
 //! legacy one-blocking-pool-job-per-connection model for comparison and
 //! debugging.
+//!
+//! There are two ways in, depending on who owns the accept loop:
+//!
+//! * [`Server`] binds (or adopts, via [`Server::from_listener`]) a
+//!   listener and runs the scheduler itself.
+//! * [`serve_connection`] drives **one** accepted connection — TLS, ALPN,
+//!   HTTP/1.1 / HTTP/2, WebSocket upgrades, tunnels — for a caller that
+//!   accepts the socket itself: a proxy gating connections by peer
+//!   address, a supervisor sharing one listener between services, or a
+//!   process that must bind before dropping privileges.
+//!
+//! Both paths run the same engine; the difference is only who calls
+//! `accept`.
 
 pub mod h1;
 pub mod h2;
+pub mod tunnel;
 pub mod ws;
 
 pub(crate) mod event;
+
+pub use tunnel::{TunnelConn, TunnelPlan, TunnelReply, TunnelService};
 
 use crate::courierust_body::Body;
 use crate::courierust_http::request::Request;
@@ -47,28 +63,70 @@ pub struct TlsSettings {
     /// fails) disables resumption rather than sealing tickets with a
     /// public constant.
     pub session_ticket_key: [u8; 32],
+    /// Client authentication (mTLS): when set, the server asks every
+    /// client for a certificate (RFC 8446 §4.4.2) and validates it
+    /// against the roots in [`crate::courierust_tls::ClientAuth`].
+    /// Implemented for TLS 1.3; an HTTP/3 listener rejects this setting
+    /// at startup rather than serving QUIC without it.
+    pub client_auth: Option<crate::courierust_tls::ClientAuth>,
 }
 
 impl Default for TlsSettings {
-    /// An empty identity with the default TLS 1.2..=1.3 window. This
-    /// exists so call sites can write `TlsSettings { identity, alpn,
-    /// ..Default::default() }`; the identity and ALPN are always provided
-    /// explicitly in practice.
+    /// [`Identity::empty`](crate::courierust_tls::Identity::empty) with
+    /// the default TLS 1.2..=1.3 window and an empty ALPN list. It exists
+    /// so call sites can write `TlsSettings { identity, alpn,
+    /// ..Default::default() }`; prefer [`TlsSettings::from_pem_file`]. A
+    /// server built on an empty identity is rejected when it is bound,
+    /// not answered with a failed handshake per connection.
     fn default() -> Self {
         let mut ticket_key = [0u8; 32];
         let _ = crate::courierust_tls::crypto::rng::fill_random(&mut ticket_key);
         Self {
-            identity: crate::courierust_tls::Identity {
-                cert_chain: Vec::new(),
-                private_key: Vec::new(),
-                is_rsa: false,
-            },
+            identity: crate::courierust_tls::Identity::empty(),
             alpn: Vec::new(),
             min_version: crate::courierust_tls::TlsVersion::Tls12,
             max_version: crate::courierust_tls::TlsVersion::Tls13,
             session_ticket_key: ticket_key,
+            client_auth: None,
         }
     }
+}
+
+impl TlsSettings {
+    /// TLS settings from a PEM certificate chain and a PEM private key,
+    /// with the ALPN offer a browser-facing HTTPS server wants: `h2`
+    /// first, then `http/1.1`.
+    ///
+    /// Both documents are validated by
+    /// [`Identity::from_pem`](crate::courierust_tls::Identity::from_pem) —
+    /// a key that does not match the leaf certificate fails *here*, at
+    /// startup, instead of failing every handshake later. Clear or replace
+    /// `alpn` afterwards to change the offer; an empty list disables ALPN,
+    /// and a TLS connection then never negotiates HTTP/2.
+    pub fn from_pem(cert_pem: &str, key_pem: &str) -> crate::courierust_tls::TlsResult<Self> {
+        Ok(Self {
+            identity: crate::courierust_tls::Identity::from_pem(cert_pem, key_pem)?,
+            alpn: default_alpn(),
+            ..Self::default()
+        })
+    }
+
+    /// [`TlsSettings::from_pem`] over two files.
+    pub fn from_pem_file(
+        cert_path: impl AsRef<std::path::Path>,
+        key_path: impl AsRef<std::path::Path>,
+    ) -> crate::courierust_tls::TlsResult<Self> {
+        Ok(Self {
+            identity: crate::courierust_tls::Identity::from_pem_file(cert_path, key_path)?,
+            alpn: default_alpn(),
+            ..Self::default()
+        })
+    }
+}
+
+/// The ALPN offer a TLS server starts with.
+fn default_alpn() -> Vec<Vec<u8>> {
+    vec![b"h2".to_vec(), b"http/1.1".to_vec()]
 }
 
 /// Server configuration.
@@ -203,6 +261,17 @@ pub trait Handler: Send + Sync + 'static {
     fn websocket(&self, _req: &Request<Body>) -> ws::WsUpgradeReply {
         ws::WsUpgradeReply::Pass
     }
+
+    /// Decide whether to tunnel this connection.
+    ///
+    /// Called before [`Handler::handle`] for every other request: returning
+    /// [`TunnelReply::Accept`] makes the server write the plan's response
+    /// head and then hand the connection — buffered bytes included — to a
+    /// [`TunnelService`], which owns it until it returns. This is how
+    /// `CONNECT`, `Upgrade: <token>` and gRPC-style raw pipes are served.
+    fn tunnel(&self, _req: &Request<Body>) -> TunnelReply {
+        TunnelReply::Pass
+    }
 }
 
 impl<F> Handler for F
@@ -284,16 +353,7 @@ pub struct Server {
 impl Server {
     /// Bind to `addr`.
     pub fn bind(addr: impl std::net::ToSocketAddrs) -> std::io::Result<Self> {
-        let (listener, h3_socket) = bind_listeners(addr, false)?;
-        Ok(Self {
-            listener,
-            pool: Arc::new(
-                ThreadPool::with_size(recommended_workers())
-                    .unwrap_or_else(|_| ThreadPool::with_size(2).expect("pool")),
-            ),
-            config: ServerConfig::default(),
-            h3_socket,
-        })
+        Self::bind_with_config(addr, ServerConfig::default())
     }
 
     /// Bind with a custom config.
@@ -302,17 +362,54 @@ impl Server {
         config: ServerConfig,
     ) -> std::io::Result<Self> {
         let (listener, h3_socket) = bind_listeners(addr, config.http3)?;
-        let size = if config.threads == 0 {
+        Self::adopt(listener, h3_socket, config)
+    }
+
+    /// Adopt a listener the caller already bound.
+    ///
+    /// For embedders that have to own the bind: a process that drops
+    /// privileges after binding, a supervisor (systemd socket activation,
+    /// a port shared between services), or a caller that wants the
+    /// descriptor first. Everything else behaves exactly like
+    /// [`Server::bind_with_config`], including the HTTP/3 socket: with
+    /// [`ServerConfig::http3`] the UDP socket is bound here on the
+    /// listener's port — the two must share it — so this call can still
+    /// fail where `bind_with_config` would have drawn another port.
+    pub fn from_listener(listener: TcpListener, config: ServerConfig) -> std::io::Result<Self> {
+        let h3_socket = if config.http3 {
+            let addr = listener.local_addr()?;
+            Some(crate::courierust_net::udp::bind_udp(addr)?)
+        } else {
+            None
+        };
+        Self::adopt(listener, h3_socket, config)
+    }
+
+    /// The single place a `Server` is assembled.
+    ///
+    /// The identity is checked here — once, at startup — rather than in
+    /// the handshake path: a TLS server with no certificate is a
+    /// configuration error, and the useful place for that error is the
+    /// call that created the server.
+    fn adopt(
+        listener: TcpListener,
+        h3_socket: Option<UdpSocket>,
+        config: ServerConfig,
+    ) -> std::io::Result<Self> {
+        if let Some(message) = identity_error(&config) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                message,
+            ));
+        }
+        let threads = if config.threads == 0 {
             recommended_workers()
         } else {
             config.threads
         };
         Ok(Self {
             listener,
-            pool: Arc::new(
-                ThreadPool::with_size(size)
-                    .unwrap_or_else(|_| ThreadPool::with_size(2).expect("pool")),
-            ),
+            pool: pool_for(threads),
             config,
             h3_socket,
         })
@@ -330,7 +427,15 @@ impl Server {
 
     /// Serve with the bound config, blocking.
     pub fn serve_with_config<H: Handler>(self, handler: H) -> std::io::Result<()> {
-        self.serve_inner(handler, None)
+        self.serve_inner(handler, None, ServerStop::new())
+    }
+
+    /// Serve with the bound config, blocking, until `stop` is requested.
+    ///
+    /// The same signal a [`ServerHandle`] carries, for a caller that wants
+    /// to run the accept loop on a thread it owns.
+    pub fn serve_with_stop<H: Handler>(self, handler: H, stop: ServerStop) -> std::io::Result<()> {
+        self.serve_inner(handler, None, stop)
     }
 
     /// Shared serve implementation. When `ready` is supplied, it receives
@@ -344,6 +449,7 @@ impl Server {
         self,
         handler: H,
         ready: Option<&std::sync::mpsc::Sender<std::io::Result<()>>>,
+        stop: ServerStop,
     ) -> std::io::Result<()> {
         let handler = Arc::new(handler);
         let config = self.config;
@@ -359,6 +465,17 @@ impl Server {
                     "ServerConfig.http3 requires a TLS identity",
                 )
             })?;
+            if tls.client_auth.is_some() {
+                // QUIC has its own handshake driver, and it does not
+                // implement client authentication: refuse at startup
+                // rather than serve QUIC connections that bypass the
+                // policy the operator asked for.
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "ServerConfig.http3 cannot enforce client authentication \
+                     (mTLS is implemented for TLS 1.3 over TCP)",
+                ));
+            }
             let socket = h3_socket.ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -385,14 +502,21 @@ impl Server {
         // Keep the HTTP/3 reactor handle alive for the whole serve loop.
         let _http3 = setup?;
         if config.event_driven {
-            return event::serve_event(self.listener, handler, config, pool);
+            return event::serve_event(self.listener, handler, config, pool, stop);
         }
         // Legacy pool model (event_driven = false): bound the number of
         // concurrently open connections with `max_connections`, so even
         // this deprecated path cannot be exhausted by a herd of idle /
         // slow clients. The default event path is the supported one.
         let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // A stop request has to reach a thread parked in `accept`: the
+        // handle keeps a second reference to the listener and connects to
+        // it, which makes the blocked accept return one throwaway socket.
+        stop.install_listener(self.listener.try_clone()?);
         for stream in self.listener.incoming() {
+            if stop.is_requested() {
+                break;
+            }
             match stream {
                 Ok(stream) => {
                     if let Some(s) = config.stats.as_deref() {
@@ -418,7 +542,7 @@ impl Server {
                     p.spawn(move || {
                         let _permit = permit;
                         // TLS handshakes (blocking) also run on the pool.
-                        let _ = serve_accepted(stream, h.as_ref(), &c);
+                        let _ = serve_connection(stream, h.as_ref(), &c);
                     });
                 }
                 Err(_) => continue,
@@ -432,19 +556,26 @@ impl Server {
     /// in `bind_with_config`, and an HTTP/3 server's UDP socket is bound
     /// in the server thread before this returns — so callers may connect
     /// to `local_addr()` immediately without racing the reactor.
+    ///
+    /// [`ServerHandle::stop`] shuts the server down; [`ServerHandle::join`]
+    /// waits for it. A server is never stopped by dropping the handle, so a
+    /// forgotten handle in a test cannot silently tear down a listener the
+    /// test is still using.
     pub fn serve_background<H: Handler>(self, handler: H) -> std::io::Result<ServerHandle> {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (tx, rx) = std::sync::mpsc::channel();
+        let stop = ServerStop::new();
+        let thread_stop = stop.clone();
         std::thread::Builder::new()
             .name("courierust-server".into())
             .spawn(move || {
-                let res = self.serve_inner(handler, Some(&ready_tx));
+                let res = self.serve_inner(handler, Some(&ready_tx), thread_stop);
                 let _ = tx.send(res);
             })?;
         // Block until the transport is ready, propagating a bind/setup
         // failure (e.g. an un-bindable HTTP/3 UDP port) to the caller.
         ready_rx.recv().unwrap_or(Ok(()))?;
-        Ok(ServerHandle { done: rx })
+        Ok(ServerHandle { done: rx, stop })
     }
 }
 
@@ -452,6 +583,33 @@ fn recommended_workers() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get().clamp(1, 8))
         .unwrap_or(4)
+}
+
+/// The worker pool a server starts with.
+///
+/// `ThreadPool::with_size` fails only when the OS refuses the thread, and
+/// a server that cannot spawn its pool cannot serve at all: fall back to
+/// the smallest pool that still makes progress instead of panicking in a
+/// constructor that is called before anything is listening.
+fn pool_for(threads: usize) -> Arc<ThreadPool> {
+    Arc::new(
+        ThreadPool::with_size(threads).unwrap_or_else(|_| ThreadPool::with_size(2).expect("pool")),
+    )
+}
+
+/// Why a configuration cannot serve TLS at all.
+///
+/// Checked by every entry point that creates a server or drives a
+/// connection, so an empty identity is one clear error at startup instead
+/// of one failed handshake per client.
+fn identity_error(config: &ServerConfig) -> Option<&'static str> {
+    match config.tls.as_ref() {
+        Some(tls) if tls.identity.is_empty() => Some(
+            "TLS is enabled but the identity is empty: load a certificate/key pair with \
+             Identity::from_pem_file (or Identity::from_pem)",
+        ),
+        _ => None,
+    }
 }
 
 fn try_reserve(active: &std::sync::atomic::AtomicUsize, limit: usize) -> bool {
@@ -494,24 +652,167 @@ impl Drop for ConnectionPermit {
     }
 }
 
-/// A handle to a background server; blocks until it exits.
+/// A stop signal for a running server.
+///
+/// Cloning shares one signal. It is separate from [`ServerHandle`] because
+/// the two paths that have to observe it — the event reactor and the
+/// blocking accept loop — live below the handle, and a caller that runs its
+/// own accept thread (`serve_with_stop`) needs the same type.
+#[derive(Clone)]
+pub struct ServerStop {
+    requested: Arc<std::sync::atomic::AtomicBool>,
+    /// The reactor's self-pipe writer; nudged so a parked poll returns.
+    reactor_wake: Arc<std::sync::Mutex<Option<TcpStream>>>,
+    /// A second reference to the listening socket, used to wake a thread
+    /// blocked in `accept` (the blocking path has no poller to wake).
+    listener: Arc<std::sync::Mutex<Option<TcpListener>>>,
+}
+
+impl ServerStop {
+    /// A fresh, unrequested signal.
+    pub fn new() -> Self {
+        Self {
+            requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            reactor_wake: Arc::new(std::sync::Mutex::new(None)),
+            listener: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Request a shutdown. Idempotent.
+    pub fn request(&self) {
+        if !self
+            .requested
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.wake();
+        }
+    }
+
+    /// Whether a shutdown has been requested.
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Wake whatever the server is parked on: the reactor's poll, or a
+    /// blocking `accept`.
+    fn wake(&self) {
+        if let Ok(guard) = self.reactor_wake.lock() {
+            if let Some(writer) = guard.as_ref() {
+                event::wake_nudge(writer);
+            }
+        }
+        if let Ok(guard) = self.listener.lock() {
+            if let Some(listener) = guard.as_ref() {
+                if let Ok(addr) = listener.local_addr() {
+                    let target = match addr.ip() {
+                        std::net::IpAddr::V4(ip) if ip.is_unspecified() => {
+                            SocketAddr::from(([127, 0, 0, 1], addr.port()))
+                        }
+                        std::net::IpAddr::V6(ip) if ip.is_unspecified() => {
+                            SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, addr.port()))
+                        }
+                        _ => addr,
+                    };
+                    let _ = TcpStream::connect_timeout(&target, Duration::from_millis(200));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn install_reactor_wake(&self, writer: TcpStream) {
+        if let Ok(mut guard) = self.reactor_wake.lock() {
+            *guard = Some(writer);
+        }
+    }
+
+    pub(crate) fn install_listener(&self, listener: TcpListener) {
+        if let Ok(mut guard) = self.listener.lock() {
+            *guard = Some(listener);
+        }
+    }
+}
+
+impl Default for ServerStop {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A handle to a background server.
 pub struct ServerHandle {
     done: std::sync::mpsc::Receiver<std::io::Result<()>>,
+    stop: ServerStop,
 }
 
 impl ServerHandle {
+    /// Ask the server to stop accepting and return. Idempotent.
+    pub fn stop(&self) {
+        self.stop.request();
+    }
+
+    /// Whether a stop has been requested on this handle.
+    pub fn is_stopping(&self) -> bool {
+        self.stop.is_requested()
+    }
+
+    /// The stop signal, for a caller that wants to observe or re-issue it.
+    pub fn stop_signal(&self) -> ServerStop {
+        self.stop.clone()
+    }
+
     /// Wait for the server to stop.
     pub fn join(self) -> std::io::Result<()> {
         self.done.recv().unwrap_or(Ok(()))
     }
 }
 
-/// Configure the raw socket and run one connection (plain or TLS).
-pub(crate) fn serve_accepted(
+impl std::fmt::Debug for ServerHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerHandle")
+            .field("stopping", &self.is_stopping())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Serve one accepted TCP connection to completion.
+///
+/// The whole per-connection engine behind one call: TLS when the config
+/// carries an identity, then ALPN, HTTP/1.1 / HTTP/2, WebSocket upgrades
+/// and tunnels. It is public because an embedder may own the accept loop
+/// — a proxy that decides on a connection before the engine sees it (peer
+/// address policy, rate limits, its own logging and accounting), a
+/// supervisor sharing one listener between services, a process that must
+/// bind before dropping privileges. The peer address is available before
+/// this call (`TcpStream::peer_addr`), and that is where per-connection
+/// policy belongs: the engine is handed a socket, not an identity.
+///
+/// The socket is configured here: `TCP_NODELAY`, plus
+/// [`ServerConfig::handshake_timeout`] while a TLS handshake runs, then
+/// [`ServerConfig::read_timeout`] for the request loop.
+///
+/// [`ServerConfig::http3`] is rejected rather than ignored: QUIC runs on
+/// the server's own UDP reactor for as long as the server lives (see
+/// [`Server::serve_background`]), which a per-connection driver cannot
+/// reach — serving only TCP while the config asked for HTTP/3 would be a
+/// silent half-service.
+pub fn serve_connection(
     stream: TcpStream,
     handler: &dyn Handler,
     config: &ServerConfig,
 ) -> crate::Result<()> {
+    if let Some(message) = identity_error(config) {
+        return Err(crate::courierust_error::Error::with_message(
+            crate::courierust_error::ErrorKind::Other,
+            message,
+        ));
+    }
+    if config.http3 {
+        return Err(crate::courierust_error::Error::with_message(
+            crate::courierust_error::ErrorKind::Other,
+            "HTTP/3 is served by the server's QUIC reactor (Server::serve_background); \
+             serve_connection drives TCP only",
+        ));
+    }
     // A TLS handshake runs under `handshake_timeout` (short) so a
     // client that connects and then stalls mid-handshake releases its
     // pool worker instead of holding it for the full application read
@@ -534,6 +835,7 @@ pub(crate) fn serve_accepted(
                     // clients actually resume instead of paying a full
                     // handshake every time.
                     session_ticket_key: Some(t.session_ticket_key),
+                    client_auth: t.client_auth.clone(),
                 });
             let arc = Arc::new(stream);
             let peer = arc
@@ -547,9 +849,9 @@ pub(crate) fn serve_accepted(
             })?;
             let conn = crate::courierust_net::ConnStream::tls_server(tls, peer);
             let _ = conn.configure(config.read_timeout);
-            serve_connection(conn, handler, config)
+            dispatch(conn, handler, config)
         }
-        None => serve_connection(
+        None => dispatch(
             crate::courierust_net::ConnStream::plain(stream),
             handler,
             config,
@@ -559,7 +861,7 @@ pub(crate) fn serve_accepted(
 
 /// Dispatch a connection to h1 or h2. TLS connections use the ALPN
 /// result when available; plain TCP connections sniff the client preface.
-pub(crate) fn serve_connection(
+pub(crate) fn dispatch(
     stream: crate::courierust_net::ConnStream,
     handler: &dyn Handler,
     config: &ServerConfig,

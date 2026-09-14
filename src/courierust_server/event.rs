@@ -34,7 +34,7 @@ use crate::courierust_server::{Handler, ServerConfig};
 use std::collections::{HashMap, HashSet};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -129,6 +129,14 @@ enum EventMsg {
         /// before "close", so the failure cannot be reached at all.
         socket: Option<Arc<TcpStream>>,
     },
+    /// A worker handed this connection to a tunnel thread: stop watching
+    /// the descriptor. The connection slot stays counted until the tunnel
+    /// reports `Closed`, so a herd of tunnels is still bounded by
+    /// `max_connections`.
+    Detach {
+        id: usize,
+        socket: Option<Arc<TcpStream>>,
+    },
 }
 
 /// The connection tables the reactor and its workers share.
@@ -164,6 +172,26 @@ enum StepOutcome {
     /// WebSocket registry, where it stays in the reactor for its whole
     /// life instead of occupying a thread.
     Upgrade(Box<crate::courierust_server::ws::WsEventConn>),
+    /// The connection became a tunnel: its handshake response is on the
+    /// wire, and a dedicated thread runs the service on it.
+    Tunnel(Box<TunnelJob>),
+}
+
+/// A connection leaving the reactor for a [`TunnelService`].
+///
+/// [`TunnelService`]: crate::courierust_server::TunnelService
+struct TunnelJob {
+    plan: crate::courierust_server::TunnelPlan,
+    /// The same socket handle the reactor held: handing it over is what
+    /// keeps the descriptor open after the reactor stops watching it, and
+    /// no second descriptor is created for one connection.
+    socket: Arc<TcpStream>,
+    /// Bytes the peer sent behind the request head (a TLS `ClientHello`
+    /// right after `CONNECT`, typically). They must reach the service
+    /// before anything it reads from the socket.
+    leftover: Vec<u8>,
+    /// Whether the connection arrived over TLS.
+    secure: bool,
 }
 
 /// The protocol class of a fresh connection, decided from its first
@@ -352,6 +380,23 @@ impl IncrRequest {
         }
     }
 
+    /// Take the bytes that arrived behind the request the server just
+    /// finished parsing.
+    ///
+    /// A tunnel's first payload usually travels with its handshake (a TLS
+    /// `ClientHello` behind `CONNECT`, a preamble behind any other
+    /// upgrade), and those bytes were read into this buffer by the parser.
+    /// They are handed to the tunnel as a seed, so the connection's first
+    /// read returns them before a socket read is attempted.
+    pub(crate) fn take_remaining(&mut self) -> Vec<u8> {
+        let tail = self.buf[self.pos..].to_vec();
+        self.buf.clear();
+        self.pos = 0;
+        self.line.clear();
+        self.phase = Phase::RequestLine;
+        tail
+    }
+
     /// Try to produce the next request. Reads from `socket` as needed
     /// (non-blocking); returns `Ok(None)` when more data is required.
     pub(crate) fn next_request(
@@ -404,11 +449,6 @@ impl IncrRequest {
                         self.parsed_req_line = Some(rl);
                         self.phase = match bl {
                             courierust_h1::BodyLen::None => Phase::Done,
-                            // A zero-length body is no body. Parking in
-                            // `BodyFixed { remaining: 0 }` waits for bytes
-                            // that cannot arrive, which hangs the
-                            // connection for any client that spells out
-                            // `Content-Length: 0`.
                             courierust_h1::BodyLen::Length(0) => Phase::Done,
                             courierust_h1::BodyLen::Length(n) => {
                                 if n > self.body_limit {
@@ -625,6 +665,10 @@ struct EventConn {
         crate::courierust_server::ws::WsPlan,
         Arc<dyn crate::courierust_server::ws::WsService>,
     )>,
+    /// Set once a tunnel head has been queued: the next moment the head is
+    /// fully written, this connection leaves the reactor for a tunnel
+    /// thread.
+    pending_tunnel: Option<crate::courierust_server::TunnelPlan>,
     /// Late-bound reactor wakeup, installed by the worker.
     wake_slot: Arc<crate::courierust_server::ws::WakeSlot>,
     reader: IncrRequest,
@@ -688,6 +732,7 @@ impl EventConn {
         Self {
             socket: Arc::new(socket),
             pending_upgrade: None,
+            pending_tunnel: None,
             wake_slot,
             reader: IncrRequest::new(body_limit, trace),
             out: Vec::new(),
@@ -794,6 +839,14 @@ impl EventConn {
                 );
                 return Ok(StepOutcome::Upgrade(Box::new(conn)));
             }
+            if let Some(plan) = self.pending_tunnel.take() {
+                return Ok(StepOutcome::Tunnel(Box::new(TunnelJob {
+                    plan,
+                    socket: self.socket.clone(),
+                    leftover: self.reader.take_remaining(),
+                    secure: config.tls.is_some(),
+                })));
+            }
             let parse = seg_start(trace);
             match self
                 .reader
@@ -814,24 +867,14 @@ impl EventConn {
                                 .parse_us
                                 .saturating_add(done.duration_since(first_read).as_micros() as u64);
                         } else {
-                            // Defensive: no read observed (should not
-                            // happen for a completed request); fall back
-                            // to charging the whole span to parse.
                             seg_end(&mut self.parse_us, parse);
                         }
                     } else {
                         seg_end(&mut self.parse_us, parse);
                     }
                     let request_close = courierust_h1::wants_close(&req.headers);
-                    // RFC 9112 §6.3: the response to HEAD is the response
-                    // to GET with the content left out. `req` is moved into
-                    // the handler below, so the answer is taken here.
                     let is_head = req.method == crate::courierust_http::method::Method::HEAD;
 
-                    // RFC 9112 §3.2: an HTTP/1.1 request must carry
-                    // exactly one non-empty `Host`. Refused before the
-                    // WebSocket decision and before the handler, so an
-                    // ambiguous request cannot be routed at all.
                     if let Some(reason) =
                         courierust_h1::host_header_error(req.version, &req.headers)
                     {
@@ -867,11 +910,6 @@ impl EventConn {
                             let outcome = self.write_more()?;
                             match outcome {
                                 StepOutcome::Idle => continue,
-                                // A body still to come outranks the close
-                                // decision: the head is only part of the
-                                // response, and returning here would
-                                // truncate every streamed response to a
-                                // `Connection: close` request.
                                 StepOutcome::Close if self.stream_rx.is_some() => continue,
                                 other => return Ok(other),
                             }
@@ -888,6 +926,42 @@ impl EventConn {
                             self.out_pos = 0;
                             self.keep_alive = true;
                             self.pending_upgrade = Some((upgrade.plan, upgrade.service));
+                            continue;
+                        }
+                    }
+
+                    // ---- raw tunnel (CONNECT / custom upgrade) ---------
+                    match handler.tunnel(&req) {
+                        crate::courierust_server::TunnelReply::Pass => {}
+                        crate::courierust_server::TunnelReply::Refuse(resp) => {
+                            let handle = seg_start(trace);
+                            seg_end(&mut self.handler_us, handle);
+                            self.out.clear();
+                            let (keep_alive, stream) =
+                                build_response(resp, request_close, is_head, &mut self.out)?;
+                            self.out_pos = 0;
+                            self.set_stream(stream);
+                            self.keep_alive = keep_alive;
+                            let outcome = self.write_more()?;
+                            match outcome {
+                                StepOutcome::Idle => continue,
+                                StepOutcome::Close if self.stream_rx.is_some() => continue,
+                                other => return Ok(other),
+                            }
+                        }
+                        crate::courierust_server::TunnelReply::Accept(plan) => {
+                            let handle = seg_start(trace);
+                            seg_end(&mut self.handler_us, handle);
+                            self.out.clear();
+                            courierust_h1::write_response_head(
+                                &mut self.out,
+                                plan.status,
+                                Version::HTTP_11,
+                                &plan.headers,
+                            )?;
+                            self.out_pos = 0;
+                            self.keep_alive = false;
+                            self.pending_tunnel = Some(plan);
                             continue;
                         }
                     }
@@ -913,11 +987,6 @@ impl EventConn {
                         StepOutcome::Idle => {
                             continue;
                         }
-                        // Same as the WebSocket-respond path above: the
-                        // streaming body has not been written yet, so the
-                        // close decision waits for it. Returning here would
-                        // truncate every streamed response to a
-                        // `Connection: close` request.
                         StepOutcome::Close if self.stream_rx.is_some() => continue,
                         other => return Ok(other),
                     }
@@ -964,17 +1033,12 @@ impl EventConn {
                     self.out_pos = 0;
                     courierust_h1::encode_chunk(&chunk, &mut self.out);
                     if matches!(self.write_more()?, StepOutcome::NeedWrite) {
-                        // The socket is full: keep the receiver so the
-                        // reactor's writability wake-up resumes here.
                         self.stream_rx = Some(body);
                         return Ok(StepOutcome::NeedWrite);
                     }
                 }
                 Ok(Err(error)) => return Err(error),
                 Err(TryRecvError::Empty) => {
-                    // The per-chunk timeout runs from the last chunk (or
-                    // from when the body first asked for one), which is
-                    // what the blocking driver's `recv_timeout` measured.
                     if let Some(timeout) = config.read_timeout {
                         let started = *body.wait_started.get_or_insert_with(Instant::now);
                         if started.elapsed() >= timeout {
@@ -987,7 +1051,6 @@ impl EventConn {
                     return Ok(StepOutcome::Idle);
                 }
                 Err(TryRecvError::Disconnected) => {
-                    // The producer finished: terminate the chunked body.
                     body.stream.clear_wake();
                     self.out.clear();
                     self.out_pos = 0;
@@ -1097,11 +1160,6 @@ fn build_response(
 ) -> Result<(bool, Option<ChannelStream>)> {
     let keep_alive = crate::courierust_server::h1::response_wire_head(&resp, request_close, out)?;
     match resp.body {
-        // The header fields stay exactly what a GET would produce —
-        // including the `Content-Length` of the body that would have been
-        // sent, which is how a client learns the resource's size — and the
-        // body itself must not follow: a HEAD response body desynchronises
-        // every conforming client.
         _ if is_head => Ok((keep_alive, None)),
         Body::Empty => Ok((keep_alive, None)),
         Body::Bytes(b) => {
@@ -1126,6 +1184,7 @@ pub(crate) fn serve_event(
     handler: Arc<dyn Handler>,
     config: ServerConfig,
     pool: Arc<crate::courierust_pool::ThreadPool>,
+    stop: crate::courierust_server::ServerStop,
 ) -> std::io::Result<()> {
     let (msg_tx, msg_rx) = channel::<EventMsg>();
     let (ready_tx, ready_rx): (Sender<Vec<usize>>, Receiver<Vec<usize>>) = channel();
@@ -1134,22 +1193,28 @@ pub(crate) fn serve_event(
     let (wake_reader, wake_writer) = wakeup_pair()?;
     let wake_writer = Arc::new(wake_writer);
 
-    // Event loop thread (owns the poller + pending/activity state).
+    stop.install_reactor_wake(wake_writer.try_clone()?);
+    stop.install_listener(listener.try_clone()?);
+
     let loop_handler = handler.clone();
     let loop_config = config.clone();
     let loop_pool = pool.clone();
     let loop_registries = registries.clone();
+    let loop_stop = stop.clone();
     let event_thread = thread::Builder::new()
         .name("courierust-event".into())
         .spawn(move || {
             event_loop(
                 msg_rx,
-                ready_tx,
-                loop_handler,
-                loop_config,
-                loop_pool,
-                loop_registries,
                 wake_reader,
+                LoopContext {
+                    ready_tx,
+                    handler: loop_handler,
+                    config: loop_config,
+                    pool: loop_pool,
+                    registries: loop_registries,
+                    stop: loop_stop,
+                },
             );
         })?;
 
@@ -1188,10 +1253,11 @@ pub(crate) fn serve_event(
     let a_msg_tx = msg_tx.clone();
     let a_wake = wake_writer.clone();
     let a_stats = config.stats.clone();
+    let a_stop = stop.clone();
     let accept_thread = thread::Builder::new()
         .name("courierust-accept".into())
         .spawn(move || {
-            accept_loop(listener, a_msg_tx, &a_wake, a_stats.as_deref());
+            accept_loop(listener, a_msg_tx, &a_wake, a_stats.as_deref(), &a_stop);
         })?;
 
     let _ = accept_thread.join();
@@ -1358,10 +1424,6 @@ fn handle_msg(
         activity,
     } = reactor;
     match msg {
-        // A streaming body produced a chunk. Handled here — not filtered
-        // out by the callers — so every path that drains the control
-        // channel dispatches it, and the wake is prompt rather than
-        // deferred to the next poll.
         EventMsg::BodyChunk { id } => wake_connection(id, poller, ready_tx),
         EventMsg::NewConn {
             id,
@@ -1391,14 +1453,6 @@ fn handle_msg(
             }
         }
         EventMsg::Register { id, fd, want_write } => {
-            // A `Register` is a hint, not the truth: between a worker's
-            // `step()` and this message reaching the reactor, an
-            // application thread can queue a frame on the same WebSocket
-            // (its own `Register { want_write: true }` is sent first) —
-            // and the worker's message would then park the socket without
-            // write interest, stranding the frame until the peer happens
-            // to speak. Re-derive the direction from the connection
-            // itself, the same way `rebuild_wait_set` does.
             let want_write = registries
                 .ws
                 .lock()
@@ -1419,20 +1473,38 @@ fn handle_msg(
             }
             drop(socket);
         }
+        EventMsg::Detach { id, socket } => {
+            poller.unregister(id);
+            pending.remove(&id);
+            drop(socket);
+        }
     }
 }
 
-/// The event loop: polls sockets, classifies new connections, and
-/// dispatches ready HTTP/1.1 and WebSocket connections to workers.
-fn event_loop(
-    msg_rx: Receiver<EventMsg>,
+/// The reactor's shared state: everything the event loop needs that does
+/// not change while it runs. Bundled so the loop takes a channel, the
+/// wake pipe and *one* context — a signature that grows a parameter per
+/// feature is how a loop stops being readable.
+struct LoopContext {
     ready_tx: Sender<Vec<usize>>,
     handler: Arc<dyn Handler>,
     config: ServerConfig,
     pool: Arc<crate::courierust_pool::ThreadPool>,
     registries: Registries,
-    wake_reader: TcpStream,
-) {
+    stop: crate::courierust_server::ServerStop,
+}
+
+/// The event loop: polls sockets, classifies new connections, and
+/// dispatches ready HTTP/1.1 and WebSocket connections to workers.
+fn event_loop(msg_rx: Receiver<EventMsg>, wake_reader: TcpStream, context: LoopContext) {
+    let LoopContext {
+        ready_tx,
+        handler,
+        config,
+        pool,
+        registries,
+        stop,
+    } = context;
     let mut poller = Poller::new();
     let mut pending: HashMap<usize, TcpStream> = HashMap::new();
     let mut activity: HashMap<usize, Instant> = HashMap::new();
@@ -1445,6 +1517,9 @@ fn event_loop(
     let idle_timeout = config.idle_timeout;
 
     loop {
+        if stop.is_requested() {
+            return;
+        }
         let mut drained = 0usize;
         loop {
             match msg_rx.try_recv() {
@@ -1474,7 +1549,7 @@ fn event_loop(
         }
 
         if poller.is_empty() {
-            match msg_rx.recv() {
+            match msg_rx.recv_timeout(Duration::from_millis(poll_timeout as u64)) {
                 Ok(msg) => handle_msg(
                     msg,
                     Reactor {
@@ -1487,7 +1562,8 @@ fn event_loop(
                     config.max_connections,
                     stats,
                 ),
-                Err(_) => return,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => return,
             }
             continue;
         }
@@ -1507,10 +1583,6 @@ fn event_loop(
             Some(next) => next.as_millis().min(poll_timeout as u128).max(1) as i32,
             None => poll_timeout,
         };
-        // Wake up for the earliest timed event too: a WebSocket
-        // keepalive/close deadline, or a parked streaming body that must
-        // be looked at again (the only progress path for a producer that
-        // has no wake, and where the body's read timeout is enforced).
         let timed = [
             ws_next_deadline(&registries),
             h1_body_next_deadline(&registries),
@@ -1619,7 +1691,7 @@ fn event_loop(
                         let c = config.clone();
                         let p = pool.clone();
                         p.spawn(move || {
-                            let _ = crate::courierust_server::serve_accepted(stream, &*h, &c);
+                            let _ = crate::courierust_server::serve_connection(stream, &*h, &c);
                         });
                         activity.remove(&id);
                         if let Some(s) = stats {
@@ -1632,7 +1704,7 @@ fn event_loop(
                         let c = config.clone();
                         let p = pool.clone();
                         p.spawn(move || {
-                            let _ = crate::courierust_server::serve_connection(
+                            let _ = crate::courierust_server::dispatch(
                                 crate::courierust_net::ConnStream::plain(stream),
                                 &*h,
                                 &c,
@@ -1672,19 +1744,12 @@ fn event_loop(
                 to_dispatch.push(id);
             }
         }
-        // Keepalive and the close-handshake timeout are the two events a
-        // silent peer can never deliver; dispatch the WebSocket
-        // connections whose deadline elapsed while we waited, so a
-        // half-open connection cannot hold a slot forever.
         let now = Instant::now();
         for id in ws_due_ids(&registries, now) {
             poller.unregister(id);
             activity.insert(id, now);
             to_dispatch.push(id);
         }
-        // A parked streaming body whose poll deadline elapsed is due the
-        // same way: nothing a silent producer does makes a descriptor
-        // ready.
         for id in h1_body_due_ids(&registries, now) {
             poller.unregister(id);
             activity.insert(id, now);
@@ -1737,31 +1802,14 @@ fn event_loop(
 /// Answer a request that could not be parsed, then linger briefly before
 /// the connection is dropped.
 ///
-/// The blocking driver does the same thing (see `h1::serve`); keeping the
-/// two identical matters because which one runs depends on
-/// `ServerConfig::event_driven`, and a client must not be able to tell
-/// the difference between them by the *absence* of a `400`.
-///
-/// The status is the honest one: a protocol error is a `400`, a header
-/// block or request line over the limit is a `431`, and a body over the
-/// limit is a `413`.
+/// The blocking driver answers through the same status mapping (see
+/// `h1::refusal_status`); keeping the two identical matters because which
+/// one runs depends on `ServerConfig::event_driven`, and a client must not
+/// be able to tell the difference between them by the *absence* of a
+/// `400`.
 fn refuse_malformed(conn: &EventConn, e: &Error) {
-    use crate::courierust_error::ErrorKind;
-    let status = match e.kind {
-        ErrorKind::Protocol => 400,
-        ErrorKind::Overflow => {
-            let header = e
-                .message
-                .as_deref()
-                .map(|m| m.contains("header") || m.contains("line"))
-                .unwrap_or(false);
-            if header {
-                431
-            } else {
-                413
-            }
-        }
-        _ => return,
+    let Some(status) = crate::courierust_server::h1::refusal_status(e) else {
+        return;
     };
     let resp = crate::courierust_server::h1::error_response(status, "bad request");
     let body: &[u8] = match &resp.body {
@@ -1896,9 +1944,6 @@ fn event_worker(
                 None => continue,
             };
 
-            // A streaming body wakes the reactor through this callback,
-            // fired by the producer's own thread on every chunk — that is
-            // what keeps the connection off a worker while it waits.
             conn.arm_wake(|| {
                 let tx = msg_tx.clone();
                 let pipe = wake_writer.clone();
@@ -1957,6 +2002,33 @@ fn event_worker(
                     });
                     wake_nudge(wake_writer);
                 }
+                StepOutcome::Tunnel(job) => {
+                    emit_trace(&mut conn, id, 0, 0);
+                    let TunnelJob {
+                        plan,
+                        socket,
+                        leftover,
+                        secure,
+                    } = *job;
+                    let _ = msg_tx.send(EventMsg::Detach {
+                        id,
+                        socket: Some(conn.socket.clone()),
+                    });
+                    wake_nudge(wake_writer);
+                    let tx = msg_tx.clone();
+                    let wake = wake_writer.clone();
+                    let spawned = std::thread::Builder::new()
+                        .name("courierust-tunnel".into())
+                        .spawn(move || {
+                            run_tunnel(socket, leftover, secure, plan);
+                            let _ = tx.send(EventMsg::Closed { id, socket: None });
+                            wake_nudge(&wake);
+                        });
+                    if spawned.is_err() {
+                        let _ = msg_tx.send(EventMsg::Closed { id, socket: None });
+                        wake_nudge(wake_writer);
+                    }
+                }
                 StepOutcome::Upgrade(upgraded) => {
                     let mut ws_conn = *upgraded;
                     let fd = fd_of(ws_conn.socket());
@@ -2000,6 +2072,29 @@ fn event_worker(
     }
 }
 
+/// Run one tunnel on the thread that owns it, then close the connection.
+///
+/// The socket was accepted non-blocking (the reactor never blocks on a
+/// read), so it is switched back before the service sees it: a tunnel is a
+/// blocking contract by definition, and `read`/`write` on a non-blocking
+/// socket would report `WouldBlock` instead of waiting.
+fn run_tunnel(
+    socket: Arc<TcpStream>,
+    leftover: Vec<u8>,
+    secure: bool,
+    plan: crate::courierust_server::tunnel::TunnelPlan,
+) {
+    let _ = socket.set_nonblocking(false);
+    let stream = Arc::new(crate::courierust_net::ConnStream::plain_shared(socket));
+    let mut reader =
+        crate::courierust_io::BufReader::new(stream.clone(), leftover.len().max(16 * 1024));
+    if !leftover.is_empty() {
+        reader.seed(&leftover);
+    }
+    let conn = crate::courierust_server::TunnelConn::new(stream, reader, secure);
+    plan.service.run(conn);
+}
+
 /// Accept loop: accept sockets and hand them to the event loop in
 /// non-blocking mode. It never reads, peeks, sleeps or classifies, so a
 /// slow client can never stall the accept path (which would starve every
@@ -2010,9 +2105,13 @@ fn accept_loop(
     msg_tx: Sender<EventMsg>,
     wake_writer: &Arc<TcpStream>,
     stats: Option<&Stats>,
+    stop: &crate::courierust_server::ServerStop,
 ) {
     let mut next_id = 1usize;
     for stream in listener.incoming() {
+        if stop.is_requested() {
+            return;
+        }
         let Ok(stream) = stream else { continue };
         if let Some(s) = stats {
             s.connections_accepted.fetch_add(1, Ordering::Relaxed);
@@ -2090,9 +2189,6 @@ mod tests {
         tx.send_bytes(b"more").unwrap();
         assert_eq!(hits.load(Ordering::Relaxed), 2);
 
-        // A raw channel has no producer that could fire a wake: adopting it
-        // must not leave it looking wake-capable, or the reactor would poll
-        // it at the slow cadence and delay every chunk.
         let (_raw_tx, raw) = std::sync::mpsc::channel();
         conn.set_stream(Some(ChannelStream::raw(raw)));
         assert!(
@@ -2138,8 +2234,6 @@ mod tests {
             StepOutcome::Idle
         ));
         assert!(conn.stream_rx.is_none(), "a finished body is released");
-        // Closing the connection flushes what the peer has already read
-        // into its own buffer, so the read below sees the whole body.
         drop(conn);
         let mut written = Vec::new();
         std::io::Read::read_to_end(&mut peer, &mut written).unwrap();

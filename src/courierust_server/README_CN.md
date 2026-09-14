@@ -43,6 +43,27 @@ flowchart LR
 - `event_driven: false` 恢复旧模型——每连接一个池任务——供对比与调试。不建议生产用：空闲/慢速羊群会耗尽池。
 - 长时间阻塞的同步 handler 会占住一个 worker（事件驱动与否都一样）——任何同步服务器的通病。流式请用 channel body：等下一块时挂起的是连接，不是 worker。
 - 同时服务 h2c 前导知识和 `h2c` Upgrade。
+- **客户端证书（mTLS）**——`TlsSettings::client_auth` 接收 `ClientAuth`（client-auth 信任根 + `required`/`optional`），配置后本服务端会向每个客户端索取证书：按信任根、有效期与 `clientAuth` EKU 校验，并由 `CertificateVerify` 证明持有私钥。要求认证而客户端拒绝时，应答 `certificate_required` (116)。两条边界是被**强制执行**而不是写在文档里：`client_auth` 与 TLS 1.2 的组合在握手建立时被拒绝；`client_auth` + `http3` 在启动时被拒绝——这里的 mTLS 指 TLS 1.3 over TCP。
+
+## 嵌入：谁来拥有 accept 循环
+
+两个入口，同一个引擎：
+
+- `Server` 负责 bind——或者用 `Server::from_listener` 接管你已经绑好的
+  listener（先 bind 再降权的进程、systemd socket 激活、多个服务共享的
+  端口）——并由它自己跑调度器。
+- `courierust_server::serve_connection(stream, handler, config)` 驱动
+  **一条**已接受的连接：TLS 握手、ALPN、HTTP/1.1 / HTTP/2、WebSocket
+  升级、隧道。这正是代理需要的形状——socket（以及它的 `peer_addr`）
+  在引擎看到之前就在你手里，所以按连接生效的策略（地址白名单、限速、
+  自己的计数统计）留在你这边，协议工作留给引擎。socket 的配置与
+  `Server` 完全一致：`TCP_NODELAY`，TLS 握手期间用
+  `handshake_timeout`，之后切到 `read_timeout`。
+
+有两条边界需要知道：`serve_connection` 会拒绝带 `http3` 的配置——QUIC
+属于服务器自己的 UDP reactor，只有 `Server::serve*` 拥有它，悄悄只服务
+TCP 等于半套服务；另外，identity 为空的 TLS 配置会在创建服务器或发起
+连接的任何入口被拒绝，在启动时而不是每个客户端来一次。
 
 ## WebSocket 升级
 

@@ -8,11 +8,12 @@
 - **HTTP/2**——每条连接由专用 driver 线程驱动，串行化线上访问的同时多路复用流。请求经 channel 到达；响应经每流 channel 流回。`max_connections_per_host` 按 authority 封顶存活连接；h2 池按 authority 共享。
 - **HTTP/3**——`http3://`（以及 ALPN `h3`）路由进 H3 runtime 的 UDP reactor，支持池化连接复用。
 - **WebSocket**——`courierust_client::ws::WebSocket` 通过 `ws://` 或 TLS（`wss://`）升级，提供 `send_text` / `send_binary` / `send_ping` / `read_message` / `close`，并支持子协议、Origin 头、压缩偏好与读超时，全部沿用同一个 `ClientConfig`。它与服务端共用组帧/UTF-8/关闭握手引擎（`courierust_ws`），两端强制的是同一套规则。
-- **TLS**——`https://` 是一等公民：`TlsSettings { roots, verify, alpn, now, min_version, max_version }`，对着 crate 自己的 TLS 栈。
+- **TLS**——`https://` 是一等公民：`TlsSettings { roots, verify, alpn, now, min_version, max_version, identity }`，对着 crate 自己的 TLS 栈。`identity` 是服务端索要证书时（mTLS）客户端出示的那张；未配置则发送规定的空证书列表，由服务端决定是否接受。
+- **HTTP 代理**——`ClientConfig::proxy` 接受一个 `Proxy`（`host:port`、可选 Basic 凭据、`Debug` 脱敏密码）。安全目标经 `CONNECT` 隧道（RFC 9110 §9.3.6）抵达，代理看不到明文；明文目标则**发给代理**并使用绝对请求形式（RFC 9112 §3.2.2）——对它打隧道反而会把代理本应看到的请求藏起来。`Proxy-Authorization` 属于该跳——明文代理请求会带上它（请求自带的字段优先于配置凭据，且只会发出一个），其他任何地方都会被过滤掉，因此代理凭据绝不会到达源站（直连或隧道内都不会）。仅支持 `http://` 代理（`https://` 代理需要嵌套 TLS 握手，该 scheme 会带原因被拒绝而不是降级）；`http3` + 代理会被拒绝——QUIC 是 UDP，隧道是 TCP；h2c（明文 HTTP/2）+ 代理同理反向：代理解析的是 HTTP/1.1 而不是帧。带 TLS 的 HTTP/2 在隧道里原样穿行。
 
 ## 重要的细节
 
-- **重定向**（301/302/303 → GET，307/308 保留方法与请求体）绝不跨 origin 转发 `Authorization` / `Cookie`（RFC 9110 §15.4）。
+- **重定向**（301/302/303 → GET，307/308 保留方法与请求体）绝不跨 origin 转发 `Authorization` / `Cookie`（RFC 9110 §15.4）。`Location` 按 RFC 3986 §5.2 作为 URI 引用相对请求自身 URL 解析：`next?q=1` 落在 `/dir/next?q=1` 而不是 `/next`；纯查询引用保留路径；`.` / `..` 段在使用前被移除；fragment 被丢弃——解析错了就会去重试**另一个资源**，而这正是前置代理会看到的东西。
 - **优先级**——`execute_priority(url, req, Priority { urgency, incremental })` 驱动 WUCS 调度器（见 `blogs/01`）。
 - **worker 占用按连接而非按流**——一条带很多流的 h2 连接只占一个 worker，流永远不会把 worker 用量翻倍，也互不阻塞。
 - **超时**——连接、握手（TLS）、读超时都在 `ClientConfig` 上配置；单个请求可用 `RequestBuilder::timeout` 覆盖读超时。这个覆盖与配置项同义，是**传输层截止时间**，按每次尝试生效（重定向每一跳都有完整超时），用后恢复，因此池化连接不会把上一个调用者的截止时间带给下一个请求。它的到期在每个平台上都表现为 `ErrorKind::Timeout`。

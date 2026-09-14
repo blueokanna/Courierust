@@ -39,13 +39,115 @@ pub(crate) enum IdentityKeyType {
     Ed25519,
 }
 
-/// Determine the key type of an [`Identity`].
-pub(crate) fn identity_key_type(identity: &Identity) -> TlsResult<IdentityKeyType> {
-    match parse_private_key(&identity.private_key)? {
+/// The key type of a DER private key.
+pub(crate) fn key_type(key_der: &[u8]) -> TlsResult<IdentityKeyType> {
+    match parse_private_key(key_der)? {
         ParsedKey::Rsa { .. } => Ok(IdentityKeyType::Rsa),
         ParsedKey::Ec { curve, .. } => Ok(IdentityKeyType::Ecdsa(curve)),
         ParsedKey::Ed25519(_) => Ok(IdentityKeyType::Ed25519),
     }
+}
+
+/// Determine the key type of an [`Identity`].
+pub(crate) fn identity_key_type(identity: &Identity) -> TlsResult<IdentityKeyType> {
+    key_type(&identity.private_key)
+}
+
+/// Whether `key_der` is the private key behind `leaf`'s public key.
+///
+/// The check is a sign/verify round trip against the certificate's own
+/// SPKI. Comparing the public halves directly (what rustls does with its
+/// `KeyPair::public_key`) would need a point derivation per curve; one
+/// signature proves the same statement for every key type this stack
+/// supports, and it cannot drift from the verification code because it
+/// *is* the verification code the handshake runs.
+pub(crate) fn key_matches_certificate(leaf: &super::x509::Certificate, key_der: &[u8]) -> bool {
+    use super::x509::der::{
+        parse_rsa_public_key, OID_EC_PUBLIC_KEY, OID_ED25519, OID_RSA_ENCRYPTION,
+    };
+
+    /// Fixed message: the content is irrelevant, the signature only has
+    /// to verify under the certificate's key.
+    const CHECK: &[u8] = b"courierust: private key / certificate consistency check";
+
+    let key = match parse_private_key(key_der) {
+        Ok(key) => key,
+        Err(_) => return false,
+    };
+    let spki = &leaf.spki;
+
+    if spki.oid == OID_RSA_ENCRYPTION {
+        let ParsedKey::Rsa { n, e, d } = key else {
+            return false;
+        };
+        let Some((cert_n, cert_e)) = parse_rsa_public_key(&spki.key) else {
+            return false;
+        };
+        let mut h = Sha256::new();
+        h.update(CHECK);
+        let digest = h.finalize();
+        let Some(signature) = rsa::sign_pkcs1v15(&n, &e, &d, rsa::DIGEST_INFO_SHA256, &digest)
+        else {
+            return false;
+        };
+        return rsa::verify_rsa_pkcs1v15(
+            &rsa::RsaPublicKey {
+                n: cert_n,
+                e: cert_e,
+            },
+            false,
+            &digest,
+            &signature,
+        );
+    }
+
+    if spki.oid == OID_ED25519 {
+        let ParsedKey::Ed25519(seed) = key else {
+            return false;
+        };
+        let Ok(public) = <[u8; 32]>::try_from(spki.key.as_slice()) else {
+            return false;
+        };
+        let signature = ed25519::sign(&seed, CHECK);
+        return ed25519::verify(&public, CHECK, &signature);
+    }
+
+    if spki.oid == OID_EC_PUBLIC_KEY {
+        let ParsedKey::Ec { curve, d } = key else {
+            return false;
+        };
+        if spki.ec_curve != Some(curve) {
+            return false;
+        }
+        let coord_len = curve.coord_len();
+        if spki.key.len() != 1 + 2 * coord_len || spki.key[0] != 0x04 {
+            return false;
+        }
+        let (qx, qy) = (&spki.key[1..1 + coord_len], &spki.key[1 + coord_len..]);
+        let digest = match curve {
+            Curve::P256 => {
+                let mut h = Sha256::new();
+                h.update(CHECK);
+                h.finalize()
+            }
+            Curve::P384 => {
+                let mut h = Sha384::new();
+                h.update(CHECK);
+                h.finalize()
+            }
+            Curve::P521 => {
+                let mut h = ed25519::Sha512::new();
+                h.update(CHECK);
+                h.finalize()
+            }
+        };
+        let Some((r, s)) = ecdsa::sign(curve, &d, &digest) else {
+            return false;
+        };
+        return ecdsa::verify_der(curve, qx, qy, &digest, &encode_ecdsa_sig(&r, &s));
+    }
+
+    false
 }
 
 /// The cipher-suite hash a server should prefer given its identity key.
@@ -124,7 +226,7 @@ pub(crate) fn sign_tls12_server_key_exchange(
 
 /// Sign the TLS 1.3 CertificateVerify message for a server identity.
 /// Returns `(signature_scheme, signature)`.
-pub(crate) fn sign_server_cert_verify(
+pub(crate) fn sign_cert_verify(
     identity: &Identity,
     message: &[u8],
     suite: CipherSuite,
@@ -242,6 +344,13 @@ fn encode_ecdsa_sig(r: &[u8], s: &[u8]) -> Vec<u8> {
 }
 
 /// Parse a PKCS#8 or PKCS#1 (RSA) private key.
+/// Parse a DER private key in any of the three containers TLS
+/// deployments use: PKCS#8 (`PRIVATE KEY`), PKCS#1 (`RSA PRIVATE KEY`)
+/// and SEC1 (`EC PRIVATE KEY`).
+///
+/// The container is decided by the DER itself, not by the PEM label, so
+/// a mislabelled block from a hand-edited file still loads — the key is
+/// the key.
 fn parse_private_key(der: &[u8]) -> TlsResult<ParsedKey> {
     // Try PKCS#8 first.
     if let Some(k) = parse_pkcs8(der) {
@@ -249,6 +358,11 @@ fn parse_private_key(der: &[u8]) -> TlsResult<ParsedKey> {
     }
     // Fall back to PKCS#1 RSAPrivateKey.
     if let Some(k) = parse_pkcs1_rsa(der) {
+        return Ok(k);
+    }
+    // ... and to a bare SEC1 ECPrivateKey, which is what
+    // `openssl ecparam -genkey` emits.
+    if let Some(k) = parse_sec1_ec(der, None) {
         return Ok(k);
     }
     Err(TlsError::Certificate(
@@ -303,40 +417,71 @@ fn parse_pkcs8(der: &[u8]) -> Option<ParsedKey> {
         return Some(ParsedKey::Ed25519(seed));
     }
     if oid.content == OID_EC_PUBLIC_KEY {
-        // The params must be a recognized named curve.
+        // The PKCS#8 parameters must name a curve this stack knows.
         let params = read_element(alg.content, &mut a)?;
         if params.tag != 0x06 {
             return None;
         }
-        let curve = match params.content {
-            OID_P256 => Curve::P256,
-            OID_P384 => Curve::P384,
-            OID_P521 => Curve::P521,
-            _ => return None,
-        };
-        // ECPrivateKey: SEQUENCE { INTEGER version, OCTET STRING d, [1] pub? }
-        let mut e = 0usize;
-        let ec_seq = expect_sequence(key.content, &mut e)?;
-        let mut ep = 0usize;
-        let ver = read_element(ec_seq, &mut ep)?;
-        if ver.tag != 0x02 {
-            return None;
-        }
-        let d_oct = read_element(ec_seq, &mut ep)?;
-        if d_oct.tag != 0x04 {
-            return None;
-        }
-        let coord_len = curve.coord_len();
-        // OpenSSL writes the scalar in a fixed-size OCTET STRING; accept
-        // exactly coord_len bytes, or a shorter minimal encoding.
-        if d_oct.content.is_empty() || d_oct.content.len() > coord_len {
-            return None;
-        }
-        let mut d = vec![0u8; coord_len];
-        d[coord_len - d_oct.content.len()..].copy_from_slice(d_oct.content);
-        return Some(ParsedKey::Ec { curve, d });
+        return parse_sec1_ec(key.content, curve_from_oid(params.content));
     }
     None
+}
+
+/// The named curve an EC parameters OID stands for.
+fn curve_from_oid(oid: &[u8]) -> Option<Curve> {
+    match oid {
+        OID_P256 => Some(Curve::P256),
+        OID_P384 => Some(Curve::P384),
+        OID_P521 => Some(Curve::P521),
+        _ => None,
+    }
+}
+
+/// Parse a SEC1 `ECPrivateKey` (RFC 5915): SEQUENCE { INTEGER version,
+/// OCTET STRING d, [0] parameters, [1] publicKey }.
+///
+/// `curve` is the named curve from an enclosing PKCS#8
+/// `AlgorithmIdentifier` when there is one (RFC 5958 §2 requires the two
+/// to agree); a bare `-----BEGIN EC PRIVATE KEY-----` block carries the
+/// curve in its own `[0] parameters` field instead, and that field wins
+/// when it is present.
+fn parse_sec1_ec(der: &[u8], curve: Option<Curve>) -> Option<ParsedKey> {
+    let mut pos = 0usize;
+    let seq = expect_sequence(der, &mut pos)?;
+    if pos != der.len() {
+        return None;
+    }
+    let mut p = 0usize;
+    // version INTEGER
+    let ver = read_element(seq, &mut p)?;
+    if ver.tag != 0x02 {
+        return None;
+    }
+    // privateKey OCTET STRING
+    let d_oct = read_element(seq, &mut p)?;
+    if d_oct.tag != 0x04 {
+        return None;
+    }
+    let mut curve = curve;
+    while let Some(el) = read_element(seq, &mut p) {
+        if el.tag == 0xa0 {
+            let mut pp = 0usize;
+            let oid = read_element(el.content, &mut pp)?;
+            if oid.tag == 0x06 {
+                curve = curve_from_oid(oid.content);
+            }
+        }
+    }
+    let curve = curve?;
+    let coord_len = curve.coord_len();
+    // OpenSSL writes the scalar in a fixed-size OCTET STRING; accept
+    // exactly coord_len bytes, or a shorter minimal encoding.
+    if d_oct.content.is_empty() || d_oct.content.len() > coord_len {
+        return None;
+    }
+    let mut d = vec![0u8; coord_len];
+    d[coord_len - d_oct.content.len()..].copy_from_slice(d_oct.content);
+    Some(ParsedKey::Ec { curve, d })
 }
 
 /// Parse a PKCS#1 RSAPrivateKey: SEQUENCE { version, n, e, d, ... }.

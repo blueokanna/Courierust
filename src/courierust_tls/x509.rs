@@ -90,15 +90,11 @@ impl NameConstraints {
     /// Whether every DNS name and IP address carried by `cert` satisfies
     /// these constraints.
     pub fn permits(&self, dns: &[String], ip: &[Vec<u8>], has_other_sans: bool) -> bool {
-        // Fail closed on name forms we do not model (rustls-webpki
-        // rejects directoryName / URI / rfc822 constraints outright).
         if self.has_other_forms && has_other_sans {
             return false;
         }
         for d in dns {
             let lower = d.trim_end_matches('.').to_ascii_lowercase();
-            // A permitted-subtrees list exists and none of its entries
-            // match the name: reject.
             if !self.permitted_dns.is_empty()
                 && !self
                     .permitted_dns
@@ -171,7 +167,6 @@ fn dns_name_matches_constraint(presented: &str, constraint: &str, is_excluded: b
     let p = presented.as_bytes();
     let c = constraint.as_bytes();
     if c.is_empty() {
-        // An empty constraint permits/forbids every name.
         return true;
     }
 
@@ -350,6 +345,22 @@ impl RootStore {
         Ok(n)
     }
 
+    /// [`RootStore::add_pem`] over a file: an OS-style CA bundle, a
+    /// deployment's own root, or the certificate a peer was pinned to.
+    ///
+    /// A missing or unreadable file is reported with its path — the one
+    /// detail that turns "no roots" into a fixable error.
+    pub fn add_pem_file(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> crate::courierust_tls::TlsResult<usize> {
+        let path = path.as_ref();
+        let pem = std::fs::read_to_string(path).map_err(|e| {
+            crate::courierust_tls::TlsError::Io(alloc::format!("{}: {e}", path.display()))
+        })?;
+        self.add_pem(&pem)
+    }
+
     /// Number of roots.
     pub fn len(&self) -> usize {
         self.roots.len()
@@ -366,60 +377,15 @@ impl RootStore {
     }
 }
 
-/// Parse all `CERTIFICATE` blocks from a PEM document.
+/// Parse every `CERTIFICATE` block from a PEM document (a CA bundle, a
+/// chain file, `openssl` output).
+///
+/// The armour is read by the shared PEM reader, so a bundle with junk
+/// between its blocks loads while a truncated, mislabelled or
+/// undecodable block is an error instead of a silently shorter trust
+/// store.
 pub fn parse_pem_certificates(pem: &str) -> crate::courierust_tls::TlsResult<Vec<Vec<u8>>> {
-    let mut out = Vec::new();
-    let mut current: Option<Vec<u8>> = None;
-    let mut in_cert = false;
-    for line in pem.lines() {
-        let line = line.trim();
-        if line.starts_with("-----BEGIN CERTIFICATE-----") {
-            in_cert = true;
-            current = Some(Vec::new());
-        } else if line.starts_with("-----END CERTIFICATE-----") {
-            if let Some(mut b64) = current.take() {
-                let raw: String = b64
-                    .drain(..)
-                    .filter(|c| !c.is_ascii_whitespace())
-                    .map(|c| c as char)
-                    .collect();
-                let der = base64_decode(&raw)
-                    .ok_or_else(|| TlsError::Protocol("invalid PEM base64".into()))?;
-                out.push(der);
-            }
-            in_cert = false;
-        } else if in_cert {
-            if let Some(buf) = current.as_mut() {
-                buf.extend_from_slice(line.as_bytes());
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// Minimal RFC 4648 base64 decoder (no padding required).
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut acc: u32 = 0;
-    let mut nbits = 0;
-    for c in s.bytes() {
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            b'=' => break,
-            _ => return None,
-        };
-        acc = (acc << 6) | v as u32;
-        nbits += 6;
-        if nbits >= 8 {
-            nbits -= 8;
-            out.push((acc >> nbits) as u8);
-        }
-    }
-    Some(out)
+    super::pem::der_blocks(pem, "CERTIFICATE")
 }
 
 // Forward-declared: the full certificate parser is implemented in the
@@ -496,6 +462,18 @@ pub fn has_server_auth_eku(cert: &Certificate) -> bool {
     cert.eku
         .iter()
         .any(|e| e.as_slice() == der::OID_KEY_USAGE_SERVER_AUTH || e.as_slice() == EKU_ANY)
+}
+
+/// RFC 5280 §4.2.1.12, the client-side counterpart: a certificate used
+/// for **client authentication** (mTLS) must carry `clientAuth` (or
+/// `anyExtendedKeyUsage`) when it carries an EKU at all.
+pub fn has_client_auth_eku(cert: &Certificate) -> bool {
+    if cert.eku.is_empty() {
+        return true;
+    }
+    cert.eku
+        .iter()
+        .any(|e| e.as_slice() == der::OID_KEY_USAGE_CLIENT_AUTH || e.as_slice() == EKU_ANY)
 }
 
 /// Validate a certificate chain (leaf first) against the root store.

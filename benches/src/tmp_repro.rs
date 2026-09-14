@@ -8,11 +8,7 @@ use std::time::Duration;
 use bytes::Buf;
 
 fn main() {
-    let identity = courierust::courierust_tls::Identity {
-        cert_chain: vec![include_bytes!("../certs/h3_server.der").to_vec()],
-        private_key: include_bytes!("../certs/h3_server_key.der").to_vec(),
-        is_rsa: false,
-    };
+    let identity = courierust::courierust_tls::Identity::from_der(vec![include_bytes!("../certs/h3_server.der").to_vec()], include_bytes!("../certs/h3_server_key.der").to_vec()).expect("valid test identity");
     let server = courierust::courierust_server::Server::bind_with_config(
         "127.0.0.1:0",
         courierust::courierust_server::ServerConfig {

@@ -33,11 +33,17 @@ pub mod x509;
 #[cfg(test)]
 pub(crate) mod testdata;
 
+mod client_auth;
 mod handshake;
+mod identity;
 mod key_schedule;
+mod pem;
 pub(crate) mod quic;
 mod record;
 mod tls12;
+
+pub use client_auth::ClientAuth;
+pub use identity::Identity;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -138,20 +144,30 @@ impl From<crate::courierust_error::Error> for TlsError {
     }
 }
 
+/// The other direction, so a caller that speaks the crate's error type —
+/// a `main` that loads an identity, an embedder wiring TLS into its own
+/// startup path — can use `?` on TLS setup instead of restating the
+/// message. The kinds that exist on both sides are carried over
+/// unchanged; the rest keeps its message.
+impl From<TlsError> for crate::courierust_error::Error {
+    fn from(e: TlsError) -> Self {
+        use crate::courierust_error::{Error, ErrorKind};
+        match e {
+            TlsError::Io(message) => Error::io(message),
+            TlsError::Protocol(message) => Error::protocol(message),
+            TlsError::Timeout => Error::new(ErrorKind::Timeout),
+            TlsError::UnexpectedEof => Error::new(ErrorKind::UnexpectedEof),
+            other => Error::with_message(ErrorKind::Other, alloc::format!("{other}")),
+        }
+    }
+}
+
 /// A result alias for TLS operations.
 pub type TlsResult<T> = core::result::Result<T, TlsError>;
 
-/// A cryptographic key pair used by the TLS server (or a client that
-/// needs client certificates — not required for this release).
-#[derive(Debug, Clone)]
-pub struct Identity {
-    /// The DER-encoded certificate chain (leaf first).
-    pub cert_chain: Vec<Vec<u8>>,
-    /// The private key (PKCS#8 or PKCS#1 DER) for the leaf certificate.
-    pub private_key: Vec<u8>,
-    /// Whether the private key is an RSA key.
-    pub is_rsa: bool,
-}
+// `Identity` lives in its own module: it is the one type here whose
+// construction needs validation (certificate parsing, key parsing and a
+// key/certificate match check), and that check owns the module.
 
 // ---------------------------------------------------------------------
 // Record-level transport (TlsIo)
@@ -1022,6 +1038,11 @@ pub struct ClientConfig {
     /// The highest TLS version the client will negotiate. Defaults to
     /// [`TlsVersion::Tls13`].
     pub max_version: TlsVersion,
+    /// The client certificate to present when a server asks for one
+    /// (mTLS). `None` answers a `CertificateRequest` with an empty
+    /// certificate list, which a server that requires authentication
+    /// refuses — exactly what that policy is for.
+    pub identity: Option<Identity>,
 }
 
 impl Default for ClientConfig {
@@ -1033,6 +1054,7 @@ impl Default for ClientConfig {
             now: 0,
             min_version: TlsVersion::Tls12,
             max_version: TlsVersion::Tls13,
+            identity: None,
         }
     }
 }
@@ -1178,6 +1200,7 @@ impl TlsConnector {
                 server_name: Some(hostname.to_string()),
                 verify: self.config.verify,
                 psk: resume_session.map(|s| (s.psk, s.suite)),
+                identity: self.config.identity.clone(),
             };
             let result = hs.run_from_server_hello(
                 &mut io,
@@ -1314,20 +1337,22 @@ pub struct ServerConfig {
     /// per-acceptor key, so sessions survive across connections served
     /// by the same acceptor but not across process restarts.
     pub session_ticket_key: Option<[u8; 32]>,
+    /// Client authentication (mTLS). `None` (the default) never asks for
+    /// a client certificate. Implemented for TLS 1.3; a client that
+    /// negotiates TLS 1.2 is refused rather than admitted unauthenticated
+    /// when this is set.
+    pub client_auth: Option<ClientAuth>,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            identity: Identity {
-                cert_chain: Vec::new(),
-                private_key: Vec::new(),
-                is_rsa: false,
-            },
+            identity: Identity::empty(),
             alpn: Vec::new(),
             min_version: TlsVersion::Tls12,
             max_version: TlsVersion::Tls13,
             session_ticket_key: None,
+            client_auth: None,
         }
     }
 }
@@ -1382,6 +1407,7 @@ impl TlsAcceptor {
                 alpn: self.config.alpn.clone(),
                 ticket_key: self.ticket_key,
                 now: unix_now(),
+                client_auth: self.config.client_auth.clone(),
             };
             let result = hs.run_from_client_hello(&mut io, &ch_body)?;
             Ok(TlsStream {
@@ -1412,6 +1438,15 @@ impl TlsAcceptor {
                 key_write_gen: 0,
             })
         } else if allow12 {
+            if self.config.client_auth.is_some() {
+                // Client authentication is implemented for TLS 1.3:
+                // a TLS 1.2 client would arrive unauthenticated, so the
+                // version is refused instead of the policy being
+                // silently downgraded.
+                return Err(TlsError::Unsupported(
+                    "client authentication requires TLS 1.3".into(),
+                ));
+            }
             let result = match tls12::server_handshake(
                 &mut io,
                 &self.config.identity,
@@ -1473,7 +1508,7 @@ pub(crate) fn server_sign(
     message: &[u8],
     suite: key_schedule::CipherSuite,
 ) -> TlsResult<Option<(u16, Vec<u8>)>> {
-    sign::sign_server_cert_verify(identity, message, suite)
+    sign::sign_cert_verify(identity, message, suite)
 }
 
 mod sign;
@@ -1500,6 +1535,8 @@ mod tests {
                 min_version: TlsVersion::Tls13,
                 max_version: TlsVersion::Tls13,
                 session_ticket_key: None,
+
+                client_auth: None,
             });
             let mut tls = acceptor.accept(&stream, &stream).unwrap();
             assert_eq!(tls.alpn(), Some(&b"h2"[..]));
@@ -1517,6 +1554,8 @@ mod tests {
             now: testdata::NOW,
             min_version: TlsVersion::Tls13,
             max_version: TlsVersion::Tls13,
+
+            identity: None,
         });
         let mut tls = connector.connect("localhost", &stream, &stream).unwrap();
         assert_eq!(tls.alpn(), Some(&b"h2"[..]));
@@ -1546,6 +1585,8 @@ mod tests {
                 min_version: TlsVersion::Tls13,
                 max_version: TlsVersion::Tls13,
                 session_ticket_key: None,
+
+                client_auth: None,
             });
             let mut tls = acceptor.accept(&stream, &stream).unwrap();
             assert_eq!(tls.read_record().unwrap(), b"before");
@@ -1569,6 +1610,8 @@ mod tests {
             now: testdata::NOW,
             min_version: TlsVersion::Tls13,
             max_version: TlsVersion::Tls13,
+
+            identity: None,
         });
         let mut tls = connector.connect("localhost", &stream, &stream).unwrap();
         tls.write_all(b"before").unwrap();
@@ -1598,6 +1641,8 @@ mod tests {
                 min_version: TlsVersion::Tls13,
                 max_version: TlsVersion::Tls13,
                 session_ticket_key: None,
+
+                client_auth: None,
             });
             let mut tls = acceptor.accept(&stream, &stream).unwrap();
             for expected in [&b"one"[..], b"two", b"three"] {
@@ -1619,6 +1664,8 @@ mod tests {
             now: testdata::NOW,
             min_version: TlsVersion::Tls13,
             max_version: TlsVersion::Tls13,
+
+            identity: None,
         });
         let mut tls = connector.connect("localhost", &stream, &stream).unwrap();
         tls.set_key_use_limit(2);
@@ -1652,6 +1699,8 @@ mod tests {
                     min_version: TlsVersion::Tls13,
                     max_version: TlsVersion::Tls13,
                     session_ticket_key: None,
+
+                    client_auth: None,
                 });
                 let _ = acceptor.accept(&stream, &stream);
             }
@@ -1666,6 +1715,8 @@ mod tests {
             now: testdata::NOW,
             min_version: TlsVersion::Tls13,
             max_version: TlsVersion::Tls13,
+
+            identity: None,
         });
         let err = match connector.connect("localhost", &stream, &stream) {
             Ok(_) => panic!("untrusted root accepted"),
@@ -1684,6 +1735,8 @@ mod tests {
             now: testdata::NOW,
             min_version: TlsVersion::Tls13,
             max_version: TlsVersion::Tls13,
+
+            identity: None,
         });
         let err = match connector.connect("not-localhost", &stream, &stream) {
             Ok(_) => panic!("hostname mismatch accepted"),
@@ -1700,6 +1753,203 @@ mod tests {
     /// hostname, both sides verify each other's Finished, and encrypted
     /// application data round-trips. Also asserts the negotiated version
     /// is TLS 1.2 with an ECDHE-RSA suite.
+    /// mTLS (RFC 8446 §4.4.2): the server asks for a client certificate,
+    /// the client presents one it proves possession of, and the handshake
+    /// completes. The server keeps the peer's leaf, which is what an
+    /// authorization layer above reads.
+    #[test]
+    fn tls13_mtls_roundtrip() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut roots = RootStore::new();
+            roots.add_der(testdata::SERVER_CERT_DER.to_vec());
+            let acceptor = TlsAcceptor::new(ServerConfig {
+                identity: testdata::server_identity(),
+                alpn: Vec::new(),
+                min_version: TlsVersion::Tls13,
+                max_version: TlsVersion::Tls13,
+                session_ticket_key: None,
+                client_auth: Some(ClientAuth::required(roots)),
+            });
+            let mut tls = acceptor.accept(&stream, &stream).unwrap();
+            assert_eq!(
+                tls.peer_certificate(),
+                Some(testdata::SERVER_CERT_DER),
+                "the authenticating client's leaf must reach the server"
+            );
+            let data = tls.read_record().unwrap();
+            assert_eq!(data, b"ping");
+            tls.write_all(b"pong").unwrap();
+            tls.close_notify().unwrap();
+        });
+
+        let stream = TcpStream::connect(addr).unwrap();
+        let connector = TlsConnector::new(ClientConfig {
+            roots: testdata::root_store(),
+            verify: true,
+            alpn: Vec::new(),
+            now: testdata::NOW,
+            min_version: TlsVersion::Tls13,
+            max_version: TlsVersion::Tls13,
+            identity: Some(testdata::server_identity()),
+        });
+        let mut tls = connector.connect("localhost", &stream, &stream).unwrap();
+        tls.write_all(b"ping").unwrap();
+        assert_eq!(tls.read_record().unwrap(), b"pong");
+        tls.close_notify().unwrap();
+        server.join().unwrap();
+    }
+
+    /// The policy, not the mechanism: a server that *requires* client
+    /// authentication refuses a client that answers the request with an
+    /// empty certificate list (RFC 8446 §6.2, `certificate_required`),
+    /// while `optional` admits the same client as anonymous.
+    #[test]
+    fn tls13_mtls_required_refuses_an_anonymous_client() {
+        for required in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut roots = RootStore::new();
+                roots.add_der(testdata::SERVER_CERT_DER.to_vec());
+                let auth = if required {
+                    ClientAuth::required(roots)
+                } else {
+                    ClientAuth::optional(roots)
+                };
+                let acceptor = TlsAcceptor::new(ServerConfig {
+                    identity: testdata::server_identity(),
+                    alpn: Vec::new(),
+                    min_version: TlsVersion::Tls13,
+                    max_version: TlsVersion::Tls13,
+                    session_ticket_key: None,
+                    client_auth: Some(auth),
+                });
+                acceptor
+                    .accept(&stream, &stream)
+                    .map(|tls| tls.peer_certificate().is_some())
+            });
+
+            let stream = TcpStream::connect(addr).unwrap();
+            let connector = TlsConnector::new(ClientConfig {
+                roots: testdata::root_store(),
+                verify: true,
+                alpn: Vec::new(),
+                now: testdata::NOW,
+                min_version: TlsVersion::Tls13,
+                max_version: TlsVersion::Tls13,
+                identity: None,
+            });
+            let outcome = connector.connect("localhost", &stream, &stream);
+            let server_outcome = server.join().unwrap();
+            if required {
+                assert!(
+                    matches!(
+                        server_outcome,
+                        Err(TlsError::Alert {
+                            level: 2,
+                            description: 116
+                        })
+                    ),
+                    "a required certificate must be refused with certificate_required"
+                );
+                // The client has already sent its Finished, so its handshake
+                // completes locally; the refusal arrives as an alert on the
+                // first read.
+                let err = match outcome {
+                    Err(e) => e,
+                    Ok(mut tls) => tls
+                        .read_record()
+                        .expect_err("the server required a client certificate"),
+                };
+                assert!(
+                    matches!(
+                        err,
+                        TlsError::Alert {
+                            level: 2,
+                            description: 116
+                        }
+                    ),
+                    "got {err:?}"
+                );
+            } else {
+                assert!(
+                    outcome.is_ok() && matches!(server_outcome, Ok(false)),
+                    "an optional request admits an anonymous client"
+                );
+                if let Ok(mut tls) = outcome {
+                    let _ = tls.close_notify();
+                }
+            }
+        }
+    }
+
+    /// A client certificate is only as good as its chain: one that does
+    /// not anchor to the configured roots fails the handshake even though
+    /// the client signed perfectly.
+    #[test]
+    fn tls13_mtls_refuses_an_untrusted_client_chain() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            // Trusts the RSA certificate only; the client will present the
+            // Ed25519 one.
+            let mut roots = RootStore::new();
+            roots.add_der(testdata::RSA_SERVER_CERT_DER.to_vec());
+            let acceptor = TlsAcceptor::new(ServerConfig {
+                identity: testdata::server_identity(),
+                alpn: Vec::new(),
+                min_version: TlsVersion::Tls13,
+                max_version: TlsVersion::Tls13,
+                session_ticket_key: None,
+                client_auth: Some(ClientAuth::required(roots)),
+            });
+            acceptor.accept(&stream, &stream).map(|_| ())
+        });
+
+        let stream = TcpStream::connect(addr).unwrap();
+        let connector = TlsConnector::new(ClientConfig {
+            roots: testdata::root_store(),
+            verify: true,
+            alpn: Vec::new(),
+            now: testdata::NOW,
+            min_version: TlsVersion::Tls13,
+            max_version: TlsVersion::Tls13,
+            identity: Some(testdata::server_identity()),
+        });
+        let client_outcome = connector.connect("localhost", &stream, &stream);
+        let server_outcome = server.join().unwrap();
+        assert!(
+            server_outcome.is_err(),
+            "an untrusted client chain must be refused"
+        );
+        // Same asymmetry: the client finishes locally and learns about the
+        // refusal from the alert the server sends (`bad_certificate`).
+        let err = match client_outcome {
+            Err(e) => e,
+            Ok(mut tls) => tls
+                .read_record()
+                .expect_err("the server refused this client chain"),
+        };
+        assert!(
+            matches!(
+                err,
+                TlsError::Alert {
+                    level: 2,
+                    description: 42
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
     #[test]
     fn tls13_with_rsa_identity_roundtrip() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1713,6 +1963,8 @@ mod tests {
                 min_version: TlsVersion::Tls13,
                 max_version: TlsVersion::Tls13,
                 session_ticket_key: None,
+
+                client_auth: None,
             });
             let mut tls = acceptor.accept(&stream, &stream).unwrap();
             assert_eq!(tls.version(), TlsVersion::Tls13);
@@ -1730,6 +1982,8 @@ mod tests {
             now: testdata::NOW,
             min_version: TlsVersion::Tls13,
             max_version: TlsVersion::Tls13,
+
+            identity: None,
         });
         let mut tls = connector.connect("localhost", &stream, &stream).unwrap();
         assert_eq!(tls.version(), TlsVersion::Tls13);
@@ -1758,6 +2012,8 @@ mod tests {
                 min_version: TlsVersion::Tls12,
                 max_version: TlsVersion::Tls12,
                 session_ticket_key: None,
+
+                client_auth: None,
             });
             let mut tls = acceptor.accept(&stream, &stream).unwrap();
             assert_eq!(tls.version(), TlsVersion::Tls12);
@@ -1776,6 +2032,8 @@ mod tests {
             now: testdata::NOW,
             min_version: TlsVersion::Tls12,
             max_version: TlsVersion::Tls12,
+
+            identity: None,
         });
         let mut tls = connector.connect("localhost", &stream, &stream).unwrap();
         assert_eq!(tls.version(), TlsVersion::Tls12);
@@ -1814,6 +2072,8 @@ mod tests {
                 min_version: TlsVersion::Tls13,
                 max_version: TlsVersion::Tls13,
                 session_ticket_key: None,
+
+                client_auth: None,
             });
             let mut tls = acceptor.accept(&stream, &stream).unwrap();
             assert_eq!(tls.version(), TlsVersion::Tls13);
@@ -1831,6 +2091,8 @@ mod tests {
             now: testdata::NOW,
             min_version: TlsVersion::Tls13,
             max_version: TlsVersion::Tls13,
+
+            identity: None,
         });
         let mut tls = connector.connect("localhost", &stream, &stream).unwrap();
         assert_eq!(tls.version(), TlsVersion::Tls13);
@@ -1862,6 +2124,8 @@ mod tests {
                 min_version: TlsVersion::Tls12,
                 max_version: TlsVersion::Tls12,
                 session_ticket_key: None,
+
+                client_auth: None,
             });
             let mut tls = acceptor.accept(&stream, &stream).unwrap();
             assert_eq!(tls.version(), TlsVersion::Tls12);
@@ -1879,6 +2143,8 @@ mod tests {
             now: testdata::NOW,
             min_version: TlsVersion::Tls12,
             max_version: TlsVersion::Tls12,
+
+            identity: None,
         });
         let mut tls = connector.connect("localhost", &stream, &stream).unwrap();
         assert_eq!(tls.version(), TlsVersion::Tls12);
@@ -1949,6 +2215,8 @@ mod tests {
                 min_version: TlsVersion::Tls12,
                 max_version: TlsVersion::Tls12,
                 session_ticket_key: None,
+
+                client_auth: None,
             });
             let mut tls = acceptor.accept(&stream, &stream).unwrap();
             assert_eq!(tls.version(), TlsVersion::Tls12);
@@ -1986,6 +2254,8 @@ mod tests {
                 min_version: TlsVersion::Tls12,
                 max_version: TlsVersion::Tls12,
                 session_ticket_key: None,
+
+                client_auth: None,
             });
             let _ = acceptor.accept(&stream, &stream);
         });
@@ -1998,6 +2268,8 @@ mod tests {
             now: testdata::NOW,
             min_version: TlsVersion::Tls13,
             max_version: TlsVersion::Tls13,
+
+            identity: None,
         });
         let err = match connector.connect("localhost", &stream, &stream) {
             Ok(_) => panic!("TLS 1.3-only client accepted a TLS 1.2 server"),
@@ -2033,6 +2305,8 @@ mod tests {
                 min_version: TlsVersion::Tls12,
                 max_version: TlsVersion::Tls12,
                 session_ticket_key: None,
+
+                client_auth: None,
             });
             let mut tls = acceptor.accept(&stream, &stream).unwrap();
             assert_eq!(tls.version(), TlsVersion::Tls12);
@@ -2050,6 +2324,8 @@ mod tests {
             now: testdata::NOW,
             min_version: TlsVersion::Tls12,
             max_version: TlsVersion::Tls12,
+
+            identity: None,
         });
         let mut tls = connector.connect("localhost", &stream, &stream).unwrap();
         assert_eq!(tls.version(), TlsVersion::Tls12);
@@ -2085,6 +2361,8 @@ mod tests {
                 min_version: TlsVersion::Tls13,
                 max_version: TlsVersion::Tls13,
                 session_ticket_key: Some(ticket_key),
+
+                client_auth: None,
             });
             for _ in 0..2 {
                 let (stream, _) = listener.accept().unwrap();
@@ -2103,6 +2381,8 @@ mod tests {
             now: testdata::NOW,
             min_version: TlsVersion::Tls13,
             max_version: TlsVersion::Tls13,
+
+            identity: None,
         });
 
         // First connection: full handshake, ticket captured on connect.
@@ -2150,6 +2430,8 @@ mod tests {
                 min_version: TlsVersion::Tls13,
                 max_version: TlsVersion::Tls13,
                 session_ticket_key: Some(ticket_key),
+
+                client_auth: None,
             });
             for _ in 0..2 {
                 let (stream, _) = listener.accept().unwrap();
@@ -2167,6 +2449,8 @@ mod tests {
             now: testdata::NOW,
             min_version: TlsVersion::Tls13,
             max_version: TlsVersion::Tls13,
+
+            identity: None,
         });
 
         // First connection: full handshake, captures a ticket.
@@ -2223,6 +2507,8 @@ mod tests {
                 min_version: TlsVersion::Tls13,
                 max_version: TlsVersion::Tls13,
                 session_ticket_key: None,
+
+                client_auth: None,
             });
             let mut tls = acceptor.accept(&stream, &stream).unwrap();
             assert_eq!(tls.read_record().unwrap(), b"ping");
@@ -2284,6 +2570,7 @@ mod tests {
             server_name: Some("localhost".to_string()),
             verify: true,
             psk: None,
+            identity: None,
         };
         let result = hs
             .run_from_server_hello(

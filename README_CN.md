@@ -212,17 +212,16 @@ use courierust::courierust_client::{Client, ClientConfig, TlsSettings as ClientT
 use courierust::courierust_server::{Server, ServerConfig, TlsSettings as ServerTls};
 
 // 服务端：用你的证书链 + 私钥开 HTTPS。
-let identity = courierust::courierust_tls::Identity {
-    cert_chain: vec![cert_der],        // 叶子在前（DER）
-    private_key: key_der,              // PKCS#8 或 PKCS#1（DER）
-    is_rsa: false,                     // Ed25519/ECDSA 为 false
-};
+// `from_pem_file` 解析证书链与私钥（PKCS#8 / PKCS#1 / SEC1），并证明二者
+// 属于同一对——不匹配的私钥在这里、启动时就会失败，而不是每个握手失败一次。
+// 私钥来自内存时用 `Identity::from_pem(cert, key)` 或
+// `Identity::from_der(chain, key)`。
 let server_cfg = ServerConfig {
     http2: true,                        // TLS 之上同时支持 h2 与 HTTP/1.1（ALPN）
-    tls: Some(ServerTls {
-        identity,
-        alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-    }),
+    tls: Some(ServerTls::from_pem_file(
+        "cert.pem",                     // 证书链，叶子在前
+        "key.pem",                      // PKCS#8 / PKCS#1 / SEC1
+    )?),
     ..Default::default()
 };
 
@@ -303,7 +302,7 @@ courierust = { version = "1.0.6", default-features = false }
 这个仓库刻意不做的，以及你接手前应该知道的：
 
 - **HTTP/3 / QUIC 已有零依赖的内置路径，但协议边界必须如实理解**。`courierust_h3` 通过 std UDP reactor 运行 HTTP/3 请求/响应，包含 QUIC v1 包保护、内置 TLS 1.3、ALPN `h3`、有界 CRYPTO/stream 重组、Retry 完整性校验与 token 绑定的地址验证、Version Negotiation、验证前 3x anti-amplification、ACK range、使用新包号的重传、RTT/RTO 采样、有界拥塞窗口、控制/QPACK 流、trailer 与 GOAWAY 校验。它还不是完整的互联网级 QUIC 实现的含义是：0-RTT 与独立互操作仍开放，但传输长尾已实现并有测试覆盖：完整 PTO/时间阈值丢包恢复、动态本地 `MAX_DATA`/`MAX_STREAM_DATA`/`MAX_STREAMS` credit 更新、连接迁移与路径验证（PATH_CHALLENGE/RESPONSE）、stateless reset（生成与校验）、带单次保护的双向自动 key update、QPACK blocked-stream acknowledgement（解码器流上的 Section Acknowledgment / Stream Cancellation / Insert Count Increment）。刻意不做：0-RTT / early data（不承担重放防护的复杂度），以及独立实现互操作（quinn+h3 握手互操作缺口在基准套件里如实上报而非造假）。这两项是宣称对外普遍互通前的剩余事项。
-- **TLS 无 0-RTT、无双向 mTLS**。TLS 1.3 会话恢复已在 TLS 层实现（服务端签发 session ticket、1-RTT PSK `psk_dhe_ke`、按主机名分键的客户端会话缓存）并有单元测试；但池化客户端目前每个请求新建 connector，跨连接恢复尚未在基准里实际生效（基准行因此如实报告 `session_resumption=n/a`）。0-RTT / early data 从不提供。TLS 1.2 session id 会携带但从不用于恢复。服务端不请求客户端证书。
+- **TLS 无 0-RTT；双向 mTLS 仅限 TLS 1.3 over TCP**。TLS 1.3 会话恢复已在 TLS 层实现（服务端签发 session ticket、1-RTT PSK `psk_dhe_ke`、按主机名分键的客户端会话缓存），池化客户端按 authority 缓存 connector，一条连接上拿到的 ticket 会在下一条连接上提供（基准行仍报告 `session_resumption=n/a`，那是基准的问题，不是实现的问题）。0-RTT / early data 从不提供。TLS 1.2 session id 会携带但从不用于恢复。客户端认证**已实现**，限 TLS 1.3 over TCP：服务端 `ClientAuth::required`/`optional`，客户端 `TlsSettings::identity`，证书链按 client-auth 信任根 + 有效期 + `clientAuth` EKU 校验，由 `CertificateVerify` 证明持有私钥；要求认证而客户端拒绝时发送 `certificate_required`——拒绝是线上的告警，而不是默默关闭套接字。与 TLS 1.2 的组合（握手建立时）和与 HTTP/3 的组合（启动时）都会被拒绝而非半服务；握手后认证超出范围。两个方向都有单元测试，并有经公共 `TlsSettings`/`client_auth` 接口的集成测试。
 - **事件驱动服务器全平台默认开启，只处理 HTTP/1.1**。`ServerConfig::event_driven`（默认 `true`）把空闲明文 HTTP 连接挂在轮询器上（Winsock `select` / POSIX `poll`），少量 worker 即可服务大量 idle keep-alive / SSE / 长轮询连接；TLS 与 HTTP/2 连接仍走阻塞池模型（由 `handshake_timeout`、`h2_idle_timeout` 与 worker 数共同约束）。设为 `false` 恢复旧的**每连接一池任务**模型；该路径已不建议用于生产——空闲/慢连接群会耗尽池——仅作对比与调试，默认事件路径用 `max_connections`（连接上限）与 `idle_timeout` 约束资源。
 - **请求体流式上传目前只在 HTTP/2 下可靠**（h2 天然分帧）。HTTP/1.1 的请求体要么一次性给全（`Body::Bytes`），要么你自己拼 chunked。
 - **gRPC 不含 protobuf、`.proto` 代码生成与 `grpc.reflection`**。消息编解码需要你实现 codec trait 或接你自己的 protobuf 生成代码；reflection 需要 protobuf 模式清单，属外部职责。
@@ -316,28 +315,71 @@ courierust = { version = "1.0.6", default-features = false }
 
 所有公共模块都以 crate 名做前缀（`courierust_`），这样任何模块路径都不会与第三方 crate（如 `h2`、`http`、`bytes`、`grpc`、`tls`）冲突：
 
-```
-src/
-├── courierust_http/        # HTTP/1.1 消息模型（请求/响应/头/URI/状态码）      [no_std]
-├── courierust_hpack/       # HPACK：表驱动 Huffman + 静态/动态索引表           [no_std]
-├── courierust_h2/          # HTTP/2 帧、SETTINGS、流状态机、流控、WUCS、PRIORITY_UPDATE [no_std]
-├── courierust_quic/        # QUIC v1 包/帧编解码、varint、连接 ID、crypto 标签  [no_std]
-├── courierust_h3/          # HTTP/3：QPACK 静态/动态表 + H3 帧/流角色         [no_std]
-├── courierust_fingerprint/ # JA3 / JA4 / Chrome HTTP/2 指纹                    [no_std]
-├── courierust_crypto/      # 自带 MD5 / SHA-256 / SHA-1 / base64（指纹与 RFC 6455 用）  [no_std]
-├── courierust_deflate/     # DEFLATE/gzip，带可复用的按消息上下文（RFC 7692）  [no_std]
-├── courierust_ws/          # RFC 6455 组帧 + 掩码 + 握手 + permessage-deflate    [no_std]
-├── courierust_bytes/       # 字节缓冲（BytesMut）                              [no_std]
-├── courierust_io/          # Read/Write trait（no_std 版）                     [no_std]
-├── courierust_error/       # 统一错误类型
-├── courierust_tls/         # TLS 1.2 + 1.3（RFC 5246/8446）：握手、记录层、X.509、HTTPS    [std]
-├── courierust_pool/        # 工作窃取线程池                                    [std]
-├── courierust_net/         # TCP → io trait 适配、轮询器、可选 stats 埋点      [std]
-├── courierust_body/        # 流式响应体（channel）                             [std]
-├── courierust_h1/          # HTTP/1.1 线上编解码                                [std]
-├── courierust_client/      # h1 连接池 + h2 驱动                                [std]
-├── courierust_server/      # 基于工作窃取池的服务器                             [std]
-└── courierust_grpc/        # gRPC 帧 + 状态 + codec trait                       [std]
+```mermaid
+flowchart TB
+
+    ROOT["Courierust"]
+
+    ROOT --> CORE
+    ROOT --> RUNTIME
+
+    subgraph CORE["no_std · Protocol & Core"]
+        direction LR
+
+        HTTP["courierust_http<br/>HTTP/1.1 消息模型<br/>请求 · 响应 · Header · URI"]
+
+        HPACK["courierust_hpack<br/>HPACK<br/>Huffman · 静态/动态表"]
+
+        H2["courierust_h2<br/>HTTP/2<br/>帧 · 流状态 · 流控 · WUCS"]
+
+        QUIC["courierust_quic<br/>QUIC v1<br/>Packet · Frame · VarInt · CID"]
+
+        H3["courierust_h3<br/>HTTP/3<br/>QPACK · H3 Frame · Stream"]
+
+        FP["courierust_fingerprint<br/>Fingerprint<br/>JA3 · JA4 · Chrome H2"]
+
+        CRYPTO["courierust_crypto<br/>Cryptography<br/>MD5 · SHA-1 · SHA-256 · Base64"]
+
+        DEFLATE["courierust_deflate<br/>Compression<br/>DEFLATE · gzip · RFC 7692"]
+
+        WS["courierust_ws<br/>WebSocket<br/>RFC 6455 · Masking · Handshake"]
+
+        BYTES["courierust_bytes<br/>Byte Buffers<br/>BytesMut"]
+
+        IO["courierust_io<br/>I/O Traits<br/>Read · Write"]
+
+        ERROR["courierust_error<br/>Unified Error"]
+    end
+
+
+    subgraph RUNTIME["std · Runtime & Services"]
+        direction LR
+
+        TLS["courierust_tls<br/>TLS 1.2 / 1.3<br/>Handshake · Record · X.509 · HTTPS"]
+
+        POOL["courierust_pool<br/>Work-Stealing Pool<br/>Thread Pool"]
+
+        NET["courierust_net<br/>Network Layer<br/>TCP · Poller · I/O Adapter"]
+
+        BODY["courierust_body<br/>Streaming Body<br/>Channel-based"]
+
+        H1["courierust_h1<br/>HTTP/1.1 Wire Codec"]
+
+        CLIENT["courierust_client<br/>HTTP Client<br/>H1 Pool · H2 Driver"]
+
+        SERVER["courierust_server<br/>HTTP Server<br/>Work-Stealing"]
+
+        GRPC["courierust_grpc<br/>gRPC<br/>Frame · Status · Codec"]
+    end
+
+
+    classDef root font-weight:bold,font-size:16px;
+    classDef core font-weight:bold;
+    classDef runtime font-weight:bold;
+
+    class ROOT root;
+    class HTTP,HPACK,H2,QUIC,H3,FP,CRYPTO,DEFLATE,WS,BYTES,IO,ERROR core;
+    class TLS,POOL,NET,BODY,H1,CLIENT,SERVER,GRPC runtime;
 ```
 
 ## 基准测试
@@ -389,11 +431,12 @@ cargo fuzz run h2_frame --fuzz-dir fuzz -- -runs=10000
 
 下面的数量按测试二进制区分，可与一次实际运行一一对应：
 
-- **单元测试 418 个**（`cargo test --lib`）：覆盖 HPACK 全部 RFC 向量（C.2/C.3/C.4/C.6）、Huffman 编解码（含解码输出上限）、帧编解码、状态机、流控、WUCS 调度、JA3/JA4 公开记录比对、指纹解析、TLS 1.3 握手与 RFC 8448 密钥调度、TLS 1.2 握手（ECDHE-RSA/ECDSA AEAD 套件、PRF、RFC 5746 重协商回显、Ed25519 ServerKeyExchange 签名/验证）、X.25519/Ed25519/ECDSA/RSA 原语、DEFLATE/gzip 编解码（往返、CRC-32 向量、损坏拒绝、输出上限、与 Python zlib 输出交叉验证，以及覆盖距离码 22-29 的远距离向量）、**WebSocket 引擎**（掩码相位表、最短长度编码、控制帧规则、增量 UTF-8 校验、握手解析、共享关闭标志、RFC 7692 协商）、轮询器 self-pipe（唤醒描述符）语义与「已关闭描述符」契约、h2 池的加权负载记账、`application/x-www-form-urlencoded` 编解码（WHATWG 透传集、`+`/`%XX` 往返、拒绝畸形转义与非 UTF-8）、h1/h2/h3 共用的字段值字符类，以及按 RFC 8446 §4.6.1 逐字段走线的 `NewSessionTicket` 线格式（空的扩展向量仍然是向量）与「武装的读截止时间在每个平台都表现为 `Timeout`」这条契约。
-- **集成测试 69 个**（`tests/integration.rs`）：真实 TCP 环回上的 h1/h2/HTTPS 请求往返、keep-alive 复用、chunked、重定向、h2 并发多路复用、流式响应、大体积流控往返、gRPC unary/服务端流/客户端流/双向流与错误状态/trailers/deadline 执行、gzip 往返、`grpc.health.v1.Health` `Check` + `Watch`、RFC 7540 §3.2 `h2c` Upgrade、并发证明（慢流不阻塞同连接其他流；大量空闲流按连接而非按流占 worker；空闲连接羊群不阻塞新请求；事件调度器回收 slow-loris 并执行 `max_connections`；服务端流式响应按短节奏冲刷；单条 h2 连接并发突发不饥饿）、**请求构建**（`Client::request` 与快捷方法发全部动词、`query`/`form` 编码、basic/bearer 认证、客户端默认头与请求自身字段的优先级、跨源重定向不被带回默认凭据、h1 与 h2 上的每请求截止时间且连接仍可复用、含 CR/LF 的头值在 h1/h2 均被拒绝）、**h1 分帧回归**（`Content-Length: 0` 必须被应答而不是挂起；HEAD 响应到头部块就结束），以及 **TLS 策略/加固**（信任拒绝、过期证书、不可信签发链、自签名但显式信任、主机名不匹配、ALPN 一致、TLS 1.2 与 TLS 1.3 分别用 RSA / P-384 / Ed25519 身份的完整往返、纯 TLS 1.3 客户端拒绝 TLS 1.2 服务器——绝不静默降级——与 RFC 8446 降级哨兵、握手中断失败、畸形 TLS 输入存活、`verify:false`）。
+- **单元测试 439 个**（`cargo test --lib`）：覆盖 HPACK 全部 RFC 向量（C.2/C.3/C.4/C.6）、Huffman 编解码（含解码输出上限）、帧编解码、状态机、流控、WUCS 调度、JA3/JA4 公开记录比对、指纹解析、TLS 1.3 握手与 RFC 8448 密钥调度、TLS 1.2 握手（ECDHE-RSA/ECDSA AEAD 套件、PRF、RFC 5746 重协商回显、Ed25519 ServerKeyExchange 签名/验证）、X.25519/Ed25519/ECDSA/RSA 原语、DEFLATE/gzip 编解码（往返、CRC-32 向量、损坏拒绝、输出上限、与 Python zlib 输出交叉验证，以及覆盖距离码 22-29 的远距离向量）、**WebSocket 引擎**（掩码相位表、最短长度编码、控制帧规则、增量 UTF-8 校验、握手解析、共享关闭标志、RFC 7692 协商）、轮询器 self-pipe（唤醒描述符）语义与「已关闭描述符」契约、h2 池的加权负载记账、`application/x-www-form-urlencoded` 编解码（WHATWG 透传集、`+`/`%XX` 往返、拒绝畸形转义与非 UTF-8）、h1/h2/h3 共用的字段值字符类，以及按 RFC 8446 §4.6.1 逐字段走线的 `NewSessionTicket` 线格式（空的扩展向量仍然是向量）与「武装的读截止时间在每个平台都表现为 `Timeout`」这条契约，PEM 读取器（护甲规则、三种私钥容器）、`Identity` 加载（PEM/DER 校验、私钥与证书不匹配、`Debug` 只打印私钥长度而非字节）、同时带两种分帧时的拒绝判定（RFC 9112 §6.1 / CWE-444），以及按 RFC 3986 §5.4 参考向量核对的重定向解析。
+- **集成测试 76 个**（`tests/integration.rs`）：真实 TCP 环回上的 h1/h2/HTTPS 请求往返、keep-alive 复用、chunked、重定向、h2 并发多路复用、流式响应、大体积流控往返、gRPC unary/服务端流/客户端流/双向流与错误状态/trailers/deadline 执行、gzip 往返、`grpc.health.v1.Health` `Check` + `Watch`、RFC 7540 §3.2 `h2c` Upgrade、并发证明（慢流不阻塞同连接其他流；大量空闲流按连接而非按流占 worker；空闲连接羊群不阻塞新请求；事件调度器回收 slow-loris 并执行 `max_connections`；服务端流式响应按短节奏冲刷；单条 h2 连接并发突发不饥饿）、**请求构建**（`Client::request` 与快捷方法发全部动词、`query`/`form` 编码、basic/bearer 认证、客户端默认头与请求自身字段的优先级、跨源重定向不被带回默认凭据、h1 与 h2 上的每请求截止时间且连接仍可复用、含 CR/LF 的头值在 h1/h2 均被拒绝）、**h1 分帧回归**（`Content-Length: 0` 必须被应答而不是挂起；HEAD 响应到头部块就结束），以及 **TLS 策略/加固**（信任拒绝、过期证书、不可信签发链、自签名但显式信任、主机名不匹配、ALPN 一致、TLS 1.2 与 TLS 1.3 分别用 RSA / P-384 / Ed25519 身份的完整往返、纯 TLS 1.3 客户端拒绝 TLS 1.2 服务器——绝不静默降级——与 RFC 8446 降级哨兵、握手中断失败、畸形 TLS 输入存活、`verify:false`），以及 **PEM 身份加载**（用 `tests/certs/*.pem` 的 OpenSSL 夹具启动的服务端能真的服务请求；带中间证书的链加载为两张证书；取自另一张证书的私钥在加载时被拒绝），以及 **请求走私防护**（同时带两种分帧的请求被**两个驱动**同样以 `400` 回答，其后面流水线发送的字节绝不会被当作第二个请求解析）和相对 `Location` 按请求路径解析（RFC 3986 §5.2）。
 - **HTTP/3 测试 14 个**（`tests/h3.rs` + `tests/h3_key_update.rs`）：QUIC v1 + TLS 1.3 真实 UDP 套接字、走公共 `Client`/`Server`：GET/POST 往返、池化连接复用、双向 256 KiB 请求/响应流控、并发多路复用、每请求 deadline 执行、HEAD 响应不等 handler 的流式 body、双向 key update，以及 H3 TLS 安全（不信任 / 过期 / 错误证书链 / 主机名不匹配证书均在握手阶段拒绝）。
 - **HTTP/2 加固测试 39 个**（`tests/h2_hardening.rs`）：恶意帧输入（超长帧、畸形 SETTINGS/PING/WINDOW_UPDATE、填充越界的 PADDED HEADERS、流级零增量 `WINDOW_UPDATE` 必须停留在流级错误、空闲流上的 `WINDOW_UPDATE`、流控窗口溢出、HPACK 头表与 Huffman 炸弹、截断/EOS Huffman、伪头顺序、`content-length` 不一致、非法 `transfer-encoding`/`connection` 系头、含 NUL/CR/LF 的字段值报流错误而非连接错误、两端 `SETTINGS_MAX_CONCURRENT_STREAMS` 强制、`h2c` 存活检测：SETTINGS_TIMEOUT 与 keepalive 死对端检测）。
 - **WebSocket 端到端测试 34 个**（`tests/ws.rs`）：真实服务端 + 真实客户端 + 真实 socket，覆盖升级握手（含 RFC 6455 accept-key 官方向量）、双向掩码、带交错控制帧的分片重组、`permessage-deflate` 协商与 RFC 7692 互操作、UTF-8 失败码、关闭握手的干净性、本 crate TLS 上的 `wss://`、其他线程推送、握手上携带客户端默认头、Origin / 子协议策略、帧/消息/队列上限，以及 reactor 回归（一条连接关闭后仍打开的连接必须继续被服务；健康 reactor 的等待自愈次数为 0）。
+- **代理测试 6 个**（`tests/proxy.rs`）：客户端对上一个只用标准库写成的 HTTP 代理——被测实现只有客户端自身。`https://` 走 `CONNECT` 隧道且凭据对代理可见、对源站不可见；`http://` 使用绝对请求形式（含 `OPTIONS *` 以空路径绝对形式出行，RFC 9110 §9.3.7）；请求自带的 `Proxy-Authorization` 优先于配置凭据，且该跳上只会出现一个；被拒绝的 `CONNECT` 会带回代理的 `403`；`http3`/`h2c` + 代理在开套接字之前就被拒绝。
 - **4 个 fuzz 目标**（`cargo-fuzz`）：`h2_frame`、`hpack_block`，加上 **`h1_request`**（两个服务端解析器共用 的 request/header/chunked 路径）与 **`h2_connection`**（用恶意帧流在两种角色下驱动完整 h2 状态机）。nightly 长跑工作流给每个目标一个墙钟预算；PR 期在 `benchmark.yml` 里跑同一批目标的冒烟运行。
 
 ```bash

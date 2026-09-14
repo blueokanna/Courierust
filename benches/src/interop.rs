@@ -191,11 +191,7 @@ fn load_test_identity() -> (
     courierust::courierust_tls::Identity,
     courierust::courierust_tls::RootStore,
 ) {
-    let identity = courierust::courierust_tls::Identity {
-        cert_chain: vec![SERVER_CERT_DER.to_vec()],
-        private_key: SERVER_KEY_DER.to_vec(),
-        is_rsa: false,
-    };
+    let identity = courierust::courierust_tls::Identity::from_der(vec![SERVER_CERT_DER.to_vec()], SERVER_KEY_DER.to_vec()).expect("valid test identity");
     let mut roots = courierust::courierust_tls::RootStore::new();
     roots.add_der(SERVER_CERT_DER.to_vec());
     (identity, roots)

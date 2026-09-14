@@ -63,6 +63,15 @@
 			"command": "cargo bench --manifest-path benches/Cargo.toml --bench complexity",
 			"problemMatcher": [],
 			"group": "test"
+		},
+		{
+			"label": "test: tls library suite",
+			"type": "shell",
+			"command": "cargo +1.78.0 test --lib courierust_tls:: --message-format=short -- --test-threads=1",
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "test"
 		}
 	]
 }

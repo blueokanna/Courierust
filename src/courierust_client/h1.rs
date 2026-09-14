@@ -37,12 +37,23 @@ pub struct H1Connection {
     /// response), never a stale connection: the request was processed,
     /// so replaying it would be a second execution, not a retry.
     read_started: bool,
+    /// Whether the peer of this connection is an HTTP proxy the request is
+    /// *addressed to* (the plaintext absolute-form hop).
+    ///
+    /// It decides exactly one thing: a `Proxy-Authorization` field belongs
+    /// to that hop, so it survives the hop-by-hop filter there and nowhere
+    /// else — to an origin, and to an origin inside a tunnel, that field
+    /// would be a credential handed to a party it was never meant for.
+    to_proxy: bool,
 }
 
 impl H1Connection {
     /// Connect to `addr` and configure the socket once. When `tls` is
     /// set, wrap the socket in a TLS 1.3 client connection validated
     /// against `hostname`.
+    ///
+    /// This is the direct path; a client with a proxy dials the proxy and
+    /// hands the tunnel to [`Self::from_socket`].
     pub fn connect(
         addr: SocketAddr,
         tls: Option<&crate::courierust_tls::TlsConnector>,
@@ -50,6 +61,45 @@ impl H1Connection {
         cfg: &ClientConfig,
     ) -> Result<Self> {
         let stream = courierust_net::connect(&addr, cfg.connect_timeout)?;
+        Self::from_socket(stream, tls, hostname, cfg)
+    }
+
+    /// Wrap an already-connected socket (a direct connection, or a
+    /// `CONNECT` tunnel to `hostname`), configuring it for the phase it
+    /// is about to run.
+    pub fn from_socket(
+        stream: std::net::TcpStream,
+        tls: Option<&crate::courierust_tls::TlsConnector>,
+        hostname: &str,
+        cfg: &ClientConfig,
+    ) -> Result<Self> {
+        Self::wrap(stream, tls, hostname, cfg, false)
+    }
+
+    /// Wrap a socket whose peer is an HTTP proxy, so the request — written
+    /// in the absolute form by the caller — is addressed *to the proxy*.
+    ///
+    /// The difference from [`Self::from_socket`] is one field: a
+    /// `Proxy-Authorization` is this hop's business, while every other
+    /// hop-by-hop field is still filtered out.
+    pub fn from_proxy_socket(
+        stream: std::net::TcpStream,
+        tls: Option<&crate::courierust_tls::TlsConnector>,
+        hostname: &str,
+        cfg: &ClientConfig,
+    ) -> Result<Self> {
+        Self::wrap(stream, tls, hostname, cfg, true)
+    }
+
+    /// The one wrapping path both constructors share: the peer's identity
+    /// is a flag, everything else about the phase is `cfg`.
+    fn wrap(
+        stream: std::net::TcpStream,
+        tls: Option<&crate::courierust_tls::TlsConnector>,
+        hostname: &str,
+        cfg: &ClientConfig,
+        to_proxy: bool,
+    ) -> Result<Self> {
         let conn = match tls {
             Some(c) => {
                 courierust_net::configure(&stream, cfg.handshake_timeout)?;
@@ -78,6 +128,7 @@ impl H1Connection {
             version: Version::HTTP_11,
             reusable: true,
             read_started: false,
+            to_proxy,
         })
     }
 
@@ -104,6 +155,7 @@ impl H1Connection {
             version: Version::HTTP_11,
             reusable: true,
             read_started: false,
+            to_proxy: false,
         })
     }
 
@@ -186,7 +238,12 @@ impl H1Connection {
     ) -> Result<Response<Body>> {
         let mut headers = HeaderMap::with_capacity(req.headers.len() + 4);
         for (n, v) in req.headers.iter() {
-            if courierust_h1::is_hop_by_hop(n.as_str()) {
+            // `Proxy-Authorization` is hop-by-hop, and the hop it is for is
+            // the proxy the request is addressed to — everywhere else the
+            // field is dropped, so a proxy credential can never be handed
+            // to an origin (directly or inside a tunnel).
+            let proxy_credential = self.to_proxy && n.as_str() == "proxy-authorization";
+            if !proxy_credential && courierust_h1::is_hop_by_hop(n.as_str()) {
                 continue;
             }
             headers.append(n.clone(), v.clone());

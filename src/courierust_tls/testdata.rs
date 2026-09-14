@@ -49,11 +49,11 @@ pub(crate) const NOW: i64 = 1_800_000_000; // 2027-01-14T00:00:00Z
 
 /// The server identity for the test certificate.
 pub(crate) fn server_identity() -> crate::courierust_tls::Identity {
-    crate::courierust_tls::Identity {
-        cert_chain: vec![SERVER_CERT_DER.to_vec()],
-        private_key: SERVER_KEY_DER.to_vec(),
-        is_rsa: false,
-    }
+    crate::courierust_tls::Identity::from_der(
+        vec![SERVER_CERT_DER.to_vec()],
+        SERVER_KEY_DER.to_vec(),
+    )
+    .expect("valid test identity")
 }
 
 /// A root store that trusts the test certificate.
@@ -85,11 +85,11 @@ pub(crate) const RSA_SERVER_KEY_DER: &[u8] = include_bytes!("testdata/rsa_server
 
 /// The RSA server identity used by the TLS 1.2 tests.
 pub(crate) fn rsa_server_identity() -> crate::courierust_tls::Identity {
-    crate::courierust_tls::Identity {
-        cert_chain: vec![RSA_SERVER_CERT_DER.to_vec()],
-        private_key: RSA_SERVER_KEY_DER.to_vec(),
-        is_rsa: true,
-    }
+    crate::courierust_tls::Identity::from_der(
+        vec![RSA_SERVER_CERT_DER.to_vec()],
+        RSA_SERVER_KEY_DER.to_vec(),
+    )
+    .expect("valid test identity")
 }
 
 /// A root store that trusts the RSA test certificate.
@@ -129,14 +129,14 @@ pub(crate) const P384_LEAF_KEY_DER: &[u8] = include_bytes!("testdata/p384_leaf_k
 /// The P-384 server identity: leaf + intermediate, signed by the P-384
 /// root. Used to prove that an ECDSA P-384 intermediate CA validates.
 pub(crate) fn p384_server_identity() -> crate::courierust_tls::Identity {
-    crate::courierust_tls::Identity {
-        cert_chain: vec![
+    crate::courierust_tls::Identity::from_der(
+        vec![
             P384_LEAF_CERT_DER.to_vec(),
             P384_INTERMEDIATE_CERT_DER.to_vec(),
         ],
-        private_key: P384_LEAF_KEY_DER.to_vec(),
-        is_rsa: false,
-    }
+        P384_LEAF_KEY_DER.to_vec(),
+    )
+    .expect("valid test identity")
 }
 
 /// A root store that trusts the P-384 root CA.

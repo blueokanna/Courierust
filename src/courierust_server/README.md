@@ -43,6 +43,30 @@ A closed descriptor sitting in a wait set is not a harmless stale entry: POSIX `
 - `event_driven: false` restores the legacy model — one pool job per connection — for comparison and debugging. Not recommended for production: idle/slow herds will exhaust the pool.
 - A long-blocking synchronous handler occupies a worker (event-driven or not) — any synchronous server's disease. Use channel bodies for streaming: waiting for a chunk parks the connection instead of the worker.
 - Both h2c prior knowledge and `h2c` Upgrade are served.
+- **Client certificates (mTLS)** — `TlsSettings::client_auth` takes a `ClientAuth` (client-auth roots + `required`/`optional`) and this server then asks every client to authenticate: the certificate is validated against those roots, the validity window and the `clientAuth` EKU, and possession is proven by `CertificateVerify`. A client that declines while authentication is required is answered with `certificate_required` (116). Two boundaries are enforced rather than documented away: a config that combines `client_auth` with TLS 1.2 is refused when the handshake is set up, and `client_auth` + `http3` is refused at startup — mTLS here is TLS 1.3 over TCP.
+
+## Embedding: who owns the accept loop
+
+Two entry points, one engine:
+
+- `Server` binds — or adopts, via `Server::from_listener`, a listener you
+  bound yourself (a process that drops privileges after binding, systemd
+  socket activation, a port shared between services) — and runs the
+  scheduler itself.
+- `courierust_server::serve_connection(stream, handler, config)` drives
+  **one** accepted connection: TLS handshake, ALPN, HTTP/1.1 / HTTP/2,
+  WebSocket upgrades, tunnels. That is the shape a proxy needs — the
+  socket (and its `peer_addr`) is yours before the engine sees it, so
+  per-connection policy (address allow-lists, rate limits, your own
+  accounting) stays yours, while the protocol work stays the engine's.
+  The socket is configured exactly as `Server` would: `TCP_NODELAY`,
+  `handshake_timeout` during the TLS handshake, then `read_timeout`.
+
+Two boundaries worth knowing. `serve_connection` refuses a config with
+`http3` set: QUIC belongs to the server's own UDP reactor, which only
+`Server::serve*` owns, and quietly serving TCP only would be a half
+service. And a TLS config with an empty identity is refused wherever a
+server or a connection is created — at startup, not once per client.
 
 ## WebSocket upgrades
 

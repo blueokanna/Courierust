@@ -157,6 +157,10 @@ pub(crate) const OID_NAME_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x1e];
 #[allow(dead_code)] // used by the TLS handshake certificate validation
 pub(crate) const OID_KEY_USAGE_SERVER_AUTH: &[u8] =
     &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+/// id-kp-clientAuth (1.3.6.1.5.5.7.3.2) — required on a certificate a
+/// peer presents when it is the one *being* authenticated (mTLS).
+pub(crate) const OID_KEY_USAGE_CLIENT_AUTH: &[u8] =
+    &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
 
 fn sig_alg_from_oid(oid: &[u8]) -> SigAlg {
     if oid == OID_RSA_SHA256 {

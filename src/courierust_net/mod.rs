@@ -102,7 +102,12 @@ pub(crate) struct ConnStream {
 }
 
 enum ConnStreamKind {
-    Plain(TcpStream),
+    /// A plain TCP socket.
+    ///
+    /// Shared (`Arc`) for the same reason the TLS variant is: the server's
+    /// tunnel handoff moves one handle into a connection that outlives the
+    /// event reactor's registration, without duplicating the descriptor.
+    Plain(Arc<TcpStream>),
     Tls {
         /// The raw socket (shared with the TLS layer, used to reconfigure
         /// timeouts after the handshake).
@@ -119,6 +124,15 @@ enum ConnStreamKind {
 impl ConnStream {
     /// Wrap a plain TCP stream.
     pub(crate) fn plain(stream: TcpStream) -> Self {
+        Self::plain_shared(Arc::new(stream))
+    }
+
+    /// Wrap a plain TCP stream this process already holds behind an `Arc`.
+    ///
+    /// Used by the server's tunnel handoff: the reactor stops watching the
+    /// descriptor and the same handle is handed to the tunnel, so no
+    /// second descriptor (and no second close) exists for one socket.
+    pub(crate) fn plain_shared(stream: Arc<TcpStream>) -> Self {
         let peer = stream
             .peer_addr()
             .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
@@ -228,6 +242,18 @@ impl ConnStream {
         self.configure(read_timeout)?;
         self.deadline.store(true, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Shut down the transport's read, write or both halves.
+    ///
+    /// Both variants share one socket, so this is the socket shutdown either
+    /// way; a TLS caller that wants the record-layer `close_notify` uses the
+    /// stream's own method instead.
+    pub(crate) fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
+        match &self.inner {
+            ConnStreamKind::Plain(s) => s.shutdown(how),
+            ConnStreamKind::Tls { socket, .. } => socket.shutdown(how),
+        }
     }
 
     /// Drain a bounded amount of unread request data before the socket is

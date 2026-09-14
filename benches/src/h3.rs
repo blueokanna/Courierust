@@ -194,11 +194,7 @@ fn run_suite() {
         "META|suite=h3|requests={requests}|workers={workers}|runs={runs}|body_bytes={body_bytes}|ack_delay_ms={ack_delay_ms}|cwnd={cwnd}"
     );
 
-    let identity = courierust::courierust_tls::Identity {
-        cert_chain: vec![CERT_DER.to_vec()],
-        private_key: KEY_DER.to_vec(),
-        is_rsa: false,
-    };
+    let identity = courierust::courierust_tls::Identity::from_der(vec![CERT_DER.to_vec()], KEY_DER.to_vec()).expect("valid test identity");
     let server_cfg = ServerConfig {
         http3: true,
         tls: Some(ServerTls {

@@ -26,21 +26,38 @@ All primitives live in `crypto/` — ChaCha20, Poly1305, ChaCha20-Poly1305, AES,
 
 ## Remote session resumption and key updates
 
-No 0-RTT / early data. TLS 1.3 session resumption is implemented — server-issued session tickets, 1-RTT PSK via `psk_dhe_ke`, a client-side session store keyed by hostname (bounded to 8 sessions) — and the pooled client caches one connector per authority, so a ticket captured on one connection is offered on the next (`tls_session_resumption_across_client_connections` proves it end to end). `KeyUpdate` (RFC 8446 §4.6.3) is implemented in both directions: an inbound update rekeys the read direction and is answered when the peer asked for one, the write direction is rekeyed before it spends its per-key record budget (§5.5), and `request_key_update()` forces one. QUIC key updates still ride the transport's key-phase bit (RFC 9001 §6). No mTLS — the server never requests a client certificate. `verify: false` exists for testing/untrusted peers and still verifies `CertificateVerify` + `Finished`, so the handshake stays cryptographically sound.
+No 0-RTT / early data. TLS 1.3 session resumption is implemented — server-issued session tickets, 1-RTT PSK via `psk_dhe_ke`, a client-side session store keyed by hostname (bounded to 8 sessions) — and the pooled client caches one connector per authority, so a ticket captured on one connection is offered on the next (`tls_session_resumption_across_client_connections` proves it end to end). `KeyUpdate` (RFC 8446 §4.6.3) is implemented in both directions: an inbound update rekeys the read direction and is answered when the peer asked for one, the write direction is rekeyed before it spends its per-key record budget (§5.5), and `request_key_update()` forces one. QUIC key updates still ride the transport's key-phase bit (RFC 9001 §6). `verify: false` exists for testing/untrusted peers and still verifies `CertificateVerify` + `Finished`, so the handshake stays cryptographically sound.
+
+## Mutual TLS (TLS 1.3)
+
+Client authentication is implemented for TLS 1.3 over TCP. A server sets `ServerConfig::client_auth` to a `ClientAuth` (roots + `required`/`optional`) and then sends a `CertificateRequest` between `EncryptedExtensions` and `Certificate`; the client answers with `Certificate` + `CertificateVerify` when `ClientConfig::identity` is set, and with the *empty* certificate list when it is not — the mandated refusal to authenticate (RFC 8446 §4.4.2), never silence. The server validates the offered leaf against the client-auth roots, its validity window, and the `clientAuth` EKU, requires the `CertificateVerify` to prove possession, and records the leaf for the layer above.
+
+The policy is the server's, and the wire says which one it chose: a client that declines when authentication was `required` gets `certificate_required` (116), an unusable or unverifiable chain gets `bad_certificate` (42), a certificate nobody asked for gets `unexpected_message` (10). Alerts are *sent*, in the application-key epoch the peer is reading from, so a refusal is visible instead of merely implied by a closed socket.
+
+Boundaries, stated rather than implied: TLS 1.2 with `client_auth` is refused at handshake time (a TLS 1.2 server would otherwise have to drop to its own, weaker authentication), and the QUIC/HTTP/3 path refuses the combination at startup — mTLS here means TLS 1.3 over TCP. Post-handshake authentication (`CertificateRequest` after `Finished`) is not implemented; a non-empty request context is rejected.
 
 ## Usage
 
 ```rust
-use courierust::courierust_tls::{RootStore, Identity};
+use courierust::courierust_tls::{Identity, RootStore};
 
 let mut roots = RootStore::new();
 roots.add_der(root_der);            // no bundled CAs — supply your own
+roots.add_pem(ca_bundle_pem)?;      // …or a PEM bundle (text between blocks is ignored)
 
-let identity = Identity {
-    cert_chain: vec![cert_der],     // leaf first
-    private_key: key_der,           // PKCS#8 or PKCS#1 (DER)
-    is_rsa: false,                  // false for Ed25519/ECDSA
-};
+// `from_pem_file` parses the chain and the key and proves they belong
+// together; `Identity::from_pem(cert, key)` and
+// `Identity::from_der(chain, key)` are the same check over text/DER you
+// already hold. Accepted key containers: PKCS#8 (`PRIVATE KEY`), PKCS#1
+// (`RSA PRIVATE KEY`) and SEC1 (`EC PRIVATE KEY`) — the DER decides,
+// not the label. `ENCRYPTED PRIVATE KEY` is refused by name, and a key
+// that does not match the leaf certificate is refused at load time
+// instead of failing every handshake.
+let identity = Identity::from_pem_file("cert.pem", "key.pem")?;
 ```
+
+`Identity` is also where a private key stops travelling: its `Debug`
+prints the chain's length and the key's *length*, never key bytes, so a
+`ServerConfig` that ends up in a log line cannot leak the key.
 
 The client (`TlsSettings` on `ClientConfig`) and server (`TlsSettings` on `ServerConfig`) wire this in; ALPN decides `h2` vs `http/1.1` vs `h3`. `examples/https.rs` and `examples/h3.rs` are working end-to-end demos.

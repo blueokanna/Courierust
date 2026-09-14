@@ -232,11 +232,7 @@ const SERVER_CERT_DER: &[u8] = include_bytes!("../../tests/certs/server_cert.der
 const SERVER_KEY_DER: &[u8] = include_bytes!("../../tests/certs/server_key.der");
 
 fn load_test_identity() -> (crate_tls::Identity, crate_tls::RootStore) {
-    let identity = crate_tls::Identity {
-        cert_chain: vec![SERVER_CERT_DER.to_vec()],
-        private_key: SERVER_KEY_DER.to_vec(),
-        is_rsa: false,
-    };
+    let identity = crate_tls::Identity::from_der(vec![SERVER_CERT_DER.to_vec()], SERVER_KEY_DER.to_vec()).expect("valid test identity");
     let mut roots = crate_tls::RootStore::new();
     roots.add_der(SERVER_CERT_DER.to_vec());
     (identity, roots)

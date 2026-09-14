@@ -1,14 +1,16 @@
 //! HTTPS (TLS 1.2 + 1.3) end-to-end example: a server with a self-signed
 //! Ed25519 identity and a client that validates it, speaking `https://`.
 //!
-//! The identity files live in `tests/certs/` (DER):
-//!   - `server_cert.der`: the self-signed leaf certificate
-//!     (CN=localhost, SAN = DNS:localhost + IP:127.0.0.1)
-//!   - `server_key.der` : the PKCS#8 Ed25519 private key
+//! The identity files live in `tests/certs/`:
+//!   - `server_cert.pem` / `server_key.pem`: the PEM pair the server
+//!     loads with `TlsSettings::from_pem_file` — the same call a
+//!     deployment uses for its own certificate and key, so a pair that
+//!     does not belong together fails here, at startup.
+//!   - `server_cert.der`: the same leaf certificate in DER, embedded so
+//!     the demo client has a root to trust (CN=localhost, SAN =
+//!     DNS:localhost + IP:127.0.0.1).
 //!
-//! The certificate is valid 2026-08-20 .. 2036-08-17. For a real
-//! deployment, load your own certificate chain (leaf first) and PKCS#8 /
-//! PKCS#1 private key instead of the test files.
+//! The certificate is valid 2026-08-20 .. 2036-08-17.
 //!
 //! Run: `cargo run --example https`
 
@@ -19,22 +21,15 @@ use courierust::courierust_http::response::Response;
 use courierust::courierust_server::{Server, ServerConfig, TlsSettings as ServerTls};
 
 const CERT_DER: &[u8] = include_bytes!("../tests/certs/server_cert.der");
-const KEY_DER: &[u8] = include_bytes!("../tests/certs/server_key.der");
 
 fn main() -> courierust::Result<()> {
     // --- HTTPS server -------------------------------------------------
-    let identity = courierust::courierust_tls::Identity {
-        cert_chain: vec![CERT_DER.to_vec()],
-        private_key: KEY_DER.to_vec(),
-        is_rsa: false, // Ed25519
-    };
     let server_cfg = ServerConfig {
         http2: true, // serve both h2 (ALPN) and HTTP/1.1 over TLS
-        tls: Some(ServerTls {
-            identity,
-            alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-            ..Default::default()
-        }),
+        tls: Some(ServerTls::from_pem_file(
+            "tests/certs/server_cert.pem",
+            "tests/certs/server_key.pem",
+        )?),
         ..Default::default()
     };
     let server = Server::bind_with_config("127.0.0.1:0", server_cfg)?;
