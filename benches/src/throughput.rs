@@ -333,6 +333,7 @@ fn tls_verify_evidence(address: std::net::SocketAddr, roots: crate_tls::RootStor
         now,
         min_version: TlsVersion::Tls12,
         max_version: TlsVersion::Tls13,
+        identity: None,
     });
     match connector.connect("127.0.0.1", &stream, &stream) {
         Ok(tls) => {

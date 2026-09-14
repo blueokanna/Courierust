@@ -439,6 +439,8 @@ cargo fuzz run h2_frame --fuzz-dir fuzz -- -runs=10000
 - **代理测试 6 个**（`tests/proxy.rs`）：客户端对上一个只用标准库写成的 HTTP 代理——被测实现只有客户端自身。`https://` 走 `CONNECT` 隧道且凭据对代理可见、对源站不可见；`http://` 使用绝对请求形式（含 `OPTIONS *` 以空路径绝对形式出行，RFC 9110 §9.3.7）；请求自带的 `Proxy-Authorization` 优先于配置凭据，且该跳上只会出现一个；被拒绝的 `CONNECT` 会带回代理的 `403`；`http3`/`h2c` + 代理在开套接字之前就被拒绝。
 - **4 个 fuzz 目标**（`cargo-fuzz`）：`h2_frame`、`hpack_block`，加上 **`h1_request`**（两个服务端解析器共用 的 request/header/chunked 路径）与 **`h2_connection`**（用恶意帧流在两种角色下驱动完整 h2 状态机）。nightly 长跑工作流给每个目标一个墙钟预算；PR 期在 `benchmark.yml` 里跑同一批目标的冒烟运行。
 
+`benches/` 与 `fuzz/` 是各自独立的 workspace（自己的 lockfile 与 target 目录）——根目录的 `cargo test` / `cargo check --all-targets` **不会**覆盖它们，而 CI 两个都会构建（`cargo bench --manifest-path benches/Cargo.toml --locked --no-run`、`cargo check --manifest-path fuzz/Cargo.toml --all-targets`）。它们依赖对标的第三方 crate，因此用 stable 而非 1.78 MSRV 构建。给公开结构体加字段时，必须把这两个工作区也编译一遍；编辑器任务 `ci: benches all targets (locked)` 与 `ci: fuzz all targets` 就是干这个的。
+
 ```bash
 cargo test                 # 全部测试
 cargo build --no-default-features   # 验证协议核心零警告编译

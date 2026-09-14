@@ -37,6 +37,20 @@
 			"group": "test"
 		},
 		{
+			"label": "ci: benches all targets (locked)",
+			"type": "shell",
+			"command": "cargo +stable check --manifest-path benches/Cargo.toml --all-targets --locked",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "ci: fuzz all targets",
+			"type": "shell",
+			"command": "cargo +stable check --manifest-path fuzz/Cargo.toml --all-targets",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
 			"label": "test: websocket end-to-end",
 			"type": "shell",
 			"command": "cargo +1.78.0 test --test ws",
