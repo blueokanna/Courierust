@@ -554,10 +554,8 @@ fn start_tungstenite_server() -> std::net::SocketAddr {
                         let _ = ws.close(None);
                         break;
                     }
-                    if msg.is_text() || msg.is_binary() {
-                        if ws.send(msg).is_err() {
-                            break;
-                        }
+                    if (msg.is_text() || msg.is_binary()) && ws.send(msg).is_err() {
+                        break;
                     }
                 }
             });

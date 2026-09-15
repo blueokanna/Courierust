@@ -427,6 +427,10 @@ cargo fuzz run h2_frame --fuzz-dir fuzz -- -runs=10000
 
 `compare` bench 还跑一个 **HTTP/3 对比**，对端是业界标准的 **quinn + h3 crate**：两个客户端都复用同一条池化 QUIC 连接、面向同一个 Courierust H3 服务端，测量热路径每请求延迟（1 KiB / 64 KiB）。quinn 行只在独立的 quinn/rustls QUIC/TLS 握手真正与 Courierust 服务端完成时才报告——完成时两行都带实测 p50/p99；不能完成时（真实的跨实现互操作缺口）quinn 行如实报告 `not_available` 并附失败原因，绝不造假。在握手能完成的 runner 上，quinn 的 1 KiB p99 约 0.3 ms、64 KiB p99 约 1.2 ms，这就是 Courierust 行对照的基准。
 
+自互操作只能证明 Courierust 的 TLS 与*自己*一致。为了对照独立实现验证 TLS 层，另一个工作流（`tls-interop.yml`，脚本 `scripts/tls_interop.sh`）用一次性 CA 签发的证书驱动 **OpenSSL `s_server`**（Courierust 客户端 → OpenSSL）、**`curl` / `openssl s_client`**（独立栈 → Courierust 服务端，h1 + h2 ALPN）、**带 HTTP/2 的 nginx**（Courierust h2 客户端 → nginx）以及 **rustls + hyper 对端**（`benches/src/tls_peer.rs`，h1 双向）。rustls 行里的 TLS 版本与 ALPN 取自对端自己打印的协商结果——绝不会出现「握手没选的版本被写进行里」。
+
+环回数字永远说明不了线缆代价。`cross-machine.yml` 在两台**不同物理机上的自托管 runner**（标签 `courierust-server` / `courierust-client`）上运行同一个 `network` bench 二进制，并把得到的 `NETWORK|...` 行与同一二进制的环回基线对比——两次运行之间的 rps/p99 差距就是网络路径，而不是协议栈。
+
 ## 测试
 
 下面的数量按测试二进制区分，可与一次实际运行一一对应：

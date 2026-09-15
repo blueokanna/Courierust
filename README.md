@@ -515,9 +515,12 @@ The self-interop suite only proves Courierust agrees with _itself_ on TLS.
 To prove the TLS layer against an independent implementation, a separate
 workflow (`tls-interop.yml`, script `scripts/tls_interop.sh`) drives
 **OpenSSL `s_server`** (Courierust client → OpenSSL), **`curl` / `openssl
-s_client`** (independent stack → Courierust server, h1 + h2 ALPN) and
-**nginx with HTTP/2** (Courierust h2 client → nginx) against a throwaway
-CA-signed certificate.
+s_client`** (independent stack → Courierust server, h1 + h2 ALPN),
+**nginx with HTTP/2** (Courierust h2 client → nginx) and the **rustls +
+hyper peer** (`benches/src/tls_peer.rs`, h1 in both directions) against a
+throwaway CA-signed certificate. The rustls rows carry the TLS version and
+ALPN the peer itself printed — a row cannot claim a version the handshake
+did not pick.
 
 Loopback numbers can never tell you what the wire costs. A
 `cross-machine.yml` workflow runs the identical `network` bench binary on

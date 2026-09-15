@@ -32,8 +32,7 @@ pub(crate) struct ClientSession {
     pub(crate) psk: Vec<u8>,
     pub(crate) suite: CipherSuite,
     pub(crate) issued_at: i64,
-    /// Validity window in seconds (the server's `ticket_lifetime`, capped
-    /// at 7 days per RFC 8446 §4.6.1).
+    /// Validity window in seconds (the server's `ticket_lifetime`).
     pub(crate) lifetime: i64,
 }
 

@@ -12,7 +12,9 @@ use courierust::courierust_client::{Client, ClientConfig};
 use courierust::courierust_http::request::Request;
 use courierust::courierust_http::response::Response;
 use courierust::courierust_server::{Server, ServerConfig, TlsSettings as ServerTls};
-use courierust_benchmark::metrics::{metric, run_concurrent, run_sequential, stats_fields, Timing, MAX_SAMPLES};
+use courierust_benchmark::metrics::{
+    metric, run_concurrent, run_sequential, stats_fields, Timing, MAX_SAMPLES,
+};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
@@ -92,7 +94,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 
 fn comparison_repetitions() -> usize {
     let requested = env_usize("BENCH_REPETITIONS", 2);
-    if requested % 2 == 0 {
+    if requested.is_multiple_of(2) {
         requested
     } else {
         requested.checked_add(1).unwrap_or(requested - 1)
@@ -608,7 +610,14 @@ fn compare_clients(
     let (courierust_timing, reqwest_timing) = measure_pair(
         repetitions,
         || {
-            run_courierust_client(protocol, address, payload, requests, workers, workers.max(1))
+            run_courierust_client(
+                protocol,
+                address,
+                payload,
+                requests,
+                workers,
+                workers.max(1),
+            )
         },
         || run_reqwest_client(protocol, address, payload, requests, workers, handle),
     );
@@ -700,7 +709,11 @@ fn compare_servers(
 
 /// A Courierust HTTP/3 (QUIC v1 + TLS 1.3, ALPN `h3`) server.
 fn h3_server(payload: Payload) -> SocketAddr {
-    let identity = courierust::courierust_tls::Identity::from_der(vec![H3_SERVER_CERT_DER.to_vec()], H3_SERVER_KEY_DER.to_vec()).expect("valid test identity");
+    let identity = courierust::courierust_tls::Identity::from_der(
+        vec![H3_SERVER_CERT_DER.to_vec()],
+        H3_SERVER_KEY_DER.to_vec(),
+    )
+    .expect("valid test identity");
     serve_courierust(
         ServerConfig {
             http3: true,
@@ -756,9 +769,7 @@ fn run_quinn_h3_client(
 
     let mut roots = rustls::RootCertStore::empty();
     roots
-        .add(rustls::pki_types::CertificateDer::from(
-            H3_CA_DER.to_vec(),
-        ))
+        .add(rustls::pki_types::CertificateDer::from(H3_CA_DER.to_vec()))
         .expect("test CA parses");
     let mut crypto = rustls::ClientConfig::builder()
         .with_root_certificates(roots)

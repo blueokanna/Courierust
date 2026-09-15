@@ -3,9 +3,11 @@
 #
 # Self-interop only proves Courierust agrees with itself. Here the TLS layer
 # is checked against mainstream independent stacks, both directions:
-#   A. Courierust client  -> OpenSSL s_server      (TLS 1.3 / 1.2, h1)
-#   B. Courierust server  <- curl / s_client       (TLS 1.3 / 1.2, h1+h2, ALPN)
-#   C. Courierust h2 client -> nginx               (TLS 1.3 / 1.2, when present)
+#   A. Courierust client   -> OpenSSL s_server       (TLS 1.3 / 1.2, h1)
+#   B. Courierust server   <- curl / s_client        (TLS 1.3 / 1.2, h1+h2, ALPN)
+#   C. Courierust h2 client -> nginx                 (TLS 1.3 / 1.2, when present)
+#   D. rustls + hyper peer  -> Courierust server     (h1; `tls_peer` bench)
+#   E. Courierust client    -> rustls + hyper server (h1; `tls_peer` bench)
 # Throwaway CA + leaf generated locally; no network, no long-lived servers.
 #
 # Usage: scripts/tls_interop.sh [bench-target-dir] [logfile]
@@ -42,11 +44,12 @@ fi
 source "$(dirname "${BASH_SOURCE[0]}")/find_bench_bin.sh"
 TLS_INTEROP_BIN="$(find_bench_bin "$BENCH_DIR" tls_interop || true)"
 NETWORK_BIN="$(find_bench_bin "$BENCH_DIR" network || true)"
-if [[ -z "$TLS_INTEROP_BIN" || -z "$NETWORK_BIN" ]]; then
-  echo "error: built tls_interop/network bench binaries not found under $BENCH_DIR" >&2
+TLS_PEER_BIN="$(find_bench_bin "$BENCH_DIR" tls_peer || true)"
+if [[ -z "$TLS_INTEROP_BIN" || -z "$NETWORK_BIN" || -z "$TLS_PEER_BIN" ]]; then
+  echo "error: built tls_interop/network/tls_peer bench binaries not found under $BENCH_DIR" >&2
   echo "searched: $BENCH_DIR/<name> and $BENCH_DIR/deps/<name>-*" >&2
   echo "deps dir listing:" >&2
-  ls -la "$BENCH_DIR/deps/" 2>/dev/null | grep -E 'tls_interop|network' || true
+  ls -la "$BENCH_DIR/deps/" 2>/dev/null | grep -E 'tls_interop|network|tls_peer' || true
   exit 1
 fi
 # Re-verify at use time and log the pick, so a stale/pruned artifact is
@@ -61,6 +64,7 @@ require_bin() {
 }
 require_bin "$TLS_INTEROP_BIN" "tls_interop"
 require_bin "$NETWORK_BIN" "network"
+require_bin "$TLS_PEER_BIN" "tls_peer"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -88,16 +92,29 @@ wait_port() {
   return 1
 }
 
-# --- 0. Throwaway Ed25519 identity: one self-signed cert doubles as server
-# identity AND trust root (SAN localhost+127.0.0.1, serverAuth, CA:TRUE) —
-# the same shape the integration tests use, so the exercised cert paths
-# match those covered by `cargo test`.
-"$OPENSSL_BIN" req -x509 -newkey ed25519 -keyout server.key -out server.pem \
-  -days 2 -nodes -subj "/CN=localhost" \
-  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
-  -addext "extendedKeyUsage=serverAuth" \
-  -addext "basicConstraints=critical,CA:TRUE" >/dev/null 2>&1
-cp server.pem ca.pem
+# --- 0. Throwaway CA -> leaf chain (P-256, leaf SAN localhost+127.0.0.1,
+# EKU serverAuth, CA:FALSE, signed by the CA). A single self-signed
+# certificate would be simpler, but strict verifiers reject a CA
+# certificate used as an end entity (rustls/webpki answers
+# CaUsedAsEndEntity) — and the rustls + hyper peer of sections D/E is
+# exactly such a verifier, so every row below runs over a real chain of
+# two certificates (the same shape `scripts/gen_h3_certs.ps1` generates
+# for the quinn/h3 interop benches).
+cat > leaf_ext.cnf <<EOF
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:localhost,IP:127.0.0.1
+EOF
+"$OPENSSL_BIN" ecparam -name prime256v1 -genkey -noout -out ca.key
+"$OPENSSL_BIN" req -new -x509 -key ca.key -out ca.pem -days 2 -sha256 \
+  -subj "/CN=Courierust interop CA" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign"
+"$OPENSSL_BIN" ecparam -name prime256v1 -genkey -noout -out server.key
+"$OPENSSL_BIN" req -new -key server.key -out server.csr -subj "/CN=localhost"
+"$OPENSSL_BIN" x509 -req -in server.csr -CA ca.pem -CAkey ca.key \
+  -CAcreateserial -days 2 -sha256 -out server.pem -extfile leaf_ext.cnf
 "$OPENSSL_BIN" x509 -in ca.pem -outform DER -out ca.der
 "$OPENSSL_BIN" x509 -in server.pem -outform DER -out server_cert.der
 "$OPENSSL_BIN" pkcs8 -topk8 -nocrypt -in server.key -outform DER -out server_key.der
@@ -270,6 +287,86 @@ EOF
 else
   record "TLSINTEROP|role=client|peer=nginx|protocol=h2|status=skipped(nginx_not_found)"
 fi
+
+# `key=value` field from a peer's `TLSINTEROP|` evidence line, or `unknown`
+# when the peer never printed it. Rows below are built from the peer's own
+# output, so a negotiated TLS version / ALPN can never be claimed unless the
+# independent stack actually reported it.
+peer_field() {
+  local log="$1" key="$2" value
+  value=$(grep -o "$key=[^|]*" "$log" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+  printf '%s' "${value:-unknown}"
+}
+
+# --- D. rustls + hyper client -> Courierust TLS server (independent Rust
+# stack; same direction as section A, different peer) ---
+rustls_peer_vs_server() {
+  local port=$((30000 + RANDOM % 20000))
+  COURIERUST_NETWORK_ROLE=server \
+  COURIERUST_NETWORK_BIND="127.0.0.1:$port" \
+  COURIERUST_NETWORK_TLS=1 \
+  COURIERUST_NETWORK_CERT_DER="$WORK/server_cert.der" \
+  COURIERUST_NETWORK_KEY_DER="$WORK/server_key.der" \
+  COURIERUST_NETWORK_PAYLOAD=64 \
+    "$NETWORK_BIN" > rustls_peer_server.log 2>&1 &
+  local pid=$!
+  if wait_port "$port"; then
+    if TLS_PEER_ROLE=rustls_client \
+       TLS_PEER_URL="https://localhost:$port/peer_probe" \
+       TLS_PEER_ROOT="$WORK/ca.der" \
+       "$TLS_PEER_BIN" > tls_rustls_peer.log 2>&1; then
+      cat tls_rustls_peer.log
+      record "TLSINTEROP|role=client|peer=rustls_hyper|tls=$(peer_field tls_rustls_peer.log tls)|negotiated=$(peer_field tls_rustls_peer.log negotiated_alpn)|protocol=h1|status=ok"
+    else
+      echo "--- rustls peer client log ---"
+      cat tls_rustls_peer.log 2>/dev/null || true
+      record "TLSINTEROP|role=client|peer=rustls_hyper|tls=$(peer_field tls_rustls_peer.log tls)|protocol=h1|status=failed"
+      mark_fail
+    fi
+  else
+    echo "--- courierust TLS server did not listen; log ---"
+    cat rustls_peer_server.log 2>/dev/null || true
+    record "TLSINTEROP|role=client|peer=rustls_hyper|protocol=h1|status=no_listen"
+    mark_fail
+  fi
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+rustls_peer_vs_server
+
+# --- E. Courierust TLS client -> hyper + rustls server (the mirror
+# direction, so the peer's server side is exercised as well) ---
+courierust_vs_hyper_peer() {
+  local port=$((30000 + RANDOM % 20000))
+  TLS_PEER_ROLE=hyper_https_server \
+  TLS_PEER_BIND="127.0.0.1:$port" \
+  TLS_PEER_CERT="$WORK/server_cert.der" \
+  TLS_PEER_KEY="$WORK/server_key.der" \
+    "$TLS_PEER_BIN" > tls_hyper_peer.log 2>&1 &
+  local pid=$!
+  if wait_port "$port"; then
+    if COURIERUST_TLS_URL="https://localhost:$port/" \
+       COURIERUST_TLS_ROOT="$WORK/ca.der" \
+       COURIERUST_TLS_PROTO="h1" \
+       "$TLS_INTEROP_BIN" > tls_hyper_client.log 2>&1; then
+      cat tls_hyper_client.log
+      record "TLSINTEROP|role=server|peer=rustls_hyper|tls=$(peer_field tls_hyper_peer.log tls)|negotiated=$(peer_field tls_hyper_peer.log negotiated_alpn)|protocol=h1|status=ok"
+    else
+      echo "--- courierust client vs hyper + rustls log ---"
+      cat tls_hyper_client.log 2>/dev/null || true
+      record "TLSINTEROP|role=server|peer=rustls_hyper|tls=$(peer_field tls_hyper_peer.log tls)|protocol=h1|status=failed"
+      mark_fail
+    fi
+  else
+    echo "--- hyper + rustls server did not listen; log ---"
+    cat tls_hyper_peer.log 2>/dev/null || true
+    record "TLSINTEROP|role=server|peer=rustls_hyper|protocol=h1|status=no_listen"
+    mark_fail
+  fi
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+courierust_vs_hyper_peer
 
 record "TLSINTEROP|suite=complete|fail=$fail"
 exit "$fail"

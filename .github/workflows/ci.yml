@@ -76,3 +76,42 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build rustdoc (missing-docs is on)
         run: cargo doc --no-deps
+
+  satellite-workspaces:
+    name: bench/fuzz workspaces
+    # The bench and fuzz workspaces pin the root crate as a path dependency,
+    # so a version bump in Cargo.toml invalidates benches/Cargo.lock and
+    # fuzz/Cargo.lock too. Every job that builds those workspaces passes
+    # --locked, so a stale lockfile used to stop them with a generic
+    # "lock file ... needs to be updated" error minutes into the build; these
+    # steps need no compiler and fail in seconds with the workspace named.
+    # The satellites are then formatted, linted and compiled here, so a fmt or
+    # clippy regression fails this job instead of only the benchmark
+    # pipeline. The toolchain is pinned to the one the satellites were
+    # verified against: they build on a newer compiler than the root's 1.78
+    # MSRV, and a floating `stable` would turn every lint landing in a new
+    # Rust release into an unrelated red pipeline.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            benches -> benches/target
+            fuzz -> fuzz/target
+      - name: Root workspace lockfile is in sync
+        run: cargo metadata --locked --format-version 1 > /dev/null
+      - name: Bench workspace lockfile is in sync
+        run: cargo metadata --manifest-path benches/Cargo.toml --locked --format-version 1 > /dev/null
+      - name: Fuzz workspace lockfile is in sync
+        run: cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 > /dev/null
+      - name: Bench workspace is rustfmt-clean
+        run: cargo fmt --manifest-path benches/Cargo.toml -- --check
+      - name: Bench workspace is clippy-clean (warnings are errors)
+        run: cargo clippy --manifest-path benches/Cargo.toml --all-targets -- -D warnings
+      - name: Fuzz workspace compiles
+        run: cargo check --manifest-path fuzz/Cargo.toml --all-targets

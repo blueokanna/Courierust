@@ -191,7 +191,11 @@ fn load_test_identity() -> (
     courierust::courierust_tls::Identity,
     courierust::courierust_tls::RootStore,
 ) {
-    let identity = courierust::courierust_tls::Identity::from_der(vec![SERVER_CERT_DER.to_vec()], SERVER_KEY_DER.to_vec()).expect("valid test identity");
+    let identity = courierust::courierust_tls::Identity::from_der(
+        vec![SERVER_CERT_DER.to_vec()],
+        SERVER_KEY_DER.to_vec(),
+    )
+    .expect("valid test identity");
     let mut roots = courierust::courierust_tls::RootStore::new();
     roots.add_der(SERVER_CERT_DER.to_vec());
     (identity, roots)
@@ -206,7 +210,11 @@ fn courierust_tls_server(alpn: Vec<Vec<u8>>) -> std::net::SocketAddr {
         "127.0.0.1:0",
         ServerConfig {
             http2,
-            tls: Some(ServerTls { identity, alpn, ..Default::default() }),
+            tls: Some(ServerTls {
+                identity,
+                alpn,
+                ..Default::default()
+            }),
             ..Default::default()
         },
     )

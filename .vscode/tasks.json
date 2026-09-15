@@ -4,84 +4,84 @@
 		{
 			"label": "ci: fmt",
 			"type": "shell",
-			"command": "cargo +1.78.0 fmt --all -- --check",
+			"command": "rustup run 1.78.0 cargo fmt --all -- --check",
 			"problemMatcher": [],
 			"group": "test"
 		},
 		{
 			"label": "ci: clippy",
 			"type": "shell",
-			"command": "cargo +1.78.0 clippy --all-targets -- -D warnings",
+			"command": "rustup run 1.78.0 cargo clippy --all-targets -- -D warnings",
 			"problemMatcher": [],
 			"group": "test"
 		},
 		{
 			"label": "ci: clippy (no default features)",
 			"type": "shell",
-			"command": "cargo +1.78.0 clippy --no-default-features --lib -- -D warnings",
+			"command": "rustup run 1.78.0 cargo clippy --no-default-features --lib -- -D warnings",
 			"problemMatcher": [],
 			"group": "test"
 		},
 		{
 			"label": "ci: test all targets",
 			"type": "shell",
-			"command": "cargo +1.78.0 test --all-targets",
+			"command": "rustup run 1.78.0 cargo test --all-targets",
 			"problemMatcher": [],
 			"group": "test"
 		},
 		{
 			"label": "ci: doc",
 			"type": "shell",
-			"command": "cargo +1.78.0 doc --no-deps",
+			"command": "rustup run 1.78.0 cargo doc --no-deps",
 			"problemMatcher": [],
 			"group": "test"
 		},
 		{
 			"label": "ci: benches all targets (locked)",
 			"type": "shell",
-			"command": "cargo +stable check --manifest-path benches/Cargo.toml --all-targets --locked",
+			"command": "rustup run stable cargo check --manifest-path benches/Cargo.toml --all-targets --locked",
 			"problemMatcher": [],
 			"group": "test"
 		},
 		{
 			"label": "ci: fuzz all targets",
 			"type": "shell",
-			"command": "cargo +stable check --manifest-path fuzz/Cargo.toml --all-targets",
+			"command": "rustup run stable cargo check --manifest-path fuzz/Cargo.toml --all-targets",
 			"problemMatcher": [],
 			"group": "test"
 		},
 		{
 			"label": "test: websocket end-to-end",
 			"type": "shell",
-			"command": "cargo +1.78.0 test --test ws",
+			"command": "rustup run 1.78.0 cargo test --test ws",
 			"problemMatcher": [],
 			"group": "test"
 		},
 		{
 			"label": "test: websocket under 2 CPUs (CI runner shape)",
 			"type": "shell",
-			"command": "powershell -NoProfile -Command \"(Get-Process -Id $PID).ProcessorAffinity = 3; cargo +1.78.0 test --test ws\"",
+			"command": "powershell -NoProfile -Command \"(Get-Process -Id $PID).ProcessorAffinity = 3; rustup run 1.78.0 cargo test --test ws\"",
 			"problemMatcher": [],
 			"group": "test"
 		},
 		{
 			"label": "bench: websocket vs tungstenite/tokio-tungstenite",
 			"type": "shell",
-			"command": "cargo bench --manifest-path benches/Cargo.toml --bench ws",
+			"command": "rustup run stable cargo bench --manifest-path benches/Cargo.toml --bench ws",
 			"problemMatcher": [],
 			"group": "test"
 		},
 		{
 			"label": "bench: complexity (time and space, vs tungstenite/reqwest)",
 			"type": "shell",
-			"command": "cargo bench --manifest-path benches/Cargo.toml --bench complexity",
+			"command": "rustup run stable cargo bench --manifest-path benches/Cargo.toml --bench complexity",
 			"problemMatcher": [],
 			"group": "test"
 		},
 		{
 			"label": "test: tls library suite",
 			"type": "shell",
-			"command": "cargo +1.78.0 test --lib courierust_tls:: --message-format=short -- --test-threads=1",
+			"command": "rustup run 1.78.0 cargo test --lib courierust_tls:: --message-format=short -- --test-threads=1",
 			"problemMatcher": [
 				"$rustc"
 			],

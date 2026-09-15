@@ -11,7 +11,9 @@ use courierust::courierust_client::{Client, ClientConfig, TlsSettings as ClientT
 use courierust::courierust_http::request::Request;
 use courierust::courierust_http::response::Response;
 use courierust::courierust_server::{Server, ServerConfig, TlsSettings as ServerTls};
-use courierust_benchmark::metrics::{metric, run_concurrent, run_sequential, stats_fields, Timing, MAX_SAMPLES};
+use courierust_benchmark::metrics::{
+    metric, run_concurrent, run_sequential, stats_fields, Timing, MAX_SAMPLES,
+};
 use std::sync::Arc;
 
 const DEFAULT_PAYLOAD: usize = 1024;
@@ -44,10 +46,10 @@ fn load_identity() -> courierust::courierust_tls::Identity {
         .expect("COURIERUST_NETWORK_CERT_DER is required for TLS server mode");
     let key_path = std::env::var("COURIERUST_NETWORK_KEY_DER")
         .expect("COURIERUST_NETWORK_KEY_DER is required for TLS server mode");
-    let cert = std::fs::read(&cert_path)
-        .unwrap_or_else(|e| panic!("read certificate {cert_path}: {e}"));
-    let key = std::fs::read(&key_path)
-        .unwrap_or_else(|e| panic!("read private key {key_path}: {e}"));
+    let cert =
+        std::fs::read(&cert_path).unwrap_or_else(|e| panic!("read certificate {cert_path}: {e}"));
+    let key =
+        std::fs::read(&key_path).unwrap_or_else(|e| panic!("read private key {key_path}: {e}"));
     // `from_der` proves the pair belongs together; the key type (RSA or
     // not) is read off the key instead of being declared by the caller.
     courierust::courierust_tls::Identity::from_der(vec![cert], key).unwrap_or_else(|e| {
