@@ -60,9 +60,6 @@ impl HeaderName {
         if !is_token(b) {
             return Err(Error::invalid_header_name());
         }
-        // Build the lowercased name directly into the owned buffer: one
-        // allocation instead of Vec + String + Box<str>. Tokens are
-        // ASCII, so `as char` cannot produce non-ASCII bytes.
         let mut lower = String::with_capacity(b.len());
         for &c in b {
             lower.push(c.to_ascii_lowercase() as char);
