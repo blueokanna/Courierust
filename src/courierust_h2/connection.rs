@@ -1239,8 +1239,6 @@ impl<R: Read, W: Write> Connection<R, W> {
                 error_code,
             } => {
                 if !self.streams.contains(&stream_id) {
-<<<<<<< HEAD
-=======
                     // RFC 9113 §5.1: RST_STREAM on an idle stream (one
                     // that was never opened) is a PROTOCOL_ERROR;
                     // RST_STREAM for a stream that has already closed is
@@ -1256,7 +1254,6 @@ impl<R: Read, W: Write> Connection<R, W> {
                     if self.recently_closed.iter().any(|&c| c == stream_id) {
                         return Ok(());
                     }
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
                     if stream_id > self.streams.last_peer_id() {
                         return self
                             .conn_error(ErrorCode::ProtocolError, "RST_STREAM on idle stream");

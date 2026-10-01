@@ -60,10 +60,11 @@ pub(crate) fn serve(
         let rl = match courierust_h1::parse_request_line(line) {
             Ok(rl) => rl,
             Err(e) => {
-<<<<<<< HEAD
-                write_early_error(&mut writer, 400, "bad request")?;
-                let _ = writer.flush();
-                stream.linger_close(LINGER_BUDGET, LINGER_DEADLINE);
+                // A malformed request gets an answer, not a silent
+                // disconnect: a client (or a proxy in front) that sends a
+                // bad request should learn that, and a silent close is
+                // indistinguishable from a network failure.
+                refuse(&mut writer, stream, &e)?;
                 return Err(e);
             }
         };
@@ -87,23 +88,6 @@ pub(crate) fn serve(
             Err(e) => return Err(e),
         };
         stream.configure(config.read_timeout)?;
-=======
-                // A malformed request gets an answer, not a silent
-                // disconnect: a client (or a proxy in front) that sends a
-                // bad request should learn that, and a silent close is
-                // indistinguishable from a network failure.
-                refuse(&mut writer, stream, &e)?;
-                return Err(e);
-            }
-        };
-        let headers = match courierust_h1::read_headers_scratch(&mut reader, &mut scratch) {
-            Ok(headers) => headers,
-            Err(e) => {
-                refuse(&mut writer, stream, &e)?;
-                return Err(e);
-            }
-        };
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
 
         let mut early = courierust_h1::host_header_error(rl.version, &headers)
             .map(|reason| error_response(400, reason));
@@ -144,10 +128,6 @@ pub(crate) fn serve(
                 }
             }
         };
-<<<<<<< HEAD
-
-=======
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
         let request_close = courierust_h1::wants_close(&headers);
         let req = Request {
             method: rl.method,
@@ -264,50 +244,6 @@ pub(crate) fn serve(
             );
         }
 
-<<<<<<< HEAD
-        let keep_alive = !request_close
-            && courierust_h1::keep_alive_requested(resp.version, &resp.headers)
-            && resp.version != Version::HTTP_10;
-
-        let mut out_headers = HeaderMap::with_capacity(resp.headers.len() + 2);
-        for (n, v) in resp.headers.iter() {
-            if courierust_h1::is_hop_by_hop(n.as_str()) {
-                continue;
-            }
-            out_headers.append(n.clone(), v.clone());
-        }
-        let chunked = matches!(resp.body, Body::Channel(_));
-        let body_len = match &resp.body {
-            Body::Bytes(b) => Some(b.len()),
-            _ => None,
-        };
-        if chunked {
-            out_headers.insert(
-                HeaderName::from_lowercase("transfer-encoding"),
-                HeaderValue::from_static("chunked"),
-            );
-        } else if let Some(n) = body_len {
-            let cl = courierust_h1::IToA::new(n);
-            out_headers.insert(
-                HeaderName::from_lowercase("content-length"),
-                HeaderValue::from_bytes(cl.as_slice())?,
-            );
-        } else if !(resp.status.is_informational()
-            || resp.status == crate::courierust_http::status::StatusCode::NO_CONTENT
-            || resp.status == crate::courierust_http::status::StatusCode::NOT_MODIFIED)
-        {
-            out_headers.insert(
-                HeaderName::from_lowercase("content-length"),
-                HeaderValue::from_static("0"),
-            );
-        }
-        out_headers.insert(
-            HeaderName::from_lowercase("connection"),
-            HeaderValue::from_static(if keep_alive { "keep-alive" } else { "close" }),
-        );
-
-=======
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
         let head = scratch.body();
         let keep_alive = response_wire_head(&resp, request_close, head)?;
         writer.write_all(head)?;
@@ -336,7 +272,6 @@ pub(crate) fn serve(
     Ok(())
 }
 
-<<<<<<< HEAD
 /// Set the underlying socket deadline to the budget remaining before a
 /// request header must be complete. This runs before every transport
 /// read, so receiving individual bytes never refreshes the budget.
@@ -361,7 +296,8 @@ fn write_header_timeout(
     let _ = writer.flush();
     stream.linger_close(LINGER_BUDGET, LINGER_DEADLINE);
     Err(Error::timeout("request header timeout"))
-=======
+}
+
 /// Write the wire head of an HTTP/1.1 response and report how the
 /// connection continues.
 ///
@@ -423,7 +359,6 @@ pub(crate) fn response_wire_head(
     );
     courierust_h1::write_response_head(out, resp.status, Version::HTTP_11, &out_headers)?;
     Ok(keep_alive)
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
 }
 
 /// RFC 9112 §3.2: an HTTP/1.1 request carries exactly one `Host` field,
@@ -456,6 +391,10 @@ pub(crate) fn error_response(status: u16, message: &str) -> Response<Body> {
 pub(crate) fn refusal_status(e: &Error) -> Option<u16> {
     use crate::courierust_error::ErrorKind;
     match e.kind {
+        // A request that did not arrive in time gets the RFC 9110 status
+        // instead of a silent close; the event driver's header deadline
+        // and the blocking driver's read deadline both land here.
+        ErrorKind::Timeout => Some(408),
         ErrorKind::Protocol => Some(400),
         ErrorKind::Overflow => {
             let header = e
@@ -483,7 +422,12 @@ fn refuse(
     error: &Error,
 ) -> Result<()> {
     if let Some(status) = refusal_status(error) {
-        write_early_error(writer, status, "bad request")?;
+        let message = if status == 408 {
+            "request timeout"
+        } else {
+            "bad request"
+        };
+        write_early_error(writer, status, message)?;
         let _ = writer.flush();
         stream.linger_close(LINGER_BUDGET, LINGER_DEADLINE);
     }
@@ -516,10 +460,6 @@ fn write_early_error(
         HeaderValue::from_static("close"),
     );
     let mut scratch = Scratch::new();
-<<<<<<< HEAD
-
-=======
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
     let head = scratch.body();
     courierust_h1::write_response_head(
         head,

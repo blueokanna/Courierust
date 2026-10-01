@@ -296,14 +296,10 @@ impl crate::courierust_io::Read for &ConnStream {
                 crate::courierust_io::Read::read(&mut r, buf)
             }
             ConnStreamKind::Tls { tls, .. } => {
-<<<<<<< HEAD
-                let mut g = crate::lock(tls);
-=======
                 // A poisoned TLS lock would otherwise turn one panicking
                 // handler into a connection that can never be read or
                 // written again.
-                let mut g = tls.lock().unwrap_or_else(|e| e.into_inner());
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
+                let mut g = crate::lock(tls);
                 crate::courierust_io::Read::read(&mut *g, buf)
             }
         };
@@ -329,11 +325,7 @@ impl crate::courierust_io::Write for &ConnStream {
                 crate::courierust_io::Write::write(&mut w, buf)
             }
             ConnStreamKind::Tls { tls, .. } => {
-<<<<<<< HEAD
                 let mut g = crate::lock(tls);
-=======
-                let mut g = tls.lock().unwrap_or_else(|e| e.into_inner());
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
                 crate::courierust_io::Write::write(&mut *g, buf)
             }
         }
@@ -346,11 +338,7 @@ impl crate::courierust_io::Write for &ConnStream {
                 crate::courierust_io::Write::flush(&mut w)
             }
             ConnStreamKind::Tls { tls, .. } => {
-<<<<<<< HEAD
                 let mut g = crate::lock(tls);
-=======
-                let mut g = tls.lock().unwrap_or_else(|e| e.into_inner());
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
                 crate::courierust_io::Write::flush(&mut *g)
             }
         }

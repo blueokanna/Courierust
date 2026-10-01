@@ -121,7 +121,6 @@ pub struct IpNet {
 }
 
 impl IpNet {
-<<<<<<< HEAD
     /// Build a network from an address and a prefix length.
     ///
     /// Returns `None` when `prefix` exceeds what the address family
@@ -133,23 +132,6 @@ impl IpNet {
     /// by accident.
     pub fn new(addr: IpAddr, prefix: u8) -> Option<Self> {
         if prefix > Self::max_prefix(addr) {
-=======
-    /// Parse `addr`, `addr/len` or a bare address (host route).
-    pub fn parse(s: &str) -> Option<Self> {
-        let (addr, prefix) = match s.split_once('/') {
-            Some((a, p)) => (a.trim(), Some(p.trim().parse::<u8>().ok()?)),
-            None => (s.trim(), None),
-        };
-        let addr: IpAddr = addr.parse().ok()?;
-        let max = if addr.is_ipv4() { 32 } else { 128 };
-        // A bare address is a host route, so its prefix length follows the
-        // address family. Defaulting it to /32 would turn `::1` into a
-        // network that also contains every `::x`, including the IPv4-
-        // mapped addresses a dual-stack listener reports — and a trusted
-        // proxy match is what makes the forwarded headers believed.
-        let prefix = prefix.unwrap_or(max);
-        if prefix > max {
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
             return None;
         }
         let mut net = Self { addr, prefix };
@@ -181,11 +163,7 @@ impl IpNet {
     pub fn host(addr: IpAddr) -> Self {
         Self {
             addr,
-<<<<<<< HEAD
             prefix: Self::max_prefix(addr),
-=======
-            prefix: if addr.is_ipv4() { 32 } else { 128 },
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
         }
     }
 
@@ -1482,7 +1460,6 @@ mod tests {
         assert!(IpNet::parse("2001:db8::/129").is_none());
         assert!(IpNet::parse("10.0.0.0/x").is_none());
         assert!(IpNet::parse("not-an-ip").is_none());
-<<<<<<< HEAD
         assert!(IpNet::new("10.0.0.0".parse().unwrap(), 33).is_none());
 
         // Host bits are truncated, so two spellings of one network are
@@ -1501,7 +1478,7 @@ mod tests {
         assert!(IpNet::parse("0.0.0.0/0")
             .unwrap()
             .contains("255.255.255.255".parse().unwrap()));
-=======
+
         // A bare IPv6 address is a host route too: defaulting it to /32
         // (the IPv4 width) would make `::1` match `::2` and every
         // IPv4-mapped address, and a trusted-proxy match is what makes the
@@ -1514,7 +1491,6 @@ mod tests {
         assert!(!v6_host.contains("::ffff:10.0.0.1".parse().unwrap()));
         assert!(!IpNet::host("::1".parse().unwrap()).contains("2001:db8::1".parse().unwrap()));
         // v4 and v6 never mix.
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
         assert!(!IpNet::parse("0.0.0.0/0")
             .unwrap()
             .contains("::1".parse().unwrap()));

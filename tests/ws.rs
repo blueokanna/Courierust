@@ -1097,7 +1097,6 @@ fn read_frame(sock: &mut TcpStream) -> (u8, Vec<u8>) {
 }
 
 // ---------------------------------------------------------------------
-<<<<<<< HEAD
 // Codec properties
 //
 // The same invariants the `ws_frame` fuzz target asserts, pinned against
@@ -1241,7 +1240,9 @@ fn utf8_validation_survives_every_split_point() {
     let mut broken = bytes.to_vec();
     broken.push(0x80);
     assert!(!Utf8Validator::validate(&broken));
-=======
+}
+
+// ---------------------------------------------------------------------
 // Client handshake validation against a stub server. A real server never
 // produces these responses, so only a hand-written peer can prove the
 // client rejects them.
@@ -1493,5 +1494,4 @@ fn client_default_headers_reach_the_handshake() {
         Some("websocket"),
         "a default must not displace the handshake's own fields"
     );
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
 }

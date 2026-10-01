@@ -2646,7 +2646,6 @@ fn h1_client_head_response_with_content_length_has_no_body() {
 }
 
 // ---------------------------------------------------------------------
-<<<<<<< HEAD
 // Content coding: the client advertises exactly what it decodes, and a
 // caller is never handed bytes it did not ask to interpret.
 // ---------------------------------------------------------------------
@@ -3000,7 +2999,20 @@ fn a_307_without_a_body_is_still_followed() {
         resp.headers.insert(
             HeaderName::from_lowercase("x-final"),
             HeaderValue::from_static("yes"),
-=======
+        );
+        resp
+    });
+
+    let client = Client::new();
+    let resp = client.get(&format!("{base}/start")).unwrap();
+    assert_eq!(resp.status.as_u16(), 200);
+    assert_eq!(
+        resp.headers.get("x-final").unwrap().to_str().unwrap(),
+        "yes"
+    );
+}
+
+// ---------------------------------------------------------------------
 // Client keep-alive pool: a pooled connection can die while it is idle
 // (the server's own keep-alive timeout, a proxy, a restart). The pool
 // probes before reusing, and a connection that turns out to be spent is
@@ -3417,19 +3429,10 @@ fn default_credentials_do_not_cross_origins() {
         resp.headers.insert(
             HeaderName::from_lowercase("location"),
             HeaderValue::from_bytes(location.as_bytes()).unwrap(),
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
         );
         resp
     });
 
-<<<<<<< HEAD
-    let client = Client::new();
-    let resp = client.get(&format!("{base}/start")).unwrap();
-    assert_eq!(resp.status.as_u16(), 200);
-    assert_eq!(
-        resp.headers.get("x-final").unwrap().to_str().unwrap(),
-        "yes"
-=======
     let mut default_headers = HeaderMap::new();
     default_headers.insert(
         HeaderName::from_lowercase("authorization"),
@@ -3776,6 +3779,5 @@ fn builder_query_goes_before_the_fragment() {
         resp.headers.get("x-target").unwrap().to_str().unwrap(),
         "/p?page=2",
         "a fragment must not swallow the query string"
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
     );
 }

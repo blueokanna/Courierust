@@ -674,11 +674,9 @@ mod tests {
         );
     }
 
-    /// RFC 9112 §6.1 / CWE-444: a message carrying both framings is a
-    /// smuggling attempt, not a precedence question — it is refused in
-    /// either field order, for requests and responses alike.
+    /// A header block whose field list exceeds the caller's cap is
+    /// refused as an overflow instead of being read unbounded.
     #[test]
-<<<<<<< HEAD
     fn custom_header_list_limit_is_enforced() {
         let mut reader = BufReader::new(SliceReader::new(b"Host: example.test\r\n\r\n"), 64);
         let mut scratch = crate::courierust_io::Scratch::new();
@@ -692,11 +690,11 @@ mod tests {
         ));
     }
 
+    /// RFC 9112 §6.1 / CWE-444: a message carrying both framings is a
+    /// smuggling attempt, not a precedence question — it is refused in
+    /// either field order, for requests and responses alike.
     #[test]
-    fn transfer_encoding_wins_over_content_length() {
-=======
     fn both_framings_rejected_as_smuggling() {
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
         let h = headers(&[("transfer-encoding", "chunked"), ("content-length", "5")]);
         assert!(body_length(&h, Some(&Method::POST), None).is_err());
         let h = headers(&[("content-length", "5"), ("transfer-encoding", "chunked")]);

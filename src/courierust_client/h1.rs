@@ -37,14 +37,6 @@ pub struct H1Connection {
     /// response), never a stale connection: the request was processed,
     /// so replaying it would be a second execution, not a retry.
     read_started: bool,
-    /// Whether the peer of this connection is an HTTP proxy the request is
-    /// *addressed to* (the plaintext absolute-form hop).
-    ///
-    /// It decides exactly one thing: a `Proxy-Authorization` field belongs
-    /// to that hop, so it survives the hop-by-hop filter there and nowhere
-    /// else — to an origin, and to an origin inside a tunnel, that field
-    /// would be a credential handed to a party it was never meant for.
-    to_proxy: bool,
 }
 
 impl H1Connection {
@@ -73,7 +65,7 @@ impl H1Connection {
         hostname: &str,
         cfg: &ClientConfig,
     ) -> Result<Self> {
-        Self::wrap(stream, tls, hostname, cfg, false)
+        Self::wrap(stream, tls, hostname, cfg)
     }
 
     /// Wrap a socket whose peer is an HTTP proxy, so the request — written
@@ -88,7 +80,7 @@ impl H1Connection {
         hostname: &str,
         cfg: &ClientConfig,
     ) -> Result<Self> {
-        Self::wrap(stream, tls, hostname, cfg, true)
+        Self::wrap(stream, tls, hostname, cfg)
     }
 
     /// The one wrapping path both constructors share: the peer's identity
@@ -98,7 +90,6 @@ impl H1Connection {
         tls: Option<&crate::courierust_tls::TlsConnector>,
         hostname: &str,
         cfg: &ClientConfig,
-        to_proxy: bool,
     ) -> Result<Self> {
         let conn = match tls {
             Some(c) => {
@@ -128,7 +119,6 @@ impl H1Connection {
             version: Version::HTTP_11,
             reusable: true,
             read_started: false,
-            to_proxy,
         })
     }
 
@@ -155,7 +145,6 @@ impl H1Connection {
             version: Version::HTTP_11,
             reusable: true,
             read_started: false,
-            to_proxy: false,
         })
     }
 
@@ -239,7 +228,6 @@ impl H1Connection {
     ) -> Result<Response<Body>> {
         let mut headers = HeaderMap::with_capacity(req.headers.len() + 4);
         for (n, v) in req.headers.iter() {
-<<<<<<< HEAD
             // `Proxy-Authorization` is hop-by-hop, so it survives exactly
             // when this connection *is* the proxy's: forwarded to an origin
             // it would hand the proxy's credentials to the origin.
@@ -248,14 +236,6 @@ impl H1Connection {
                     continue;
                 }
             } else if courierust_h1::is_hop_by_hop(n.as_str()) {
-=======
-            // `Proxy-Authorization` is hop-by-hop, and the hop it is for is
-            // the proxy the request is addressed to — everywhere else the
-            // field is dropped, so a proxy credential can never be handed
-            // to an origin (directly or inside a tunnel).
-            let proxy_credential = self.to_proxy && n.as_str() == "proxy-authorization";
-            if !proxy_credential && courierust_h1::is_hop_by_hop(n.as_str()) {
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
                 continue;
             }
             headers.append(n.clone(), v.clone());

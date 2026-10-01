@@ -13,11 +13,7 @@ The multi-core HTTP client: an HTTP/1.1 keep-alive pool grouped by authority, HT
 
 ## The details that matter
 
-<<<<<<< HEAD
 - **Redirects** (301/302/303 → GET) never forward `Authorization` / `Cookie` / `Proxy-Authorization` across origins (RFC 9110 §15.4). The body-less follow-up also drops `Content-Length` / `Content-Type` / `Transfer-Encoding`: a length with no bytes behind it is how a request desynchronises the connection it is written on. A 307/308 that would have to replay the body is **handed back** instead of followed — the body is gone (a streaming body cannot be replayed), so following it would send a different request than the caller wrote.
-=======
-- **Redirects** (301/302/303 → GET, 307/308 keep method and body) never forward `Authorization` / `Cookie` across origins (RFC 9110 §15.4). A `Location` is resolved as a URI-reference against the request's own URL (RFC 3986 §5.2): `next?q=1` lands on `/dir/next?q=1` rather than `/next`, a query-only reference keeps the path, `.` / `..` segments are removed before the target is used, and the fragment is dropped — a relative location that resolved wrongly would retry a *different resource*, which is what a proxy in front would see.
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
 - **Priorities** — `execute_priority(url, req, Priority { urgency, incremental })` drives the WUCS scheduler (see `blogs/01`).
 - **Worker occupancy is per connection, not per stream** — a single h2 connection with many streams holds exactly one worker, so streams never multiply worker usage and never block each other.
 - **Timeouts** — connect, handshake (TLS) and read timeouts are configured on `ClientConfig`; a single request can override the read timeout with `RequestBuilder::timeout`. The override is a *transport deadline* with the same meaning as the configured one, applied per attempt (a redirect chain gives every hop a full timeout) and restored afterwards, so a pooled connection never carries one caller's deadline into the next request. Its expiry surfaces as `ErrorKind::Timeout` on every platform.

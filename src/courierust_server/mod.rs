@@ -25,11 +25,8 @@
 
 pub mod h1;
 pub mod h2;
-<<<<<<< HEAD
 pub mod reverse_proxy;
-=======
 pub mod tunnel;
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
 pub mod ws;
 
 pub(crate) mod event;
@@ -569,12 +566,8 @@ impl Server {
                     };
                     p.spawn(move || {
                         let _permit = permit;
-<<<<<<< HEAD
-                        let _ = serve_accepted(stream, h.as_ref(), &c);
-=======
                         // TLS handshakes (blocking) also run on the pool.
                         let _ = serve_connection(stream, h.as_ref(), &c);
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
                     });
                 }
                 Err(_) => continue,
@@ -830,8 +823,6 @@ pub fn serve_connection(
     handler: &dyn Handler,
     config: &ServerConfig,
 ) -> crate::Result<()> {
-<<<<<<< HEAD
-=======
     if let Some(message) = identity_error(config) {
         return Err(crate::courierust_error::Error::with_message(
             crate::courierust_error::ErrorKind::Other,
@@ -849,7 +840,6 @@ pub fn serve_connection(
     // client that connects and then stalls mid-handshake releases its
     // pool worker instead of holding it for the full application read
     // timeout. The application timeout is restored before serving.
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
     if config.tls.is_some() {
         crate::courierust_net::configure(&stream, config.handshake_timeout)?;
     } else {

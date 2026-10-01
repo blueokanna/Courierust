@@ -909,13 +909,17 @@ impl EventConn {
                     ..
                 }) => {
                     self.out.clear();
-                    self.keep_alive = build_response(
+                    // The request never parsed, so whether it was a HEAD is
+                    // unknown; sending the body is the safe answer.
+                    let (keep_alive, stream) = build_response(
                         crate::courierust_server::h1::error_response(408, "request header timeout"),
-                        config,
                         true,
+                        false,
                         &mut self.out,
                     )?;
+                    self.keep_alive = keep_alive;
                     self.out_pos = 0;
+                    self.set_stream(stream);
                     return self.write_more();
                 }
                 Err(error) => return Err(error),
@@ -1077,10 +1081,10 @@ impl EventConn {
         }
     }
 
-<<<<<<< HEAD
     fn header_timeout_remaining(&self, timeout: Duration, now: Instant) -> Option<Duration> {
         self.reader.header_timeout_remaining(timeout, now)
-=======
+    }
+
     /// Pump a channel response body as chunked encoding.
     ///
     /// Each chunk is written as far as the socket allows before the next
@@ -1138,7 +1142,6 @@ impl EventConn {
                 }
             }
         }
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
     }
 
     /// Write pending output; returns the continuation.
@@ -1851,7 +1854,6 @@ fn event_loop(msg_rx: Receiver<EventMsg>, wake_reader: TcpStream, context: LoopC
                 to_dispatch.push(id);
             }
         }
-<<<<<<< HEAD
         let header_deadline_due = next_header
             .map(|next| next <= Duration::from_millis(poll_timeout as u64))
             .unwrap_or(false);
@@ -1871,7 +1873,6 @@ fn event_loop(msg_rx: Receiver<EventMsg>, wake_reader: TcpStream, context: LoopC
             }
         }
 
-=======
         let now = Instant::now();
         for id in ws_due_ids(&registries, now) {
             poller.unregister(id);
@@ -1883,7 +1884,6 @@ fn event_loop(msg_rx: Receiver<EventMsg>, wake_reader: TcpStream, context: LoopC
             activity.insert(id, now);
             to_dispatch.push(id);
         }
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
         if !to_dispatch.is_empty() {
             for chunk in to_dispatch.chunks(DISPATCH_BATCH) {
                 let _ = ready_tx.send(chunk.to_vec());
@@ -1896,19 +1896,11 @@ fn event_loop(msg_rx: Receiver<EventMsg>, wake_reader: TcpStream, context: LoopC
             if near_idle {
                 let now = Instant::now();
                 let mut expired = Vec::new();
-<<<<<<< HEAD
-                let registered: HashSet<usize> =
-                    crate::lock(&registries.h1).keys().copied().collect();
-=======
-                let registered: HashSet<usize> = registries
-                    .h1
-                    .lock()
-                    .unwrap()
+                let registered: HashSet<usize> = crate::lock(&registries.h1)
                     .keys()
-                    .chain(registries.ws.lock().unwrap().keys())
+                    .chain(crate::lock(&registries.ws).keys())
                     .copied()
                     .collect();
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
                 for (&id, &at) in &activity {
                     if header_expired.contains(&id) {
                         continue;
@@ -1923,12 +1915,8 @@ fn event_loop(msg_rx: Receiver<EventMsg>, wake_reader: TcpStream, context: LoopC
                 for id in expired {
                     poller.unregister(id);
                     pending.remove(&id);
-<<<<<<< HEAD
                     crate::lock(&registries.h1).remove(&id);
-=======
-                    registries.h1.lock().unwrap().remove(&id);
-                    registries.ws.lock().unwrap().remove(&id);
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
+                    crate::lock(&registries.ws).remove(&id);
                     if activity.remove(&id).is_some() {
                         if let Some(s) = stats {
                             Stats::decrement(&s.connections_active, 1);
@@ -1949,28 +1937,8 @@ fn event_loop(msg_rx: Receiver<EventMsg>, wake_reader: TcpStream, context: LoopC
 /// be able to tell the difference between them by the *absence* of a
 /// `400`.
 fn refuse_malformed(conn: &EventConn, e: &Error) {
-<<<<<<< HEAD
-    use crate::courierust_error::ErrorKind;
-    let status = match e.kind {
-        ErrorKind::Timeout => 408,
-        ErrorKind::Protocol => 400,
-        ErrorKind::Overflow => {
-            let header = e
-                .message
-                .as_deref()
-                .map(|m| m.contains("header") || m.contains("line"))
-                .unwrap_or(false);
-            if header {
-                431
-            } else {
-                413
-            }
-        }
-        _ => return,
-=======
     let Some(status) = crate::courierust_server::h1::refusal_status(e) else {
         return;
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
     };
     let message = if status == 408 {
         "request header timeout"
@@ -2315,6 +2283,7 @@ mod tests {
         let conn = EventConn::new(
             socket,
             1024 * 1024,
+            1 << 20,
             None,
             crate::courierust_server::ws::WakeSlot::new(),
         );

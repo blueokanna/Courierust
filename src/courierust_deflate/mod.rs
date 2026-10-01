@@ -811,18 +811,16 @@ pub fn inflate_into(data: &[u8], out: &mut Vec<u8>, max_out: usize) -> Result<()
 // DEFLATE compression (fixed Huffman + LZ77)
 // ---------------------------------------------------------------------
 
-<<<<<<< HEAD
 /// Default cap on the match finder, just under DEFLATE's 32 KiB window.
 ///
 /// It is deliberately a little below 32768 so a proposed distance can
 /// always be expressed by the 15-bit distance code; a negotiation that
 /// reduces the window caps it further (see [`Deflater::set_window_bits`]).
 const WINDOW: usize = 28_672;
-=======
+
 /// The largest LZ77 window DEFLATE allows (RFC 1951 §3.2.5: distances
 /// reach 32768 bytes back).
 const MAX_WINDOW: usize = 32_768;
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
 const HASH_BITS: u32 = 15;
 const HASH_SIZE: usize = 1 << HASH_BITS;
 const MAX_CHAIN: usize = 64;
@@ -942,11 +940,11 @@ fn encode_lz77(w: &mut BitWriter, data: &[u8], mf: &mut MatchFinder, window: usi
         if i + MIN_MATCH <= data.len() {
             let h = hash3(data[i], data[i + 1], data[i + 2]);
             let mut candidate = mf.head[h];
-<<<<<<< HEAD
-            let limit = i.saturating_sub(mf.max_dist) as u32;
-=======
-            let limit = i.saturating_sub(window) as u32;
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
+            // Two bounds apply and the tighter one wins: `window` is the
+            // absolute maximum this entry point reaches back, and
+            // `mf.max_dist` is what the peer's negotiation promised
+            // (RFC 7692 §7.2.1 — a longer match is undecodable there).
+            let limit = i.saturating_sub(window.min(mf.max_dist)) as u32;
             let mut steps = 0usize;
             while candidate != EMPTY && candidate >= limit && steps < MAX_CHAIN {
                 steps += 1;
@@ -1337,12 +1335,11 @@ pub struct Deflater {
     /// state compression allocates nothing (not even on the
     /// "compression did not pay" path).
     writer: BitWriter,
-<<<<<<< HEAD
     /// Window this compressor is allowed to reference, in bits.
-    window_bits: u8,
-=======
-    /// LZ77 window bound in bits (8..=15). Zero never survives:
-    /// [`Deflater::default`] forwards to [`Deflater::new`].
+    ///
+    /// Zero never survives: [`Deflater::new`] starts at the maximum and
+    /// [`Deflater::set_window_bits`] clamps whatever is configured into
+    /// the range RFC 7692 admits.
     window_bits: u8,
 }
 
@@ -1350,7 +1347,6 @@ impl Default for Deflater {
     fn default() -> Self {
         Self::new()
     }
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
 }
 
 impl Deflater {
@@ -1367,13 +1363,9 @@ impl Deflater {
             finder: MatchFinder::default(),
             writer: BitWriter::new(),
             window_bits: MAX_WINDOW_BITS,
-<<<<<<< HEAD
         };
         deflater.apply_window_bits();
         deflater
-=======
-        }
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
     }
 
     /// Set the minimum payload size that is worth compressing.
@@ -1381,7 +1373,6 @@ impl Deflater {
         self.threshold = bytes;
     }
 
-<<<<<<< HEAD
     /// Constrain the compressor to the negotiated window.
     ///
     /// RFC 7692 §7.1.2.1 makes `*_max_window_bits` a promise the
@@ -1399,31 +1390,15 @@ impl Deflater {
     }
 
     /// The window this compressor is constrained to, in bits.
-=======
-    /// Bound the compressor's LZ77 window.
-    ///
-    /// RFC 7692 §7.2.1 requires the window to stay within the negotiated
-    /// `server_max_window_bits` / `client_max_window_bits` of the
-    /// direction being written; a longer match is not merely a poor
-    /// choice, it is undecodable by the peer.
-    pub fn set_window_bits(&mut self, bits: u8) {
-        self.window_bits = bits.clamp(MIN_WINDOW_BITS, MAX_WINDOW_BITS);
-    }
-
-    /// The window bound in bits.
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
     #[inline]
     pub fn window_bits(&self) -> u8 {
         self.window_bits
     }
 
-<<<<<<< HEAD
     fn apply_window_bits(&mut self) {
         self.finder.max_dist = WINDOW.min(1usize << self.window_bits);
     }
 
-=======
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
     /// Drop history (no-op for this encoder; present so the API mirrors
     /// [`Inflater`] when `*_no_context_takeover` is negotiated).
     pub fn reset(&mut self) {}

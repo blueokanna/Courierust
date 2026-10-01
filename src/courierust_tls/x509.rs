@@ -345,7 +345,6 @@ impl RootStore {
         Ok(n)
     }
 
-<<<<<<< HEAD
     /// Load the platform's trust anchors (Windows `ROOT` store, or the
     /// distribution's PEM bundle on Unix).
     ///
@@ -355,7 +354,8 @@ impl RootStore {
     /// store could be read, never a silently empty store.
     pub fn load_system(&mut self) -> crate::courierust_tls::TlsResult<usize> {
         crate::courierust_tls::system_roots::load_into(self)
-=======
+    }
+
     /// [`RootStore::add_pem`] over a file: an OS-style CA bundle, a
     /// deployment's own root, or the certificate a peer was pinned to.
     ///
@@ -370,7 +370,6 @@ impl RootStore {
             crate::courierust_tls::TlsError::Io(alloc::format!("{}: {e}", path.display()))
         })?;
         self.add_pem(&pem)
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
     }
 
     /// Number of roots.

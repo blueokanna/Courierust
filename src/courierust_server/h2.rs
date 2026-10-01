@@ -203,19 +203,11 @@ fn serve_loop(
                         s.h2_streams_total.fetch_add(1, Ordering::Relaxed);
                     }
                     if end_stream {
-<<<<<<< HEAD
-                        let resp = handler.handle_connected(
-                            &connection_info,
-                            build_request(&headers, Body::Empty)?,
-                        );
-                        send_response(conn, stream_id, resp, deferred)?;
-=======
                         let request = build_request(&headers, Body::Empty)?;
                         let is_head =
                             request.method == crate::courierust_http::method::Method::HEAD;
-                        let resp = handler.handle(request);
+                        let resp = handler.handle_connected(&connection_info, request);
                         send_response(conn, stream_id, resp, is_head, deferred)?;
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
                     } else {
                         req_bodies.insert(
                             stream_id,
@@ -245,19 +237,11 @@ fn serve_loop(
                                 } else {
                                     Body::Bytes(Bytes::from(rb.body))
                                 };
-<<<<<<< HEAD
-                                let resp = handler.handle_connected(
-                                    &connection_info,
-                                    build_request(&rb.headers, body)?,
-                                );
-                                send_response(conn, stream_id, resp, deferred)?;
-=======
                                 let request = build_request(&rb.headers, body)?;
                                 let is_head =
                                     request.method == crate::courierust_http::method::Method::HEAD;
-                                let resp = handler.handle(request);
+                                let resp = handler.handle_connected(&connection_info, request);
                                 send_response(conn, stream_id, resp, is_head, deferred)?;
->>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
                             }
                         }
                     }
