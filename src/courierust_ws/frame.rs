@@ -686,6 +686,29 @@ pub mod close {
         matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999)
     }
 
+    /// The close code to answer a peer's **malformed Close frame** with.
+    ///
+    /// RFC 6455 §7.4.1 distinguishes two failures a received Close frame
+    /// can have: a reason that is not usable as UTF-8 text (1007,
+    /// "invalid frame payload data") and everything about the frame
+    /// itself being malformed (1002). [`parse`] reports both as protocol
+    /// errors, so the rule lives next to the parser that produces them
+    /// rather than being re-derived by every caller — the same defect
+    /// answered with two different codes on two paths is exactly what a
+    /// conformance suite is for.
+    pub fn failure_code(e: &Error) -> u16 {
+        let utf8_reason = e
+            .message
+            .as_deref()
+            .map(|m| m.contains("UTF-8"))
+            .unwrap_or(false);
+        if utf8_reason {
+            INVALID_PAYLOAD
+        } else {
+            PROTOCOL_ERROR
+        }
+    }
+
     /// A parsed Close frame.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct CloseFrame {

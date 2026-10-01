@@ -52,14 +52,23 @@ impl Worker {
             if self.shared.shutdown.load(Ordering::Acquire) {
                 return;
             }
-            // 1. Local LIFO.
-            if let Some(job) = self.local.lock().unwrap().pop_back() {
+            // 1. Local LIFO. The pop is bound to a local first so that the
+            // `MutexGuard` is released before the job runs. In the
+            // `if let ... = self.local.lock()...` spelling the guard is a
+            // temporary of the scrutinee and lives for the whole body
+            // (edition 2021), which holds this worker's LIFO lock for the
+            // entire duration of the job — a peer's `steal()` would then
+            // block on the lock instead of taking the queued work, and the
+            // pool would degenerate into "every worker runs only its own
+            // queue", which is the opposite of what it is for.
+            let job = crate::lock(&self.local).pop_back();
+            if let Some(job) = job {
                 run_job(job);
                 continue;
             }
             // 2. Global FIFO.
             {
-                let mut g = self.shared.global.lock().unwrap();
+                let mut g = crate::lock(&self.shared.global);
                 if let Some(job) = g.pop_front() {
                     drop(g);
                     run_job(job);
@@ -76,9 +85,16 @@ impl Worker {
                 self.shared.park_seq.fetch_add(1, Ordering::Relaxed) + 1,
                 Ordering::Relaxed,
             );
-            let mut g = self.shared.global.lock().unwrap();
+            let mut g = crate::lock(&self.shared.global);
             while g.is_empty() && !self.shared.shutdown.load(Ordering::Acquire) {
-                g = self.shared.has_work.wait(g).unwrap();
+                // A `Condvar` wait can only report poisoning, and the guard
+                // is handed back inside the error: recovering keeps a worker
+                // parked instead of killing it.
+                g = self
+                    .shared
+                    .has_work
+                    .wait(g)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
         }
     }
@@ -86,7 +102,7 @@ impl Worker {
     /// Try to steal the oldest job from a random peer.
     fn steal(&self) -> Option<Job> {
         let workers = {
-            let w = self.shared.workers.lock().unwrap();
+            let w = crate::lock(&self.shared.workers);
             if w.len() <= 1 {
                 return None;
             }
@@ -104,7 +120,7 @@ impl Worker {
             .iter()
             .min_by_key(|w| w.idle_seq.load(Ordering::Relaxed))
             .unwrap();
-        let stolen = victim.local.lock().unwrap().pop_front();
+        let stolen = crate::lock(&victim.local).pop_front();
         stolen
     }
 }
@@ -166,7 +182,7 @@ impl ThreadPool {
                 idle_seq: AtomicUsize::new(0),
             });
             worker_arcs.push(worker.clone());
-            shared.workers.lock().unwrap().push(Arc::downgrade(&worker));
+            crate::lock(&shared.workers).push(Arc::downgrade(&worker));
             let w2 = worker.clone();
             handles.push(
                 thread::Builder::new()

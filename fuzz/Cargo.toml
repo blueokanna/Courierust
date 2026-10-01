@@ -41,3 +41,24 @@ path = "fuzz_targets/h2_connection.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ws_frame"
+path = "fuzz_targets/ws_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ws_handshake"
+path = "fuzz_targets/ws_handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ws_session"
+path = "fuzz_targets/ws_session.rs"
+test = false
+doc = false
+bench = false

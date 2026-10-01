@@ -154,6 +154,11 @@ impl ConnStream {
         self.peer
     }
 
+    /// Whether this transport is TLS.
+    pub(crate) fn is_tls(&self) -> bool {
+        matches!(self.inner, ConnStreamKind::Tls { .. })
+    }
+
     /// The negotiated ALPN protocol (TLS connections only).
     pub(crate) fn alpn(&self) -> Option<Vec<u8>> {
         match &self.inner {
@@ -217,7 +222,7 @@ impl crate::courierust_io::Read for &ConnStream {
                 crate::courierust_io::Read::read(&mut r, buf)
             }
             ConnStreamKind::Tls { tls, .. } => {
-                let mut g = tls.lock().unwrap();
+                let mut g = crate::lock(tls);
                 crate::courierust_io::Read::read(&mut *g, buf)
             }
         }
@@ -232,7 +237,7 @@ impl crate::courierust_io::Write for &ConnStream {
                 crate::courierust_io::Write::write(&mut w, buf)
             }
             ConnStreamKind::Tls { tls, .. } => {
-                let mut g = tls.lock().unwrap();
+                let mut g = crate::lock(tls);
                 crate::courierust_io::Write::write(&mut *g, buf)
             }
         }
@@ -245,7 +250,7 @@ impl crate::courierust_io::Write for &ConnStream {
                 crate::courierust_io::Write::flush(&mut w)
             }
             ConnStreamKind::Tls { tls, .. } => {
-                let mut g = tls.lock().unwrap();
+                let mut g = crate::lock(tls);
                 crate::courierust_io::Write::flush(&mut *g)
             }
         }

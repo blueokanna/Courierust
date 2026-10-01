@@ -14,6 +14,7 @@ use crate::courierust_net::ConnStream;
 use crate::courierust_server::{ws, Handler, ServerConfig};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Bytes of unread request data a refusal is willing to drain before the
 /// socket closes (`linger_close`), and how long it is willing to wait.
@@ -30,37 +31,62 @@ pub(crate) fn serve(
     let mut reader = BufReader::new(stream.clone(), 16 * 1024);
     let mut writer = BufWriter::new(stream.clone(), 16 * 1024);
     let mut scratch = Scratch::new();
+    // Fixed for the connection's lifetime, so a handler that asks for it
+    // does not cost a syscall per request.
+    let connection_info = crate::courierust_server::ConnectionInfo {
+        peer: stream.peer_addr(),
+        secure: stream.is_tls(),
+    };
     loop {
+        let header_deadline = config
+            .request_header_timeout
+            .and_then(|timeout| Instant::now().checked_add(timeout));
+        let mut before_header_read = || set_header_read_deadline(stream, header_deadline);
+
         // Request line.
         let line = scratch.line();
-        match reader.read_until_into(b'\n', 16 * 1024, line) {
+        match reader.read_until_into_with(b'\n', 16 * 1024, line, &mut before_header_read) {
             Err(Error {
                 kind: crate::courierust_error::ErrorKind::UnexpectedEof,
                 ..
             }) => return Ok(()),
+            Err(Error {
+                kind: crate::courierust_error::ErrorKind::Timeout,
+                ..
+            }) => return write_header_timeout(&mut writer, stream),
             Err(e) => return Err(e),
             Ok(()) => {}
         }
         let rl = match courierust_h1::parse_request_line(line) {
             Ok(rl) => rl,
             Err(e) => {
-                // A malformed request line gets an answer, not a silent
-                // disconnect: a client (or a proxy in front) that sends a
-                // bad request should learn that, and a silent close is
-                // indistinguishable from a network failure.
                 write_early_error(&mut writer, 400, "bad request")?;
                 let _ = writer.flush();
                 stream.linger_close(LINGER_BUDGET, LINGER_DEADLINE);
                 return Err(e);
             }
         };
-        let headers = courierust_h1::read_headers_scratch(&mut reader, &mut scratch)?;
+        let headers = match courierust_h1::read_headers_scratch_with_limit(
+            &mut reader,
+            &mut scratch,
+            config.max_header_list,
+            &mut before_header_read,
+        ) {
+            Ok(headers) => headers,
+            Err(Error {
+                kind: crate::courierust_error::ErrorKind::Timeout,
+                ..
+            }) => return write_header_timeout(&mut writer, stream),
+            Err(e) if e.kind == crate::courierust_error::ErrorKind::Overflow => {
+                write_early_error(&mut writer, 431, "request header fields too large")?;
+                let _ = writer.flush();
+                stream.linger_close(LINGER_BUDGET, LINGER_DEADLINE);
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
+        stream.configure(config.read_timeout)?;
 
-        // RFC 9112 §3.2: an HTTP/1.1 request must carry exactly one,
-        // non-empty `Host` field. Checking it *before* the body is read
-        // means an ambiguous request cannot reach a handler or pin a body
-        // buffer, and a proxy in front never has to guess which authority
-        // the request meant.
         let mut early = courierust_h1::host_header_error(rl.version, &headers)
             .map(|reason| error_response(400, reason));
         let refuses_early = early.is_some();
@@ -88,9 +114,7 @@ pub(crate) fn serve(
                 }
             }
         };
-        // RFC 7230 §6.3: a request carrying `Connection: close` forces the
-        // connection closed after this response, regardless of the
-        // response's own keep-alive hints.
+
         let request_close = courierust_h1::wants_close(&headers);
         let req = Request {
             method: rl.method,
@@ -100,23 +124,38 @@ pub(crate) fn serve(
             body,
         };
 
-        // ---- WebSocket upgrade -------------------------------------
-        // Decided *before* the normal handler runs, so the policy checks
-        // (origin, subprotocol, extensions, version) can inspect the very
-        // request the client sent. When the upgrade is accepted this call
-        // never returns: the connection becomes a framed byte stream.
         if early.is_none()
             && config.websocket.enabled
             && crate::courierust_ws::is_websocket_upgrade(&req.headers)
         {
-            match handler.websocket(&req) {
-                ws::WsUpgradeReply::Pass => {}
-                ws::WsUpgradeReply::Refuse(resp) => early = Some(resp),
-                ws::WsUpgradeReply::Accept(service) => {
-                    let peer = stream.peer_addr().ip();
-                    let tls_active = config.tls.is_some();
-                    match ws::plan(&req, peer, tls_active, &config.websocket) {
-                        Ok(plan) => {
+            // `None` = the server's own policy picks the subprotocol;
+            // `Some(None)` = advertise none, which is what a proxy says when
+            // the upstream agreed on none. A bare `Accept` must not be read
+            // as the latter, or it would erase a subprotocol this server did
+            // negotiate.
+            let accepted = match handler.websocket(&req) {
+                ws::WsUpgradeReply::Pass => None,
+                ws::WsUpgradeReply::Refuse(resp) => {
+                    early = Some(resp);
+                    None
+                }
+                ws::WsUpgradeReply::Accept(service) => Some((service, None)),
+                ws::WsUpgradeReply::AcceptWith { service, protocol } => {
+                    Some((service, Some(protocol)))
+                }
+            };
+            if let Some((service, protocol)) = accepted {
+                let peer = stream.peer_addr().ip();
+                let tls_active = config.tls.is_some();
+                match ws::plan(&req, peer, tls_active, &config.websocket) {
+                    Ok(mut plan) => {
+                        let applied = match protocol {
+                            Some(protocol) => plan.override_protocol(protocol.as_deref()),
+                            None => Ok(()),
+                        };
+                        if let Err(refusal) = applied {
+                            early = Some(refusal.response());
+                        } else {
                             let mut head = HeaderMap::with_capacity(6);
                             for (n, v) in plan.accept_headers()?.iter() {
                                 head.append(n.clone(), v.clone());
@@ -130,11 +169,6 @@ pub(crate) fn serve(
                             )?;
                             writer.write_all(bytes)?;
                             writer.flush()?;
-                            // The reader still holds any bytes the client
-                            // pipelined behind the handshake — hand it to
-                            // the session so none are lost. Frame traffic
-                            // is read in much larger chunks than a request
-                            // head, so the buffer grows first.
                             let mut reader = reader;
                             reader.ensure_capacity(config.websocket.read_buffer);
                             return ws::serve_blocking(
@@ -145,22 +179,17 @@ pub(crate) fn serve(
                                 &config.websocket,
                             );
                         }
-                        Err(refusal) => early = Some(refusal.response()),
                     }
+                    Err(refusal) => early = Some(refusal.response()),
                 }
             }
         }
 
         let resp = match early {
             Some(resp) => resp,
-            None => handler.handle(req),
+            None => handler.handle_connected(&connection_info, req),
         };
 
-        // RFC 7540 §3.2: an `h2c` Upgrade request switches this connection
-        // to HTTP/2 (when the server is configured to speak h2). The
-        // handler's response to the upgrade request is delivered on h2
-        // stream 1. An h1-only server ignores the Upgrade and answers
-        // normally.
         if upgrade && config.http2 {
             let out =
                 b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n";
@@ -176,15 +205,10 @@ pub(crate) fn serve(
             );
         }
 
-        // `keep_alive_requested` applies exact-token `Connection`
-        // semantics (a `closex` token does not close) and already
-        // returns false for a close token; no separate substring check
-        // here, or this path and the event path would disagree.
         let keep_alive = !request_close
             && courierust_h1::keep_alive_requested(resp.version, &resp.headers)
             && resp.version != Version::HTTP_10;
 
-        // Build wire headers (drop hop-by-hop, add framing).
         let mut out_headers = HeaderMap::with_capacity(resp.headers.len() + 2);
         for (n, v) in resp.headers.iter() {
             if courierust_h1::is_hop_by_hop(n.as_str()) {
@@ -212,8 +236,6 @@ pub(crate) fn serve(
             || resp.status == crate::courierust_http::status::StatusCode::NO_CONTENT
             || resp.status == crate::courierust_http::status::StatusCode::NOT_MODIFIED)
         {
-            // Empty body: pin Content-Length: 0 so the response framing is
-            // unambiguous for the peer.
             out_headers.insert(
                 HeaderName::from_lowercase("content-length"),
                 HeaderValue::from_static("0"),
@@ -238,9 +260,6 @@ pub(crate) fn serve(
         }
         writer.flush()?;
         if refuses_early {
-            // The peer is likely still sending a body we chose not to
-            // read; draining a bounded amount keeps the response from
-            // being destroyed by a RST on Linux.
             stream.linger_close(LINGER_BUDGET, LINGER_DEADLINE);
         }
 
@@ -249,6 +268,32 @@ pub(crate) fn serve(
         }
     }
     Ok(())
+}
+
+/// Set the underlying socket deadline to the budget remaining before a
+/// request header must be complete. This runs before every transport
+/// read, so receiving individual bytes never refreshes the budget.
+fn set_header_read_deadline(stream: &ConnStream, deadline: Option<Instant>) -> Result<()> {
+    let Some(deadline) = deadline else {
+        return Ok(());
+    };
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| Error::timeout("request header timeout"))?;
+    stream.configure(Some(remaining))
+}
+
+/// Respond to an HTTP/1.x request-head deadline with the RFC 9110 status
+/// instead of silently closing the connection.
+fn write_header_timeout(
+    writer: &mut BufWriter<Arc<ConnStream>>,
+    stream: &ConnStream,
+) -> Result<()> {
+    write_early_error(writer, 408, "request header timeout")?;
+    let _ = writer.flush();
+    stream.linger_close(LINGER_BUDGET, LINGER_DEADLINE);
+    Err(Error::timeout("request header timeout"))
 }
 
 /// RFC 9112 §3.2: an HTTP/1.1 request carries exactly one `Host` field,
@@ -296,8 +341,7 @@ fn write_early_error(
         HeaderValue::from_static("close"),
     );
     let mut scratch = Scratch::new();
-    // `Scratch::body()` clears the buffer on every call, so the slice must
-    // be taken once and used for both the write and the send.
+
     let head = scratch.body();
     courierust_h1::write_response_head(
         head,

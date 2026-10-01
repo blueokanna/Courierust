@@ -865,7 +865,9 @@ impl<R: Read, W: Write> Connection<R, W> {
             if let Some(q) = self.send_queue.get_mut(&sid) {
                 let front_empty = q.front().map(|c| c.data.is_empty()).unwrap_or(false);
                 if front_empty {
-                    let popped = q.pop_front().unwrap();
+                    let Some(popped) = q.pop_front() else {
+                        continue;
+                    };
                     end_stream = popped.end_stream && q.is_empty();
                     if end_stream {
                         trailers = popped.trailers;
@@ -873,7 +875,11 @@ impl<R: Read, W: Write> Connection<R, W> {
                 }
             }
             {
-                let s = self.streams.get_mut(&sid).unwrap();
+                let Some(s) = self.streams.get_mut(&sid) else {
+                    self.scheduler.remove(sid);
+                    self.scheduled.remove(&sid);
+                    continue;
+                };
                 s.send_window -= payload.len() as i64;
                 s.send_buffered = s.send_buffered.saturating_sub(payload.len());
             }
@@ -901,13 +907,19 @@ impl<R: Read, W: Write> Connection<R, W> {
                     self.close_stream(sid);
                     continue;
                 }
-                let s = self.streams.get_mut(&sid).unwrap();
-                if s.state == StreamState::Open {
-                    s.state = StreamState::HalfClosedLocal;
+                let s = self.streams.get_mut(&sid);
+                if let Some(s) = s {
+                    if s.state == StreamState::Open {
+                        s.state = StreamState::HalfClosedLocal;
+                    }
                 }
             }
 
-            let stream = self.streams.get(&sid).unwrap();
+            let Some(stream) = self.streams.get(&sid) else {
+                self.scheduler.remove(sid);
+                self.scheduled.remove(&sid);
+                continue;
+            };
             let exhausted = self
                 .send_queue
                 .get(&sid)
@@ -961,9 +973,6 @@ impl<R: Read, W: Write> Connection<R, W> {
         if self.scheduled.contains(&stream_id) {
             return;
         }
-        // A stream is schedulable while it has buffered data and send
-        // credit — even if `send_done` is set (END_STREAM is queued behind
-        // the data).
         let has_data = self
             .send_queue
             .get(&stream_id)
@@ -1127,10 +1136,6 @@ impl<R: Read, W: Write> Connection<R, W> {
                 error_code,
             } => {
                 if !self.streams.contains(&stream_id) {
-                    // RFC 9113 §5.1: RST_STREAM on an idle stream (one
-                    // that was never opened) is a PROTOCOL_ERROR, but
-                    // RST_STREAM for a stream we already closed is a
-                    // normal race and MUST be ignored.
                     if stream_id > self.streams.last_peer_id() {
                         return self
                             .conn_error(ErrorCode::ProtocolError, "RST_STREAM on idle stream");
@@ -1178,7 +1183,6 @@ impl<R: Read, W: Write> Connection<R, W> {
                     last_stream_id,
                     debug,
                 });
-                // Streams above last_stream_id are implicitly failed.
                 let ids: Vec<u32> = self
                     .streams
                     .iter()
@@ -1220,17 +1224,17 @@ impl<R: Read, W: Write> Connection<R, W> {
                     let old = s.priority;
                     s.priority = priority;
                     self.scheduler.update(prioritized_stream_id, old, priority);
+                } else if self.pending_priority.len() < 1024 {
+                    self.pending_priority
+                        .insert(prioritized_stream_id, priority);
                 } else {
-                    // Buffer the most recent update for an idle stream
-                    // (RFC 9218 §7: bounded, most-recent wins).
-                    if self.pending_priority.len() < 1024 {
-                        self.pending_priority
-                            .insert(prioritized_stream_id, priority);
-                    } else {
-                        self.pending_priority.clear();
-                        self.pending_priority
-                            .insert(prioritized_stream_id, priority);
-                    }
+                    // The cap is a memory guard, not a policy: once the hint
+                    // table is full a *new* priority is worth more than a
+                    // stale one, so the table is reset rather than the update
+                    // dropped.
+                    self.pending_priority.clear();
+                    self.pending_priority
+                        .insert(prioritized_stream_id, priority);
                 }
                 self.events.push_back(Event::PriorityUpdate {
                     stream_id: prioritized_stream_id,
@@ -1261,16 +1265,11 @@ impl<R: Read, W: Write> Connection<R, W> {
 
         if is_new {
             if !self.validate_header_block(sid, &fields, !self.config.client, false)? {
-                // The block was malformed: the stream is reset and the
-                // connection carries on (RFC 9113 §8.1.1).
                 return Ok(());
             }
 
             if self.config.client {
                 if self.recently_closed.iter().any(|&c| c == sid) {
-                    // The stream was closed (typically by our RST_STREAM)
-                    // and this HEADERS raced it: stream error, not a
-                    // connection error.
                     self.pending_frames.push_back(Frame::RstStream {
                         stream_id: sid,
                         error_code: ErrorCode::StreamClosed,
@@ -1383,8 +1382,6 @@ impl<R: Read, W: Write> Connection<R, W> {
             );
         }
         if !self.validate_header_block(sid, &fields, false, false)? {
-            // Malformed response (RFC 9113 §8.1.1): reset the stream and
-            // leave the connection usable for its other streams.
             return Ok(());
         }
         let cl = self.parse_content_length(&fields)?;
@@ -1395,15 +1392,7 @@ impl<R: Read, W: Write> Connection<R, W> {
             .and_then(|s| s.parse::<u16>().ok())
             .unwrap_or(200);
         if (100..=199).contains(&status) && self.config.client {
-            // RFC 9110 §15.2 / RFC 9113 §8.1: interim (1xx) responses.
-            // The stream stays open awaiting the final response; the
-            // interim block must NOT mark the headers as delivered, or
-            // the real response arriving next would be misread as
-            // trailers (and rejected for carrying `:status`). Interim
-            // responses carry no body, so the block is simply dropped.
             if p.end_stream {
-                // The peer terminated the exchange with only an interim
-                // response; no final response will follow.
                 self.pending_frames.push_back(Frame::RstStream {
                     stream_id: sid,
                     error_code: ErrorCode::Cancel,
@@ -1512,8 +1501,6 @@ impl<R: Read, W: Write> Connection<R, W> {
         let mut path: Option<&str> = None;
         let mut has_authority = false;
         let mut has_status = false;
-        // RFC 9113 §8.1.2.3: request pseudo-headers must not appear more
-        // than once (each occurrence after the first is malformed).
         let mut saw_method = false;
         let mut saw_scheme = false;
         let mut saw_path = false;
@@ -1698,12 +1685,6 @@ impl<R: Read, W: Write> Connection<R, W> {
     fn on_data(&mut self, stream_id: u32, data: Bytes, end_stream: bool) -> Result<()> {
         if !self.streams.contains(&stream_id) {
             if self.recently_closed.iter().any(|&c| c == stream_id) {
-                // The stream was open and has since closed — most commonly
-                // in-flight DATA racing the RST_STREAM we just sent. RFC
-                // 9113 §5.1 makes this a *stream* error (STREAM_CLOSED),
-                // not a connection error: killing the whole multiplex here
-                // would fail every unrelated in-flight request because one
-                // peer kept sending on a stream we already reset.
                 self.pending_frames.push_back(Frame::RstStream {
                     stream_id,
                     error_code: ErrorCode::StreamClosed,
@@ -1769,7 +1750,6 @@ impl<R: Read, W: Write> Connection<R, W> {
         if end_stream {
             self.verify_content_length(stream_id);
             if !self.streams.contains(&stream_id) {
-                // verify_content_length reset the stream.
                 return Ok(());
             }
         }
@@ -1811,7 +1791,6 @@ impl<R: Read, W: Write> Connection<R, W> {
         }
         self.encoder
             .set_peer_table_size(new_settings.header_table_size as usize);
-        // Apply INITIAL_WINDOW_SIZE delta to every stream's send window.
         let delta = new_settings.initial_window_size as i64 - self.peer.initial_window_size as i64;
         if delta != 0 {
             let ids: Vec<u32> = self.streams.iter().map(|s| s.id).collect();
@@ -1928,10 +1907,6 @@ impl<R: Read, W: Write> Connection<R, W> {
     /// fields stay connection errors as a request-smuggling guard).
     fn reject_malformed(&mut self, stream_id: u32, msg: &str) {
         if !self.config.client {
-            // Remember a peer-initiated id even when its block is
-            // rejected: §5.1.1 requires later ids to be strictly higher,
-            // and the normal path records this one only for accepted
-            // requests.
             self.streams.accept_peer_id(stream_id);
         }
         self.stream_error(stream_id, ErrorCode::ProtocolError, msg);
@@ -2001,10 +1976,6 @@ impl<R: Read, W: Write> Connection<R, W> {
             s.recv_ended = true;
             s.send_done = true;
         }
-        // Flush connection-level credit accumulated on close so it is not
-        // stranded when the application never released the stream's data
-        // (a peer closing many streams with un-released bodies would
-        // otherwise shrink the connection receive window indefinitely).
         let conn_threshold = 32 * 1024i64;
         if self.conn_pending_release >= conn_threshold {
             let inc = self.conn_pending_release.min(i64::from(u32::MAX)) as u32;
@@ -2019,8 +1990,6 @@ impl<R: Read, W: Write> Connection<R, W> {
         self.send_queue.remove(&stream_id);
         self.pending_priority.remove(&stream_id);
         self.streams.remove(&stream_id);
-        // Remember the id so late frames on it are treated as stream
-        // errors (STREAM_CLOSED) rather than connection errors.
         self.recently_closed.push_back(stream_id);
         const CLOSED_TRACK: usize = 2048;
         if self.recently_closed.len() > CLOSED_TRACK {

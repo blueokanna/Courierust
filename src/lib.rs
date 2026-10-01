@@ -70,6 +70,25 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+/// Lock a [`std::sync::Mutex`], recovering from poisoning.
+///
+/// A poisoned lock means some thread panicked while holding it. For a
+/// server that must not escalate: the panic already failed one request,
+/// and `unwrap()` would turn it into a permanent failure of every later
+/// operation on the same pool, pool registry or health state — an outage
+/// caused by a bug that would otherwise have cost a single request.
+///
+/// Recovery is sound for the structures this crate puts behind these
+/// locks: each is one standard-library call away from a consistent state
+/// (a map insert/remove, a queue push/pop, a counter), so there is no
+/// multi-step invariant a panic could tear. Where a panic *could* leave
+/// torn state, the lock is not shared in the first place.
+#[cfg(feature = "std")]
+#[inline]
+pub(crate) fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub mod courierust_bytes;
 pub mod courierust_crypto;
 pub mod courierust_deflate;

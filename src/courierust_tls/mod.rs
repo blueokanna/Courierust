@@ -28,6 +28,7 @@
 
 pub mod crypto;
 pub(crate) mod session;
+pub mod system_roots;
 pub mod x509;
 
 #[cfg(test)]
@@ -669,7 +670,7 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
                         max_early_data_size: ticket.max_early_data_size,
                     };
                     if let Some(store) = &self.session_store {
-                        cache_session(&mut store.lock().unwrap(), sess);
+                        cache_session(&mut crate::lock(store), sess);
                     }
                 }
             }
@@ -931,17 +932,17 @@ impl TlsConnector {
 
     /// Forget every cached resumption session.
     pub fn clear_sessions(&self) {
-        self.sessions.lock().unwrap().clear();
+        crate::lock(&self.sessions).clear();
     }
 
     /// Number of cached resumption sessions (diagnostics / tests).
     pub fn session_count(&self) -> usize {
-        self.sessions.lock().unwrap().len()
+        crate::lock(&self.sessions).len()
     }
 
     /// Find a fresh resumption session for `hostname`.
     fn find_session(&self, hostname: &str) -> Option<session::ClientSession> {
-        let sessions = self.sessions.lock().unwrap();
+        let sessions = crate::lock(&self.sessions);
         sessions
             .iter()
             .find(|s| s.hostname == hostname)

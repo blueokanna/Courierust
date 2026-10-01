@@ -37,16 +37,291 @@ fn main() {
             .filter(|e| e.path().extension().map(|x| x == "proto").unwrap_or(false))
             .collect();
         entries.sort_by_key(|e| e.file_name());
+        let mut compiled: Vec<(String, ProtoFile)> = Vec::new();
         for entry in entries {
+            let file_name = entry.file_name().to_string_lossy().into_owned();
             let text = fs::read_to_string(entry.path()).expect("read proto file");
             match parse_proto(&text) {
-                Ok(file) => generate_file(&mut generated, &file),
+                Ok(file) => {
+                    generate_file(&mut generated, &file);
+                    compiled.push((file_name, file));
+                }
                 Err(error) => panic!("failed to parse {}: {error}", entry.path().display()),
             }
         }
+        // The descriptors come from the same parse that generated the code,
+        // so what a reflection client is told can not drift from what the
+        // service actually implements.
+        generate_descriptors(&mut generated, &compiled);
     }
     let out_path = Path::new(&out_dir).join("courierust_generated.rs");
     fs::write(out_path, &generated).expect("write generated code");
+}
+
+// ---------------------------------------------------------------------
+// Descriptor generation
+// ---------------------------------------------------------------------
+
+/// Emit the compiled files as serialized `FileDescriptorProto`s plus the
+/// tables a reflection service needs, under `generated::descriptors`.
+fn generate_descriptors(out: &mut String, files: &[(String, ProtoFile)]) {
+    out.push_str(
+        "\n/// Protobuf descriptors for the compiled `.proto` files.\n\
+         ///\n\
+         /// Each constant is a serialized `FileDescriptorProto` — the same bytes\n\
+         /// `protoc --descriptor_set_out` would write for that file — and the\n\
+         /// tables beside them are what a server-side reflection implementation\n\
+         /// answers with. `FILES` handles `file_by_filename`, `SERVICES` backs\n\
+         /// `list_services`, and a symbol lookup scans the services and the\n\
+         /// messages in the descriptors.\n\
+         pub mod descriptors {\n",
+    );
+    for (name, file) in files {
+        let const_name = descriptor_const_name(name);
+        let bytes = encode_file_descriptor(name, file);
+        out.push_str(&format!(
+            "    /// `{name}` as a serialized `FileDescriptorProto`.\n    pub const {const_name}: &[u8] = &["
+        ));
+        for (index, byte) in bytes.iter().enumerate() {
+            if index % 16 == 0 {
+                out.push_str("\n        ");
+            }
+            out.push_str(&format!("{byte}, "));
+        }
+        out.push_str("\n    ];\n");
+    }
+    out.push_str(
+        "\n    /// Every compiled `.proto`, by the name it was compiled under.\n    \
+         pub const FILES: &[(&str, &[u8])] = &[\n",
+    );
+    for (name, _) in files {
+        out.push_str(&format!(
+            "        (\"{name}\", {}),\n",
+            descriptor_const_name(name)
+        ));
+    }
+    out.push_str("    ];\n");
+    out.push_str(
+        "\n    /// Fully-qualified names of every service, in file order.\n    \
+         pub const SERVICES: &[&str] = &[\n",
+    );
+    for (_, file) in files {
+        for service in &file.services {
+            out.push_str(&format!(
+                "        \"{}\",\n",
+                qualified(&service.name, &file.package)
+            ));
+        }
+    }
+    out.push_str("    ];\n");
+    out.push_str(
+        "\n    /// Fully-qualified names of every message, in file order.\n    \
+         pub const MESSAGES: &[&str] = &[\n",
+    );
+    for (_, file) in files {
+        for message in &file.messages {
+            out.push_str(&format!(
+                "        \"{}\",\n",
+                qualified(&message.name, &file.package)
+            ));
+        }
+    }
+    out.push_str("    ];\n");
+    out.push_str(
+        "\n    /// Every symbol a file defines — `package.Service`,\n    \
+         /// `package.Service.Method` and `package.Message` — mapped to the file\n    \
+         /// that defines it, which is what `file_containing_symbol` answers from.\n    \
+         pub const SYMBOLS: &[(&str, &str)] = &[\n",
+    );
+    for (name, file) in files {
+        for service in &file.services {
+            let service_name = qualified(&service.name, &file.package);
+            out.push_str(&format!("        (\"{service_name}\", \"{name}\"),\n"));
+            for rpc in &service.rpcs {
+                out.push_str(&format!(
+                    "        (\"{service_name}.{}\", \"{name}\"),\n",
+                    rpc.name
+                ));
+            }
+        }
+        for message in &file.messages {
+            out.push_str(&format!(
+                "        (\"{}\", \"{name}\"),\n",
+                qualified(&message.name, &file.package)
+            ));
+        }
+    }
+    out.push_str("    ];\n}\n");
+}
+
+/// `proto/hello_world.proto` -> `HELLO_WORLD_FILE_DESCRIPTOR`.
+fn descriptor_const_name(file_name: &str) -> String {
+    let stem = file_name.strip_suffix(".proto").unwrap_or(file_name);
+    let mut name = String::new();
+    for ch in stem.chars() {
+        if ch.is_ascii_alphanumeric() {
+            name.push(ch.to_ascii_uppercase());
+        } else {
+            name.push('_');
+        }
+    }
+    format!("{name}_FILE_DESCRIPTOR")
+}
+
+fn qualified(name: &str, package: &Option<String>) -> String {
+    match package {
+        Some(package) => format!("{package}.{name}"),
+        None => name.to_string(),
+    }
+}
+
+// --- protobuf wire helpers (build-time only) ---
+
+fn pb_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push(value as u8 | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn pb_tag(out: &mut Vec<u8>, field: u32, wire: u32) {
+    pb_varint(out, u64::from(field) << 3 | u64::from(wire));
+}
+
+fn pb_varint_field(out: &mut Vec<u8>, field: u32, value: u64) {
+    pb_tag(out, field, 0);
+    pb_varint(out, value);
+}
+
+fn pb_bytes_field(out: &mut Vec<u8>, field: u32, value: &[u8]) {
+    pb_tag(out, field, 2);
+    pb_varint(out, value.len() as u64);
+    out.extend_from_slice(value);
+}
+
+fn pb_string_field(out: &mut Vec<u8>, field: u32, value: &str) {
+    pb_bytes_field(out, field, value.as_bytes());
+}
+
+/// A sub-message field: encode it, then wrap it in a length-delimited field.
+fn pb_message_field(out: &mut Vec<u8>, field: u32, message: &[u8]) {
+    pb_bytes_field(out, field, message);
+}
+
+/// `FieldDescriptorProto.Type`.
+fn descriptor_type(name: &str) -> u64 {
+    match name {
+        "double" => 1,
+        "float" => 2,
+        "int64" => 3,
+        "uint64" => 4,
+        "int32" => 5,
+        "fixed64" => 6,
+        "fixed32" => 7,
+        "bool" => 8,
+        "string" => 9,
+        "bytes" => 12,
+        "uint32" => 13,
+        "sfixed32" => 15,
+        "sfixed64" => 16,
+        "sint32" => 17,
+        "sint64" => 18,
+        other => panic!("no descriptor type for scalar `{other}`"),
+    }
+}
+
+/// The name protoc puts in `FieldDescriptorProto.type_name`: fully
+/// qualified, with a leading dot. Relative names resolve against the
+/// enclosing package, which is what the parser hands us.
+fn type_name(name: &str, package: &Option<String>) -> String {
+    if name.starts_with('.') {
+        return name.to_string();
+    }
+    if name.contains('.') {
+        return format!(".{name}");
+    }
+    match package {
+        Some(package) => format!(".{package}.{name}"),
+        None => format!(".{name}"),
+    }
+}
+
+/// protoc's `json_name`: lowerCamelCase of the field name.
+fn json_name(field: &str) -> String {
+    let mut out = String::with_capacity(field.len());
+    let mut upper_next = false;
+    for ch in field.chars() {
+        if ch == '_' {
+            upper_next = true;
+            continue;
+        }
+        if upper_next {
+            out.extend(ch.to_uppercase());
+            upper_next = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn encode_file_descriptor(file_name: &str, file: &ProtoFile) -> Vec<u8> {
+    let mut out = Vec::new();
+    pb_string_field(&mut out, 1, file_name); // name
+    if let Some(package) = &file.package {
+        pb_string_field(&mut out, 2, package); // package
+    }
+    for message in &file.messages {
+        pb_message_field(&mut out, 4, &encode_message(message, &file.package));
+    }
+    for service in &file.services {
+        pb_message_field(&mut out, 6, &encode_service(service, &file.package));
+    }
+    pb_string_field(&mut out, 12, "proto3"); // syntax
+    out
+}
+
+fn encode_message(message: &Message, package: &Option<String>) -> Vec<u8> {
+    let mut out = Vec::new();
+    pb_string_field(&mut out, 1, &message.name);
+    for field in &message.fields {
+        let (label, ty, type_name) = match &field.ty {
+            FieldType::Scalar(scalar) => (1, descriptor_type(scalar), None),
+            FieldType::Repeated(scalar) => (3, descriptor_type(scalar), None),
+            FieldType::Message(name) => (1, 11, Some(type_name(name, package))),
+            FieldType::RepeatedMessage(name) => (3, 11, Some(type_name(name, package))),
+        };
+        let mut encoded = Vec::new();
+        pb_string_field(&mut encoded, 1, &field.name);
+        pb_varint_field(&mut encoded, 3, u64::from(field.number));
+        pb_varint_field(&mut encoded, 4, label);
+        pb_varint_field(&mut encoded, 5, ty);
+        if let Some(type_name) = type_name {
+            pb_string_field(&mut encoded, 6, &type_name);
+        }
+        pb_string_field(&mut encoded, 10, &json_name(&field.name));
+        pb_message_field(&mut out, 2, &encoded);
+    }
+    out
+}
+
+fn encode_service(service: &Service, package: &Option<String>) -> Vec<u8> {
+    let mut out = Vec::new();
+    pb_string_field(&mut out, 1, &service.name);
+    for rpc in &service.rpcs {
+        let mut encoded = Vec::new();
+        pb_string_field(&mut encoded, 1, &rpc.name);
+        pb_string_field(&mut encoded, 2, &type_name(&rpc.request, package));
+        pb_string_field(&mut encoded, 3, &type_name(&rpc.response, package));
+        // `client_streaming` and `server_streaming` default to false, so a
+        // false value is left out exactly as protoc leaves it out.
+        if rpc.server_streaming {
+            pb_varint_field(&mut encoded, 6, 1);
+        }
+        pb_message_field(&mut out, 2, &encoded);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------

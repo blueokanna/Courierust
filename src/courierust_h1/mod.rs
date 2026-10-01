@@ -130,13 +130,25 @@ pub fn read_headers_scratch<R: Read>(
     reader: &mut BufReader<R>,
     scratch: &mut crate::courierust_io::Scratch,
 ) -> Result<HeaderMap> {
+    read_headers_scratch_with_limit(reader, scratch, MAX_HEADER_BLOCK, || Ok(()))
+}
+
+/// Like [`read_headers_scratch`], but applies `max_header_list` and
+/// invokes `before_read` immediately before each transport read needed
+/// to finish the header block.
+pub(crate) fn read_headers_scratch_with_limit<R: Read, F: FnMut() -> Result<()>>(
+    reader: &mut BufReader<R>,
+    scratch: &mut crate::courierust_io::Scratch,
+    max_header_list: usize,
+    mut before_read: F,
+) -> Result<HeaderMap> {
     let mut headers = HeaderMap::new();
     let mut total = 0usize;
     loop {
         let line = scratch.line();
-        reader.read_until_into(b'\n', MAX_LINE, line)?;
+        reader.read_until_into_with(b'\n', MAX_LINE, line, &mut before_read)?;
         total += line.len();
-        if total > MAX_HEADER_BLOCK {
+        if total > max_header_list {
             return Err(Error::overflow("header block too large"));
         }
         if line.len() >= MAX_LINE {
@@ -226,14 +238,6 @@ pub fn body_length(
     method: Option<&Method>,
     status: Option<StatusCode>,
 ) -> Result<BodyLen> {
-    // RFC 9112 §6.3: a response to a HEAD request, or any response with
-    // a 1xx/204/304 status, never carries a body regardless of the
-    // framing header fields present. These checks MUST precede
-    // Content-Length/Transfer-Encoding parsing: otherwise a
-    // "204/304 + Content-Length: N" or a "HEAD + Content-Length: N"
-    // response would be mis-framed and a client would wait for bytes
-    // that never arrive (and, behind a proxy, the mismatch becomes a
-    // response-queue-poisoning / smuggling vector).
     let head_response = method == Some(&Method::HEAD);
     let bodyless_status = status.is_some_and(|s| {
         s.is_informational() || s == StatusCode::NO_CONTENT || s == StatusCode::NOT_MODIFIED
@@ -478,9 +482,6 @@ pub fn write_headers(out: &mut Vec<u8>, headers: &HeaderMap) -> Result<()> {
         if n.is_pseudo() {
             continue; // pseudo-headers are not serialized in HTTP/1
         }
-        // Defense in depth: values constructed via `from_static` skip
-        // validation, so reject CR/LF/NUL here rather than letting a
-        // crafted value split the message (header injection).
         if v.as_bytes()
             .iter()
             .any(|&c| c == b'\r' || c == b'\n' || c == 0)
@@ -539,8 +540,6 @@ impl IToA {
     /// The formatted digits.
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
-        // Digits are written right-to-left from the end of the buffer;
-        // the formatted value occupies the trailing `len` bytes.
         &self.buf[self.buf.len() - self.len..]
     }
 }
@@ -639,6 +638,20 @@ mod tests {
             body_length(&h, Some(&Method::POST), None).unwrap(),
             BodyLen::Length(5)
         );
+    }
+
+    #[test]
+    fn custom_header_list_limit_is_enforced() {
+        let mut reader = BufReader::new(SliceReader::new(b"Host: example.test\r\n\r\n"), 64);
+        let mut scratch = crate::courierust_io::Scratch::new();
+        let result = read_headers_scratch_with_limit(&mut reader, &mut scratch, 8, || Ok(()));
+        assert!(matches!(
+            result,
+            Err(Error {
+                kind: ErrorKind::Overflow,
+                ..
+            })
+        ));
     }
 
     #[test]

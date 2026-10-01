@@ -77,10 +77,10 @@ pub use frame::{
     MAX_CONTROL_PAYLOAD, MAX_HEADER_LEN,
 };
 pub use handshake::{
-    accept_key, client_ip, effective_host, is_secure, is_valid_key, is_websocket_upgrade,
-    origin_equivalent, origin_matches, parse_extensions, CompressionParams, ExtensionOffer,
-    HandshakeRejection, IpNet, OriginPolicy, PerMessageDeflate, PmDeflatePolicy, WsOffer,
-    WS_VERSION,
+    accept_key, client_ip, effective_host, is_secure, is_trusted_proxy, is_valid_key,
+    is_websocket_upgrade, origin_equivalent, origin_matches, parse_extensions, CompressionParams,
+    ExtensionOffer, HandshakeRejection, IpNet, OriginPolicy, PerMessageDeflate, PmDeflatePolicy,
+    WsOffer, WS_VERSION,
 };
 pub use session::{Event, MaskSource, Role, Session, SessionConfig, Stats};
 pub use utf8::Utf8Validator;

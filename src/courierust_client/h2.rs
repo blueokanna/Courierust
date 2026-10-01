@@ -726,7 +726,6 @@ fn handle_cmd(
                     }
                     let (body_tx, body_rx) = channel::<Result<Bytes>>();
                     let trailers = Arc::new(std::sync::Mutex::new(None));
-                    // Headers with END_STREAM clear; the body is streamed.
                     if let Err(e) = conn.send_headers(sid, &fields, false) {
                         let _ = reply.send(Err(e));
                         return true;
@@ -923,18 +922,6 @@ fn drain_events(
                                         trailers: p.trailers.clone(),
                                     }));
                                 }
-                                // Keep the pending entry so `body_tx`
-                                // stays alive for the DATA frames that
-                                // follow the response head.
-                                //
-                                // The per-request deadline is a
-                                // no-progress guard, not an absolute
-                                // request limit: an active long-lived
-                                // stream (gRPC server-streaming, long
-                                // downloads) must not be killed merely
-                                // because it outlives `read_timeout`.
-                                // Refresh it now that the head arrived;
-                                // DATA keeps it rolling below.
                                 if let Some(t) = timeout {
                                     p.deadline = Some(std::time::Instant::now() + t);
                                 }
@@ -963,9 +950,6 @@ fn drain_events(
                         continue;
                     }
                     let _ = p.body_tx.as_ref().map(|tx| tx.send(Ok(data)));
-                    // Roll the no-progress deadline: receiving body data
-                    // proves the peer is alive and the stream is making
-                    // progress.
                     if let Some(t) = timeout {
                         p.deadline = Some(std::time::Instant::now() + t);
                     }
@@ -980,7 +964,7 @@ fn drain_events(
                     for f in &headers {
                         map.append(f.name.clone(), f.value.clone());
                     }
-                    *p.trailers.lock().unwrap() = Some(map);
+                    *crate::lock(&p.trailers) = Some(map);
                     pending.remove(&stream_id);
                 }
             }

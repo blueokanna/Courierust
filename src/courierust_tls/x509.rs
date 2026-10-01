@@ -350,6 +350,17 @@ impl RootStore {
         Ok(n)
     }
 
+    /// Load the platform's trust anchors (Windows `ROOT` store, or the
+    /// distribution's PEM bundle on Unix).
+    ///
+    /// This is what makes `https://` work against a public server without
+    /// the caller having to find and ship a root bundle; it returns how
+    /// many roots were added and an error naming what was tried when no
+    /// store could be read, never a silently empty store.
+    pub fn load_system(&mut self) -> crate::courierust_tls::TlsResult<usize> {
+        crate::courierust_tls::system_roots::load_into(self)
+    }
+
     /// Number of roots.
     pub fn len(&self) -> usize {
         self.roots.len()
@@ -760,7 +771,6 @@ fn verify_cert_signature(cert: &Certificate, issuer: &Spki) -> bool {
                     h.finalize()
                 }
                 _ => {
-                    // ECDSA-with-SHA512 (P-521): SHA-512 digest.
                     let mut h = Sha512Digest::create();
                     h.update(&cert.tbs);
                     h.finalize()

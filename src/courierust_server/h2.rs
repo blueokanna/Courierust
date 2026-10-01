@@ -153,6 +153,12 @@ fn serve_loop(
     stats: Option<&Stats>,
 ) -> Result<()> {
     let mut peer_goaway = false;
+    // Fixed for the connection's lifetime, so a handler that asks for it
+    // does not cost a syscall per request.
+    let connection_info = crate::courierust_server::ConnectionInfo {
+        peer: stream.peer_addr(),
+        secure: stream.is_tls(),
+    };
 
     let started = std::time::Instant::now();
     let mut last_rx = started;
@@ -193,7 +199,10 @@ fn serve_loop(
                         s.h2_streams_total.fetch_add(1, Ordering::Relaxed);
                     }
                     if end_stream {
-                        let resp = handler.handle(build_request(&headers, Body::Empty)?);
+                        let resp = handler.handle_connected(
+                            &connection_info,
+                            build_request(&headers, Body::Empty)?,
+                        );
                         send_response(conn, stream_id, resp, deferred)?;
                     } else {
                         req_bodies.insert(
@@ -224,7 +233,10 @@ fn serve_loop(
                                 } else {
                                     Body::Bytes(Bytes::from(rb.body))
                                 };
-                                let resp = handler.handle(build_request(&rb.headers, body)?);
+                                let resp = handler.handle_connected(
+                                    &connection_info,
+                                    build_request(&rb.headers, body)?,
+                                );
                                 send_response(conn, stream_id, resp, deferred)?;
                             }
                         }

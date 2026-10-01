@@ -113,10 +113,18 @@ impl H1Connection {
         req: &Request<Body>,
         cfg: &ClientConfig,
         host_header: &str,
+        to_proxy: bool,
     ) -> Result<Response<Body>> {
         let mut headers = HeaderMap::with_capacity(req.headers.len() + 4);
         for (n, v) in req.headers.iter() {
-            if courierust_h1::is_hop_by_hop(n.as_str()) {
+            // `Proxy-Authorization` is hop-by-hop, so it survives exactly
+            // when this connection *is* the proxy's: forwarded to an origin
+            // it would hand the proxy's credentials to the origin.
+            if n.as_str() == "proxy-authorization" {
+                if !to_proxy {
+                    continue;
+                }
+            } else if courierust_h1::is_hop_by_hop(n.as_str()) {
                 continue;
             }
             headers.append(n.clone(), v.clone());

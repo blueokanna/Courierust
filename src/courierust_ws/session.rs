@@ -287,6 +287,17 @@ impl<R: Read, S: frame::FrameSink> Session<R, S> {
         matches!(self.phase, Phase::Finished)
     }
 
+    /// Whether a frame or a fragmented message is partially read, so the
+    /// next call resumes it instead of waiting for a new one.
+    ///
+    /// A blocking driver uses this to scope a transport deadline to the
+    /// *wait* for a frame: bytes that are already in flight stream without
+    /// paying a socket deadline on every read.
+    #[inline]
+    pub fn is_mid_frame(&self) -> bool {
+        !matches!(self.phase, Phase::Header { filled: 0 })
+    }
+
     /// Whether we have sent our closing frame.
     pub fn close_sent(&self) -> bool {
         self.close_sent
@@ -365,6 +376,36 @@ impl<R: Read, S: frame::FrameSink> Session<R, S> {
         match self.poll_message()? {
             Some(event) => Ok(event),
             None => Err(Error::new(ErrorKind::WouldBlock)),
+        }
+    }
+
+    /// Drive the state machine until a frame header is parsed, without
+    /// reading that frame's payload.
+    ///
+    /// `Ok(true)` leaves the session ready for [`Session::poll_message`]
+    /// to stream the frame; `Ok(false)` means the transport had nothing
+    /// yet (a non-blocking caller should park and retry).
+    ///
+    /// Splitting the wait from the body is what lets a blocking driver
+    /// arm a transport deadline for the wait and clear it for the
+    /// transfer, which matters where a socket deadline is charged per
+    /// blocking operation rather than per timeout (see
+    /// `courierust_client::ws`).
+    pub fn poll_header(&mut self) -> Result<bool> {
+        match self.phase {
+            Phase::Finished => Err(Error::with_message(
+                ErrorKind::UnexpectedEof,
+                "websocket: session already closed",
+            )),
+            // Already inside a frame: the body is what comes next.
+            Phase::Payload { .. } => Ok(true),
+            Phase::Header { .. } => match self.read_header()? {
+                Some(header) => {
+                    self.begin_frame(header)?;
+                    Ok(true)
+                }
+                None => Ok(false),
+            },
         }
     }
 
@@ -686,8 +727,14 @@ impl<R: Read, S: frame::FrameSink> Session<R, S> {
                     Err(e) => {
                         // Echo a legal close code and stop: the peer's
                         // payload was unusable, but the handshake still
-                        // has to complete (RFC 6455 §7.1.7).
-                        let _ = self.close(close::PROTOCOL_ERROR, "");
+                        // has to complete (RFC 6455 §7.1.7). The code is
+                        // the one §7.4.1 prescribes for the *specific*
+                        // defect — 1007 for a reason that is not UTF-8,
+                        // 1002 for the frame itself — because answering
+                        // every malformed Close with 1002 tells a peer
+                        // with a bad reason string the wrong thing.
+                        let code = close::failure_code(&e);
+                        let _ = self.close(code, "");
                         self.close_received = true;
                         return Err(self.fatal(e));
                     }

@@ -286,10 +286,29 @@ impl<R: Read> BufReader<R> {
     /// allocation-free — this is the hot path for HTTP/1.1 header
     /// blocks.
     pub fn read_until_into(&mut self, delim: u8, max: usize, out: &mut Vec<u8>) -> Result<()> {
+        self.read_until_into_with(delim, max, out, || Ok(()))
+    }
+
+    /// Like [`Self::read_until_into`], but calls `before_read` immediately
+    /// before each transport read. Protocol servers use this to keep an
+    /// absolute request-header deadline across a peer that drips bytes.
+    pub(crate) fn read_until_into_with<F>(
+        &mut self,
+        delim: u8,
+        max: usize,
+        out: &mut Vec<u8>,
+        mut before_read: F,
+    ) -> Result<()>
+    where
+        F: FnMut() -> Result<()>,
+    {
         out.clear();
         loop {
             if out.len() >= max {
                 return Err(Error::overflow("read_until exceeded max"));
+            }
+            if self.buffered() == 0 {
+                before_read()?;
             }
             let b = self.fill_buf()?;
             if b.is_empty() {
@@ -548,7 +567,6 @@ mod tests {
         w.flush().unwrap();
         assert_eq!(w.get_ref().out, [0x41; 100]);
 
-        // Buffered path: small writes coalesce, then flush loops.
         let mut w = BufWriter::new(
             ShortWriter {
                 out: Vec::new(),

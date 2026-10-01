@@ -12,7 +12,9 @@
 
 ## 重要的细节
 
-- **重定向**（301/302/303 → GET）绝不跨 origin 转发 `Authorization` / `Cookie`（RFC 9110 §15.4）。
+- **重定向**（301/302/303 → GET）绝不跨 origin 转发 `Authorization` / `Cookie` / `Proxy-Authorization`（RFC 9110 §15.4）。无 body 的后续请求同样会丢掉 `Content-Length` / `Content-Type` / `Transfer-Encoding`：长度后面没有字节，正是一条连接上请求错位的开始。需要回放 body 的 307/308 会被**原样交回**而不是跟随——body 已经不在了（流式 body 无法重放），跟过去发出去的就不是调用方写的那个请求。
+- **内容编码**——`accept_encoding`（默认开）声明 `gzip, deflate` 并解码同一集合：声明了却不解码，就是把看起来像乱码的字节交给调用方。客户端**没有解码器**的编码（比如 `br`）原样透传并**保留 `content-encoding` 标签**，调用方一眼能看出手里拿的不是明文，而不是拿到无法解释的数据。即使调用方自己指定了 `accept-encoding` 而被服务端无视，客户端仍会解码它认识的编码——但绝不改写调用方的请求头。解码受 `max_body` 约束：压缩炸弹是报错，不是一次分配。`accept_encoding: false` 是整个关掉——声明与解码一起关，不允许只关一边。
+- **正向代理**——`ClientConfig.proxy = Some("http://user:pass@host:3128")`。`http://` 目标用 **absolute-form** 发给代理（RFC 9110 §3.2.2），由代理去解析 origin 域名——这正是客户端站在代理后面的意义。`https://` 目标先建 `CONNECT` 隧道，TLS 与 origin **端到端**协商：代理只转发密文，既读不到也换不了证书。URL 里的凭据变成 `Proxy-Authorization: Basic …`，只发给代理（隧道场景下它根本到不了 origin；absolute-form 场景下由代理消费）。下面两件事**故意不支持**，且一律报错而不是静默兜底：`https://` 代理（需要 TLS 套 TLS，传输层没有嵌套 TLS），以及代理搭配明文 h2c / HTTP/3（两者都没有不改变语义的正向代理形式）。本 crate **不读任何环境变量**（`HTTP_PROXY` / `NO_PROXY`）：看不见的配置就是无法如实报告的配置。
 - **优先级**——`execute_priority(url, req, Priority { urgency, incremental })` 驱动 WUCS 调度器（见 `blogs/01`）。
 - **worker 占用按连接而非按流**——一条带很多流的 h2 连接只占一个 worker，流永远不会把 worker 用量翻倍，也互不阻塞。
 - **超时**——连接、握手（TLS）、读、整请求超时，全部可配。
@@ -48,3 +50,17 @@ println!("{}", String::from_utf8_lossy(&resp.body.collect()?));
 
 let resp = client.post("http://127.0.0.1:8080/submit", b"hello")?;
 ```
+
+### 访问真实 `https://`
+
+`Client::new()` **不装任何信任锚**，`RootStore::new()` 也是空的——空存储会让每一次验证都失败，而且是响亮地失败。这个默认是对的（一个偷偷信任它能找到的一切的客户端，没人能对它作出推理），但代价是第一次 `https://` 请求必须明确说出信任来自哪里：
+
+```rust
+use courierust::courierust_client::Client;
+
+// 操作系统信任库：Windows 读 `ROOT`，Unix 读常见的 PEM bundle。
+let client = Client::with_system_roots()?;
+let resp = client.get("https://example.com/")?;
+```
+
+`Client::with_system_roots()` 等价于 `TlsSettings::with_system_roots()` 再加 `http2: true`，所以服务端支持时直接协商 `h2`。要往自己配的客户端里加公共根，用 `Client::with_tls_roots(roots)`，或者自己构造 `TlsSettings` 并保持 `verify: true`。

@@ -233,6 +233,8 @@ struct IncrRequest {
     body: Vec<u8>,
     /// Total header bytes (enforces the header-block cap).
     header_bytes: usize,
+    /// Maximum total HTTP/1 header-section bytes for this connection.
+    header_limit: usize,
     phase: Phase,
     body_limit: usize,
     /// `COURIERUST_H1_TRACE` gate; when off, `first_read_at` stays `None`
@@ -242,10 +244,14 @@ struct IncrRequest {
     /// socket, splitting the worker dispatch (pickup → first read) from
     /// the parse (first read → request complete).
     first_read_at: Option<Instant>,
+    /// Absolute deadline for the request line and headers currently
+    /// being assembled. It is deliberately independent of socket
+    /// activity, so a slowloris cannot renew it one byte at a time.
+    header_started_at: Option<Instant>,
 }
 
 impl IncrRequest {
-    fn new(body_limit: usize, trace: bool) -> Self {
+    fn new(body_limit: usize, header_limit: usize, trace: bool) -> Self {
         Self {
             buf: Vec::with_capacity(8192),
             pos: 0,
@@ -255,10 +261,12 @@ impl IncrRequest {
             headers: HeaderMap::new(),
             body: Vec::new(),
             header_bytes: 0,
+            header_limit,
             phase: Phase::RequestLine,
             body_limit,
             trace,
             first_read_at: None,
+            header_started_at: None,
         }
     }
 
@@ -332,8 +340,17 @@ impl IncrRequest {
         &mut self,
         socket: &TcpStream,
         reads: Option<&AtomicUsize>,
+        header_timeout: Option<Duration>,
     ) -> Result<Option<Request<Body>>> {
         loop {
+            if matches!(self.phase, Phase::RequestLine | Phase::Headers)
+                && self.header_started_at.is_none()
+            {
+                self.header_started_at = Some(Instant::now());
+            }
+            if self.header_timeout_expired(header_timeout, Instant::now()) {
+                return Err(Error::timeout("request header timeout"));
+            }
             if let Phase::Done = self.phase {
                 return Ok(Some(self.finish_request()?));
             }
@@ -345,6 +362,18 @@ impl IncrRequest {
                 return Ok(None);
             }
         }
+    }
+
+    fn header_timeout_expired(&self, timeout: Option<Duration>, now: Instant) -> bool {
+        match (self.header_started_at, timeout) {
+            (Some(start), Some(timeout)) => now.duration_since(start) >= timeout,
+            _ => false,
+        }
+    }
+
+    fn header_timeout_remaining(&self, timeout: Duration, now: Instant) -> Option<Duration> {
+        self.header_started_at
+            .map(|start| timeout.saturating_sub(now.duration_since(start)))
     }
 
     /// Advance one parse step. Returns true if progress was made (call
@@ -368,7 +397,7 @@ impl IncrRequest {
                         return Err(Error::overflow("header line too long"));
                     }
                     self.header_bytes += self.line.len();
-                    if self.header_bytes > MAX_HEADER_BLOCK {
+                    if self.header_bytes > self.header_limit {
                         return Err(Error::overflow("header block too large"));
                     }
                     let trimmed = courierust_h1::trim_crlf(&self.line);
@@ -376,13 +405,26 @@ impl IncrRequest {
                         let rl = courierust_h1::parse_request_line(&self.req_line)?;
                         let bl = courierust_h1::body_length(&self.headers, Some(&rl.method), None)?;
                         self.parsed_req_line = Some(rl);
+                        self.header_started_at = None;
                         self.phase = match bl {
                             courierust_h1::BodyLen::None => Phase::Done,
                             courierust_h1::BodyLen::Length(n) => {
                                 if n > self.body_limit {
                                     return Err(Error::overflow("request body too large"));
                                 }
-                                Phase::BodyFixed { remaining: n }
+                                // `Content-Length: 0` is a body of no bytes,
+                                // not a promise of one: the request is already
+                                // complete. Waiting for it here left the
+                                // connection parked for ever, because the
+                                // `BodyFixed` step only advances when there is
+                                // something in the buffer to consume (most
+                                // clients send nothing at all after such a
+                                // head).
+                                if n == 0 {
+                                    Phase::Done
+                                } else {
+                                    Phase::BodyFixed { remaining: n }
+                                }
                             }
                             courierust_h1::BodyLen::Chunked => Phase::BodyChunked(Chunked {
                                 state: ChunkState::Size,
@@ -542,6 +584,9 @@ impl IncrRequest {
 /// An active event-loop HTTP/1.1 connection.
 struct EventConn {
     socket: Arc<TcpStream>,
+    /// The peer's address, resolved once: a handler that asks for it must
+    /// not cost a syscall per request.
+    peer: std::net::SocketAddr,
     /// Set once a `101` head has been queued: the next moment the head is
     /// fully written, this connection becomes a WebSocket.
     pending_upgrade: Option<(
@@ -588,6 +633,7 @@ impl EventConn {
     fn new(
         socket: TcpStream,
         body_limit: usize,
+        header_limit: usize,
         stats: Option<&Stats>,
         wake_slot: Arc<crate::courierust_server::ws::WakeSlot>,
     ) -> Self {
@@ -599,11 +645,15 @@ impl EventConn {
             None => (None, None),
         };
         let trace = h1_trace();
+        let peer = socket
+            .peer_addr()
+            .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
         Self {
             socket: Arc::new(socket),
+            peer,
             pending_upgrade: None,
             wake_slot,
-            reader: IncrRequest::new(body_limit, trace),
+            reader: IncrRequest::new(body_limit, header_limit, trace),
             out: Vec::new(),
             out_pos: 0,
             keep_alive: true,
@@ -656,10 +706,29 @@ impl EventConn {
                 return Ok(StepOutcome::Upgrade(Box::new(conn)));
             }
             let parse = seg_start(trace);
-            match self
-                .reader
-                .next_request(&self.socket, self.reads.as_deref())?
-            {
+            let request = match self.reader.next_request(
+                &self.socket,
+                self.reads.as_deref(),
+                config.request_header_timeout,
+            ) {
+                Ok(request) => request,
+                Err(Error {
+                    kind: crate::courierust_error::ErrorKind::Timeout,
+                    ..
+                }) => {
+                    self.out.clear();
+                    self.keep_alive = build_response(
+                        crate::courierust_server::h1::error_response(408, "request header timeout"),
+                        config,
+                        true,
+                        &mut self.out,
+                    )?;
+                    self.out_pos = 0;
+                    return self.write_more();
+                }
+                Err(error) => return Err(error),
+            };
+            match request {
                 Some(req) => {
                     if trace {
                         if let Some(first_read) = self.reader.first_read_at.take() {
@@ -742,7 +811,13 @@ impl EventConn {
                     }
 
                     let handle = seg_start(trace);
-                    let resp = handler.handle(req);
+                    // The event-driven scheduler is the clear-text path; TLS
+                    // connections are served by the blocking loop.
+                    let connection_info = crate::courierust_server::ConnectionInfo {
+                        peer: self.peer,
+                        secure: false,
+                    };
+                    let resp = handler.handle_connected(&connection_info, req);
                     seg_end(&mut self.handler_us, handle);
                     self.out.clear();
                     let build = seg_start(trace);
@@ -772,6 +847,10 @@ impl EventConn {
                 }
             }
         }
+    }
+
+    fn header_timeout_remaining(&self, timeout: Duration, now: Instant) -> Option<Duration> {
+        self.reader.header_timeout_remaining(timeout, now)
     }
 
     /// Write pending output; returns the continuation.
@@ -832,22 +911,33 @@ impl EventConn {
         if !config.websocket.enabled || !crate::courierust_ws::is_websocket_upgrade(&req.headers) {
             return Ok(WsDecision::Pass);
         }
-        match handler.websocket(req) {
-            crate::courierust_server::ws::WsUpgradeReply::Pass => Ok(WsDecision::Pass),
+        let (service, protocol) = match handler.websocket(req) {
+            crate::courierust_server::ws::WsUpgradeReply::Pass => return Ok(WsDecision::Pass),
             crate::courierust_server::ws::WsUpgradeReply::Refuse(resp) => {
-                Ok(WsDecision::Respond(resp))
+                return Ok(WsDecision::Respond(resp))
             }
-            crate::courierust_server::ws::WsUpgradeReply::Accept(service) => {
-                let peer = self
-                    .socket
-                    .peer_addr()
-                    .map(|a| a.ip())
-                    .unwrap_or(core::net::IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED));
-                match crate::courierust_server::ws::plan(req, peer, false, &config.websocket) {
-                    Ok(plan) => Ok(WsDecision::Upgrade(Box::new(WsUpgrade { plan, service }))),
+            crate::courierust_server::ws::WsUpgradeReply::Accept(service) => (service, None),
+            crate::courierust_server::ws::WsUpgradeReply::AcceptWith { service, protocol } => {
+                (service, Some(protocol))
+            }
+        };
+        let peer = self
+            .socket
+            .peer_addr()
+            .map(|a| a.ip())
+            .unwrap_or(core::net::IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED));
+        match crate::courierust_server::ws::plan(req, peer, false, &config.websocket) {
+            Ok(mut plan) => {
+                let applied = match protocol {
+                    Some(protocol) => plan.override_protocol(protocol.as_deref()),
+                    None => Ok(()),
+                };
+                match applied {
+                    Ok(()) => Ok(WsDecision::Upgrade(Box::new(WsUpgrade { plan, service }))),
                     Err(refusal) => Ok(WsDecision::Respond(refusal.response())),
                 }
             }
+            Err(refusal) => Ok(WsDecision::Respond(refusal.response())),
         }
     }
 }
@@ -1080,10 +1170,10 @@ fn rebuild_wait_set(
     for (id, stream) in pending.iter() {
         poller.register(*id, fd_of(stream), false);
     }
-    for (id, conn) in registries.h1.lock().unwrap().iter() {
+    for (id, conn) in crate::lock(&registries.h1).iter() {
         poller.register(*id, fd_of(&conn.socket), conn.has_pending_output());
     }
-    for (id, conn) in registries.ws.lock().unwrap().iter() {
+    for (id, conn) in crate::lock(&registries.ws).iter() {
         poller.register(*id, fd_of(conn.socket()), conn.has_queued_output());
     }
 }
@@ -1165,6 +1255,7 @@ fn event_loop(
     let wake_fd = fd_of(&wake_reader);
     let poll_timeout = config.event_poll_timeout_ms.clamp(1, 1000) as i32;
     let idle_timeout = config.idle_timeout;
+    let header_timeout = config.request_header_timeout;
 
     loop {
         let mut drained = 0usize;
@@ -1217,7 +1308,21 @@ fn event_loop(
                 .min()
                 .unwrap_or(Duration::from_secs(3600))
         });
-        let wait_ms = match next_idle {
+        let next_header = header_timeout.and_then(|timeout| {
+            registries
+                .h1
+                .lock()
+                .unwrap()
+                .values()
+                .filter_map(|conn| conn.header_timeout_remaining(timeout, now))
+                .min()
+        });
+        let next_deadline = match (next_idle, next_header) {
+            (Some(idle), Some(header)) => Some(idle.min(header)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        };
+        let wait_ms = match next_deadline {
             Some(next) => next.as_millis().min(poll_timeout as u128).max(1) as i32,
             None => poll_timeout,
         };
@@ -1339,13 +1444,14 @@ fn event_loop(
                         let conn = EventConn::new(
                             stream,
                             config.max_body,
+                            config.max_header_list,
                             stats,
                             crate::courierust_server::ws::WakeSlot::new(),
                         );
                         if let Some(s) = stats {
                             s.h1_connections.fetch_add(1, Ordering::Relaxed);
                         }
-                        registries.h1.lock().unwrap().insert(id, conn);
+                        crate::lock(&registries.h1).insert(id, conn);
                         to_dispatch.push(id);
                     }
                     Class::NeedMore => {
@@ -1364,6 +1470,25 @@ fn event_loop(
                 to_dispatch.push(id);
             }
         }
+        let header_deadline_due = next_header
+            .map(|next| next <= Duration::from_millis(poll_timeout as u64))
+            .unwrap_or(false);
+        let mut header_expired = HashSet::new();
+        if header_deadline_due {
+            if let Some(timeout) = header_timeout {
+                let now = Instant::now();
+                for (&id, conn) in crate::lock(&registries.h1).iter() {
+                    if conn.header_timeout_remaining(timeout, now) == Some(Duration::ZERO) {
+                        poller.unregister(id);
+                        header_expired.insert(id);
+                        if !to_dispatch.contains(&id) {
+                            to_dispatch.push(id);
+                        }
+                    }
+                }
+            }
+        }
+
         if !to_dispatch.is_empty() {
             for chunk in to_dispatch.chunks(DISPATCH_BATCH) {
                 let _ = ready_tx.send(chunk.to_vec());
@@ -1378,8 +1503,11 @@ fn event_loop(
                 let now = Instant::now();
                 let mut expired = Vec::new();
                 let registered: HashSet<usize> =
-                    registries.h1.lock().unwrap().keys().copied().collect();
+                    crate::lock(&registries.h1).keys().copied().collect();
                 for (&id, &at) in &activity {
+                    if header_expired.contains(&id) {
+                        continue;
+                    }
                     if now.duration_since(at) < t {
                         continue;
                     }
@@ -1390,7 +1518,7 @@ fn event_loop(
                 for id in expired {
                     poller.unregister(id);
                     pending.remove(&id);
-                    registries.h1.lock().unwrap().remove(&id);
+                    crate::lock(&registries.h1).remove(&id);
                     if activity.remove(&id).is_some() {
                         if let Some(s) = stats {
                             Stats::decrement(&s.connections_active, 1);
@@ -1416,6 +1544,7 @@ fn event_loop(
 fn refuse_malformed(conn: &EventConn, e: &Error) {
     use crate::courierust_error::ErrorKind;
     let status = match e.kind {
+        ErrorKind::Timeout => 408,
         ErrorKind::Protocol => 400,
         ErrorKind::Overflow => {
             let header = e
@@ -1431,7 +1560,12 @@ fn refuse_malformed(conn: &EventConn, e: &Error) {
         }
         _ => return,
     };
-    let resp = crate::courierust_server::h1::error_response(status, "bad request");
+    let message = if status == 408 {
+        "request header timeout"
+    } else {
+        "bad request"
+    };
+    let resp = crate::courierust_server::h1::error_response(status, message);
     let body: &[u8] = match &resp.body {
         Body::Bytes(b) => b.as_ref(),
         _ => b"",
@@ -1510,12 +1644,12 @@ fn event_worker(
     wake_writer: &Arc<TcpStream>,
 ) {
     loop {
-        let ids = match ready_rx.lock().unwrap().recv() {
+        let ids = match crate::lock(&ready_rx).recv() {
             Ok(ids) => ids,
             Err(_) => return,
         };
         for id in ids {
-            let ws_conn = registries.ws.lock().unwrap().remove(&id);
+            let ws_conn = crate::lock(&registries.ws).remove(&id);
             if let Some(mut ws_conn) = ws_conn {
                 let step =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ws_conn.step()));
@@ -1529,7 +1663,7 @@ fn event_worker(
                         let fd = fd_of(ws_conn.socket());
                         let want_write =
                             matches!(outcome, crate::courierust_server::ws::WsStep::NeedWrite);
-                        registries.ws.lock().unwrap().insert(id, ws_conn);
+                        crate::lock(&registries.ws).insert(id, ws_conn);
                         let _ = msg_tx.send(EventMsg::Register { id, fd, want_write });
                         wake_nudge(wake_writer);
                     }
@@ -1544,7 +1678,7 @@ fn event_worker(
                 }
                 continue;
             }
-            let mut conn = match registries.h1.lock().unwrap().remove(&id) {
+            let mut conn = match crate::lock(&registries.h1).remove(&id) {
                 Some(c) => c,
                 None => continue,
             };
@@ -1585,7 +1719,7 @@ fn event_worker(
                     if conn.trace {
                         conn.parked_at = Some(Instant::now());
                     }
-                    registries.h1.lock().unwrap().insert(id, conn);
+                    crate::lock(&registries.h1).insert(id, conn);
                     let _ = msg_tx.send(EventMsg::Register { id, fd, want_write });
                     wake_nudge(wake_writer);
                 }

@@ -58,6 +58,7 @@ pub mod compress;
 pub mod generated;
 pub mod health;
 pub mod proto;
+pub mod reflection;
 pub mod status;
 
 use crate::courierust_body::Body;
@@ -478,7 +479,7 @@ impl MessageStream {
 
     /// Response trailers (populated once the body ends).
     pub fn trailers(&self) -> Option<HeaderMap> {
-        self.trailers.lock().unwrap().clone()
+        crate::lock(&self.trailers).clone()
     }
 
     /// Pull the next raw message payload, blocking until it is available
@@ -533,7 +534,7 @@ impl MessageStream {
     }
 
     fn finish(&self) -> Result<()> {
-        let trailers = self.trailers.lock().unwrap();
+        let trailers = crate::lock(&self.trailers);
         let code = trailers
             .as_ref()
             .and_then(|t| t.get("grpc-status"))

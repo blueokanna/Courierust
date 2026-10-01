@@ -174,6 +174,17 @@ pub struct WebSocket {
     stream: Arc<ConnStream>,
     info: WsClientInfo,
     close_timeout: Duration,
+    /// Liveness deadline for the **wait for a frame**.
+    ///
+    /// `ClientConfig::read_timeout` is deliberately not left armed on the
+    /// socket for the life of the connection: on Windows `SO_RCVTIMEO` is
+    /// charged on every blocking operation, so a 256 KiB message received
+    /// with it armed runs about twice as slow, and every write on the
+    /// socket pays it too. It is armed around the wait for a frame header
+    /// and cleared while the body streams — the shape the server's
+    /// blocking driver already uses. A `Cell` keeps
+    /// [`WebSocket::set_read_timeout`] taking `&self`, as it always has.
+    read_timeout: std::cell::Cell<Option<Duration>>,
 }
 
 impl WebSocket {
@@ -199,10 +210,6 @@ impl WebSocket {
                 Error::protocol("ws: a wss:// URL requires ClientConfig::tls to be configured")
             })?;
             net::configure(&stream, cfg.handshake_timeout)?;
-            // Offer only HTTP/1.1: RFC 8441 WebSocket-over-HTTP/2 is a
-            // different handshake, and silently negotiating h2 here would
-            // produce a connection that looks established and never
-            // carries a frame.
             let mut settings = tls.clone();
             settings.alpn = vec![b"http/1.1".to_vec()];
             let connector = crate::courierust_tls::TlsConnector::new(
@@ -295,9 +302,6 @@ impl WebSocket {
 
         let mut compression = None;
         if response_headers.get("sec-websocket-extensions").is_some() {
-            // Validate against the offer this client actually sent:
-            // parsing our own header back is the only way that check can
-            // never drift from what went on the wire.
             let mut offered =
                 crate::courierust_ws::handshake::parse_extension_value(PM_DEFLATE_OFFER)?;
             let offers = parse_extensions(&response_headers)?;
@@ -325,8 +329,6 @@ impl WebSocket {
             }
         }
 
-        // A handshake read may have pulled frame bytes into the reader;
-        // the session takes that reader over, so nothing is lost.
         let params = compression.map(|p| p.client_view());
         let sink = SharedSink::new(stream.clone());
         let frame_writer = FrameWriter::new(sink.clone(), MaskSource::Random, params);
@@ -343,6 +345,7 @@ impl WebSocket {
             },
         );
         let _ = writer.flush();
+        let _ = stream.configure(None);
 
         Ok(Self {
             session,
@@ -358,6 +361,7 @@ impl WebSocket {
                 compression,
             },
             close_timeout: opts.close_timeout,
+            read_timeout: std::cell::Cell::new(cfg.read_timeout),
         })
     }
 
@@ -398,9 +402,28 @@ impl WebSocket {
 
     /// Block until the next message arrives.
     ///
-    /// The transport's read timeout (`ClientConfig::read_timeout`) bounds
-    /// the wait and surfaces as [`ErrorKind::Timeout`].
+    /// [`ClientConfig::read_timeout`](super::ClientConfig::read_timeout)
+    /// bounds the **wait for a frame** and surfaces as
+    /// [`ErrorKind::Timeout`]. It is not left armed while a
+    /// message body transfers: `SO_RCVTIMEO` is charged on every blocking
+    /// operation on Windows, which roughly doubles the cost of a 256 KiB
+    /// receive and taxes every write on the socket. A peer that announces
+    /// a frame and then goes silent is still caught, because the wait for
+    /// the header is bounded; a peer that stalls *inside* a body is left
+    /// to TCP, which is the same posture the crate's blocking server
+    /// takes (a body in flight is not an idle connection).
+    ///
+    /// The deadline is cleared again before returning, so a caller that
+    /// echoes (read then write) never pays it on the write half either.
     pub fn read_message(&mut self) -> Result<Event> {
+        if !self.session.is_mid_frame() {
+            self.stream.configure(self.read_timeout.get())?;
+        }
+        let header = self.session.poll_header();
+        let _ = self.stream.configure(None);
+        if !header? {
+            return Err(Error::new(ErrorKind::WouldBlock));
+        }
         self.session.read_message()
     }
 
@@ -467,9 +490,16 @@ impl WebSocket {
         self.info.peer
     }
 
-    /// Change the transport's read timeout (bounds how long
-    /// [`WebSocket::read_message`] blocks).
+    /// Set the liveness deadline for the wait for a frame.
+    ///
+    /// [`WebSocket::read_message`] re-scopes it per frame: it arms the
+    /// deadline for the wait for a header and clears it while a body
+    /// streams, so this bounds how long a wait for *new* data may take,
+    /// not the transfer of a body that has already started. Setting it
+    /// also applies it to the socket immediately, which is the historical
+    /// behaviour and matters to a caller that arms it before its own read.
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<()> {
+        self.read_timeout.set(timeout);
         self.stream.configure(timeout)
     }
 }
@@ -533,8 +563,6 @@ fn read_response_head(
     scratch: &mut Scratch,
 ) -> Result<(crate::courierust_http::status::StatusCode, HeaderMap)> {
     loop {
-        // The status line borrows the scratch line buffer; it is parsed
-        // and released before the header block reuses that buffer.
         let status = {
             let line = scratch.line();
             reader.read_until_into(b'\n', 16 * 1024, line)?;

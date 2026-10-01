@@ -12,6 +12,7 @@
 
 pub mod h1;
 pub mod h2;
+pub mod reverse_proxy;
 pub mod ws;
 
 pub(crate) mod event;
@@ -73,6 +74,11 @@ impl Default for TlsSettings {
 pub struct ServerConfig {
     /// Read timeout for connections.
     pub read_timeout: Option<Duration>,
+    /// Maximum time allowed to receive one complete HTTP/1.x request
+    /// line and header section. Unlike [`Self::read_timeout`], this is
+    /// an absolute deadline: trickling one byte at a time cannot extend
+    /// it. `None` disables the deadline.
+    pub request_header_timeout: Option<Duration>,
     /// Maximum header-list size.
     pub max_header_list: usize,
     /// Maximum request body size.
@@ -157,6 +163,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             read_timeout: Some(Duration::from_secs(120)),
+            request_header_timeout: Some(Duration::from_secs(15)),
             max_header_list: 1 << 20,
             max_body: 16 * 1024 * 1024,
             http2: true,
@@ -181,10 +188,33 @@ impl Default for ServerConfig {
     }
 }
 
+/// What the server knows about the connection a request arrived on.
+///
+/// Handed to [`Handler::handle_connected`] so a handler that needs it — a
+/// reverse proxy synthesizing `X-Forwarded-*`, an access log, a rate
+/// limiter — does not have to guess. A handler that does not care keeps
+/// implementing [`Handler::handle`] and never sees this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionInfo {
+    /// The client's address.
+    pub peer: std::net::SocketAddr,
+    /// Whether the connection is TLS.
+    pub secure: bool,
+}
+
 /// A request handler.
 pub trait Handler: Send + Sync + 'static {
     /// Handle one request and produce a response.
     fn handle(&self, req: Request<Body>) -> Response<Body>;
+
+    /// Handle one request, told what the connection knows about it.
+    ///
+    /// The default drops the context and calls [`Handler::handle`], so a
+    /// handler implements whichever of the two it needs and existing ones
+    /// keep working unchanged.
+    fn handle_connected(&self, _info: &ConnectionInfo, req: Request<Body>) -> Response<Body> {
+        self.handle(req)
+    }
 
     /// Decide whether to accept a WebSocket upgrade.
     ///
@@ -308,15 +338,10 @@ impl Server {
                 Err(error) => Err(std::io::Error::new(error.kind(), error.to_string())),
             });
         }
-        // Keep the HTTP/3 reactor handle alive for the whole serve loop.
         let _http3 = setup?;
         if config.event_driven {
             return event::serve_event(self.listener, handler, config, pool);
         }
-        // Legacy pool model (event_driven = false): bound the number of
-        // concurrently open connections with `max_connections`, so even
-        // this deprecated path cannot be exhausted by a herd of idle /
-        // slow clients. The default event path is the supported one.
         let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         for stream in self.listener.incoming() {
             match stream {
@@ -343,7 +368,6 @@ impl Server {
                     };
                     p.spawn(move || {
                         let _permit = permit;
-                        // TLS handshakes (blocking) also run on the pool.
                         let _ = serve_accepted(stream, h.as_ref(), &c);
                     });
                 }
@@ -367,8 +391,6 @@ impl Server {
                 let res = self.serve_inner(handler, Some(&ready_tx));
                 let _ = tx.send(res);
             })?;
-        // Block until the transport is ready, propagating a bind/setup
-        // failure (e.g. an un-bindable HTTP/3 UDP port) to the caller.
         ready_rx.recv().unwrap_or(Ok(()))?;
         Ok(ServerHandle { done: rx })
     }
@@ -438,10 +460,6 @@ pub(crate) fn serve_accepted(
     handler: &dyn Handler,
     config: &ServerConfig,
 ) -> crate::Result<()> {
-    // A TLS handshake runs under `handshake_timeout` (short) so a
-    // client that connects and then stalls mid-handshake releases its
-    // pool worker instead of holding it for the full application read
-    // timeout. The application timeout is restored before serving.
     if config.tls.is_some() {
         crate::courierust_net::configure(&stream, config.handshake_timeout)?;
     } else {
@@ -455,10 +473,6 @@ pub(crate) fn serve_accepted(
                     alpn: t.alpn.clone(),
                     min_version: t.min_version,
                     max_version: t.max_version,
-                    // A per-process stable ticket key: tickets issued on
-                    // one connection are accepted on the next, so pooled
-                    // clients actually resume instead of paying a full
-                    // handshake every time.
                     session_ticket_key: Some(t.session_ticket_key),
                 });
             let arc = Arc::new(stream);
