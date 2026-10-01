@@ -8,6 +8,10 @@ HTTP/3 (RFC 9114): framing, stream roles, SETTINGS, and QPACK (RFC 9204) field-l
 - **`qpack.rs`** — the complete QPACK codec: the **99-entry static table**, prefix integers, Huffman strings, every field-line representation (T bit, relative/post-base indexing), the dynamic table, and the encoder/decoder instruction streams. Validated against RFC 9204 Appendix B.1–B.4.
 - **`runtime.rs`** (std) — the UDP reactor wiring it all together: QUIC v1 packet protection, TLS 1.3 with ALPN `h3`, control/QPACK streams, request streams, response trailers, GOAWAY validation, retransmission, and strict stream reassembly.
 
+## Malformed messages are stream errors
+
+RFC 9114 §4.1.2: a message that is an otherwise valid frame sequence but violates the message rules (pseudo-header rules, connection-specific fields, a `content-length` that disagrees with the body) aborts **that one stream** with `H3_MESSAGE_ERROR` (0x010e) and tells its caller, while the connection and every other request on it keep working. The distinction is carried by the error type ([`ErrorKind::H3Stream`](../courierust_error/index.html)) so the stream layer can act on it; connection-level errors are reserved for what really breaks connection synchronization (CONTROL stream violations, QPACK failure, frame-layer errors).
+
 ## The QPACK gotcha
 
 QPACK's static table is **0-indexed**, unlike HPACK's 1-indexed table. Get this wrong and every indexed field line decodes to the wrong header. It's exactly the kind of off-by-one that passes smoke tests and fails in production — the appendix vectors exist to catch it.

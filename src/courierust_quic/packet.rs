@@ -316,8 +316,6 @@ mod tests {
             100,
         )
         .unwrap();
-        // `encode_long` emits the header and packet number. The declared
-        // payload length still has to be present on the wire.
         wire.extend_from_slice(&[0u8; 98]);
         let parsed = parse(&wire, 12000, 0).unwrap();
         match parsed {

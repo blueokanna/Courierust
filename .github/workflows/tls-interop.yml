@@ -12,8 +12,10 @@ on:
     paths:
       - '.github/workflows/tls-interop.yml'
       - 'scripts/tls_interop.sh'
+      - 'benches/Cargo.toml'
       - 'benches/src/tls_interop.rs'
       - 'benches/src/network.rs'
+      - 'benches/src/tls_peer.rs'
       - 'src/courierust_tls/**'
       - 'src/courierust_net/**'
       - 'src/courierust_client/**'
@@ -22,8 +24,10 @@ on:
     paths:
       - '.github/workflows/tls-interop.yml'
       - 'scripts/tls_interop.sh'
+      - 'benches/Cargo.toml'
       - 'benches/src/tls_interop.rs'
       - 'benches/src/network.rs'
+      - 'benches/src/tls_peer.rs'
       - 'src/courierust_tls/**'
       - 'src/courierust_net/**'
       - 'src/courierust_client/**'
@@ -52,10 +56,11 @@ jobs:
           sudo apt-get install -y -qq nginx
           nginx -v
       # Build-only: executing the benches would run `network` client mode,
-      # which panics without a target URL. Binaries land in
+      # which panics without a target URL. `tls_peer` is the rustls + hyper
+      # independent peer sections D/E drive. Binaries land in
       # target/release/deps/<name>-<hash>; the script locates them.
       - name: Build the interop binaries (release)
-        run: cargo bench --manifest-path benches/Cargo.toml --locked --bench tls_interop --bench network --no-run
+        run: cargo bench --manifest-path benches/Cargo.toml --locked --bench tls_interop --bench network --bench tls_peer --no-run
       - name: Run TLS interop (OpenSSL s_server, curl, s_client, nginx)
         shell: bash
         run: |

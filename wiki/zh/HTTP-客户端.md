@@ -6,6 +6,7 @@
 
 ```rust
 use courierust::courierust_client::{Client, ClientConfig};
+use courierust::courierust_http::header::HeaderMap;
 use std::time::Duration;
 
 let cfg = ClientConfig {
@@ -20,6 +21,9 @@ let cfg = ClientConfig {
     max_redirects: 10,
     // 请求携带的 User-Agent；None 则不发送。
     user_agent: Some("my-app/1.0".to_string()),
+    // 每条本客户端发起的请求都带上的字段。请求自身设置的字段永远优先；
+    // 跨源重定向会剥掉 authorization / proxy-authorization / cookie（两者都算）。
+    default_headers: HeaderMap::new(),
     // 防御性限制：接受的对端头列表与响应体大小上限。
     max_header_list: 1 << 20,
     max_body: 16 * 1024 * 1024,
@@ -50,6 +54,29 @@ println!("body: {}", body.to_str()?);
 let resp = client.post("http://127.0.0.1:8080/submit", "raw text payload")?;
 let resp = client.post("http://127.0.0.1:8080/submit", vec![1u8, 2, 3])?;
 ```
+
+## 请求构建器
+
+`Client::request(url, method)` 返回 `RequestBuilder`：它构造的就是下面手写形式所发的同一个 `Request`，交给同一条路径，所以重定向、连接池与三种协议的行为完全一致。`Client::{put, delete, head, patch, options}` 是一次调用就能用的快捷方法。
+
+```rust
+use courierust::courierust_http::Method;
+
+let resp = client
+    .request("http://127.0.0.1:8080/api/items", Method::POST)
+    .query([("page", "2")])          // 追加到 URL，做百分号转义
+    .form([("name", "widget")])      // body + content-type，urlencoded
+    .header("accept", "application/json")
+    .basic_auth("user", "secret")    // 或 .bearer_auth("token")
+    .timeout(std::time::Duration::from_secs(5))
+    .send()?;
+println!("{}", resp.text()?);
+```
+
+- `query` / `form` 使用 WHATWG `application/x-www-form-urlencoded` 编码（`courierust_http::form`）：空格变 `+`，`A-Za-z0-9*-._` 之外的字节变 `%XX`。
+- `timeout` **只对这一个请求**覆盖 `ClientConfig::read_timeout`：同义的传输层截止时间，按每次尝试生效、用后恢复，因此连接带着配置值回到池中。h1、h2、h3 都生效。
+- `priority` 是 RFC 9218 提示：HTTP/2 会读它（喂给 WUCS 调度器），HTTP/1.1 与 HTTP/3 没有可携带它的字段，原样发请求。
+- `resp.text()` / `resp.bytes()` 消费 body；`text` 遇到不是合法 UTF-8 的 body 会报错，而不是用 U+FFFD 代替。
 
 ## 带请求头的 Request 与响应检查
 
@@ -84,7 +111,7 @@ println!("x-request-id: {:?}", resp.headers.get("x-request-id"));
 
 ## 重定向
 
-默认开启，由 `max_redirects` 限制次数。`301`/`302`/`303` 自动转为 `GET`（RFC 9110）并丢弃请求体。绝对地址、协议相对（`//host/...`）、相对路径三种 `Location` 都支持：
+默认开启，由 `max_redirects` 限制次数。`301`/`302`/`303` 自动转为 `GET`（RFC 9110）并丢弃请求体；`307`/`308` 保留方法与请求体，若请求体只以流的形式存在（无法重放），则显式报错而不是发送空体。绝对地址、协议相对（`//host/...`）、相对路径三种 `Location` 都支持：
 
 ```rust
 // 最多自动跟随 10 跳，最终响应原样返回。
@@ -141,6 +168,7 @@ match client.get("http://127.0.0.1:9/") {
 - **配置后支持 HTTPS**。客户端默认 `tls: None`，因此默认会拒绝 `https://`；通过 `ClientConfig::tls` 提供 `RootStore`，或使用 `Client::with_tls_roots` 启用内置 TLS 1.2 + 1.3。crate 不内置 CA 根证书。ALPN 必须与 `ClientConfig::http2` 一致：HTTP/2 使用 `h2`，HTTP/1.1 使用 `http/1.1`。
 - **HTTP/2 并发取决于连接策略**。每条连接由一个 driver 负责复用多个 stream；需要独立 HTTP/2 driver 时提高 `max_connections_per_host`，并针对实际配置观察完整延迟尾部。
 - **流式请求体仅 HTTP/2 支持**。`Client::execute` 会把 `Body::Channel` 请求体先完整读进内存再发送；真正的客户端上传流式使用 `execute_h2_stream`。
+- **HTTP/1.1 keep-alive 池在复用前会探活**。服务器在空转期间关掉的连接不付出任何代价——什么都没写入，因此即使非幂等方法在新建连接上也是安全的。若池中连接在请求途中死亡，只在新连接上重试**一次**，且仅限可安全重放的方法（RFC 9110 §9.2.2：GET/HEAD/OPTIONS/TRACE/PUT/DELETE/PROPFIND）——`POST` 直接返回失败，不冒二次执行的风险。
 
 ## WebSocket 客户端
 

@@ -20,7 +20,7 @@
 
 ```toml
 [dependencies]
-courierust = { version = "0.1", default-features = false }
+courierust = { version = "1.0.6", default-features = false }
 ```
 
 构建检查：

@@ -265,11 +265,11 @@ fn h3_request_timeout() {
 /// handshake even when the client explicitly trusts it (validity window).
 #[test]
 fn h3_rejects_expired_certificate() {
-    let expired_identity = courierust::courierust_tls::Identity {
-        cert_chain: vec![include_bytes!("certs/expired_cert.der").to_vec()],
-        private_key: include_bytes!("certs/expired_key.der").to_vec(),
-        is_rsa: false,
-    };
+    let expired_identity = courierust::courierust_tls::Identity::from_der(
+        vec![include_bytes!("certs/expired_cert.der").to_vec()],
+        include_bytes!("certs/expired_key.der").to_vec(),
+    )
+    .expect("valid test identity");
     let base = spawn_h3_server_with_identity(expired_identity, echo_handler);
     let mut roots = courierust::courierust_tls::RootStore::new();
     roots.add_der(include_bytes!("certs/expired_cert.der").to_vec());
@@ -297,14 +297,14 @@ fn h3_rejects_expired_certificate() {
 /// rejected (the chain does not anchor to any trusted root).
 #[test]
 fn h3_rejects_wrong_certificate_chain() {
-    let wrong_chain_identity = courierust::courierust_tls::Identity {
-        cert_chain: vec![
+    let wrong_chain_identity = courierust::courierust_tls::Identity::from_der(
+        vec![
             include_bytes!("certs/wrong_chain_cert.der").to_vec(),
             include_bytes!("certs/ca_other_cert.der").to_vec(),
         ],
-        private_key: include_bytes!("certs/wrong_chain_key.der").to_vec(),
-        is_rsa: false,
-    };
+        include_bytes!("certs/wrong_chain_key.der").to_vec(),
+    )
+    .expect("valid test identity");
     let base = spawn_h3_server_with_identity(wrong_chain_identity, echo_handler);
     let client = h3_client(1 << 20, Duration::from_secs(5)); // trusts only the real root
 
@@ -321,11 +321,11 @@ fn h3_rejects_wrong_certificate_chain() {
 /// so the hostname check must reject the handshake.
 #[test]
 fn h3_rejects_hostname_mismatch() {
-    let mismatch_identity = courierust::courierust_tls::Identity {
-        cert_chain: vec![include_bytes!("certs/mismatch_cert.der").to_vec()],
-        private_key: include_bytes!("certs/mismatch_key.der").to_vec(),
-        is_rsa: false,
-    };
+    let mismatch_identity = courierust::courierust_tls::Identity::from_der(
+        vec![include_bytes!("certs/mismatch_cert.der").to_vec()],
+        include_bytes!("certs/mismatch_key.der").to_vec(),
+    )
+    .expect("valid test identity");
     let base = spawn_h3_server_with_identity(mismatch_identity, echo_handler);
     let mut roots = courierust::courierust_tls::RootStore::new();
     roots.add_der(include_bytes!("certs/mismatch_cert.der").to_vec());
@@ -347,4 +347,43 @@ fn h3_rejects_hostname_mismatch() {
         .map(|_| ())
         .expect_err("a hostname not covered by the certificate SAN must be rejected");
     assert!(!err.to_string().is_empty());
+}
+
+/// A HEAD response has no content, so the server must not sit on the
+/// handler's streaming body before answering: a producer that keeps
+/// streaming would otherwise hold that stream (and its response) open for
+/// as long as it likes.
+#[test]
+fn h3_head_response_does_not_wait_for_a_streaming_body() {
+    let base = spawn_h3_server(|req: Request<Body>| {
+        let (tx, body) = courierust::courierust_body::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(Bytes::from_static(b"chunk"));
+            // The server must never have waited for this to arrive.
+            std::thread::sleep(Duration::from_secs(5));
+            let _ = tx.send(Bytes::from_static(b"late"));
+        });
+        let mut resp =
+            courierust::courierust_http::response::Response::<Body>::with_status(200.into());
+        resp.headers.insert(
+            courierust::courierust_http::header::HeaderName::from_lowercase("x-method"),
+            courierust::courierust_http::header::HeaderValue::from_bytes(
+                req.method.as_str().as_bytes(),
+            )
+            .unwrap(),
+        );
+        resp.body = body;
+        resp
+    });
+    // Two seconds: draining the body would take five.
+    let client = h3_client(1 << 20, Duration::from_secs(2));
+
+    let resp = client
+        .head(&format!("{base}/stream"))
+        .expect("a HEAD response must not wait for the body");
+    assert_eq!(resp.status.as_u16(), 200);
+    assert!(
+        resp.body.collect().unwrap().is_empty(),
+        "a HEAD response has no content"
+    );
 }

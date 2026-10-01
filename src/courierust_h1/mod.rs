@@ -267,6 +267,15 @@ pub fn body_length(
             te_count += 1;
         }
     }
+    if any_te && headers.contains_key("content-length") {
+        // RFC 9112 §6.1: a message carrying *both* framings "might
+        // indicate an attempt to perform request smuggling ... and ought
+        // to be handled as an error". Two peers can read the same bytes
+        // as two different messages — that is the whole mechanism of a
+        // desync (CWE-444) — so this stack refuses the message instead
+        // of picking a winner that a neighbour might not pick.
+        return Err(Error::protocol("both transfer-encoding and content-length"));
+    }
     if any_te {
         match chunked_pos {
             Some(i) if i == te_count - 1 => return Ok(BodyLen::Chunked),
@@ -423,21 +432,46 @@ fn read_body_chunked_into<R: Read>(
     Ok(())
 }
 
-/// Parse a chunk-size line (`1A`, `1A;ext`, optional whitespace). The
-/// size must be pure hex; trailing garbage or overflow returns `None`.
-/// Shared by the blocking and event-driven parsers so both paths accept
-/// and reject exactly the same byte sequences.
+/// Parse a chunk-size line (`1A`, `1A;ext`). The size must be pure hex
+/// (RFC 9112 §7.1 `chunk-size = 1*HEXDIG`); the only whitespace allowed
+/// is the optional BWS run that precedes a `;` extension. Trailing
+/// garbage or overflow returns `None`. Shared by the blocking and
+/// event-driven parsers so both paths accept and reject exactly the same
+/// byte sequences.
 pub(crate) fn parse_chunk_size(line: &[u8]) -> Option<usize> {
-    let before_ext = match line.iter().position(|&b| b == b';') {
-        Some(i) => &line[..i],
+    let digits = match line.iter().position(|&b| b == b';') {
+        // `chunk-ext = *( BWS ";" BWS chunk-ext-name ... )` allows BWS
+        // before the semicolon, so trailing SP/HTAB is legal *there*.
+        Some(i) => {
+            let mut head = &line[..i];
+            loop {
+                match head.last() {
+                    Some(&b) if b == b' ' || b == b'\t' => head = &head[..head.len() - 1],
+                    _ => break,
+                }
+            }
+            head
+        }
         None => line,
     };
-    let s = core::str::from_utf8(before_ext).ok()?;
-    let s = s.trim();
-    if s.is_empty() {
+    // Everything else is a spelling — a leading space, a sign, a tab in
+    // the middle — that `str::trim` + `from_str_radix` used to accept and
+    // that a stricter intermediary may parse differently, which is the
+    // raw material of request smuggling.
+    if digits.is_empty() || digits.len() > 16 {
         return None;
     }
-    usize::from_str_radix(s, 16).ok()
+    let mut value = 0usize;
+    for &b in digits {
+        let d = match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            b'A'..=b'F' => b - b'A' + 10,
+            _ => return None,
+        };
+        value = value.checked_mul(16)?.checked_add(d as usize)?;
+    }
+    Some(value)
 }
 
 /// Serialize a request head into `out`.
@@ -640,7 +674,11 @@ mod tests {
         );
     }
 
+    /// RFC 9112 §6.1 / CWE-444: a message carrying both framings is a
+    /// smuggling attempt, not a precedence question — it is refused in
+    /// either field order, for requests and responses alike.
     #[test]
+<<<<<<< HEAD
     fn custom_header_list_limit_is_enforced() {
         let mut reader = BufReader::new(SliceReader::new(b"Host: example.test\r\n\r\n"), 64);
         let mut scratch = crate::courierust_io::Scratch::new();
@@ -656,11 +694,16 @@ mod tests {
 
     #[test]
     fn transfer_encoding_wins_over_content_length() {
+=======
+    fn both_framings_rejected_as_smuggling() {
+>>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
         let h = headers(&[("transfer-encoding", "chunked"), ("content-length", "5")]);
-        assert_eq!(
-            body_length(&h, Some(&Method::POST), None).unwrap(),
-            BodyLen::Chunked
-        );
+        assert!(body_length(&h, Some(&Method::POST), None).is_err());
+        let h = headers(&[("content-length", "5"), ("transfer-encoding", "chunked")]);
+        assert!(body_length(&h, Some(&Method::POST), None).is_err());
+        // A response with both is the same desync in the other direction.
+        let h = headers(&[("transfer-encoding", "chunked"), ("content-length", "5")]);
+        assert!(body_length(&h, None, Some(StatusCode::OK)).is_err());
     }
 
     /// A chunk-size line too large for `usize` must be rejected with
@@ -828,18 +871,28 @@ mod tests {
     }
 
     /// Chunk-size parsing is shared by the blocking and event-driven
-    /// parsers; whitespace and extensions around the size are tolerated,
-    /// trailing garbage is not.
+    /// parsers: the size is `1*HEXDIG` (RFC 9112 §7.1), the BWS before a
+    /// chunk extension is allowed, and every other spelling is not.
     #[test]
     fn chunk_size_whitespace_and_garbage() {
-        assert_eq!(parse_chunk_size(b"1A\r\n"), Some(0x1a));
-        assert_eq!(parse_chunk_size(b"1A ;ext\r\n"), Some(0x1a));
-        assert_eq!(parse_chunk_size(b"1A\t;ext\r\n"), Some(0x1a));
-        assert_eq!(parse_chunk_size(b" 1A \r\n"), Some(0x1a));
-        assert_eq!(parse_chunk_size(b"1A zzz\r\n"), None); // garbage after size
-        assert_eq!(parse_chunk_size(b"\r\n"), None); // empty
+        assert_eq!(parse_chunk_size(b"1A"), Some(0x1a));
+        assert_eq!(parse_chunk_size(b"1a"), Some(0x1a));
+        assert_eq!(parse_chunk_size(b"1A;ext"), Some(0x1a));
+        assert_eq!(parse_chunk_size(b"1A ;ext"), Some(0x1a));
+        assert_eq!(parse_chunk_size(b"1A\t;ext"), Some(0x1a));
+        // Neither leading whitespace nor trailing whitespace without an
+        // extension is part of the grammar.
+        assert_eq!(parse_chunk_size(b" 1A"), None);
+        assert_eq!(parse_chunk_size(b"1A "), None);
+        assert_eq!(parse_chunk_size(b"1A\r\n"), None);
+        // `from_str_radix` accepts a sign; the ABNF does not.
+        assert_eq!(parse_chunk_size(b"+A"), None);
+        assert_eq!(parse_chunk_size(b"-A"), None);
+        assert_eq!(parse_chunk_size(b"0x1A"), None);
+        assert_eq!(parse_chunk_size(b"1A zzz"), None); // garbage after size
+        assert_eq!(parse_chunk_size(b""), None); // empty
         assert_eq!(
-            parse_chunk_size(b"ffffffffffffffffffff\r\n"),
+            parse_chunk_size(b"ffffffffffffffffffff"),
             None // overflows usize
         );
     }

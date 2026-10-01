@@ -112,7 +112,7 @@ let handler = |_req: Request<Body>| -> Response<Body> {
 
 - 无响应体的 HTTP/1.1 响应会显式补 `Content-Length: 0`；长度未知时发 chunked。
 - 明文 HTTP/1.1 全平台默认走事件调度器：半截请求挂在轮询器上（零 worker），超过 `ServerConfig::idle_timeout` 的空转连接被回收，`max_connections` 封顶驻留连接数。TLS 与 HTTP/2 连接走阻塞池，由 `handshake_timeout` / `h2_idle_timeout` 约束。设 `event_driven: false` 恢复旧的每连接一池任务模型。
-- **同步 handler** 阻塞多久就占住事件 worker 多久——与任何同步服务器一致。流式场景用 channel body（`Body::Channel`），worker 可及时归还。
+- **同步 handler** 阻塞多久就占住事件 worker 多久——与任何同步服务器一致。流式场景用 channel body（`Body::Channel`，或 `courierust_body::channel()`），worker 可及时归还：生产者两块钱之间连接是挂起的，生产者的 `send` 直接唤醒 reactor（`Body::Stream`）；裸 `Body::Channel` 没有生产者侧唤醒，则转为轮询。对 `Connection: close` 请求的流式响应会完整写完再关连接。
 - gRPC 服务器就是这层之上的薄封装，见 [gRPC 使用指南](gRPC-使用指南)。
 
 ## WebSocket

@@ -126,7 +126,7 @@ Send an error mid-stream with `tx.fail(err)` — the connection resets that stre
 
 - HTTP/1.1 responses without a body get an explicit `Content-Length: 0`; chunked encoding is emitted when the length is unknown.
 - The event scheduler is the default on every platform for plain HTTP/1.1: a partial request parks on the poller (zero workers), and connections idle for `ServerConfig::idle_timeout` are reaped. `max_connections` caps the parked population. TLS and HTTP/2 connections run on the blocking pool, bounded by `handshake_timeout` / `h2_idle_timeout`. Setting `event_driven: false` restores the legacy one-pool-job-per-connection model.
-- A *synchronous handler* that blocks holds its event worker for as long as it blocks — exactly like any synchronous server. Use a channel body (`Body::Channel`) for streaming so the worker returns promptly.
+- A *synchronous handler* that blocks holds its event worker for as long as it blocks — exactly like any synchronous server. Use a channel body (`Body::Channel`, or `courierust_body::channel()`) for streaming so the worker returns promptly: while the producer is between chunks the connection is parked, and the producer's `send` wakes the reactor (`Body::Stream`); a raw `Body::Channel` has no producer-side wake and is polled instead. A streamed response to a `Connection: close` request is written in full before the connection closes.
 - gRPC servers are a thin layer on this server — see [gRPC](gRPC).
 
 ## WebSockets

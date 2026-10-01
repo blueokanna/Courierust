@@ -166,7 +166,7 @@ fn rss_kib() -> Option<u64> {
             let mut info: ProcessMemoryCounters = std::mem::zeroed();
             info.cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
             let ok = K32GetProcessMemoryInfo(GetCurrentProcess(), &mut info, info.cb);
-            (ok != 0).then(|| (info.working_set_size / 1024) as u64)
+            (ok != 0).then_some((info.working_set_size / 1024) as u64)
         }
     }
     #[cfg(not(any(target_os = "linux", windows)))]
@@ -415,7 +415,11 @@ fn emit_complexity(
 /// Ours versus the reference at one size: with the exponents equal, what
 /// is left is the constant factor.
 fn emit_ratio(family: &str, op: &str, metric: &str, n: usize, ours: f64, theirs: f64) {
-    let ratio = if theirs > 0.0 { ours / theirs } else { f64::NAN };
+    let ratio = if theirs > 0.0 {
+        ours / theirs
+    } else {
+        f64::NAN
+    };
     println!(
         "RATIO|family={family}|op={op}|metric={metric}|n={n}|a={ours:.4}|b={theirs:.4}|ratio={ratio:.3}"
     );
@@ -479,7 +483,14 @@ impl Series {
             n,
             sample.alloc_bytes_per_op,
         );
-        emit_scale(family, implementation, op, "allocs", n, sample.allocs_per_op);
+        emit_scale(
+            family,
+            implementation,
+            op,
+            "allocs",
+            n,
+            sample.allocs_per_op,
+        );
         self.time.push((n as f64, sample.ns_per_op));
         if sample.alloc_bytes_per_op > 0.0 {
             self.alloc.push((n as f64, sample.alloc_bytes_per_op));
@@ -533,7 +544,8 @@ fn codec_family() {
         print_sample("courierust encode (unmasked)", &ours);
         ours_encode.push("codec", "courierust", "encode_unmasked", size, &ours);
 
-        let theirs_frame = TungFrame::message(payload.clone(), TungOpCode::Data(Data::Binary), true);
+        let theirs_frame =
+            TungFrame::message(payload.clone(), TungOpCode::Data(Data::Binary), true);
         let mut theirs_out = Vec::with_capacity(size + MAX_HEADER_LEN);
         let theirs = measure(ops, || {
             theirs_out.clear();
@@ -541,7 +553,14 @@ fn codec_family() {
         });
         print_sample("tungstenite encode (unmasked)", &theirs);
         theirs_encode.push("codec", "tungstenite", "encode_unmasked", size, &theirs);
-        emit_ratio("codec", "encode_unmasked", "time_ns", size, ours.ns_per_op, theirs.ns_per_op);
+        emit_ratio(
+            "codec",
+            "encode_unmasked",
+            "time_ns",
+            size,
+            ours.ns_per_op,
+            theirs.ns_per_op,
+        );
         emit_ratio(
             "codec",
             "encode_unmasked",
@@ -560,7 +579,13 @@ fn codec_family() {
                 .ok();
         });
         print_sample("courierust encode (masked)", &ours_masked_sample);
-        ours_masked.push("codec", "courierust", "encode_masked", size, &ours_masked_sample);
+        ours_masked.push(
+            "codec",
+            "courierust",
+            "encode_masked",
+            size,
+            &ours_masked_sample,
+        );
 
         let mut theirs_masked_frame = theirs_frame.clone();
         theirs_masked_frame.header_mut().mask = Some([1, 2, 3, 4]);
@@ -569,7 +594,13 @@ fn codec_family() {
             let _ = theirs_masked_frame.clone().format(&mut theirs_out);
         });
         print_sample("tungstenite encode (masked)", &theirs_masked_sample);
-        theirs_masked.push("codec", "tungstenite", "encode_masked", size, &theirs_masked_sample);
+        theirs_masked.push(
+            "codec",
+            "tungstenite",
+            "encode_masked",
+            size,
+            &theirs_masked_sample,
+        );
         emit_ratio(
             "codec",
             "encode_masked",
@@ -594,7 +625,14 @@ fn codec_family() {
             mask.apply(0, &mut raw);
         });
         print_sample("courierust mask (in place)", &ours_mask);
-        emit_scale("codec", "courierust", "mask_in_place", "time_ns", size, ours_mask.ns_per_op);
+        emit_scale(
+            "codec",
+            "courierust",
+            "mask_in_place",
+            "time_ns",
+            size,
+            ours_mask.ns_per_op,
+        );
         emit_scale(
             "codec",
             "courierust",
@@ -614,7 +652,14 @@ fn codec_family() {
             Mask::new(header.mask_key).apply(0, &mut scratch);
         });
         print_sample("courierust decode + unmask", &ours_decode);
-        emit_scale("codec", "courierust", "decode_unmask", "time_ns", size, ours_decode.ns_per_op);
+        emit_scale(
+            "codec",
+            "courierust",
+            "decode_unmask",
+            "time_ns",
+            size,
+            ours_decode.ns_per_op,
+        );
         emit_scale(
             "codec",
             "courierust",
@@ -628,14 +673,22 @@ fn codec_family() {
         let theirs_wire = wire.clone();
         let theirs_parse = measure(ops, || {
             let mut cursor = std::io::Cursor::new(&theirs_wire);
-            let (_header, len) =
-                tungstenite::protocol::frame::FrameHeader::parse(&mut cursor).unwrap().unwrap();
+            let (_header, len) = tungstenite::protocol::frame::FrameHeader::parse(&mut cursor)
+                .unwrap()
+                .unwrap();
             let start = cursor.position() as usize;
             let body = &theirs_wire[start..start + len as usize];
             std::hint::black_box(body);
         });
         print_sample("tungstenite parse header", &theirs_parse);
-        emit_scale("codec", "tungstenite", "parse_header", "time_ns", size, theirs_parse.ns_per_op);
+        emit_scale(
+            "codec",
+            "tungstenite",
+            "parse_header",
+            "time_ns",
+            size,
+            theirs_parse.ns_per_op,
+        );
         println!();
     }
 
@@ -663,9 +716,30 @@ fn codec_family() {
     });
     print_sample("courierust utf8 validate", &ours);
     print_sample("std str::from_utf8", &control);
-    emit_scale("codec", "courierust", "utf8_validate", "time_ns", bytes.len(), ours.ns_per_op);
-    emit_scale("codec", "std", "utf8_validate", "time_ns", bytes.len(), control.ns_per_op);
-    emit_ratio("codec", "utf8_validate", "time_ns", bytes.len(), ours.ns_per_op, control.ns_per_op);
+    emit_scale(
+        "codec",
+        "courierust",
+        "utf8_validate",
+        "time_ns",
+        bytes.len(),
+        ours.ns_per_op,
+    );
+    emit_scale(
+        "codec",
+        "std",
+        "utf8_validate",
+        "time_ns",
+        bytes.len(),
+        control.ns_per_op,
+    );
+    emit_ratio(
+        "codec",
+        "utf8_validate",
+        "time_ns",
+        bytes.len(),
+        ours.ns_per_op,
+        control.ns_per_op,
+    );
 }
 
 /// A masked, wire-format frame for `payload`.
@@ -727,7 +801,9 @@ fn hyper_server(payload: usize) -> SocketAddr {
         .enable_all()
         .build()
         .unwrap();
-    let listener = runtime.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
     let address = listener.local_addr().unwrap();
     let body = HyperBytes::from(vec![0x41u8; payload]);
 
@@ -783,7 +859,13 @@ fn http_family() {
         let ours_client = Client::new();
         let ours_url = format!("http://{ours_addr}/complexity");
         assert_eq!(
-            ours_client.get(&ours_url).unwrap().body.collect().unwrap().len(),
+            ours_client
+                .get(&ours_url)
+                .unwrap()
+                .body
+                .collect()
+                .unwrap()
+                .len(),
             size
         );
         let ours = measure(ops, || {
@@ -793,7 +875,16 @@ fn http_family() {
 
         let theirs_client = reqwest::blocking::Client::builder().build().unwrap();
         let theirs_url = format!("http://{theirs_addr}/complexity");
-        assert_eq!(theirs_client.get(&theirs_url).send().unwrap().bytes().unwrap().len(), size);
+        assert_eq!(
+            theirs_client
+                .get(&theirs_url)
+                .send()
+                .unwrap()
+                .bytes()
+                .unwrap()
+                .len(),
+            size
+        );
         let theirs = measure(ops, || {
             let response = theirs_client.get(&theirs_url).send().unwrap();
             assert_eq!(response.bytes().unwrap().len(), size);
@@ -804,7 +895,14 @@ fn http_family() {
         print_sample("reqwest client + hyper server", &theirs);
         ours_series.push("http", "courierust", "get_roundtrip", size, &ours);
         theirs_series.push("http", "reqwest_hyper", "get_roundtrip", size, &theirs);
-        emit_ratio("http", "get_roundtrip", "time_ns", size, ours.ns_per_op, theirs.ns_per_op);
+        emit_ratio(
+            "http",
+            "get_roundtrip",
+            "time_ns",
+            size,
+            ours.ns_per_op,
+            theirs.ns_per_op,
+        );
         emit_ratio(
             "http",
             "get_roundtrip",
@@ -829,20 +927,73 @@ const HEADER_COUNTS: [usize; 3] = [4, 16, 64];
 /// Static names, because `HeaderName::from_lowercase` requires a
 /// `&'static str` (names are interned by design, not built per request).
 const BENCH_HEADER_NAMES: [&str; 64] = [
-    "x-bench-00", "x-bench-01", "x-bench-02", "x-bench-03", "x-bench-04", "x-bench-05", "x-bench-06",
-    "x-bench-07", "x-bench-08", "x-bench-09", "x-bench-10", "x-bench-11", "x-bench-12", "x-bench-13",
-    "x-bench-14", "x-bench-15", "x-bench-16", "x-bench-17", "x-bench-18", "x-bench-19", "x-bench-20",
-    "x-bench-21", "x-bench-22", "x-bench-23", "x-bench-24", "x-bench-25", "x-bench-26", "x-bench-27",
-    "x-bench-28", "x-bench-29", "x-bench-30", "x-bench-31", "x-bench-32", "x-bench-33", "x-bench-34",
-    "x-bench-35", "x-bench-36", "x-bench-37", "x-bench-38", "x-bench-39", "x-bench-40", "x-bench-41",
-    "x-bench-42", "x-bench-43", "x-bench-44", "x-bench-45", "x-bench-46", "x-bench-47", "x-bench-48",
-    "x-bench-49", "x-bench-50", "x-bench-51", "x-bench-52", "x-bench-53", "x-bench-54", "x-bench-55",
-    "x-bench-56", "x-bench-57", "x-bench-58", "x-bench-59", "x-bench-60", "x-bench-61", "x-bench-62",
+    "x-bench-00",
+    "x-bench-01",
+    "x-bench-02",
+    "x-bench-03",
+    "x-bench-04",
+    "x-bench-05",
+    "x-bench-06",
+    "x-bench-07",
+    "x-bench-08",
+    "x-bench-09",
+    "x-bench-10",
+    "x-bench-11",
+    "x-bench-12",
+    "x-bench-13",
+    "x-bench-14",
+    "x-bench-15",
+    "x-bench-16",
+    "x-bench-17",
+    "x-bench-18",
+    "x-bench-19",
+    "x-bench-20",
+    "x-bench-21",
+    "x-bench-22",
+    "x-bench-23",
+    "x-bench-24",
+    "x-bench-25",
+    "x-bench-26",
+    "x-bench-27",
+    "x-bench-28",
+    "x-bench-29",
+    "x-bench-30",
+    "x-bench-31",
+    "x-bench-32",
+    "x-bench-33",
+    "x-bench-34",
+    "x-bench-35",
+    "x-bench-36",
+    "x-bench-37",
+    "x-bench-38",
+    "x-bench-39",
+    "x-bench-40",
+    "x-bench-41",
+    "x-bench-42",
+    "x-bench-43",
+    "x-bench-44",
+    "x-bench-45",
+    "x-bench-46",
+    "x-bench-47",
+    "x-bench-48",
+    "x-bench-49",
+    "x-bench-50",
+    "x-bench-51",
+    "x-bench-52",
+    "x-bench-53",
+    "x-bench-54",
+    "x-bench-55",
+    "x-bench-56",
+    "x-bench-57",
+    "x-bench-58",
+    "x-bench-59",
+    "x-bench-60",
+    "x-bench-61",
+    "x-bench-62",
     "x-bench-63",
 ];
 
-const BENCH_HEADER_VALUE: &str =
-    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const BENCH_HEADER_VALUE: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const HEADERS_BODY: usize = 1024;
 
 fn http_headers_family() {
@@ -862,9 +1013,10 @@ fn http_headers_family() {
         let ours = measure(ops, || {
             let mut request = Request::get("/complexity").with_body(Body::Empty);
             for name in BENCH_HEADER_NAMES.iter().take(count) {
-                request
-                    .headers
-                    .insert(HeaderName::from_static(name), HeaderValue::from_static(BENCH_HEADER_VALUE));
+                request.headers.insert(
+                    HeaderName::from_static(name),
+                    HeaderValue::from_static(BENCH_HEADER_VALUE),
+                );
             }
             let response = ours_client.execute(&ours_url, request).unwrap();
             assert_eq!(response.body.collect().unwrap().len(), HEADERS_BODY);
@@ -885,14 +1037,29 @@ fn http_headers_family() {
         print_sample("courierust client + server", &ours);
         print_sample("reqwest client + hyper server", &theirs);
         ours_series.push("headers", "courierust", "get_with_headers", count, &ours);
-        theirs_series.push("headers", "reqwest_hyper", "get_with_headers", count, &theirs);
-        emit_ratio("headers", "get_with_headers", "time_ns", count, ours.ns_per_op, theirs.ns_per_op);
+        theirs_series.push(
+            "headers",
+            "reqwest_hyper",
+            "get_with_headers",
+            count,
+            &theirs,
+        );
+        emit_ratio(
+            "headers",
+            "get_with_headers",
+            "time_ns",
+            count,
+            ours.ns_per_op,
+            theirs.ns_per_op,
+        );
         println!();
     }
 
     ours_series.emit_fits("headers", "courierust", "get_with_headers");
     theirs_series.emit_fits("headers", "reqwest_hyper", "get_with_headers");
-    note("headers|scope=end_to_end_one_keep_alive_request_per_sample_including_request_construction");
+    note(
+        "headers|scope=end_to_end_one_keep_alive_request_per_sample_including_request_construction",
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -918,7 +1085,10 @@ fn open_idle_connection(address: SocketAddr) -> TcpStream {
     let mut chunk = [0u8; 1024];
     let head_end = loop {
         let read = stream.read(&mut chunk).unwrap();
-        assert!(read > 0, "the server closed the connection during the request");
+        assert!(
+            read > 0,
+            "the server closed the connection during the request"
+        );
         buffer.extend_from_slice(&chunk[..read]);
         if let Some(position) = find_head_end(&buffer) {
             break position;
@@ -1022,9 +1192,9 @@ fn connection_family() {
                     let _ = stream.set_nodelay(true);
                     let service = service_fn(move |request: hyper::Request<Incoming>| async move {
                         let _ = http_body_util::BodyExt::collect(request.into_body()).await;
-                        Ok::<_, Infallible>(hyper::Response::new(Full::new(HyperBytes::from_static(
-                            b"ok",
-                        ))))
+                        Ok::<_, Infallible>(hyper::Response::new(Full::new(
+                            HyperBytes::from_static(b"ok"),
+                        )))
                     });
                     let builder = AutoBuilder::new(TokioExecutor::new()).http1_only();
                     tokio::spawn(async move {
@@ -1133,7 +1303,10 @@ fn deflate_family() {
     note("deflate|methods=courierust_deflater_reused_vs_deflate_sync_fresh|no_third_party_deflate_in_this_workspace_to_compare_against");
     note("deflate|payloads=compressible_text_and_incompressible_bytes");
 
-    for (label, pattern) in [("compressible", Pattern::Text), ("incompressible", Pattern::Bytes)] {
+    for (label, pattern) in [
+        ("compressible", Pattern::Text),
+        ("incompressible", Pattern::Bytes),
+    ] {
         let mut reused_series = Series::default();
         let mut fresh_series = Series::default();
         let mut inflate_series = Series::default();
@@ -1153,7 +1326,9 @@ fn deflate_family() {
             // clear. The cost of the decision *and* of the failed match
             // search is what the measurement reports, and the comment on
             // the row says which outcome it was.
-            let compressed_outcome = deflater.deflate_message(&payload, &mut compressed).is_some();
+            let compressed_outcome = deflater
+                .deflate_message(&payload, &mut compressed)
+                .is_some();
             let reused = measure(ops, || {
                 let _ = deflater.deflate_message(&payload, &mut compressed);
             });
@@ -1170,7 +1345,9 @@ fn deflate_family() {
             let mut inflated = Vec::with_capacity(size * 2);
             let inflate = compressed_outcome.then(|| {
                 assert!(
-                    deflater.deflate_message(&payload, &mut compressed).is_some(),
+                    deflater
+                        .deflate_message(&payload, &mut compressed)
+                        .is_some(),
                     "the same payload must take the same path twice"
                 );
                 measure(ops, || {

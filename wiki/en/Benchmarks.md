@@ -7,6 +7,7 @@ The `benches/` workspace provides release-profile executables:
 - `concurrency`: incomplete-header and slow-sender connection pressure against the server scheduler.
 - `network`: an explicit cross-machine client/server endpoint; it never labels loopback as remote evidence.
 - `interop`: protocol correctness checks against hyper, hyper-util, and reqwest. It is a validation suite, not a performance benchmark.
+- `tls_interop` / `tls_peer`: the TLS interop matrix driven by `scripts/tls_interop.sh` (workflow `tls-interop.yml`) — Courierust's client and server against OpenSSL `s_server`, `curl`, `openssl s_client`, nginx over HTTP/2, and a rustls + hyper peer in both directions. The peer rows report the TLS version and ALPN the independent stack actually negotiated, never a requested value.
 
 Run the same suites used by GitHub Actions:
 

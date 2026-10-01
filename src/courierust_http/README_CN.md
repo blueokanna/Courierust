@@ -15,6 +15,8 @@ HTTP 消息模型：请求、响应、头、URI、状态码、版本、body。
 - `Uri` / `PathAndQuery` / `Url`——absolute-form 和 origin-form 的目标，外加客户端用的绝对 URL 类型（scheme/authority 拆分）。
 - `Method`、`StatusCode`、`Version`——你预期的那几个枚举，外加你总忘的那个（比如 `CONNECT`）。
 - `Body`——这一层只有 `Empty` / `Bytes`。channel 背靠背的流式变体在 `courierust_body`（std 层），核心保持轻量、`no_std`。
+- `form`——`application/x-www-form-urlencoded` 的字节序列化与解析（`encode`、`serialize`、`decode`、`decode_bytes`、`parse`）。查询串和表单 body 需要同一套转义，客户端构建器直接用它，而不是另造一份。
+- `header::is_valid_field_value`——RFC 9110 §5.5 允许出现在字段值里的字符类。h1 在写出消息时拒绝含 CR / LF / NUL 的值；h2 与 h3 用的是同一个检查，因为在它们那里这是**畸形消息**（RFC 9113 §8.2.1、RFC 9114 §10.3），合规对端会重置该流，而不是一个分帧意外。
 
 ## 设计决策
 

@@ -197,18 +197,48 @@ fn point_compress(p: Point) -> [u8; 32] {
     out
 }
 
-/// Scalar multiplication (variable base), double-and-add from the MSB.
-/// Handles any 256-bit scalar (the group order L is < 2^253, but the
-/// clamped Ed25519 signing scalar may have bit 254 set).
+/// Scalar multiplication (variable base) in fixed time.
+///
+/// The classical double-and-add branches on every scalar bit; the scalar
+/// is the private key or the per-signature nonce, so the *sequence* of
+/// additions is itself secret (an observer of the timing, or of the
+/// branch predictor, sees the key). Every iteration here doubles, adds,
+/// and then selects the sum with a mask, so the work — and every memory
+/// access — is the same for a 0 bit and a 1 bit. Handles any 256-bit
+/// scalar (the group order L is < 2^253, but the clamped Ed25519 signing
+/// scalar may have bit 254 set).
 fn scalar_mult(p: Point, scalar: &[u64; 4]) -> Point {
     let mut result = Point::identity();
     for bit in (0..256).rev() {
         result = point_double(result);
-        if (scalar[bit / 64] >> (bit % 64)) & 1 == 1 {
-            result = point_add(result, p);
-        }
+        let sum = point_add(result, p);
+        let choice = (scalar[bit / 64] >> (bit % 64)) & 1;
+        result = point_select(&result, &sum, choice);
     }
     result
+}
+
+/// `a` when `mask == 0`, `b` when `mask == u64::MAX` (a pre-negated
+/// choice), without branching.
+#[inline]
+fn fe_select(a: &Fe, b: &Fe, mask: u64) -> Fe {
+    let mut out = ZERO;
+    for i in 0..5 {
+        out[i] = (a[i] & !mask) | (b[i] & mask);
+    }
+    out
+}
+
+/// Constant-time point selection: `a` when `choice == 0`, `b` when 1.
+#[inline]
+fn point_select(a: &Point, b: &Point, choice: u64) -> Point {
+    let mask = choice.wrapping_neg();
+    Point {
+        x: fe_select(&a.x, &b.x, mask),
+        y: fe_select(&a.y, &b.y, mask),
+        z: fe_select(&a.z, &b.z, mask),
+        t: fe_select(&a.t, &b.t, mask),
+    }
 }
 
 // ---- 256-bit helpers for scalar reduction mod L ----
@@ -222,25 +252,31 @@ fn cmp8(a: &[u64; 8], b: &[u64; 8]) -> core::cmp::Ordering {
     core::cmp::Ordering::Equal
 }
 
-fn sub8(a: &[u64; 8], b: &[u64; 8]) -> [u64; 8] {
+/// 1 when `a >= b`, 0 otherwise — branch-free (the borrow chain is a
+/// data-independent sequence of subtractions).
+fn ge8(a: &[u64; 8], b: &[u64; 8]) -> u64 {
+    let mut borrow = 0u64;
+    for i in 0..8 {
+        let (s1, b1) = a[i].overflowing_sub(b[i]);
+        let (_, b2) = s1.overflowing_sub(borrow);
+        borrow = (b1 as u64) | (b2 as u64);
+    }
+    // No borrow out of the top limb means a >= b.
+    borrow ^ 1
+}
+
+/// `a - b` when `select == 1`, `a` when `select == 0` — branch-free.
+fn sub8_selected(a: &[u64; 8], b: &[u64; 8], select: u64) -> [u64; 8] {
+    let mask = select.wrapping_neg();
     let mut out = [0u64; 8];
     let mut borrow = 0u64;
     for i in 0..8 {
         let (s1, b1) = a[i].overflowing_sub(b[i]);
         let (s2, b2) = s1.overflowing_sub(borrow);
-        out[i] = s2;
-        borrow = (b1 as u64) + (b2 as u64);
+        out[i] = (a[i] & !mask) | (s2 & mask);
+        borrow = (b1 as u64) | (b2 as u64);
     }
     out
-}
-
-fn highest_bit(a: &[u64; 8]) -> Option<usize> {
-    for i in (0..8).rev() {
-        if a[i] != 0 {
-            return Some(i * 64 + 63 - a[i].leading_zeros() as usize);
-        }
-    }
-    None
 }
 
 fn shl8(a: &[u64; 8], shift: usize) -> [u64; 8] {
@@ -258,31 +294,36 @@ fn shl8(a: &[u64; 8], shift: usize) -> [u64; 8] {
 }
 
 /// Reduce a 512-bit value (8 limbs, little-endian) mod L.
+///
+/// Shift-and-subtract with a *fixed* number of steps and masked
+/// subtractions. The obvious `while highest_bit(r) >= 253 { ... }` loop
+/// stops as soon as the running value is small, and in signing that value
+/// is `r + k·a` — a function of the private scalar — so where it stops is
+/// itself information about the key. L's top bit is 252, so `L << 259`
+/// covers bit 511 of the input.
 fn mod_l(a: [u64; 8]) -> [u64; 4] {
     let l8: [u64; 8] = [L[0], L[1], L[2], L[3], 0, 0, 0, 0];
     let mut r = a;
-    while let Some(hi) = highest_bit(&r) {
-        if hi < 253 {
-            break;
-        }
-        let shift = hi - 252;
+    for shift in (0..=259usize).rev() {
         let shifted = shl8(&l8, shift);
-        r = if cmp8(&r, &shifted) >= core::cmp::Ordering::Equal {
-            sub8(&r, &shifted)
-        } else {
-            sub8(&r, &shl8(&l8, shift - 1))
-        };
+        let ge = ge8(&r, &shifted);
+        r = sub8_selected(&r, &shifted, ge);
     }
-    let mut out = [r[0], r[1], r[2], r[3]];
-    if cmp8(&r, &l8) >= core::cmp::Ordering::Equal {
-        let l4 = L;
-        let mut borrow = 0u64;
-        for i in 0..4 {
-            let (s1, b1) = out[i].overflowing_sub(l4[i]);
-            let (s2, b2) = s1.overflowing_sub(borrow);
-            out[i] = s2;
-            borrow = (b1 as u64) + (b2 as u64);
+    debug_assert!(cmp8(&r, &l8) == core::cmp::Ordering::Less);
+    [r[0], r[1], r[2], r[3]]
+}
+
+/// `a · b` for 256-bit operands, into eight limbs (schoolbook, branch-free).
+fn mul_wide(a: &[u64; 4], b: &[u64; 4]) -> [u64; 8] {
+    let mut out = [0u64; 8];
+    for i in 0..4 {
+        let mut carry = 0u64;
+        for j in 0..4 {
+            let t = (a[i] as u128) * (b[j] as u128) + (out[i + j] as u128) + (carry as u128);
+            out[i + j] = t as u64;
+            carry = (t >> 64) as u64;
         }
+        out[i + 4] = carry;
     }
     out
 }
@@ -350,8 +391,6 @@ fn base_point() -> Point {
 
 /// Sign `message` with a 32-byte Ed25519 seed (RFC 8032 §5.1.6).
 pub(crate) fn sign(seed: &[u8; 32], message: &[u8]) -> [u8; 64] {
-    use super::rsa::BigInt;
-
     // Expand: SHA-512(seed) → 64 bytes; first 32 = clamped scalar,
     // last 32 = nonce prefix.
     let mut expand = Sha512::new();
@@ -395,16 +434,24 @@ pub(crate) fn sign(seed: &[u8; 32], message: &[u8]) -> [u8; 64] {
     }
     let k = mod_l(k_full);
 
-    // S = (r + k·a) mod L (via the big-integer module).
-    let l = BigInt::from_le_limbs(&L);
-    let r_big = BigInt::from_le_limbs(&r);
-    let k_big = BigInt::from_le_limbs(&k);
-    let a_big = BigInt::from_le_limbs(&a_limbs);
-    let s = r_big.add(&k_big.mul(&a_big)).rem(&l);
+    let ka = mul_wide(&k, &a_limbs);
+    let mut sum = [0u64; 8];
+    let mut carry = 0u64;
+    for i in 0..8 {
+        let rw = if i < 4 { r[i] } else { 0 };
+        let (s1, c1) = ka[i].overflowing_add(rw);
+        let (s2, c2) = s1.overflowing_add(carry);
+        sum[i] = s2;
+        carry = (c1 as u64) | (c2 as u64);
+    }
+    debug_assert_eq!(carry, 0);
+    let s = mod_l(sum);
 
     let mut sig = [0u8; 64];
     sig[..32].copy_from_slice(&r_enc);
-    sig[32..].copy_from_slice(&s.to_le_32());
+    for (i, limb) in s.iter().enumerate() {
+        sig[32 + i * 8..40 + i * 8].copy_from_slice(&limb.to_le_bytes());
+    }
     sig
 }
 

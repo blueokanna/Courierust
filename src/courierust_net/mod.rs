@@ -3,10 +3,20 @@
 //! Implements [`crate::courierust_io::Read`]/[`crate::courierust_io::Write`] for `&TcpStream`
 //! so the same buffered codec drives both loopback tests and real
 //! sockets. Non-blocking `WouldBlock` maps to [`crate::ErrorKind::WouldBlock`].
+//!
+//! A socket read timeout is *not* reported the same way by every kernel:
+//! Windows fails the read with `WSAETIMEDOUT`, POSIX with `EAGAIN` — the
+//! very code that otherwise means "no data right now". The connection
+//! adapter therefore distinguishes the two reasons a read timeout can be
+//! armed: a *deadline* (`ConnStream::set_deadline`, a request or a
+//! shutdown budget, where expiry is an answer of its own) and a *poll*
+//! (`ConnStream::configure`, where the h2/h3 drivers use a short timeout
+//! to regain control and must keep seeing `WouldBlock`).
 
 use crate::courierust_error::{Error, ErrorKind, Result};
 use crate::courierust_io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -83,11 +93,21 @@ pub type Listener = TcpListener;
 /// accepts TLS on the same accept loop as plain HTTP.
 pub(crate) struct ConnStream {
     peer: SocketAddr,
+    /// Whether the socket timeout is a *deadline*: on expiry the read is
+    /// cut short by the kernel and POSIX reports `EAGAIN`, which has to
+    /// be told apart from "no data yet", so the flag decides how
+    /// `WouldBlock` is classified. See the module docs.
+    deadline: AtomicBool,
     inner: ConnStreamKind,
 }
 
 enum ConnStreamKind {
-    Plain(TcpStream),
+    /// A plain TCP socket.
+    ///
+    /// Shared (`Arc`) for the same reason the TLS variant is: the server's
+    /// tunnel handoff moves one handle into a connection that outlives the
+    /// event reactor's registration, without duplicating the descriptor.
+    Plain(Arc<TcpStream>),
     Tls {
         /// The raw socket (shared with the TLS layer, used to reconfigure
         /// timeouts after the handshake).
@@ -104,11 +124,21 @@ enum ConnStreamKind {
 impl ConnStream {
     /// Wrap a plain TCP stream.
     pub(crate) fn plain(stream: TcpStream) -> Self {
+        Self::plain_shared(Arc::new(stream))
+    }
+
+    /// Wrap a plain TCP stream this process already holds behind an `Arc`.
+    ///
+    /// Used by the server's tunnel handoff: the reactor stops watching the
+    /// descriptor and the same handle is handed to the tunnel, so no
+    /// second descriptor (and no second close) exists for one socket.
+    pub(crate) fn plain_shared(stream: Arc<TcpStream>) -> Self {
         let peer = stream
             .peer_addr()
             .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
         Self {
             peer,
+            deadline: AtomicBool::new(false),
             inner: ConnStreamKind::Plain(stream),
         }
     }
@@ -127,6 +157,7 @@ impl ConnStream {
             .map_err(|e| Error::io(e.to_string()))?;
         Ok(Self {
             peer,
+            deadline: AtomicBool::new(false),
             inner: ConnStreamKind::Tls {
                 socket,
                 tls: Box::new(std::sync::Mutex::new(tls)),
@@ -142,6 +173,7 @@ impl ConnStream {
         let socket = tls.underlying().clone();
         Self {
             peer,
+            deadline: AtomicBool::new(false),
             inner: ConnStreamKind::Tls {
                 socket,
                 tls: Box::new(std::sync::Mutex::new(tls)),
@@ -179,11 +211,53 @@ impl ConnStream {
         }
     }
 
-    /// Configure nodelay + read timeout on the underlying socket.
+    /// The underlying socket descriptor, for a readiness poll.
+    ///
+    /// A poll (unlike a read) cannot disturb a TLS stream: it observes
+    /// the wire, which is exactly what a liveness probe asks about.
+    pub(crate) fn raw_fd(&self) -> crate::courierust_net::poller::Fd {
+        match &self.inner {
+            ConnStreamKind::Plain(s) => crate::courierust_net::poller::fd_of(s),
+            ConnStreamKind::Tls { socket, .. } => crate::courierust_net::poller::fd_of(socket),
+        }
+    }
+
+    /// Configure nodelay + read timeout on the underlying socket, with
+    /// *poll* semantics: an expiry reports `WouldBlock` so a driver that
+    /// armed a short timeout to regain control can tell it apart from a
+    /// real failure and go round its loop again.
     pub(crate) fn configure(&self, read_timeout: Option<Duration>) -> Result<()> {
+        self.deadline.store(false, Ordering::Relaxed);
         match &self.inner {
             ConnStreamKind::Plain(s) => configure(s, read_timeout),
             ConnStreamKind::Tls { socket, .. } => configure(socket, read_timeout),
+        }
+    }
+
+    /// Configure nodelay + read timeout with *deadline* semantics: the
+    /// timeout is a budget whose expiry is an outcome, not a lull.
+    ///
+    /// On expiry the read fails with `WSAETIMEDOUT` on Windows and with
+    /// `EAGAIN` on POSIX; the second is the same code a non-blocking
+    /// socket uses for "nothing yet", so the adapter needs to be told
+    /// which one this is. While a deadline is armed, a read that would
+    /// report `WouldBlock` reports [`ErrorKind::Timeout`] instead — for
+    /// every read path, including the ones buried in a buffered codec.
+    pub(crate) fn set_deadline(&self, read_timeout: Option<Duration>) -> Result<()> {
+        self.configure(read_timeout)?;
+        self.deadline.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Shut down the transport's read, write or both halves.
+    ///
+    /// Both variants share one socket, so this is the socket shutdown either
+    /// way; a TLS caller that wants the record-layer `close_notify` uses the
+    /// stream's own method instead.
+    pub(crate) fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
+        match &self.inner {
+            ConnStreamKind::Plain(s) => s.shutdown(how),
+            ConnStreamKind::Tls { socket, .. } => socket.shutdown(how),
         }
     }
 
@@ -216,16 +290,34 @@ impl ConnStream {
 
 impl crate::courierust_io::Read for &ConnStream {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        match &self.inner {
+        let read = match &self.inner {
             ConnStreamKind::Plain(s) => {
                 let mut r: &TcpStream = s;
                 crate::courierust_io::Read::read(&mut r, buf)
             }
             ConnStreamKind::Tls { tls, .. } => {
+<<<<<<< HEAD
                 let mut g = crate::lock(tls);
+=======
+                // A poisoned TLS lock would otherwise turn one panicking
+                // handler into a connection that can never be read or
+                // written again.
+                let mut g = tls.lock().unwrap_or_else(|e| e.into_inner());
+>>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
                 crate::courierust_io::Read::read(&mut *g, buf)
             }
-        }
+        };
+        // A read cut short by an armed deadline is reported as a timeout
+        // whichever way the kernel signals it (see the module docs).
+        // Without this, POSIX callers of `timeout(..)` see `WouldBlock`,
+        // and a close-delimited body treats the expiry as a clean EOF.
+        read.map_err(|e| {
+            if e.kind == ErrorKind::WouldBlock && self.deadline.load(Ordering::Relaxed) {
+                Error::timeout("read deadline expired")
+            } else {
+                e
+            }
+        })
     }
 }
 
@@ -237,7 +329,11 @@ impl crate::courierust_io::Write for &ConnStream {
                 crate::courierust_io::Write::write(&mut w, buf)
             }
             ConnStreamKind::Tls { tls, .. } => {
+<<<<<<< HEAD
                 let mut g = crate::lock(tls);
+=======
+                let mut g = tls.lock().unwrap_or_else(|e| e.into_inner());
+>>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
                 crate::courierust_io::Write::write(&mut *g, buf)
             }
         }
@@ -250,7 +346,11 @@ impl crate::courierust_io::Write for &ConnStream {
                 crate::courierust_io::Write::flush(&mut w)
             }
             ConnStreamKind::Tls { tls, .. } => {
+<<<<<<< HEAD
                 let mut g = crate::lock(tls);
+=======
+                let mut g = tls.lock().unwrap_or_else(|e| e.into_inner());
+>>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
                 crate::courierust_io::Write::flush(&mut *g)
             }
         }
@@ -306,6 +406,15 @@ pub fn configure(stream: &TcpStream, read_timeout: Option<Duration>) -> Result<(
     stream
         .set_read_timeout(read_timeout)
         .map_err(|e| Error::io(e.to_string()))?;
+    // A blocking `write` on a socket whose peer has stopped reading parks
+    // until the kernel gives up — minutes, or never. Every driver loop
+    // here is built around a bounded wait (it has to service timeouts,
+    // ACKs and shutdown while a body is being sent), so the write side
+    // gets the same deadline as the read side: a peer that stops reading
+    // is a liveness failure, not a reason to freeze the thread.
+    stream
+        .set_write_timeout(read_timeout)
+        .map_err(|e| Error::io(e.to_string()))?;
     Ok(())
 }
 
@@ -320,4 +429,41 @@ pub fn connect(addr: &std::net::SocketAddr, timeout: Option<Duration>) -> Result
         .set_nodelay(true)
         .map_err(|e| Error::io(e.to_string()))?;
     Ok(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A read timeout armed as a *deadline* is a timeout on every
+    /// platform: Windows fails the read with `WSAETIMEDOUT`, which the
+    /// raw adapter already maps to [`ErrorKind::Timeout`], while POSIX
+    /// fails it with `EAGAIN`, which means "no data yet" to everyone
+    /// else — the deadline flag is what makes the two agree.
+    #[test]
+    fn deadline_read_timeout_is_reported_as_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        // The peer has to stay open for the whole wait, or the socket
+        // would report a reset instead of an expiry.
+        let (_peer, _) = listener.accept().unwrap();
+
+        let stream = ConnStream::plain(client);
+        stream
+            .set_deadline(Some(Duration::from_millis(50)))
+            .unwrap();
+
+        let mut sink = [0u8; 16];
+        let started = std::time::Instant::now();
+        let mut reader: &ConnStream = &stream;
+        let err = reader
+            .read(&mut sink)
+            .expect_err("nothing was ever sent on the connection");
+        assert_eq!(err.kind, ErrorKind::Timeout, "{err:?}");
+        assert!(
+            started.elapsed() >= Duration::from_millis(40),
+            "the read must wait out the deadline instead of failing at once"
+        );
+    }
 }

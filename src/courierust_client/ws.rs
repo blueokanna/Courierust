@@ -18,9 +18,9 @@
 //!   on a protocol switch is a framing ambiguity, and a client that
 //!   tolerates it is a desynchronised proxy's best friend.
 //! * The `Sec-WebSocket-Protocol` the server selects must be one this
-//!   client offered; `Sec-WebSocket-Extensions` parameters must be ones
-//!   it offered, with window sizes no larger than requested
-//!   ([`PerMessageDeflate::from_response`]).
+//!   client offered, and so must be every `Sec-WebSocket-Extensions`
+//!   element — validated against the bytes this client actually sent, not
+//!   against a constant ([`PerMessageDeflate::from_response`]).
 //!
 //! ```no_run
 //! # #[cfg(feature = "std")]
@@ -52,23 +52,23 @@ use crate::courierust_net as net;
 use crate::courierust_net::ConnStream;
 use crate::courierust_ws::frame::SharedSink;
 use crate::courierust_ws::handshake::{
-    accept_key, generate_key, header_has_token, parse_extensions, PerMessageDeflate,
-    PmDeflatePolicy,
+    accept_key, generate_key, header_has_token, is_token, parse_extension_value, parse_extensions,
+    ExtensionOffer, PerMessageDeflate, PmDeflatePolicy,
 };
 use crate::courierust_ws::session::{MaskSource, Role, Session, SessionConfig, Stats};
 use crate::courierust_ws::writer::FrameWriter;
 use crate::courierust_ws::Event;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// The one extension this client offers, in the exact wire form that is
-/// sent **and** used to validate the response.
-///
-/// One constant for both directions is deliberate: a hand-written second
-/// copy of "what we offered" is how a client ends up accepting a
-/// parameter it never offered (or rejecting one it did).
+/// The extension this client drives, in the exact wire form it is
+/// offered in.
 const PM_DEFLATE_OFFER: &str = "permessage-deflate; client_max_window_bits";
+
+/// How many `1xx` responses may precede the switch before the handshake
+/// is abandoned (a peer that never stops sending them must not stall it).
+const MAX_INFORMATIONAL: usize = 5;
 
 /// Client-side WebSocket options.
 #[derive(Debug, Clone)]
@@ -201,6 +201,7 @@ impl WebSocket {
     ) -> Result<Self> {
         let (secure, http_url) = normalise_url(url)?;
         let parsed = Url::parse(&http_url)?;
+        crate::courierust_client::reject_url_credentials(&parsed)?;
         let host = parsed.host.clone();
         let port = parsed.port;
         let (addr, stream) = connect_to(&host, port, cfg)?;
@@ -228,7 +229,7 @@ impl WebSocket {
             net::configure(&stream, cfg.read_timeout)?;
             ConnStream::plain(stream)
         };
-        let _ = conn.configure(cfg.read_timeout);
+        let _ = conn.set_deadline(cfg.read_timeout);
         let stream = Arc::new(conn);
 
         // ---- handshake ------------------------------------------------
@@ -238,10 +239,17 @@ impl WebSocket {
         let mut scratch = Scratch::new();
 
         let mut headers = HeaderMap::with_capacity(8 + opts.protocols.len());
-        let host_header = if (secure && port == 443) || (!secure && port == 80) {
-            host.clone()
+        // An IPv6 literal keeps its brackets (RFC 3986 §3.2.2); `Url`
+        // strips them from the host.
+        let literal = if host.contains(':') {
+            alloc::format!("[{host}]")
         } else {
-            alloc::format!("{host}:{port}")
+            host.clone()
+        };
+        let host_header = if (secure && port == 443) || (!secure && port == 80) {
+            literal
+        } else {
+            alloc::format!("{literal}:{port}")
         };
         push(&mut headers, "host", &host_header)?;
         push(&mut headers, "upgrade", "websocket")?;
@@ -249,20 +257,49 @@ impl WebSocket {
         push(&mut headers, "sec-websocket-key", &key)?;
         push(&mut headers, "sec-websocket-version", "13")?;
         if !opts.protocols.is_empty() {
+            for p in &opts.protocols {
+                if !is_token(p) {
+                    return Err(Error::protocol("ws: subprotocol is not a token"));
+                }
+            }
             push(
                 &mut headers,
                 "sec-websocket-protocol",
                 &opts.protocols.join(", "),
             )?;
         }
+        // What actually goes on the wire: the offer above plus any the
+        // caller added. The response is validated against *this*, never
+        // against a constant (RFC 6455 §4.1: an extension that was not
+        // offered fails the connection).
+        let mut offered: Vec<ExtensionOffer> = Vec::new();
         if opts.compression {
+            offered.extend(parse_extension_value(PM_DEFLATE_OFFER)?);
             push(&mut headers, "sec-websocket-extensions", PM_DEFLATE_OFFER)?;
+        }
+        for (name, value) in &opts.headers {
+            if name.eq_ignore_ascii_case("sec-websocket-extensions") {
+                offered.extend(parse_extension_value(value)?);
+            }
         }
         if let Some(origin) = &opts.origin {
             push(&mut headers, "origin", origin)?;
         }
         for (name, value) in &opts.headers {
             push(&mut headers, name, value)?;
+        }
+        // The client's default fields belong on this request too: it is a
+        // request from the same client to the authority the URL names, and
+        // a handshake that silently drops a tracing header — or an
+        // authorization the caller configured once — is the inconsistency
+        // `default_headers` exists to remove. The handshake's own fields
+        // (host, upgrade, connection, sec-websocket-*) are already set
+        // above, so a default can never displace them, and a field passed
+        // through `WsOptions` wins as it does on the HTTP path.
+        for (name, value) in cfg.default_headers.iter() {
+            if !headers.contains_key(name.as_str()) {
+                headers.append(name.clone(), value.clone());
+            }
         }
         if !headers.contains_key("user-agent") {
             if let Some(ua) = &cfg.user_agent {
@@ -301,6 +338,7 @@ impl WebSocket {
         }
 
         let mut compression = None;
+<<<<<<< HEAD
         if response_headers.get("sec-websocket-extensions").is_some() {
             let mut offered =
                 crate::courierust_ws::handshake::parse_extension_value(PM_DEFLATE_OFFER)?;
@@ -326,7 +364,22 @@ impl WebSocket {
                     ext,
                     &PmDeflatePolicy::default(),
                 )?);
+=======
+        for (i, ext) in parse_extensions(&response_headers)?.iter().enumerate() {
+            let offer = offered.iter().find(|o| o.name == ext.name).ok_or_else(|| {
+                Error::protocol("ws: the server selected an extension that was not offered")
+            })?;
+            if i > 0 {
+                return Err(Error::protocol(
+                    "ws: the server selected more than one extension",
+                ));
+>>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
             }
+            compression = Some(PerMessageDeflate::from_response(
+                offer,
+                ext,
+                &PmDeflatePolicy::default(),
+            )?);
         }
 
         let params = compression.map(|p| p.client_view());
@@ -434,11 +487,16 @@ impl WebSocket {
 
     /// A push handle usable from another thread while this one reads.
     pub fn writer(&self) -> WsClientWriter {
+        // The push handle must share the connection's Close flag with the
+        // session: RFC 6455 §5.5.1 — nothing may follow a Close frame — is
+        // a property of the connection, not of one writer.
+        let close_flag = self.session.writer().close_flag();
         WsClientWriter {
-            inner: Arc::new(std::sync::Mutex::new(FrameWriter::new(
+            inner: Arc::new(std::sync::Mutex::new(FrameWriter::with_close_flag(
                 self.sink.clone(),
                 MaskSource::Random,
                 self.session.compression(),
+                close_flag,
             ))),
         }
     }
@@ -462,7 +520,7 @@ impl WebSocket {
         self.session.close(code, reason)?;
         self.session.flush()?;
         let deadline = std::time::Instant::now() + self.close_timeout;
-        let _ = self.stream.configure(Some(self.close_timeout));
+        let _ = self.stream.set_deadline(Some(self.close_timeout));
         loop {
             if std::time::Instant::now() >= deadline {
                 return Ok(());
@@ -490,6 +548,7 @@ impl WebSocket {
         self.info.peer
     }
 
+<<<<<<< HEAD
     /// Set the liveness deadline for the wait for a frame.
     ///
     /// [`WebSocket::read_message`] re-scopes it per frame: it arms the
@@ -501,6 +560,14 @@ impl WebSocket {
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<()> {
         self.read_timeout.set(timeout);
         self.stream.configure(timeout)
+=======
+    /// Change the transport's read timeout (bounds how long
+    /// [`WebSocket::read_message`] blocks) with deadline semantics, so
+    /// its expiry reaches the caller as [`ErrorKind::Timeout`] on every
+    /// platform rather than as a POSIX-only `WouldBlock`.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<()> {
+        self.stream.set_deadline(timeout)
+>>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
     }
 }
 
@@ -520,34 +587,29 @@ fn normalise_url(url: &str) -> Result<(bool, String)> {
     }
 }
 
-/// Connect to the first address that accepts.
+/// Connect to the origin, directly or through the configured proxy.
 ///
 /// A host name that resolves to several addresses (the usual `localhost`
 /// case: `::1` and `127.0.0.1`) must not fail just because the first one
-/// in the list is not the one the server bound. Each attempt keeps its
-/// own connect timeout, and the last failure is reported.
+/// in the list is not the one the server bound: every address is tried,
+/// each with its own connect timeout, and the last failure is reported.
 fn connect_to(
     host: &str,
     port: u16,
     cfg: &crate::courierust_client::ClientConfig,
 ) -> Result<(SocketAddr, std::net::TcpStream)> {
-    let addresses: Vec<SocketAddr> = (host, port)
-        .to_socket_addrs()
-        .map_err(|e| Error::io(alloc::format!("ws: cannot resolve {host}:{port}: {e}")))?
-        .collect();
-    if addresses.is_empty() {
-        return Err(Error::io(alloc::format!(
-            "ws: {host}:{port} resolved to no address"
-        )));
+    match &cfg.proxy {
+        // A proxy is tunnelled to the origin authority with `CONNECT`
+        // (RFC 9110 §9.3.6). The handshake that follows is the same for
+        // `ws://` and `wss://` — the tunnel is byte-transparent, so only
+        // the origin's own protocol differs.
+        Some(proxy) => crate::courierust_client::proxy::connect_through(
+            proxy,
+            &crate::courierust_client::proxy::authority(host, port),
+            cfg.connect_timeout,
+        ),
+        None => crate::courierust_client::proxy::connect_direct(host, port, cfg.connect_timeout),
     }
-    let mut last: Option<Error> = None;
-    for addr in addresses {
-        match net::connect(&addr, cfg.connect_timeout) {
-            Ok(stream) => return Ok((addr, stream)),
-            Err(e) => last = Some(e),
-        }
-    }
-    Err(last.unwrap_or_else(|| Error::io("ws: connect failed")))
 }
 
 fn push(headers: &mut HeaderMap, name: &str, value: &str) -> Result<()> {
@@ -557,17 +619,24 @@ fn push(headers: &mut HeaderMap, name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Read the response head, skipping any `1xx` informational response.
+/// Read the response head, skipping up to [`MAX_INFORMATIONAL`] `1xx`
+/// responses.
 fn read_response_head(
     reader: &mut BufReader<Arc<ConnStream>>,
     scratch: &mut Scratch,
 ) -> Result<(crate::courierust_http::status::StatusCode, HeaderMap)> {
+<<<<<<< HEAD
     loop {
         let status = {
+=======
+    for _ in 0..=MAX_INFORMATIONAL {
+        // The status line borrows the scratch line buffer; it is parsed
+        // and released before the header block reuses that buffer.
+        let (status, version) = {
+>>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
             let line = scratch.line();
             reader.read_until_into(b'\n', 16 * 1024, line)?;
-            let (status, _version) = courierust_h1::parse_status_line(line)?;
-            status
+            courierust_h1::parse_status_line(line)?
         };
         let headers = courierust_h1::read_headers_scratch(reader, scratch)?;
         if status.is_informational()
@@ -575,8 +644,18 @@ fn read_response_head(
         {
             continue;
         }
+        // A protocol switch is an HTTP/1.1 response; a 1.0 status line
+        // means the peer is not following §4.1.
+        if version != Version::HTTP_11 {
+            return Err(Error::protocol(
+                "ws: the handshake response is not HTTP/1.1",
+            ));
+        }
         return Ok((status, headers));
     }
+    Err(Error::protocol(
+        "ws: too many informational responses before the switch",
+    ))
 }
 
 /// Everything a `101` must (and must not) contain.

@@ -12,7 +12,9 @@ use courierust::courierust_http::response::Response;
 use courierust::courierust_net::stats::Stats;
 use courierust::courierust_server::{Server, ServerConfig};
 use courierust::courierust_tls as crate_tls;
-use courierust_benchmark::metrics::{metric, run_concurrent, run_sequential, stats_fields, Timing, MAX_SAMPLES};
+use courierust_benchmark::metrics::{
+    metric, run_concurrent, run_sequential, stats_fields, Timing, MAX_SAMPLES,
+};
 use std::sync::Arc;
 
 const EMPTY: Payload = Payload {
@@ -232,11 +234,9 @@ const SERVER_CERT_DER: &[u8] = include_bytes!("../../tests/certs/server_cert.der
 const SERVER_KEY_DER: &[u8] = include_bytes!("../../tests/certs/server_key.der");
 
 fn load_test_identity() -> (crate_tls::Identity, crate_tls::RootStore) {
-    let identity = crate_tls::Identity {
-        cert_chain: vec![SERVER_CERT_DER.to_vec()],
-        private_key: SERVER_KEY_DER.to_vec(),
-        is_rsa: false,
-    };
+    let identity =
+        crate_tls::Identity::from_der(vec![SERVER_CERT_DER.to_vec()], SERVER_KEY_DER.to_vec())
+            .expect("valid test identity");
     let mut roots = crate_tls::RootStore::new();
     roots.add_der(SERVER_CERT_DER.to_vec());
     (identity, roots)
@@ -310,9 +310,7 @@ fn bench_https(requests: usize, payload: Payload, server_threads: usize) {
 /// handshake would fail), negotiated ALPN + cipher suite as observed on the
 /// wire. session_resumption=n/a: a single handshake does not measure it.
 fn tls_verify_evidence(address: std::net::SocketAddr, roots: crate_tls::RootStore) {
-    use courierust::courierust_tls::{
-        ClientConfig as TlsClientConfig, TlsConnector, TlsVersion,
-    };
+    use courierust::courierust_tls::{ClientConfig as TlsClientConfig, TlsConnector, TlsVersion};
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -337,6 +335,7 @@ fn tls_verify_evidence(address: std::net::SocketAddr, roots: crate_tls::RootStor
         now,
         min_version: TlsVersion::Tls12,
         max_version: TlsVersion::Tls13,
+        identity: None,
     });
     match connector.connect("127.0.0.1", &stream, &stream) {
         Ok(tls) => {

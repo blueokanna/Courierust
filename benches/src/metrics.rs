@@ -102,11 +102,8 @@ pub fn coefficient_of_variation(values: &[f64]) -> Option<f64> {
     if mean == 0.0 {
         return None;
     }
-    let variance = values
-        .iter()
-        .map(|v| (v - mean) * (v - mean))
-        .sum::<f64>()
-        / values.len() as f64;
+    let variance =
+        values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / values.len() as f64;
     Some(variance.sqrt() / mean)
 }
 

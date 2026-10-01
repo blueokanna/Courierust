@@ -52,11 +52,11 @@ pub const NOW: i64 = 1_800_000_000; // 2027-01-14T00:00:00Z
 
 /// Build the TLS server identity for the test certificate.
 pub fn server_identity() -> courierust::courierust_tls::Identity {
-    courierust::courierust_tls::Identity {
-        cert_chain: vec![SERVER_CERT_DER.to_vec()],
-        private_key: SERVER_KEY_DER.to_vec(),
-        is_rsa: false,
-    }
+    courierust::courierust_tls::Identity::from_der(
+        vec![SERVER_CERT_DER.to_vec()],
+        SERVER_KEY_DER.to_vec(),
+    )
+    .expect("valid test identity")
 }
 
 /// A root store that trusts the test certificate.

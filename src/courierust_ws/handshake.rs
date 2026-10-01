@@ -19,9 +19,9 @@
 //!    duplicate-header rejection, token-level `Connection`/`Upgrade`
 //!    parsing. Any of these being sloppy is a request-smuggling or
 //!    cache-poisoning hazard when a proxy sits in front.
-//! 3. **Extension negotiation**, specifically `permessage-deflate`
-//!    (RFC 7692) with strict parameter validation on both sides — the
-//!    client must verify the server only picked parameters it offered.
+//! 3. **Extension negotiation** for `permessage-deflate` (RFC 7692):
+//!    offers with undefined parameters or invalid values are declined,
+//!    and a response is validated against what the client offered.
 
 use crate::courierust_crypto::{base64, sha1::Sha1};
 use crate::courierust_error::{Error, Result};
@@ -103,11 +103,7 @@ pub fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
     if headers.get_all("sec-websocket-version").count() != 1 {
         return false;
     }
-    let upgrade_ok = headers.get_all("upgrade").any(|v| {
-        v.to_str()
-            .map(|s| s.trim().eq_ignore_ascii_case("websocket"))
-            .unwrap_or(false)
-    });
+    let upgrade_ok = header_has_token(headers, "upgrade", "websocket");
     upgrade_ok && header_has_token(headers, "connection", "upgrade")
 }
 
@@ -125,6 +121,7 @@ pub struct IpNet {
 }
 
 impl IpNet {
+<<<<<<< HEAD
     /// Build a network from an address and a prefix length.
     ///
     /// Returns `None` when `prefix` exceeds what the address family
@@ -136,6 +133,23 @@ impl IpNet {
     /// by accident.
     pub fn new(addr: IpAddr, prefix: u8) -> Option<Self> {
         if prefix > Self::max_prefix(addr) {
+=======
+    /// Parse `addr`, `addr/len` or a bare address (host route).
+    pub fn parse(s: &str) -> Option<Self> {
+        let (addr, prefix) = match s.split_once('/') {
+            Some((a, p)) => (a.trim(), Some(p.trim().parse::<u8>().ok()?)),
+            None => (s.trim(), None),
+        };
+        let addr: IpAddr = addr.parse().ok()?;
+        let max = if addr.is_ipv4() { 32 } else { 128 };
+        // A bare address is a host route, so its prefix length follows the
+        // address family. Defaulting it to /32 would turn `::1` into a
+        // network that also contains every `::x`, including the IPv4-
+        // mapped addresses a dual-stack listener reports — and a trusted
+        // proxy match is what makes the forwarded headers believed.
+        let prefix = prefix.unwrap_or(max);
+        if prefix > max {
+>>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
             return None;
         }
         let mut net = Self { addr, prefix };
@@ -167,7 +181,11 @@ impl IpNet {
     pub fn host(addr: IpAddr) -> Self {
         Self {
             addr,
+<<<<<<< HEAD
             prefix: Self::max_prefix(addr),
+=======
+            prefix: if addr.is_ipv4() { 32 } else { 128 },
+>>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
         }
     }
 
@@ -298,15 +316,16 @@ fn parse_forwarded_ip(token: &str) -> Option<IpAddr> {
 /// The `Host` the client actually addressed.
 ///
 /// `X-Forwarded-Host` (and Traefik's `X-Forwarded-Server` fallback) is
-/// only honoured when the peer is a trusted proxy — otherwise any client
-/// could rewrite the host a same-origin check compares against.
+/// only honoured from a trusted proxy — otherwise any client could
+/// rewrite the host a same-origin check compares against. The right-most
+/// value wins, like [`client_ip`]: each hop appends what it saw, so the
+/// last entry is the one the closest proxy added.
 pub fn effective_host(headers: &HeaderMap, peer: IpAddr, trusted: &[IpNet]) -> Option<String> {
     if is_trusted_proxy(peer, trusted) {
         for name in ["x-forwarded-host", "x-forwarded-server"] {
             if let Some(v) = headers.get(name).and_then(|v| v.to_str().ok()) {
-                let first = v.split(',').next().unwrap_or("").trim();
-                if !first.is_empty() {
-                    return Some(first.to_ascii_lowercase());
+                if let Some(last) = v.split(',').rev().map(str::trim).find(|s| !s.is_empty()) {
+                    return Some(last.to_ascii_lowercase());
                 }
             }
         }
@@ -609,7 +628,7 @@ fn split_quoted(s: &str, sep: char) -> Result<Vec<String>> {
 }
 
 /// RFC 9110 token.
-fn is_token(s: &str) -> bool {
+pub fn is_token(s: &str) -> bool {
     !s.is_empty()
         && s.bytes().all(|b| {
             b.is_ascii_alphanumeric()
@@ -694,9 +713,17 @@ impl Default for PmDeflatePolicy {
     }
 }
 
+/// The registered extension name for RFC 7692 compression.
+pub const PERMESSAGE_DEFLATE: &str = "permessage-deflate";
+
 fn parse_window_bits(value: Option<&str>, name: &str) -> Result<u8> {
     let v = value
         .ok_or_else(|| Error::protocol(alloc::format!("websocket: {name} requires a value")))?;
+    // RFC 7692 §7.1.2: `1*DIGIT`, no sign and no leading zero.
+    if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) || (v.len() > 1 && v.starts_with('0'))
+    {
+        return Err(Error::protocol(alloc::format!("websocket: invalid {name}")));
+    }
     let bits: u8 = v
         .parse()
         .map_err(|_| Error::protocol(alloc::format!("websocket: invalid {name}")))?;
@@ -711,24 +738,29 @@ fn parse_window_bits(value: Option<&str>, name: &str) -> Result<u8> {
 impl PerMessageDeflate {
     /// Select parameters for the server role from one client offer.
     ///
-    /// Returns `None` when the offer cannot be satisfied by the policy
-    /// (in which case the extension is simply not selected, which is
-    /// legal — the connection proceeds uncompressed).
+    /// `None` declines it: RFC 7692 §7 requires declining an offer that
+    /// carries an undefined parameter or an invalid value, and a declined
+    /// extension simply leaves the connection uncompressed.
     pub fn negotiate(offer: &ExtensionOffer, policy: &PmDeflatePolicy) -> Option<Self> {
-        if !policy.enabled || offer.name != "permessage-deflate" {
+        if !policy.enabled || offer.name != PERMESSAGE_DEFLATE {
             return None;
+        }
+        const PARAMS: [&str; 4] = [
+            "server_no_context_takeover",
+            "client_no_context_takeover",
+            "server_max_window_bits",
+            "client_max_window_bits",
+        ];
+        for (name, value) in &offer.params {
+            let takes_value = matches!(
+                name.as_str(),
+                "server_max_window_bits" | "client_max_window_bits"
+            );
+            if !PARAMS.contains(&name.as_str()) || (!takes_value && value.is_some()) {
+                return None;
+            }
         }
         let mut selected = Self::default();
-
-        // Parameters the client must not send a value for.
-        if offer.params.iter().any(|(n, v)| {
-            matches!(
-                n.as_str(),
-                "server_no_context_takeover" | "client_no_context_takeover"
-            ) && v.is_some()
-        }) {
-            return None;
-        }
 
         if let Some(v) = offer.param("server_max_window_bits") {
             let bits = parse_window_bits(v, "server_max_window_bits").ok()?;
@@ -763,7 +795,7 @@ impl PerMessageDeflate {
 
     /// The `Sec-WebSocket-Extensions` value that announces this choice.
     pub fn response_header(&self) -> String {
-        let mut s = String::from("permessage-deflate");
+        let mut s = String::from(PERMESSAGE_DEFLATE);
         if self.server_no_context_takeover {
             s.push_str("; server_no_context_takeover");
         }
@@ -783,22 +815,19 @@ impl PerMessageDeflate {
 
     /// Validate a server's response against what the client offered.
     ///
-    /// RFC 7692 §7.1.2: the server may only use parameters the client
-    /// offered, must not introduce a parameter that changes the client's
-    /// send direction unless it was offered, and must not respond with
-    /// `server_max_window_bits` larger than offered. A client that skips
-    /// these checks can be steered into an unbounded window.
+    /// A parameter the response may not carry, or a `server_max_window_bits`
+    /// larger than offered, fails the connection (RFC 7692 §7.1.2).
     pub fn from_response(
         offer: &ExtensionOffer,
         response: &ExtensionOffer,
         client_policy: &PmDeflatePolicy,
     ) -> Result<Self> {
-        if response.name != "permessage-deflate" {
+        if response.name != PERMESSAGE_DEFLATE {
             return Err(Error::protocol(
                 "websocket: unexpected extension in response",
             ));
         }
-        if offer.name != "permessage-deflate" {
+        if offer.name != PERMESSAGE_DEFLATE {
             return Err(Error::protocol(
                 "websocket: server selected an extension that was not offered",
             ));
@@ -820,6 +849,11 @@ impl PerMessageDeflate {
                 }
                 "server_max_window_bits" => {
                     let bits = parse_window_bits(value.as_deref(), "server_max_window_bits")?;
+                    // RFC 7692 §7.1.2.1: a server MAY include this parameter
+                    // even when the offer did not carry it, so an unoffered
+                    // value is accepted — it is still capped at 15 by
+                    // `parse_window_bits`, so it cannot widen our window.
+                    // Only a value *larger than offered* is a failure.
                     if let Some(Some(offered)) = offer.param("server_max_window_bits") {
                         let offered: u8 = offered
                             .parse()
@@ -829,10 +863,6 @@ impl PerMessageDeflate {
                                 "websocket: server window larger than offered",
                             ));
                         }
-                    } else {
-                        return Err(Error::protocol(
-                            "websocket: server_max_window_bits was not offered",
-                        ));
                     }
                     out.server_max_window_bits = bits;
                 }
@@ -1356,6 +1386,75 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_host_uses_the_rightmost_value() {
+        let trusted = [IpNet::parse("10.0.0.0/8").unwrap()];
+        let proxy: IpAddr = "10.0.0.5".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_lowercase("x-forwarded-host"),
+            HeaderValue::from_static("evil.example, real.example"),
+        );
+        assert_eq!(
+            effective_host(&headers, proxy, &trusted).as_deref(),
+            Some("real.example"),
+            "the closest proxy's value is the one that counts"
+        );
+    }
+
+    fn extension_offer(params: &[(&str, Option<&str>)]) -> ExtensionOffer {
+        ExtensionOffer {
+            name: String::from(PERMESSAGE_DEFLATE),
+            params: params
+                .iter()
+                .map(|(n, v)| (String::from(*n), v.map(String::from)))
+                .collect(),
+        }
+    }
+
+    /// RFC 7692 §7: an offer carrying a parameter this extension does not
+    /// define, or a value its ABNF forbids, MUST be declined (the
+    /// connection then simply runs uncompressed).
+    #[test]
+    fn undefined_or_invalid_offer_parameters_are_declined() {
+        let policy = PmDeflatePolicy::default();
+        assert!(PerMessageDeflate::negotiate(&extension_offer(&[]), &policy).is_some());
+
+        let bad: &[&[(&str, Option<&str>)]] = &[
+            &[("x-unknown", None)],
+            &[("x-unknown", Some("1"))],
+            &[("server_no_context_takeover", Some("1"))],
+            &[("client_no_context_takeover", Some(""))],
+            &[("server_max_window_bits", None)],
+            &[("server_max_window_bits", Some("+9"))],
+            &[("server_max_window_bits", Some("09"))],
+            &[("server_max_window_bits", Some("7"))],
+            &[("server_max_window_bits", Some("16"))],
+            &[("client_max_window_bits", Some("9x"))],
+        ];
+        for params in bad {
+            assert!(
+                PerMessageDeflate::negotiate(&extension_offer(params), &policy).is_none(),
+                "{params:?} must be declined"
+            );
+        }
+
+        let good = PerMessageDeflate::negotiate(
+            &extension_offer(&[
+                ("server_no_context_takeover", None),
+                ("client_no_context_takeover", None),
+                ("server_max_window_bits", Some("10")),
+                ("client_max_window_bits", Some("12")),
+            ]),
+            &policy,
+        )
+        .expect("the four defined parameters with legal values are accepted");
+        assert_eq!(good.server_max_window_bits, 10);
+        assert_eq!(good.client_max_window_bits, 12);
+        assert!(good.server_no_context_takeover);
+        assert!(good.client_no_context_takeover);
+    }
+
+    #[test]
     fn ipnet_matching() {
         let n = IpNet::parse("10.0.0.0/8").unwrap();
         assert!(n.contains("10.1.2.3".parse().unwrap()));
@@ -1383,6 +1482,7 @@ mod tests {
         assert!(IpNet::parse("2001:db8::/129").is_none());
         assert!(IpNet::parse("10.0.0.0/x").is_none());
         assert!(IpNet::parse("not-an-ip").is_none());
+<<<<<<< HEAD
         assert!(IpNet::new("10.0.0.0".parse().unwrap(), 33).is_none());
 
         // Host bits are truncated, so two spellings of one network are
@@ -1401,6 +1501,20 @@ mod tests {
         assert!(IpNet::parse("0.0.0.0/0")
             .unwrap()
             .contains("255.255.255.255".parse().unwrap()));
+=======
+        // A bare IPv6 address is a host route too: defaulting it to /32
+        // (the IPv4 width) would make `::1` match `::2` and every
+        // IPv4-mapped address, and a trusted-proxy match is what makes the
+        // X-Forwarded-* headers believed.
+        assert_eq!(IpNet::parse("::1").unwrap().prefix, 128);
+        assert_eq!(IpNet::host("::1".parse().unwrap()).prefix, 128);
+        let v6_host = IpNet::parse("::1").unwrap();
+        assert!(v6_host.contains("::1".parse().unwrap()));
+        assert!(!v6_host.contains("::2".parse().unwrap()));
+        assert!(!v6_host.contains("::ffff:10.0.0.1".parse().unwrap()));
+        assert!(!IpNet::host("::1".parse().unwrap()).contains("2001:db8::1".parse().unwrap()));
+        // v4 and v6 never mix.
+>>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
         assert!(!IpNet::parse("0.0.0.0/0")
             .unwrap()
             .contains("::1".parse().unwrap()));
@@ -1523,15 +1637,30 @@ mod tests {
         let offer = parse_extensions(&headers).unwrap().remove(0);
         let policy = PmDeflatePolicy::default();
 
-        // A response the client never opened the door for.
-        let mut bad = HeaderMap::new();
-        bad.append(
+        // RFC 7692 §7.1.2.1: a server MAY answer with
+        // server_max_window_bits even though the offer did not carry it,
+        // and refusing that rejects an otherwise compliant server.
+        let mut ok = HeaderMap::new();
+        ok.append(
             HeaderName::from_lowercase("sec-websocket-extensions"),
             HeaderValue::from_static("permessage-deflate; server_max_window_bits=10"),
         );
-        let resp = parse_extensions(&bad).unwrap().remove(0);
-        assert!(PerMessageDeflate::from_response(&offer, &resp, &policy).is_err());
+        let resp = parse_extensions(&ok).unwrap().remove(0);
+        let selected = PerMessageDeflate::from_response(&offer, &resp, &policy).unwrap();
+        assert_eq!(selected.server_max_window_bits, 10);
+        assert_eq!(selected.client_max_window_bits, 15);
 
+        // ...but a value *larger than offered* is a failure (§7.1.2.1).
+        let mut offered = HeaderMap::new();
+        offered.append(
+            HeaderName::from_lowercase("sec-websocket-extensions"),
+            HeaderValue::from_static("permessage-deflate; server_max_window_bits=8"),
+        );
+        let offer_8 = parse_extensions(&offered).unwrap().remove(0);
+        assert!(PerMessageDeflate::from_response(&offer_8, &resp, &policy).is_err());
+
+        // client_max_window_bits is the other way round (§7.1.2.2): the
+        // server may only pick it when the client offered it.
         let mut bad = HeaderMap::new();
         bad.append(
             HeaderName::from_lowercase("sec-websocket-extensions"),

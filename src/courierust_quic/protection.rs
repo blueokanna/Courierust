@@ -65,11 +65,6 @@ fn key_len(suite: u16) -> Option<usize> {
 }
 
 fn expand_quic(suite: u16, secret: &[u8], label: &[u8], len: usize) -> Vec<u8> {
-    // RFC 9001 §5.1 / Appendix A.1: every QUIC HKDF-Expand-Label call uses
-    // the TLS 1.3 construction, whose label prefix is "tls13 " (the QUIC
-    // "quic key" / "client in" / ... strings are appended to that prefix,
-    // e.g. "tls13 quic key"). `expand_label` already applies the correct
-    // "tls13 " prefix with an empty context.
     expand_label(digest_for_suite(suite).as_mut(), secret, label, &[], len)
 }
 
@@ -141,13 +136,6 @@ impl PacketKey {
             self.secret_len,
         );
         let mut next = Self::from_secret(self.suite, &secret)?;
-        // RFC 9001 §5.4: the header protection key is used for the
-        // duration of the connection and MUST NOT change after a key
-        // update — only the AEAD key and IV are derived from the new
-        // secret. Re-deriving hp here made Courierust internally
-        // consistent (both peers did the same) but wire-incompatible
-        // with quinn, whose key update keeps the header protection key
-        // unchanged.
         next.hp = self.hp;
         Ok(next)
     }
@@ -281,10 +269,6 @@ impl PacketKey {
             .ok_or_else(|| Error::protocol("QUIC packet is too short for header protection"))?;
         let sample: &[u8; 16] = sample.try_into().expect("checked QUIC sample length");
         let mask = self.hp_mask(sample);
-        // The packet-number length is encoded in the unprotected low bits.
-        // Read it before masking the first byte; deriving it afterwards can
-        // select a different number of PN bytes and make the sender's AAD
-        // differ from the receiver's reconstructed header.
         let pn_len = (packet[0] & 0x03) as usize + 1;
         packet[0] ^= mask[0] & if long_header { 0x0f } else { 0x1f };
         let pn_end = pn_offset
@@ -336,11 +320,6 @@ impl PacketKey {
         {
             *byte ^= *m;
         }
-        // Reserved bits are 0x0c for long headers and 0x18 for short
-        // headers (RFC 9000 §17.2 / §17.3.1); the short header's key phase
-        // bit (0x04) must NOT be treated as reserved, or every
-        // post-key-update packet would be rejected here before the AEAD
-        // can even be attempted.
         if packet[0] & 0x40 == 0 || packet[0] & if long_header { 0x0c } else { 0x18 } != 0 {
             return Err(Error::protocol(
                 "QUIC fixed or reserved header bits are invalid",
@@ -415,19 +394,8 @@ mod tests {
 
     #[test]
     fn initial_keys_match_rfc9001_appendix_a1() {
-        // RFC 9001 Appendix A.1 test vector. The DCID used to derive the
-        // Initial keys is 0x8394c8f03e515708.
         let dcid = [0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
         let (client, server) = initial_pair(&dcid).unwrap();
-        // Published values:
-        //   client: key=1f369613dd76d5467730efcbe3b1a22d iv=fa044b2f42a3fd3b46fb255c
-        //           hp=9f50449e04a0e810283a1e9933adedd2
-        //   server: key=cf3a5331653c364c88f0f379b6067e37 iv=0ac1493ca1905853b0bba03e
-        //           hp=c206b8d9b9f0f37644430b490eeaa314
-        // The struct stores the key/iv/hp in private arrays; expose them
-        // through a serialized seal round-trip is not enough, so compare
-        // by deriving the fingerprints we can reach: the AEAD key and IV.
-        // `fingerprint()` gives key[..4] ++ iv[..4].
         assert_eq!(
             hex(&client.fingerprint()),
             hex(&[
@@ -446,9 +414,7 @@ mod tests {
             ]),
             "server Initial keys diverge from RFC 9001 A.1"
         );
-        // Header-protection keys are also part of the vector; verify the
-        // AEAD open of a vector packet is impossible if the HP keys were
-        // wrong (the round trip below exercises both together).
+
         let mut header = vec![
             0xc1, 0, 0, 0, 1, 8, 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08, 0, 0, 0x40, 0x04,
             0, 1,
@@ -466,9 +432,6 @@ mod tests {
 
     #[test]
     fn key_update_matches_rfc9001_appendix_a5() {
-        // RFC 9001 Appendix A.5 (ChaCha20-Poly1305): from the application
-        // write secret, "quic key"/"quic iv"/"quic hp"/"quic ku" are
-        // derived with the TLS 1.3 "tls13 " label prefix.
         let secret: [u8; 32] = [
             0x9a, 0xc3, 0x12, 0xa7, 0xf8, 0x77, 0x46, 0x8e, 0xbe, 0x69, 0x42, 0x27, 0x48, 0xad,
             0x00, 0xa1, 0x54, 0x43, 0xf1, 0x82, 0x03, 0xa0, 0x7d, 0x60, 0x60, 0xf6, 0x88, 0xf3,
@@ -492,17 +455,10 @@ mod tests {
             "quic ku secret diverges from RFC 9001 A.5"
         );
         let next = key.next_key_phase().unwrap();
-        // The next phase key is derived from the ku secret, so its first
-        // key bytes come from "tls13 quic key" applied to the ku secret.
         let expected_next_key =
             expand_quic(TLS_CHACHA20_POLY1305_SHA256, &ku_secret, b"quic key", 32);
         assert_eq!(hex(&next.fingerprint()[..4]), hex(&expected_next_key[..4]));
-        // RFC 9001 §5.4: the header protection key MUST NOT change on a key
-        // update. A packet sealed with the phase-1 AEAD key must open with
-        // the phase-1 key even though the header was protected with the
-        // phase-0 hp key. Exercise this with a short-header round trip.
         let mut header = [0u8; 13];
-        // Short header: fixed bit (0x40), key phase 1 (0x04), pn len 4 (0x03).
         header[0] = 0x40 | 0x04 | 0x03;
         header[1..9].copy_from_slice(&[9, 9, 9, 9, 9, 9, 9, 9]);
         header[9..13].copy_from_slice(&7u32.to_be_bytes());
@@ -510,9 +466,6 @@ mod tests {
         let mut wire = header.to_vec();
         wire.extend_from_slice(&sealed);
         next.protect_header(&mut wire, 9, false).unwrap();
-        // Unprotect the header using the phase-1 key; if the hp key had
-        // changed, the recovered header would be wrong and the AEAD would
-        // fail.
         let pn_len = next.unprotect_header(&mut wire, 9, false).unwrap();
         let pn = crate::courierust_quic::packet::decode_pn(&wire[9..9 + pn_len], 7, pn_len);
         assert_eq!(pn, 7);

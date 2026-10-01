@@ -19,9 +19,7 @@ pub trait Digest {
     fn output_len(&self) -> usize;
     /// The block size in bytes (used by HMAC).
     fn block_len(&self) -> usize;
-    /// Return a copy of this hasher with the same running state. The
-    /// TLS transcript hashes a growing message log without disturbing
-    /// it, so we fork a snapshot and finalize that.
+    /// Return a copy of this hasher with the same running state.
     fn fork(&self) -> BoxDigest;
 }
 

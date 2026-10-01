@@ -19,7 +19,7 @@ That's it. Small enough that adapting any transport takes a few lines, and `no_s
 
 - `BufReader` — buffered reads with exact-read and big-endian integer helpers (the h1/h2 codecs need those).
 - `BufWriter` — buffered writes.
-- `Scratch` — a reusable line buffer so steady-state HTTP/1.1 keep-alive requests do **zero per-request allocation**.
+- `Scratch` — a reusable line/header buffer, so a keep-alive steady state does not allocate one buffer per request.
 
 The `&mut T` blanket impls mean you can pass `&mut stream` anywhere a `Read` is expected, which keeps lifetimes sane.
 

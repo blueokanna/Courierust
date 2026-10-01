@@ -19,18 +19,22 @@ const R: u128 = 0xe1 << 120;
 /// Multiply two field elements in the GCM representation (NIST SP
 /// 800-38D Algorithm 1). `a` is consumed from its leftmost bit (x^127)
 /// down to bit 0 (x^0).
+///
+/// Both data-dependent decisions — "xor in `v`" and "reduce after the
+/// shift" — are taken with arithmetic masks instead of branches. `v`
+/// carries the hash subkey H and its iterates, so a branch here makes the
+/// reduction schedule a function of H, and recovering H is enough to
+/// forge tags for the whole connection. The loop itself is a fixed 128
+/// iterations, so the only variable cost left is the mask value itself.
 fn gf_mul(a: u128, b: u128) -> u128 {
     let mut z = 0u128;
     let mut v = b;
     for i in (0..128).rev() {
-        if (a >> i) & 1 == 1 {
-            z ^= v;
-        }
+        let bit = (a >> i) & 1;
+        z ^= v & bit.wrapping_neg(); // all-ones when the bit is set
         let lsb = v & 1;
         v >>= 1;
-        if lsb == 1 {
-            v ^= R;
-        }
+        v ^= R & lsb.wrapping_neg();
     }
     z
 }

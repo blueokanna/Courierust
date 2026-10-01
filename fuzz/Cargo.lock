@@ -28,7 +28,11 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "courierust"
+<<<<<<< HEAD
 version = "1.0.5"
+=======
+version = "1.0.8"
+>>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
 
 [[package]]
 name = "courierust-fuzz"

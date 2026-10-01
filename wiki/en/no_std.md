@@ -20,7 +20,7 @@ What requires `std` (behind the default feature): `courierust_pool`, `courierust
 
 ```toml
 [dependencies]
-courierust = { version = "0.1", default-features = false }
+courierust = { version = "1.0.6", default-features = false }
 ```
 
 Build check:

@@ -39,6 +39,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_DATAGRAM: usize = 65_527;
 const MIN_INITIAL_DATAGRAM: usize = 1200;
+/// Smallest datagram that can be a valid QUIC packet: RFC 9000 §10.3
+/// makes a short-header packet below 21 bytes unconditionally invalid,
+/// so such a datagram must be discarded rather than answered.
+const MIN_SHORT_DATAGRAM: usize = 21;
 const MAX_PACKET_FRAMES: usize = 1024;
 // Keep protected packets below the smallest practical UDP path MTU. A TLS
 // flight is split into multiple CRYPTO frames; QUIC retransmits each packet
@@ -62,6 +66,10 @@ const MAX_H3_UNI_STREAMS: usize = 16;
 /// far smaller than this cap — so evicting the oldest entry is safe.
 const MAX_COMPLETED_STREAMS: usize = 1024;
 const MAX_H3_PENDING_REQUESTS: usize = 256;
+/// Cap on the queue of stream-abort signals waiting for the socket. A peer
+/// cannot make this grow without bound: each entry needs a stream that was
+/// actually opened, and the entries are flushed on the next tick.
+const MAX_STREAM_SIGNALS: usize = 256;
 const MAX_H3_CONNECTION_BUFFER: usize = 64 * 1024 * 1024;
 /// Upper bound on datagrams drained per poll wake. A peer that floods
 /// (or a zero-length datagram burst) must not starve the reactor's
@@ -208,6 +216,21 @@ const SERVER_QPACK_DECODER_STREAM: u64 = 11;
 /// A field section that was blocked on QPACK encoder-stream progress and
 /// can now be decoded: (request/response stream id, decoded fields).
 type UnblockedSection = (u64, Vec<FieldLine>);
+
+/// A stream error waiting for the socket. A malformed message aborts that
+/// one stream (RFC 9114 §4.1.2), but the frames go out from a context that
+/// owns the socket — the decode path only has `&mut self` — so the abort
+/// is queued here and flushed on the next tick (see [`send_stream_signals`]).
+struct PendingStreamSignal {
+    stream_id: u64,
+    /// Application error code, e.g. `H3_MESSAGE_ERROR`.
+    code: u32,
+    /// `Some(final_size)` resets the local send direction as well: a client
+    /// aborting a response while its request body is still in flight must
+    /// not leave the server waiting for bytes that will never arrive
+    /// (RFC 9000 §3.5, §19.4). The value is the size already committed to.
+    reset_final_size: Option<u64>,
+}
 
 /// Server idle receive window: bounds how long the reactor parks on the
 /// poller with no datagram pending. Datagrams and the completed-response
@@ -469,21 +492,6 @@ pub(crate) struct Http3Handle {
     _join: thread::JoinHandle<()>,
 }
 
-/// Start the UDP HTTP/3 reactor on the UDP port corresponding to the TCP
-/// listener. TCP and UDP may legally share a numeric port.
-pub(crate) fn spawn_server(
-    addr: SocketAddr,
-    tls: &TlsSettings,
-    handler: Arc<dyn Handler>,
-    config: ServerConfig,
-) -> std::io::Result<Http3Handle> {
-    // macOS (BSD) requires `SO_REUSEADDR` on the UDP socket before it
-    // may share its numeric port with the TCP listener; other platforms
-    // bind directly (see `courierust_net::udp`).
-    let socket = crate::courierust_net::udp::bind_udp(addr)?;
-    spawn_server_with_socket(socket, tls, handler, config)
-}
-
 /// Start the reactor on an already-bound UDP socket.
 ///
 /// Callers that can choose their own port (tests) use this to sidestep
@@ -583,6 +591,9 @@ pub(crate) enum H3Cmd {
     Request {
         request: Request<Body>,
         reply: mpsc::Sender<Result<Response<Body>>>,
+        /// Per-request deadline override; `None` uses the connection's
+        /// configured timeout.
+        timeout: Option<Duration>,
     },
     Shutdown,
 }
@@ -716,14 +727,20 @@ fn run_client_driver(
         let mut shutdown = false;
         while let Ok(cmd) = commands.try_recv() {
             match cmd {
-                H3Cmd::Request { request, reply } => {
+                H3Cmd::Request {
+                    request,
+                    reply,
+                    timeout,
+                } => {
                     if conn.peer_goaway.is_some() {
                         let _ =
                             reply.send(Err(Error::canceled("HTTP/3 connection received GOAWAY")));
                         continue;
                     }
-                    let deadline =
-                        Instant::now() + options.timeout.unwrap_or(Duration::from_secs(60));
+                    let deadline = Instant::now()
+                        + timeout
+                            .or(options.timeout)
+                            .unwrap_or(Duration::from_secs(60));
                     conn.queue_request(request, reply, deadline);
                     last_activity = Instant::now();
                 }
@@ -901,26 +918,41 @@ fn stateless_reset_token(reset_key: &[u8; 32], cid: &[u8]) -> [u8; 16] {
 }
 
 /// Build a stateless reset datagram (RFC 9000 §10.3): a short-header
-/// packet addressed to `dcid` with a random payload whose final 16 bytes
-/// are the connection's stateless reset token. The datagram is padded so
-/// the receiver can read the token without risking the packet being
-/// confused with a valid short packet.
-fn build_stateless_reset(dcid: &[u8], token: &[u8; 16]) -> Result<Vec<u8>> {
+/// packet addressed to `dcid`, with a random body whose final 16 bytes
+/// are the connection's stateless reset token.
+///
+/// `max_len` is the largest datagram the caller may send. RFC 9000 §10.3.3
+/// requires a Stateless Reset to be *smaller* than the packet that
+/// triggered it unless the endpoint keeps state about that packet, and
+/// §10.3 forbids a reset three times larger than the trigger: an
+/// unauthenticated datagram must not be an amplifier. `Ok(None)` means the
+/// triggering packet is too small for a well-formed reset, in which case
+/// the correct action is to send nothing.
+fn build_stateless_reset(dcid: &[u8], token: &[u8; 16], max_len: usize) -> Result<Option<Vec<u8>>> {
     if dcid.is_empty() || dcid.len() > 20 {
         return Err(protocol("invalid connection ID for stateless reset"));
     }
-    let mut out = Vec::with_capacity(1 + dcid.len() + 21 + 16);
+    let head = 1 + dcid.len();
+    // A short-header packet needs at least 21 bytes to be valid at all
+    // (RFC 9000 §10.3), and the token has to sit at the tail.
+    let min_len = (head + 1 + token.len()).max(MIN_SHORT_DATAGRAM);
+    if max_len < min_len {
+        return Ok(None);
+    }
+    let total = (head + 21 + token.len()).min(max_len);
+    let random_len = total - head - token.len();
+    let mut out = Vec::with_capacity(total);
     // Short header with the destination connection ID length in the low
     // 6 bits (RFC 9000 §17.3).
     out.push(0x40 | ((dcid.len() as u8).saturating_sub(1) & 0x3f));
     out.extend_from_slice(dcid);
-    let mut random = [0u8; 21];
+    let mut random = alloc::vec![0u8; random_len];
     if !crate::courierust_tls::crypto::rng::fill_random(&mut random) {
         return Err(protocol("OS randomness unavailable for stateless reset"));
     }
     out.extend_from_slice(&random);
     out.extend_from_slice(token);
-    Ok(out)
+    Ok(Some(out))
 }
 
 fn run_server(
@@ -1099,12 +1131,14 @@ fn run_server(
                 let connection_id = connection_id.clone();
                 let wake = wake_writer.clone();
                 let received_at = request.received_at;
+                let is_head =
+                    request.request.method == crate::courierust_http::method::Method::HEAD;
                 pool.spawn(move || {
                     // clippy::blocks_in_conditions: bind the catch_unwind
                     // result before matching on it.
                     let caught = panic::catch_unwind(AssertUnwindSafe(|| {
                         let response = handler.handle(request.request);
-                        materialize_response(response, max_body)
+                        materialize_response(response, max_body, is_head)
                     }));
                     let response = match caught {
                         Ok(response) => response,
@@ -1219,10 +1253,10 @@ fn handle_server_datagram(
             }
         }
     }
-    if !datagram.is_empty() && datagram[0] & 0x80 == 0 && datagram[0] & 0x40 != 0 {
+    if n >= MIN_SHORT_DATAGRAM && datagram[0] & 0x80 == 0 && datagram[0] & 0x40 != 0 {
         if let Some(dcid) = packet_destination_cid(datagram) {
             let token = stateless_reset_token(reset_key, dcid);
-            if let Ok(reset) = build_stateless_reset(dcid, &token) {
+            if let Ok(Some(reset)) = build_stateless_reset(dcid, &token, n - 1) {
                 if reset.len() <= MAX_DATAGRAM {
                     if let Some(stats) = config.stats.as_deref() {
                         stats.h3_udp_send_syscalls.fetch_add(1, Ordering::Relaxed);
@@ -1448,6 +1482,10 @@ struct ClientConnection {
     last_activity: Instant,
     stats: Option<Arc<Stats>>,
     active_streams: BTreeSet<u64>,
+    /// Streams aborted with an HTTP/3 application error, queued while
+    /// parsing (where no socket is in hand) and flushed by
+    /// [`send_stream_signals`].
+    pending_stream_signals: Vec<PendingStreamSignal>,
 }
 
 impl ClientConnection {
@@ -1489,6 +1527,7 @@ impl ClientConnection {
             last_activity: Instant::now(),
             stats,
             active_streams: BTreeSet::new(),
+            pending_stream_signals: Vec::new(),
         })
     }
 
@@ -1675,6 +1714,11 @@ impl ClientConnection {
 
     fn on_tick(&mut self, socket: &UdpSocket) -> Result<()> {
         self.transport.flush_acks(socket)?;
+        send_stream_signals(
+            &mut self.transport,
+            socket,
+            &mut self.pending_stream_signals,
+        )?;
         self.transport
             .check_path_validation_timeout(socket, Instant::now())?;
         self.transport.replenish_connection_window(socket)?;
@@ -1784,8 +1828,13 @@ impl ClientConnection {
         if self.goaway_sent || !self.control_sent {
             return Ok(());
         }
-        let last = 4u64.saturating_mul(self.next_stream_index.saturating_sub(1));
-        let goaway = h3frame::Frame::GoAway(last).to_bytes();
+        // RFC 9114 §5.2 / §7.2.6: in the client-to-server direction the
+        // GOAWAY field is a *Push ID*, not a stream ID — the two number
+        // spaces are unrelated, and a server reading a stream ID here
+        // would refuse requests that were never in question. This
+        // endpoint never accepts a push (it never sends MAX_PUSH_ID), so
+        // "no push id is acceptable" is the honest value.
+        let goaway = h3frame::Frame::GoAway(0).to_bytes();
         match self
             .transport
             .send_stream_append(socket, APPLICATION, 2, &goaway)
@@ -2012,6 +2061,43 @@ impl ClientConnection {
         );
     }
 
+    /// Abort one response stream with an HTTP/3 application error.
+    ///
+    /// RFC 9114 §4.1.2: a malformed response is a *stream* error, so the
+    /// stream is dropped and its caller told — the connection, and every
+    /// other request on it, keeps working.
+    ///
+    /// The frame that expresses this from the client side is STOP_SENDING:
+    /// the request and its FIN are already sent, so there is nothing left
+    /// to reset, while the server has to hear "stop sending this response"
+    /// before it gives up its send direction. The one case that does need a
+    /// local reset is an early response: the request body is still being
+    /// written and the abort is what stops it (RFC 9000 §3.5).
+    fn abort_stream(&mut self, id: u64, code: u32) {
+        let mut reset_final_size = None;
+        if let Some(request) = self.active.remove(&id) {
+            // `offset < wire.len()` means the FIN was never sent, so the
+            // send direction must be reset at the size the request
+            // committed to (a reset may not reduce that size).
+            if request.offset < request.wire.len() {
+                reset_final_size = Some(request.wire.len() as u64);
+            }
+            let _ = request
+                .reply
+                .send(Err(Error::h3_stream(code, "malformed HTTP/3 response")));
+        }
+        self.streams.remove(&id);
+        h3_close_stream(self.stats.as_ref(), &mut self.active_streams, id);
+        self.qpack.cancel_stream(id);
+        if self.pending_stream_signals.len() < MAX_STREAM_SIGNALS {
+            self.pending_stream_signals.push(PendingStreamSignal {
+                stream_id: id,
+                code,
+                reset_final_size,
+            });
+        }
+    }
+
     /// Drop one active stream and report `error` to its caller.
     fn fail_stream(&mut self, stream_id: u64, error: Error) {
         if let Some(request) = self.active.remove(&stream_id) {
@@ -2053,7 +2139,24 @@ impl ClientConnection {
             .min()
     }
 
+    /// Classify the outcome of decoding one stream: a malformed message
+    /// (RFC 9114 §4.1.2) aborts only that stream — the caller is told and
+    /// the peer is asked to stop — while every other error keeps its
+    /// connection-level meaning.
     fn receive_stream(&mut self, id: u64, offset: u64, data: &[u8], fin: bool) -> Result<()> {
+        match self.receive_stream_inner(id, offset, data, fin) {
+            Ok(()) => Ok(()),
+            Err(error) => match error.h3_stream_code() {
+                Some(code) => {
+                    self.abort_stream(id, code);
+                    Ok(())
+                }
+                None => Err(error),
+            },
+        }
+    }
+
+    fn receive_stream_inner(&mut self, id: u64, offset: u64, data: &[u8], fin: bool) -> Result<()> {
         self.transport.accept_stream_data(id, offset, data.len())?;
         if stream_id::is_unidirectional(id) {
             if stream_id::is_client_initiated(id) {
@@ -2099,6 +2202,7 @@ impl ClientConnection {
                     max_header_list: self.max_header_list,
                     max_body: self.max_body,
                 },
+                true,
             )?
             .unwrap_or_default();
             self.unblock_streams(unblocked)?;
@@ -2149,52 +2253,64 @@ impl ClientConnection {
         self.ensure_buffer_budget()
     }
 
-    /// Apply field sections that the QPACK encoder stream just unblocked:
-    /// install the headers on the paused response stream and resume
-    /// draining its remaining frames (delivering the response when the
-    /// stream is complete).
+    /// Apply field sections that the QPACK encoder stream just unblocked.
+    /// A malformed section is a stream error (RFC 9114 §4.1.2), so that one
+    /// response is aborted and the rest of the connection is untouched.
     fn unblock_streams(&mut self, unblocked: Vec<UnblockedSection>) -> Result<()> {
         for (id, fields) in unblocked {
-            let mut stream = match self.streams.remove(&id) {
-                Some(stream) => stream,
-                None => continue, // response stream already released
-            };
-            if stream.headers.is_some() {
-                if stream.trailers.is_some() {
-                    return Err(protocol("multiple HTTP/3 response trailer blocks"));
+            if let Err(error) = self.resume_stream_response(id, fields) {
+                match error.h3_stream_code() {
+                    Some(code) => self.abort_stream(id, code),
+                    None => return Err(error),
                 }
-                stream.trailers = Some(response_trailers_from_fields(fields)?);
-            } else {
-                stream.headers = Some(fields);
             }
-            stream.blocked = false;
-            let mut finished = false;
-            if let Some(request) = self.active.get_mut(&id) {
-                process_client_stream(
-                    &mut stream,
-                    &mut self.control_received,
-                    &mut self.peer_goaway,
-                    &mut self.peer_max_header_list,
-                    &mut self.qpack,
-                    H3Limits {
-                        max_header_list: self.max_header_list,
-                        max_body: self.max_body,
-                    },
-                    &mut request.response,
-                )?;
-                finished = request.response.is_some();
+        }
+        Ok(())
+    }
+
+    /// Install the field section the QPACK encoder stream just unblocked on
+    /// the paused response stream and resume draining its remaining frames
+    /// (delivering the response when the stream is complete).
+    fn resume_stream_response(&mut self, id: u64, fields: Vec<FieldLine>) -> Result<()> {
+        let mut stream = match self.streams.remove(&id) {
+            Some(stream) => stream,
+            None => return Ok(()), // response stream already released
+        };
+        if stream.headers.is_some() {
+            if stream.trailers.is_some() {
+                return Err(protocol("multiple HTTP/3 response trailer blocks"));
             }
-            if finished {
-                let mut request = self
-                    .active
-                    .remove(&id)
-                    .expect("request present while resuming its response");
-                let response = request.response.take().expect("response just completed");
-                let _ = request.reply.send(Ok(response));
-                h3_close_stream(self.stats.as_ref(), &mut self.active_streams, id);
-            } else if !(stream.reassembly.finished() && stream.completed) {
-                self.streams.insert(id, stream);
-            }
+            stream.trailers = Some(response_trailers_from_fields(fields)?);
+        } else {
+            stream.headers = Some(fields);
+        }
+        stream.blocked = false;
+        let mut finished = false;
+        if let Some(request) = self.active.get_mut(&id) {
+            process_client_stream(
+                &mut stream,
+                &mut self.control_received,
+                &mut self.peer_goaway,
+                &mut self.peer_max_header_list,
+                &mut self.qpack,
+                H3Limits {
+                    max_header_list: self.max_header_list,
+                    max_body: self.max_body,
+                },
+                &mut request.response,
+            )?;
+            finished = request.response.is_some();
+        }
+        if finished {
+            let mut request = self
+                .active
+                .remove(&id)
+                .expect("request present while resuming its response");
+            let response = request.response.take().expect("response just completed");
+            let _ = request.reply.send(Ok(response));
+            h3_close_stream(self.stats.as_ref(), &mut self.active_streams, id);
+        } else if !(stream.reassembly.finished() && stream.completed) {
+            self.streams.insert(id, stream);
         }
         Ok(())
     }
@@ -2259,9 +2375,6 @@ fn send_request_chunks(
                 active.offset = end
             }
             Err(error) if error.kind == ErrorKind::WouldBlock => {
-                // Flow-control / congestion-window backpressure: the body
-                // upload is parked here until ACKs or credit free the
-                // window — the exact stall a 64 KiB upload tail points at.
                 if !active.credit_blocked {
                     active.credit_blocked = true;
                     if h3_packet_trace() {
@@ -2288,6 +2401,45 @@ fn send_request_chunks(
     Ok(())
 }
 
+/// Send the queued stream-abort frames from a context that owns the socket
+/// (RFC 9000 §3.5: RESET_STREAM ends our send direction, STOP_SENDING asks
+/// the peer to end theirs). A `WouldBlock` requeues the signal instead of
+/// dropping it, so an abort is at worst delayed, never lost.
+fn send_stream_signals(
+    transport: &mut QuicTransport,
+    socket: &UdpSocket,
+    pending: &mut Vec<PendingStreamSignal>,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let signals = std::mem::take(pending);
+    for signal in signals {
+        let mut frames = Vec::with_capacity(2);
+        if let Some(final_size) = signal.reset_final_size {
+            frames.push(QFrame::ResetStream {
+                stream_id: signal.stream_id,
+                app_error_code: u64::from(signal.code),
+                final_size,
+            });
+        }
+        frames.push(QFrame::StopSending {
+            stream_id: signal.stream_id,
+            app_error_code: u64::from(signal.code),
+        });
+        match transport.send_frames(socket, APPLICATION, &frames, false) {
+            Ok(()) => {}
+            Err(error) if error.kind == ErrorKind::WouldBlock => {
+                if pending.len() < MAX_STREAM_SIGNALS {
+                    pending.push(signal);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 struct ServerConnection {
     transport: QuicTransport,
     tls: QuicServer,
@@ -2307,6 +2459,9 @@ struct ServerConnection {
     /// `MAX_COMPLETED_STREAMS`).
     completed_streams: VecDeque<u64>,
     pending_requests: VecDeque<PendingRequest>,
+    /// Stream errors queued by a malformed request, flushed on the next tick
+    /// once the socket is in hand (see [`send_stream_signals`]).
+    pending_stream_signals: Vec<PendingStreamSignal>,
     qpack: QpackConnection,
     peer_transport: Option<TransportParameters>,
     initial_crypto: CryptoReassembly,
@@ -2382,6 +2537,7 @@ impl ServerConnection {
             streams: BTreeMap::new(),
             completed_streams: VecDeque::new(),
             pending_requests: VecDeque::new(),
+            pending_stream_signals: Vec::new(),
             qpack: QpackConnection::new(QPACK_MAX_TABLE_CAPACITY, QPACK_BLOCKED_STREAMS),
             peer_transport: None,
             initial_crypto: CryptoReassembly::default(),
@@ -2550,6 +2706,11 @@ impl ServerConnection {
     }
 
     fn on_tick(&mut self, socket: &UdpSocket) -> Result<()> {
+        send_stream_signals(
+            &mut self.transport,
+            socket,
+            &mut self.pending_stream_signals,
+        )?;
         self.flush_pending_crypto(socket)?;
         if self.handshake_complete && !self.control_sent {
             self.send_control(socket)?;
@@ -2705,7 +2866,24 @@ impl ServerConnection {
         Ok(())
     }
 
+    /// Classify the outcome of decoding one request stream: a malformed
+    /// request (RFC 9114 §4.1.2) aborts only that stream — the peer is told
+    /// and the request is discarded — while every other error keeps its
+    /// connection-level meaning.
     fn receive_stream(&mut self, id: u64, offset: u64, data: &[u8], fin: bool) -> Result<()> {
+        match self.receive_stream_inner(id, offset, data, fin) {
+            Ok(()) => Ok(()),
+            Err(error) => match error.h3_stream_code() {
+                Some(code) => {
+                    self.abort_request_stream(id, code);
+                    Ok(())
+                }
+                None => Err(error),
+            },
+        }
+    }
+
+    fn receive_stream_inner(&mut self, id: u64, offset: u64, data: &[u8], fin: bool) -> Result<()> {
         self.transport.accept_stream_data(id, offset, data.len())?;
         if stream_id::is_unidirectional(id) {
             if !stream_id::is_client_initiated(id) {
@@ -2770,35 +2948,47 @@ impl ServerConnection {
         self.ensure_buffer_budget()
     }
 
-    /// Apply field sections that the QPACK encoder stream just unblocked:
-    /// install the request headers on the paused stream and resume
-    /// draining its remaining frames (enqueueing the request when the
-    /// stream is complete).
+    /// Apply field sections that the QPACK encoder stream just unblocked.
+    /// A malformed request is a stream error (RFC 9114 §4.1.2), so that one
+    /// request is aborted and the rest of the connection is untouched.
     fn unblock_streams(&mut self, unblocked: Vec<UnblockedSection>) -> Result<()> {
         for (id, fields) in unblocked {
-            let mut stream = match self.streams.remove(&id) {
-                Some(stream) => stream,
-                None => continue, // request stream already released
-            };
-            stream.headers = Some(fields);
-            stream.blocked = false;
-            process_server_stream(
-                &mut stream,
-                &mut self.local_settings_received,
-                &mut self.peer_goaway,
-                &mut self.peer_max_header_list,
-                &mut self.qpack,
-                H3Limits {
-                    max_header_list: self.max_header_list,
-                    max_body: self.max_body,
-                },
-                &mut self.pending_requests,
-            )?;
-            if stream.reassembly.finished() && stream.completed {
-                self.note_completed_stream(id);
-            } else {
-                self.streams.insert(id, stream);
+            if let Err(error) = self.resume_request_stream(id, fields) {
+                match error.h3_stream_code() {
+                    Some(code) => self.abort_request_stream(id, code),
+                    None => return Err(error),
+                }
             }
+        }
+        Ok(())
+    }
+
+    /// Install the unblocked field section on the paused request stream and
+    /// resume draining its remaining frames (enqueueing the request when the
+    /// stream is complete).
+    fn resume_request_stream(&mut self, id: u64, fields: Vec<FieldLine>) -> Result<()> {
+        let mut stream = match self.streams.remove(&id) {
+            Some(stream) => stream,
+            None => return Ok(()), // request stream already released
+        };
+        stream.headers = Some(fields);
+        stream.blocked = false;
+        process_server_stream(
+            &mut stream,
+            &mut self.local_settings_received,
+            &mut self.peer_goaway,
+            &mut self.peer_max_header_list,
+            &mut self.qpack,
+            H3Limits {
+                max_header_list: self.max_header_list,
+                max_body: self.max_body,
+            },
+            &mut self.pending_requests,
+        )?;
+        if stream.reassembly.finished() && stream.completed {
+            self.note_completed_stream(id);
+        } else {
+            self.streams.insert(id, stream);
         }
         Ok(())
     }
@@ -2810,6 +3000,43 @@ impl ServerConnection {
             self.completed_streams.pop_front();
         }
         self.completed_streams.push_back(id);
+    }
+
+    /// Abort one request stream with an HTTP/3 application error.
+    ///
+    /// RFC 9114 §4.1.2: a malformed request is a *stream* error. The request
+    /// is discarded before it ever reaches the handler, the peer is told to
+    /// stop sending the rest of it and our send direction is reset — the
+    /// connection keeps serving every other request multiplexed on it.
+    fn abort_request_stream(&mut self, id: u64, code: u32) {
+        self.streams.remove(&id);
+        // The request never ran; drop it defensively anyway (a handler may
+        // already have dequeued nothing at all, but the invariant is "no
+        // request for an aborted stream is ever handed out").
+        self.pending_requests
+            .retain(|pending| pending.stream_id != id);
+        // A late retransmission must not re-create the stream state — and
+        // must not re-trigger the abort for every retransmitted frame.
+        self.note_completed_stream(id);
+        h3_close_stream(self.stats.as_ref(), &mut self.active_streams, id);
+        self.qpack.cancel_stream(id);
+        // Final size = bytes already written on our send direction. Nothing
+        // has been answered for a malformed request, so this is 0; reading
+        // the recorded offset keeps the frame valid even if that changes.
+        let reset_final_size = Some(
+            self.transport
+                .sent_stream_data
+                .get(&id)
+                .copied()
+                .unwrap_or(0),
+        );
+        if self.pending_stream_signals.len() < MAX_STREAM_SIGNALS {
+            self.pending_stream_signals.push(PendingStreamSignal {
+                stream_id: id,
+                code,
+                reset_final_size,
+            });
+        }
     }
 
     fn take_request(&mut self) -> Option<PendingRequest> {
@@ -2856,9 +3083,17 @@ impl ServerConnection {
             }
         };
         let outbound_limit = self.max_header_list.min(self.peer_max_header_list);
-        if let Ok(wire) =
-            build_response_wire(response, &mut self.qpack, outbound_limit, self.max_body)
-        {
+        // No HEAD flag: the response body was already emptied where the
+        // request's method was still known (the worker's
+        // `materialize_response`), so this layer only re-materialises what
+        // it is handed.
+        if let Ok(wire) = build_response_wire(
+            response,
+            &mut self.qpack,
+            outbound_limit,
+            self.max_body,
+            false,
+        ) {
             let _ = self.transport.queue_stream_wire(stream_id, wire);
         } else {
             self.queue_service_unavailable(stream_id);
@@ -2872,9 +3107,13 @@ impl ServerConnection {
             HeaderValue::from_static("0"),
         );
         let outbound_limit = self.max_header_list.min(self.peer_max_header_list);
-        if let Ok(wire) =
-            build_response_wire(response, &mut self.qpack, outbound_limit, self.max_body)
-        {
+        if let Ok(wire) = build_response_wire(
+            response,
+            &mut self.qpack,
+            outbound_limit,
+            self.max_body,
+            false,
+        ) {
             let _ = self.transport.queue_stream_wire(stream_id, wire);
         }
     }
@@ -2901,7 +3140,21 @@ impl ServerConnection {
     }
 }
 
-fn materialize_response(response: Response<Body>, max_body: usize) -> Result<Response<Body>> {
+fn materialize_response(
+    response: Response<Body>,
+    max_body: usize,
+    is_head: bool,
+) -> Result<Response<Body>> {
+    // A HEAD response has no content, so the handler's body is not
+    // materialized at all: draining a streaming body to do nothing with it
+    // would hold a worker for as long as the producer keeps sending, and
+    // that producer is entitled to stream forever.
+    if is_head {
+        return Ok(Response {
+            body: Body::Empty,
+            ..response
+        });
+    }
     let Response {
         status,
         version,
@@ -2919,7 +3172,13 @@ fn materialize_response(response: Response<Body>, max_body: usize) -> Result<Res
         status,
         version,
         headers,
-        body: Body::from(bytes),
+        // RFC 9113 §8.1: the fields stay those of the GET response;
+        // the content is what a HEAD response leaves out.
+        body: if is_head {
+            Body::Empty
+        } else {
+            Body::from(bytes)
+        },
         trailers,
     })
 }
@@ -2935,6 +3194,11 @@ struct ReceiveStream {
     completed: bool,
     stream_type: Option<u64>,
     control_started: bool,
+    /// True once this stream's type has been registered with the
+    /// connection (the per-type "only one of each" bookkeeping): the
+    /// handler runs again for every arriving chunk of the same stream, and
+    /// the registration must happen exactly once.
+    type_registered: bool,
     /// True while a HEADERS frame waits for the QPACK encoder stream
     /// (Required Insert Count not yet met). The stream's remaining frames
     /// stay buffered and are drained once the section is decoded.
@@ -3245,6 +3509,7 @@ fn process_unidirectional_stream(
     peer_max_header_list: &mut usize,
     qpack: &mut QpackConnection,
     limits: H3Limits,
+    client_side: bool,
 ) -> Result<Option<Vec<UnblockedSection>>> {
     if stream.stream_type.is_none() && stream_id::is_unidirectional(stream_id_of(stream)) {
         let (kind, used) = match varint::decode(&stream.frame_buf) {
@@ -3269,6 +3534,7 @@ fn process_unidirectional_stream(
     let Some(kind) = stream.stream_type else {
         return Ok(None);
     };
+    let first_time = !core::mem::replace(&mut stream.type_registered, true);
     match kind {
         H3_CONTROL_STREAM => {
             let mut pos = 0;
@@ -3294,7 +3560,7 @@ fn process_unidirectional_stream(
                             return Err(protocol("duplicate HTTP/3 SETTINGS"));
                         }
                         h3frame::Frame::GoAway(id) => {
-                            validate_goaway_id(id, *peer_goaway)?;
+                            validate_goaway_id(id, *peer_goaway, client_side)?;
                             *peer_goaway =
                                 Some(peer_goaway.map_or(id, |previous| previous.min(id)));
                         }
@@ -3312,6 +3578,10 @@ fn process_unidirectional_stream(
             Ok(Some(Vec::new()))
         }
         H3_QPACK_ENCODER_STREAM => {
+            // RFC 9204 §4.2: only one encoder stream per peer.
+            if first_time {
+                qpack.mark_encoder_stream()?;
+            }
             // Apply the peer's encoder-stream instructions (Set Capacity,
             // inserts, duplicates) and retry any field sections that were
             // waiting on the entries they define.
@@ -3327,6 +3597,10 @@ fn process_unidirectional_stream(
             Ok(Some(unblocked))
         }
         H3_QPACK_DECODER_STREAM => {
+            // RFC 9204 §4.2: only one decoder stream per peer.
+            if first_time {
+                qpack.mark_decoder_stream()?;
+            }
             // Apply the peer's decoder-stream instructions: Insert Count
             // Increment raises our encoder-side Known Received Count.
             let consumed = qpack.on_decoder_stream(&stream.frame_buf)?;
@@ -3371,6 +3645,7 @@ fn process_server_stream(
         peer_max_header_list,
         qpack,
         limits,
+        false,
     )? {
         return Ok(unblocked);
     }
@@ -3380,7 +3655,6 @@ fn process_server_stream(
     drain_request_frames(
         stream,
         control_received,
-        peer_goaway,
         qpack,
         limits.max_header_list,
         limits.max_body,
@@ -3405,6 +3679,7 @@ fn process_client_stream(
         peer_max_header_list,
         qpack,
         limits,
+        true,
     )? {
         return Ok(unblocked);
     }
@@ -3429,7 +3704,6 @@ fn stream_id_of(stream: &ReceiveStream) -> u64 {
 fn drain_request_frames(
     stream: &mut ReceiveStream,
     control_received: &bool,
-    peer_goaway: &Option<u64>,
     qpack: &mut QpackConnection,
     max_header_list: usize,
     max_body: usize,
@@ -3493,9 +3767,10 @@ fn drain_request_frames(
             stream.completed = true;
             return Ok(());
         }
-        if peer_goaway.is_some_and(|last| stream.id > last) {
-            return Err(protocol("HTTP/3 request is beyond peer GOAWAY"));
-        }
+        // A client's GOAWAY carries a Push ID, not a request stream ID
+        // (RFC 9114 §5.2), so it says nothing about which requests this
+        // server may accept. Refusing `stream.id > push_id` here would
+        // break every connection whose client greeted it with GOAWAY(0).
         if !*control_received {
             return Err(protocol("HTTP/3 request arrived before peer SETTINGS"));
         }
@@ -3694,8 +3969,12 @@ fn validate_content_length(headers: &HeaderMap, actual: usize) -> Result<()> {
     Ok(())
 }
 
-fn validate_goaway_id(id: u64, previous: Option<u64>) -> Result<()> {
-    if id & 0x03 != 0 {
+fn validate_goaway_id(id: u64, previous: Option<u64>, client_side: bool) -> Result<()> {
+    // RFC 9114 §5.2/§7.2.6: a server's GOAWAY names a client-initiated
+    // bidirectional stream; a client's GOAWAY names a Push ID, which has
+    // no stream-id shape at all — requiring `id % 4 == 0` there would
+    // reject a compliant peer's push id 1.
+    if client_side && id & 0x03 != 0 {
         return Err(protocol("HTTP/3 GOAWAY contains an invalid stream id"));
     }
     if previous.is_some_and(|last| id > last) {
@@ -3704,7 +3983,31 @@ fn validate_goaway_id(id: u64, previous: Option<u64>) -> Result<()> {
     Ok(())
 }
 
+/// HTTP/3 application error code: the message was malformed
+/// (RFC 9114 §8.1).
+const H3_MESSAGE_ERROR: u32 = 0x010e;
+
+/// Map any failure while assembling a message from its field section to
+/// H3_MESSAGE_ERROR, the *stream* error RFC 9114 §4.1.2 prescribes.
+///
+/// Nothing in that assembly fails for a connection-level reason — the
+/// errors are field-name/value syntax, the pseudo-header rules and the
+/// content-length check — so the mapping is total on purpose: one bad
+/// request must not cost every other request multiplexed on the same QUIC
+/// connection.
+fn as_malformed(error: Error) -> Error {
+    if error.h3_stream_code().is_some() {
+        return error;
+    }
+    let detail = format!("malformed HTTP/3 message: {error}");
+    Error::h3_stream(H3_MESSAGE_ERROR, detail)
+}
+
 fn request_from_fields(fields: Vec<FieldLine>, body: Vec<u8>) -> Result<Request<Body>> {
+    request_from_fields_inner(fields, body).map_err(as_malformed)
+}
+
+fn request_from_fields_inner(fields: Vec<FieldLine>, body: Vec<u8>) -> Result<Request<Body>> {
     let mut method = None;
     let mut path = None;
     let mut scheme = None;
@@ -3771,6 +4074,14 @@ fn response_from_fields(
     body: Vec<u8>,
     trailers: Option<HeaderMap>,
 ) -> Result<Response<Body>> {
+    response_from_fields_inner(fields, body, trailers).map_err(as_malformed)
+}
+
+fn response_from_fields_inner(
+    fields: Vec<FieldLine>,
+    body: Vec<u8>,
+    trailers: Option<HeaderMap>,
+) -> Result<Response<Body>> {
     let mut status = None;
     let mut headers = HeaderMap::new();
     let mut regular = false;
@@ -3816,6 +4127,10 @@ fn response_from_fields(
 }
 
 fn response_trailers_from_fields(fields: Vec<FieldLine>) -> Result<HeaderMap> {
+    response_trailers_from_fields_inner(fields).map_err(as_malformed)
+}
+
+fn response_trailers_from_fields_inner(fields: Vec<FieldLine>) -> Result<HeaderMap> {
     let mut trailers = HeaderMap::new();
     for field in fields {
         if field.name.starts_with(':')
@@ -3893,8 +4208,9 @@ fn build_response_wire(
     qpack: &mut QpackConnection,
     max_header_list: usize,
     max_body: usize,
+    is_head: bool,
 ) -> Result<Vec<u8>> {
-    let response = materialize_response(response, max_body)?;
+    let response = materialize_response(response, max_body, is_head)?;
     let body = response.body.as_bytes().unwrap_or(&[]).to_vec();
     let mut fields = vec![(
         ":status".to_string(),
@@ -4667,6 +4983,16 @@ impl QuicTransport {
             }
         }
         let adaptive_delay = self.current_ack_delay();
+        // Snapshotted before `self.spaces` is mutably borrowed for the
+        // frame loop: a MAX_STREAM_DATA must not shadow the transport
+        // parameter's initial limit with a smaller one, and the defaults
+        // are per direction (RFC 9000 §4.1).
+        let server_side = self.server;
+        let stream_data_defaults = (
+            self.peer_max_stream_data_uni,
+            self.peer_max_stream_data_bidi_remote,
+            self.peer_max_stream_data_bidi_local,
+        );
         let space = &mut self.spaces[level];
         if !space.received.insert(pn) {
             space.ack_pending = true;
@@ -4727,6 +5053,13 @@ impl QuicTransport {
                     unidirectional,
                     max,
                 } => {
+                    // RFC 9000 §4.6/§19.11: the count can never exceed 2^60
+                    // (no stream id above 2^62-1 can be encoded), and a
+                    // frame that permits opening more is a connection
+                    // error of type FRAME_ENCODING_ERROR.
+                    if *max > (1u64 << 60) {
+                        return Err(protocol("MAX_STREAMS exceeds the stream id space"));
+                    }
                     if *unidirectional {
                         self.peer_max_streams_uni = self.peer_max_streams_uni.max(*max);
                     } else {
@@ -4740,8 +5073,21 @@ impl QuicTransport {
                             h3_role(self.server)
                         );
                     }
-                    let limit = self.peer_stream_limits.entry(*stream_id).or_insert(0);
-                    *limit = (*limit).max(*max);
+                    // MAX_STREAM_DATA only ever raises the limit: it
+                    // cannot go below the transport parameter's initial
+                    // value, so the map entry must not shadow that value
+                    // with a smaller one (RFC 9000 §4.1).
+                    let (uni_default, bidi_remote_default, bidi_local_default) =
+                        stream_data_defaults;
+                    let floor = if stream_id::is_unidirectional(*stream_id) {
+                        uni_default
+                    } else if stream_id::is_client_initiated(*stream_id) != server_side {
+                        bidi_remote_default
+                    } else {
+                        bidi_local_default
+                    };
+                    let entry = self.peer_stream_limits.entry(*stream_id).or_insert(floor);
+                    *entry = (*entry).max(*max);
                 }
                 _ => {}
             }
@@ -5608,6 +5954,15 @@ impl QuicTransport {
         if ack_eliciting
             && self.unacknowledged_bytes().saturating_add(wire.len()) > self.congestion_window
         {
+            // The packet was not sent, so everything it carried is still
+            // pending — including a piggybacked ACK that the code above
+            // has already marked consumed. Dropping it would look like
+            // loss to the peer and trigger a retransmission of data we
+            // already hold.
+            if due_ack {
+                self.spaces[level].ack_pending = true;
+                self.spaces[level].ack_deadline = Some(Instant::now());
+            }
             if let Some(stats) = self.stats.as_deref() {
                 stats.h3_credit_stalls.fetch_add(1, Ordering::Relaxed);
             }
@@ -5912,7 +6267,15 @@ fn acknowledge(
         for pn in acknowledged {
             if let Some(packet) = sent.remove(&pn) {
                 acknowledged_bytes = acknowledged_bytes.saturating_add(packet.size);
-                rtt_sample = rtt_sample.or_else(|| now.checked_duration_since(packet.sent_at));
+                // RFC 9002 §5.1: the sample is the time to the *largest*
+                // packet number newly acknowledged — here the high end of
+                // the first range, and only when this ACK is what
+                // acknowledged it. Timing the oldest packet of a burst
+                // inflates the RTT (and with it PTO and every deadline
+                // derived from it) by the spread of the burst.
+                if index == 0 && pn == high && rtt_sample.is_none() {
+                    rtt_sample = now.checked_duration_since(packet.sent_at);
+                }
             }
         }
         if index + 1 < ranges.len() {
@@ -5930,6 +6293,13 @@ fn acknowledge(
 }
 
 fn decode_quic_frames(buf: &[u8]) -> Result<Vec<QFrame>> {
+    if buf.is_empty() {
+        // RFC 9000 §12.4: "An endpoint MUST treat receipt of a packet
+        // containing no frames as a connection error of type
+        // PROTOCOL_VIOLATION." A sender that pads writes at least four
+        // zero bytes, so an empty plaintext is always malformed.
+        return Err(protocol("QUIC packet contains no frames"));
+    }
     let mut pos = 0usize;
     let mut frames = Vec::new();
     while pos < buf.len() {
@@ -6200,30 +6570,7 @@ mod tests {
     #[test]
     fn forged_packet_on_datagram_is_dropped() {
         let local_cid = vec![0x44; 8];
-        let transport =
-            QuicTransport::client(local_cid.clone(), vec![0x55; 8], vec![0x66; 8], None).unwrap();
-        let mut conn = ClientConnection::new(
-            transport,
-            // TLS is never touched for an undecryptable packet; dummy
-            // values are sufficient.
-            crate::courierust_tls::quic::QuicClient::new(
-                "localhost",
-                vec![b"h3".to_vec()],
-                false,
-                crate::courierust_tls::RootStore::new(),
-                0,
-                TransportParameters::default(),
-                vec![0x66; 8],
-            ),
-            Vec::new(),
-            "localhost".into(),
-            H3Limits {
-                max_header_list: 16 * 1024,
-                max_body: 16 * 1024 * 1024,
-            },
-            None,
-        )
-        .unwrap();
+        let mut conn = raw_client_connection(local_cid.clone(), vec![0x55; 8], vec![0x66; 8]);
         let mut forged = vec![0x40u8];
         forged.extend_from_slice(&local_cid);
         forged.push(0x00);
@@ -6244,28 +6591,7 @@ mod tests {
     #[test]
     fn malformed_version_negotiation_packet_is_dropped() {
         let local_cid = vec![0x44; 8];
-        let transport =
-            QuicTransport::client(local_cid.clone(), vec![0x55; 8], vec![0x66; 8], None).unwrap();
-        let mut conn = ClientConnection::new(
-            transport,
-            crate::courierust_tls::quic::QuicClient::new(
-                "localhost",
-                vec![b"h3".to_vec()],
-                false,
-                crate::courierust_tls::RootStore::new(),
-                0,
-                TransportParameters::default(),
-                vec![0x66; 8],
-            ),
-            Vec::new(),
-            "localhost".into(),
-            H3Limits {
-                max_header_list: 16 * 1024,
-                max_body: 16 * 1024 * 1024,
-            },
-            None,
-        )
-        .unwrap();
+        let mut conn = raw_client_connection(local_cid, vec![0x55; 8], vec![0x66; 8]);
         // Long header, version 1, DCID length 0xff (> 20, invalid).
         let mut malformed = vec![0x80, 0x00, 0x00, 0x00, 0x01, 0xff, 0x11, 0x22, 0x33, 0x44];
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -6416,6 +6742,7 @@ mod tests {
             &mut peer_max_header_list,
             &mut qpack,
             limits,
+            false,
         )
         .unwrap();
         assert!(
@@ -6456,6 +6783,7 @@ mod tests {
             &mut peer_max_header_list,
             &mut qpack,
             limits,
+            false,
         )
         .is_ok());
     }
@@ -6555,6 +6883,8 @@ mod tests {
         assert!(validate_content_length(&headers, 2).is_err());
     }
 
+    /// RFC 9114 §4.1.2: a response that violates the message rules (here a
+    /// status that forbids a body, carrying one) is a *stream* error.
     #[test]
     fn response_statuses_forbid_http3_body() {
         let fields = vec![FieldLine {
@@ -6562,7 +6892,13 @@ mod tests {
             value: b"204".to_vec(),
             never_indexed: false,
         }];
-        assert!(response_from_fields(fields, b"body".to_vec(), None).is_err());
+        let error = response_from_fields(fields, b"body".to_vec(), None)
+            .expect_err("a 204 with a body is malformed");
+        assert_eq!(
+            error.h3_stream_code(),
+            Some(H3_MESSAGE_ERROR),
+            "got {error:?}"
+        );
     }
 
     /// A pooled HTTP/3 client for loopback tests. Requests go through the
@@ -6668,6 +7004,37 @@ mod tests {
             assert_eq!(response.status, StatusCode::OK);
             assert_eq!(response.body.as_bytes(), Some(path.as_bytes()));
         }
+    }
+
+    /// A `ClientConnection` whose TLS state is deliberately unused, for
+    /// tests that drive the QUIC/H3 layer directly (`receive_stream`,
+    /// `on_datagram`).
+    fn raw_client_connection(
+        local_cid: Vec<u8>,
+        remote_cid: Vec<u8>,
+        initial_dcid: Vec<u8>,
+    ) -> ClientConnection {
+        let transport = QuicTransport::client(local_cid, remote_cid, initial_dcid, None).unwrap();
+        ClientConnection::new(
+            transport,
+            crate::courierust_tls::quic::QuicClient::new(
+                "localhost",
+                vec![b"h3".to_vec()],
+                false,
+                crate::courierust_tls::RootStore::new(),
+                0,
+                TransportParameters::default(),
+                vec![0x66; 8],
+            ),
+            Vec::new(),
+            "localhost".into(),
+            H3Limits {
+                max_header_list: 16 * 1024,
+                max_body: 16 * 1024 * 1024,
+            },
+            None,
+        )
+        .unwrap()
     }
 
     /// Drive a raw `ClientConnection` until the queued request's reply
@@ -6962,6 +7329,239 @@ mod tests {
         assert_eq!(
             trailers.get("checksum").map(|v| v.as_bytes()),
             Some(&b"sha256:abc123"[..])
+        );
+    }
+
+    /// RFC 9114 §4.1.2: a malformed *request* is a stream error, not a
+    /// connection error. The mapping lives where the message is assembled
+    /// from its field section, so the stream layer can tell the two apart.
+    #[test]
+    fn malformed_request_is_a_stream_error() {
+        let fields = vec![
+            FieldLine {
+                name: ":method".into(),
+                value: b"POST".to_vec(),
+                never_indexed: false,
+            },
+            FieldLine {
+                name: ":scheme".into(),
+                value: b"https".to_vec(),
+                never_indexed: false,
+            },
+            FieldLine {
+                name: ":path".into(),
+                value: b"/bad".to_vec(),
+                never_indexed: false,
+            },
+            FieldLine {
+                name: "content-length".into(),
+                value: b"5".to_vec(),
+                never_indexed: false,
+            },
+        ];
+        let error = request_from_fields(fields, b"hi".to_vec())
+            .expect_err("a content-length that does not match the body is malformed");
+        assert_eq!(
+            error.h3_stream_code(),
+            Some(H3_MESSAGE_ERROR),
+            "got {error:?}"
+        );
+    }
+
+    /// RFC 9114 §4.1.2 (client side): a malformed response aborts only its
+    /// own stream. The caller is told, the stream state is released and the
+    /// abort is queued for the socket — the connection is untouched, which
+    /// is the whole point of a *stream* error.
+    #[test]
+    fn malformed_response_aborts_only_its_stream() {
+        let mut conn = raw_client_connection(vec![0x11; 8], vec![0x22; 8], vec![0x33; 8]);
+        let (reply, responses) = std::sync::mpsc::channel();
+        conn.active.insert(
+            0,
+            ActiveRequest {
+                wire: vec![0u8; 64],
+                offset: 0,
+                reply,
+                response: None,
+                deadline: Instant::now() + Duration::from_secs(5),
+                created: Instant::now(),
+                sent_at: None,
+                headers_at: None,
+                credit_blocked: false,
+            },
+        );
+
+        // A response whose body does not match the content-length it
+        // declares — well-formed frames, malformed message.
+        let mut qpack = QpackConnection::new(QPACK_MAX_TABLE_CAPACITY, QPACK_BLOCKED_STREAMS);
+        let block = qpack
+            .encode(
+                &[
+                    (":status".to_string(), b"200".to_vec()),
+                    ("content-length".to_string(), b"5".to_vec()),
+                ],
+                16 * 1024,
+            )
+            .unwrap();
+        let mut wire = h3frame::Frame::Headers(block).to_bytes();
+        wire.extend_from_slice(&h3frame::Frame::Data(b"hi".to_vec()).to_bytes());
+
+        let result = conn.receive_stream(0, 0, &wire, true);
+        assert!(
+            result.is_ok(),
+            "a malformed response must not be connection-fatal: {result:?}"
+        );
+
+        let error = responses
+            .try_recv()
+            .expect("the caller must be told")
+            .expect_err("the malformed response must not be delivered");
+        assert_eq!(
+            error.h3_stream_code(),
+            Some(H3_MESSAGE_ERROR),
+            "got {error:?}"
+        );
+        assert!(
+            !conn.active.contains_key(&0),
+            "the aborted stream must be released"
+        );
+        assert_eq!(conn.pending_stream_signals.len(), 1);
+        let signal = &conn.pending_stream_signals[0];
+        assert_eq!(signal.stream_id, 0);
+        assert_eq!(signal.code, H3_MESSAGE_ERROR);
+        // The request FIN was never sent (offset 0 of 64 wire bytes), so the
+        // abort also resets the send direction at the committed size.
+        assert_eq!(signal.reset_final_size, Some(64));
+        assert!(
+            conn.waiting.is_empty(),
+            "unrelated work must be unaffected by the abort"
+        );
+    }
+
+    /// Drive `conn` for `duration`, discarding inbound datagrams, so a peer
+    /// can act on what was just written before the test's next step.
+    fn drain_for(socket: &std::net::UdpSocket, conn: &mut ClientConnection, duration: Duration) {
+        let mut datagram = [0u8; MAX_DATAGRAM];
+        let deadline = Instant::now() + duration;
+        while Instant::now() < deadline {
+            let _ = conn.on_tick(socket);
+            loop {
+                match socket.recv_from(&mut datagram) {
+                    Ok((n, source)) if n > 0 => {
+                        conn.on_datagram(socket, source, &mut datagram[..n])
+                            .expect("the connection must stay healthy while draining");
+                    }
+                    _ => break,
+                }
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// RFC 9114 §4.1.2 end to end: a server that receives a malformed
+    /// request resets that stream only. The handler never sees it and the
+    /// next request on the *same* connection is served normally — a
+    /// connection-level reaction would have closed the connection and
+    /// failed both halves of this test.
+    #[test]
+    fn loopback_http3_malformed_request_keeps_the_connection() {
+        let identity = crate::courierust_tls::testdata::server_identity();
+        let tls = TlsSettings {
+            identity,
+            alpn: vec![b"h3".to_vec()],
+            ..Default::default()
+        };
+        let served: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = served.clone();
+        let handler: Arc<dyn Handler> = Arc::new(move |request: Request<Body>| {
+            let path = request.uri.as_str().to_string();
+            recorded.lock().unwrap().push(path.clone());
+            Response::<Body>::with_status(StatusCode::OK).with_body(Body::from(path))
+        });
+        let config = ServerConfig {
+            http3: true,
+            tls: Some(tls.clone()),
+            max_body: 1024 * 1024,
+            ..ServerConfig::default()
+        };
+        let (addr, _server) = spawn_h3_server(&tls, handler, config);
+
+        let options = ClientRequestOptions {
+            roots: crate::courierust_tls::testdata::root_store(),
+            verify: true,
+            now: crate::courierust_tls::testdata::NOW,
+            max_header_list: 16 * 1024,
+            max_body: 1024 * 1024,
+            timeout: Some(Duration::from_secs(8)),
+            stats: None,
+        };
+        let (socket, mut conn) = build_client_connection(
+            addr,
+            "localhost",
+            &format!("localhost:{}", addr.port()),
+            &options,
+        )
+        .unwrap();
+        socket.set_nonblocking(true).unwrap();
+
+        // Warm up: handshake, control streams, peer SETTINGS.
+        let (tx, rx) = std::sync::mpsc::channel();
+        conn.queue_request(
+            Request::<Body>::new(Method::GET, "/warmup"),
+            tx,
+            Instant::now() + Duration::from_secs(8),
+        );
+        let response = drive_raw_client(&socket, &[&socket], &mut conn, &rx).unwrap();
+        assert_eq!(response.body.as_bytes(), Some(&b"/warmup"[..]));
+
+        // Hand-write a malformed request — content-length 5, body 2 — on the
+        // stream id the client would use next, then burn that id so the next
+        // real request cannot collide with it.
+        let stream_id = 4 * conn.next_stream_index;
+        conn.next_stream_index += 1;
+        let mut qpack = QpackConnection::new(QPACK_MAX_TABLE_CAPACITY, QPACK_BLOCKED_STREAMS);
+        let block = qpack
+            .encode(
+                &[
+                    (":method".to_string(), b"POST".to_vec()),
+                    (":scheme".to_string(), b"https".to_vec()),
+                    (
+                        ":authority".to_string(),
+                        format!("localhost:{}", addr.port()).into_bytes(),
+                    ),
+                    (":path".to_string(), b"/bad".to_vec()),
+                    ("content-length".to_string(), b"5".to_vec()),
+                ],
+                16 * 1024,
+            )
+            .unwrap();
+        let mut wire = h3frame::Frame::Headers(block).to_bytes();
+        wire.extend_from_slice(&h3frame::Frame::Data(b"hi".to_vec()).to_bytes());
+        conn.transport
+            .send_stream(&socket, APPLICATION, stream_id, &wire, true)
+            .unwrap();
+        drain_for(&socket, &mut conn, Duration::from_millis(250));
+
+        // Still usable afterwards — on the same connection, a new stream.
+        let (tx, rx) = std::sync::mpsc::channel();
+        conn.queue_request(
+            Request::<Body>::new(Method::GET, "/after"),
+            tx,
+            Instant::now() + Duration::from_secs(8),
+        );
+        let response = drive_raw_client(&socket, &[&socket], &mut conn, &rx)
+            .expect("a malformed request must not cost the connection");
+        assert_eq!(response.body.as_bytes(), Some(&b"/after"[..]));
+
+        let served = served.lock().unwrap().clone();
+        assert!(
+            served.contains(&"/after".to_string()),
+            "the connection must keep serving: {served:?}"
+        );
+        assert!(
+            !served.contains(&"/bad".to_string()),
+            "a malformed request must never reach the handler: {served:?}"
         );
     }
 }

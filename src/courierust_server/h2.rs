@@ -4,7 +4,7 @@
 //! responses stream back with flow-control-aware backpressure: channel
 //! bodies are only drained when the connection accepts more data.
 
-use crate::courierust_body::Body;
+use crate::courierust_body::{Body, ChannelStream};
 use crate::courierust_bytes::Bytes;
 use crate::courierust_error::{Error, Result};
 use crate::courierust_h2::connection::{Config as H2Config, Connection, Event};
@@ -19,12 +19,12 @@ use crate::courierust_net::ConnStream;
 use crate::courierust_server::{Handler, ServerConfig};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::TryRecvError;
 use std::sync::Arc;
 
 /// A response body waiting for flow-control room.
 struct Deferred {
-    rx: Receiver<Result<Bytes>>,
+    rx: ChannelStream,
     ending: bool,
     /// Trailing header block to send once the body ends (HTTP/2).
     trailers: Option<Vec<HeaderField>>,
@@ -65,19 +65,22 @@ pub(crate) fn serve(
         s.h2_connections.fetch_add(1, Ordering::Relaxed);
         s.h2_connections_active.fetch_add(1, Ordering::Relaxed);
     }
-    let result = serve_inner(stream, handler, config, None, stats);
+    let result = serve_inner(stream, handler, config, None, false, stats);
     if let Some(s) = stats {
         Stats::decrement(&s.h2_connections_active, 1);
     }
     result
 }
 
-/// Serve the HTTP/2 side of an RFC 7540 §3.2 `h2c` Upgrade.
+/// Serve the HTTP/2 side of an RFC 7540 §3.2 `h2c` Upgrade. `is_head`
+/// is the upgrade request's own method: the response to that request is
+/// delivered on stream 1 and obeys the same no-content rule as any other.
 pub(crate) fn serve_upgraded(
     stream: &ConnStream,
     handler: &dyn Handler,
     config: &ServerConfig,
     resp: Response<Body>,
+    is_head: bool,
 ) -> Result<()> {
     read_preface(stream)?;
     configure_read_timeout(stream);
@@ -87,7 +90,7 @@ pub(crate) fn serve_upgraded(
         s.h2_connections.fetch_add(1, Ordering::Relaxed);
         s.h2_connections_active.fetch_add(1, Ordering::Relaxed);
     }
-    let result = serve_inner(stream, handler, config, Some(resp), stats);
+    let result = serve_inner(stream, handler, config, Some(resp), is_head, stats);
     if let Some(s) = stats {
         Stats::decrement(&s.h2_connections_active, 1);
     }
@@ -101,6 +104,7 @@ fn serve_inner(
     handler: &dyn Handler,
     config: &ServerConfig,
     upgrade_resp: Option<Response<Body>>,
+    upgrade_is_head: bool,
     stats: Option<&Stats>,
 ) -> Result<()> {
     // Transport call counters: real ones when stats are attached, inert
@@ -118,7 +122,7 @@ fn serve_inner(
         conn.register_upgrade_stream()?;
         let mut req_bodies: HashMap<u32, RequestBuilder> = HashMap::new();
         let mut deferred: HashMap<u32, Deferred> = HashMap::new();
-        send_response(&mut conn, 1, resp, &mut deferred)?;
+        send_response(&mut conn, 1, resp, upgrade_is_head, &mut deferred)?;
         return serve_loop(
             &mut conn,
             stream,
@@ -199,11 +203,19 @@ fn serve_loop(
                         s.h2_streams_total.fetch_add(1, Ordering::Relaxed);
                     }
                     if end_stream {
+<<<<<<< HEAD
                         let resp = handler.handle_connected(
                             &connection_info,
                             build_request(&headers, Body::Empty)?,
                         );
                         send_response(conn, stream_id, resp, deferred)?;
+=======
+                        let request = build_request(&headers, Body::Empty)?;
+                        let is_head =
+                            request.method == crate::courierust_http::method::Method::HEAD;
+                        let resp = handler.handle(request);
+                        send_response(conn, stream_id, resp, is_head, deferred)?;
+>>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
                     } else {
                         req_bodies.insert(
                             stream_id,
@@ -233,11 +245,19 @@ fn serve_loop(
                                 } else {
                                     Body::Bytes(Bytes::from(rb.body))
                                 };
+<<<<<<< HEAD
                                 let resp = handler.handle_connected(
                                     &connection_info,
                                     build_request(&rb.headers, body)?,
                                 );
                                 send_response(conn, stream_id, resp, deferred)?;
+=======
+                                let request = build_request(&rb.headers, body)?;
+                                let is_head =
+                                    request.method == crate::courierust_http::method::Method::HEAD;
+                                let resp = handler.handle(request);
+                                send_response(conn, stream_id, resp, is_head, deferred)?;
+>>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
                             }
                         }
                     }
@@ -412,6 +432,7 @@ fn send_response(
     conn: &mut Connection<Counting<&ConnStream>, Counting<&ConnStream>>,
     sid: u32,
     resp: Response<Body>,
+    is_head: bool,
     deferred: &mut HashMap<u32, Deferred>,
 ) -> Result<()> {
     let fields = response_fields(&resp);
@@ -419,13 +440,17 @@ fn send_response(
     enum K {
         Empty,
         Bytes(Bytes),
-        Channel(Receiver<Result<Bytes>>),
+        Channel(ChannelStream),
     }
     let kind = match resp.body {
+        // RFC 9113 §8.1: a response to HEAD has the header fields a GET
+        // would and no content, so the stream ends at the header block.
+        _ if is_head => K::Empty,
         Body::Empty => K::Empty,
         Body::Bytes(b) if b.is_empty() => K::Empty,
         Body::Bytes(b) => K::Bytes(b),
-        Body::Channel(rx) => K::Channel(rx),
+        Body::Channel(rx) => K::Channel(ChannelStream::raw(rx)),
+        Body::Stream(stream) => K::Channel(stream),
     };
     let has_trailers = trailers.is_some();
     match kind {

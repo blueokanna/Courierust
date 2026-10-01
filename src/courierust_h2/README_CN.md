@@ -30,7 +30,7 @@ HTTP/2（RFC 9113）：帧、流状态机、流控、RFC 9218 优先级。`no_st
 
 ## 加固
 
-这层把对端每个字节都当恶意：HPACK 炸弹（整数溢出、头列表上限、动态表大小、Huffman EOS/padding）、流控窗口溢出（`FLOW_CONTROL_ERROR`）、无 body 消息上的 DATA、流结束时的 `content-length` 不匹配、idle 流上的 RST、`SETTINGS_TIMEOUT`、keepalive 死对端检测。30 个加固测试就是干这个的。
+这层把对端每个字节都当恶意：HPACK 炸弹（整数溢出、头列表上限、动态表大小、Huffman EOS/padding）、流控窗口溢出（`FLOW_CONTROL_ERROR`）、无 body 消息上的 DATA、流结束时的 `content-length` 不匹配、idle 流上的 RST、`SETTINGS_TIMEOUT`、keepalive 死对端检测。39 个加固测试就是干这个的。
 
 ## 用法
 

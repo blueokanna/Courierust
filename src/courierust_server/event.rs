@@ -20,11 +20,11 @@
 //! Scope: TLS and HTTP/2 connections still use the blocking pool; a
 //! long-blocking synchronous handler still occupies a worker.
 
-use crate::courierust_body::Body;
+use crate::courierust_body::{Body, ChannelStream};
 use crate::courierust_bytes::Bytes;
 use crate::courierust_error::{Error, Result};
 use crate::courierust_h1;
-use crate::courierust_http::header::{HeaderMap, HeaderName, HeaderValue};
+use crate::courierust_http::header::HeaderMap;
 use crate::courierust_http::request::Request;
 use crate::courierust_http::response::Response;
 use crate::courierust_http::version::Version;
@@ -34,7 +34,7 @@ use crate::courierust_server::{Handler, ServerConfig};
 use std::collections::{HashMap, HashSet};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -48,6 +48,21 @@ const MAX_HEADER_BLOCK: usize = 1024 * 1024;
 /// event workers. Batching amortizes the shared channel + mutex so a
 /// burst of ready connections cannot serialize one send/recv per id.
 const DISPATCH_BATCH: usize = 16;
+
+/// Poll cadence for a parked streaming response body (ms).
+///
+/// A producer without a wake — a raw [`Body::Channel`] built from a plain
+/// `std::sync::mpsc` pair — can only be noticed by polling, so its first
+/// polls are fast and double up to [`BODY_POLL_MAX_MS`] while the stream
+/// stays silent: a slow chunk still goes out promptly, and a quiet stream
+/// costs a bounded number of dispatches per second instead of a worker
+/// thread.
+const BODY_POLL_MIN_MS: u64 = 1;
+const BODY_POLL_MAX_MS: u64 = 16;
+/// Poll cadence for a body that *did* install a wake (ms). The deadline
+/// then only enforces `read_timeout` and covers a wake lost to a dispatch
+/// race, so it can be coarse.
+const BODY_POLL_WAKE_MS: u64 = 25;
 
 /// Cached `COURIERUST_H1_TRACE` presence. The per-request segment timing
 /// reads it at connection construction and per segment, so it is cached
@@ -90,6 +105,17 @@ enum EventMsg {
         fd: Fd,
         want_write: bool,
     },
+    /// A streaming response body produced another chunk: dispatch the
+    /// connection so its worker can write it.
+    ///
+    /// The message carries no descriptor on purpose: an application
+    /// thread is the sender, and it may fire after the connection it
+    /// belonged to is gone. The reactor resolves the id against its own
+    /// tables, so a stale wake is a no-op rather than a registration of a
+    /// recycled file descriptor.
+    BodyChunk {
+        id: usize,
+    },
     Closed {
         id: usize,
         /// A handle the reactor keeps alive until it has stopped
@@ -101,6 +127,14 @@ enum EventMsg {
         /// descriptor fails as a whole on Winsock. Holding one handle
         /// across the handover makes "stop watching" strictly happen
         /// before "close", so the failure cannot be reached at all.
+        socket: Option<Arc<TcpStream>>,
+    },
+    /// A worker handed this connection to a tunnel thread: stop watching
+    /// the descriptor. The connection slot stays counted until the tunnel
+    /// reports `Closed`, so a herd of tunnels is still bounded by
+    /// `max_connections`.
+    Detach {
+        id: usize,
         socket: Option<Arc<TcpStream>>,
     },
 }
@@ -138,6 +172,26 @@ enum StepOutcome {
     /// WebSocket registry, where it stays in the reactor for its whole
     /// life instead of occupying a thread.
     Upgrade(Box<crate::courierust_server::ws::WsEventConn>),
+    /// The connection became a tunnel: its handshake response is on the
+    /// wire, and a dedicated thread runs the service on it.
+    Tunnel(Box<TunnelJob>),
+}
+
+/// A connection leaving the reactor for a [`TunnelService`].
+///
+/// [`TunnelService`]: crate::courierust_server::TunnelService
+struct TunnelJob {
+    plan: crate::courierust_server::TunnelPlan,
+    /// The same socket handle the reactor held: handing it over is what
+    /// keeps the descriptor open after the reactor stops watching it, and
+    /// no second descriptor is created for one connection.
+    socket: Arc<TcpStream>,
+    /// Bytes the peer sent behind the request head (a TLS `ClientHello`
+    /// right after `CONNECT`, typically). They must reach the service
+    /// before anything it reads from the socket.
+    leftover: Vec<u8>,
+    /// Whether the connection arrived over TLS.
+    secure: bool,
 }
 
 /// The protocol class of a fresh connection, decided from its first
@@ -334,6 +388,23 @@ impl IncrRequest {
         }
     }
 
+    /// Take the bytes that arrived behind the request the server just
+    /// finished parsing.
+    ///
+    /// A tunnel's first payload usually travels with its handshake (a TLS
+    /// `ClientHello` behind `CONNECT`, a preamble behind any other
+    /// upgrade), and those bytes were read into this buffer by the parser.
+    /// They are handed to the tunnel as a seed, so the connection's first
+    /// read returns them before a socket read is attempted.
+    pub(crate) fn take_remaining(&mut self) -> Vec<u8> {
+        let tail = self.buf[self.pos..].to_vec();
+        self.buf.clear();
+        self.pos = 0;
+        self.line.clear();
+        self.phase = Phase::RequestLine;
+        tail
+    }
+
     /// Try to produce the next request. Reads from `socket` as needed
     /// (non-blocking); returns `Ok(None)` when more data is required.
     pub(crate) fn next_request(
@@ -408,6 +479,7 @@ impl IncrRequest {
                         self.header_started_at = None;
                         self.phase = match bl {
                             courierust_h1::BodyLen::None => Phase::Done,
+                            courierust_h1::BodyLen::Length(0) => Phase::Done,
                             courierust_h1::BodyLen::Length(n) => {
                                 if n > self.body_limit {
                                     return Err(Error::overflow("request body too large"));
@@ -582,6 +654,51 @@ impl IncrRequest {
 // ---------------------------------------------------------------------
 
 /// An active event-loop HTTP/1.1 connection.
+/// The receive side of a streaming response body, plus the park state the
+/// reactor needs while the producer is between chunks.
+///
+/// One type covers both body variants: a raw [`Body::Channel`] wraps a
+/// plain channel ([`ChannelStream::raw`]) and a [`Body::Stream`] carries
+/// the producer wake handle that makes delivery immediate.
+struct BodyRx {
+    stream: ChannelStream,
+    /// When the current wait for the next chunk began. The per-chunk
+    /// `read_timeout` is measured from here, exactly like the blocking
+    /// driver's `recv_timeout`.
+    wait_started: Option<Instant>,
+    /// Consecutive dispatches that found the queue empty: the poll
+    /// backoff for a producer that cannot wake us.
+    empty_polls: u32,
+    /// When the reactor must re-dispatch this connection to look at the
+    /// body again. `None` while the connection is being processed.
+    poll_at: Option<Instant>,
+}
+
+impl BodyRx {
+    fn new(stream: ChannelStream) -> Self {
+        Self {
+            stream,
+            wait_started: None,
+            empty_polls: 0,
+            poll_at: None,
+        }
+    }
+}
+
+/// How long to wait before polling a parked body again.
+///
+/// A body with a wake is polled coarsely (the deadline only enforces the
+/// read timeout and covers a lost wake). Without one, the poll *is* the
+/// progress path, so it starts at 1 ms and backs off to 16 ms; a chunk
+/// resets it, so a bursty stream is never charged the backoff.
+fn body_poll_delay(body: &BodyRx) -> Duration {
+    if body.stream.has_wake() {
+        return Duration::from_millis(BODY_POLL_WAKE_MS);
+    }
+    let shift = body.empty_polls.min(4);
+    Duration::from_millis((BODY_POLL_MIN_MS << shift).min(BODY_POLL_MAX_MS))
+}
+
 struct EventConn {
     socket: Arc<TcpStream>,
     /// The peer's address, resolved once: a handler that asks for it must
@@ -593,6 +710,10 @@ struct EventConn {
         crate::courierust_server::ws::WsPlan,
         Arc<dyn crate::courierust_server::ws::WsService>,
     )>,
+    /// Set once a tunnel head has been queued: the next moment the head is
+    /// fully written, this connection leaves the reactor for a tunnel
+    /// thread.
+    pending_tunnel: Option<crate::courierust_server::TunnelPlan>,
     /// Late-bound reactor wakeup, installed by the worker.
     wake_slot: Arc<crate::courierust_server::ws::WakeSlot>,
     reader: IncrRequest,
@@ -600,6 +721,15 @@ struct EventConn {
     out: Vec<u8>,
     /// Write cursor into `out`.
     out_pos: usize,
+    /// Body of a streaming response that is still being produced. The
+    /// head has already been written; each chunk is written as it
+    /// arrives, so `out` never holds more than one chunk, and the worker
+    /// parks between chunks instead of blocking on the channel.
+    stream_rx: Option<BodyRx>,
+    /// True once the reactor's wake has been installed into `wake_slot`.
+    /// Armed on the first dispatch: a wake must be in place before any
+    /// body exists, and every later response reuses it.
+    wake_armed: bool,
     keep_alive: bool,
     /// Transport read-call counter (h1 syscall evidence), when attached.
     reads: Option<Arc<AtomicUsize>>,
@@ -652,10 +782,13 @@ impl EventConn {
             socket: Arc::new(socket),
             peer,
             pending_upgrade: None,
+            pending_tunnel: None,
             wake_slot,
             reader: IncrRequest::new(body_limit, header_limit, trace),
             out: Vec::new(),
             out_pos: 0,
+            stream_rx: None,
+            wake_armed: false,
             keep_alive: true,
             reads,
             writes,
@@ -681,6 +814,51 @@ impl EventConn {
         self.out_pos < self.out.len()
     }
 
+    /// Install the reactor's wake callback into this connection, once.
+    ///
+    /// Called by the worker, which is the only component that holds the
+    /// reactor's dispatch handle. A streaming body fires this slot from
+    /// the producer's thread, so a chunk goes out the moment it exists
+    /// instead of when a poll tick notices it. `make` is only invoked the
+    /// first time: every later response reuses the wake already armed.
+    fn arm_wake(&mut self, make: impl FnOnce() -> Arc<dyn Fn() + Send + Sync>) {
+        if self.wake_armed {
+            return;
+        }
+        self.wake_slot.set(make());
+        self.wake_armed = true;
+    }
+
+    /// Point a freshly installed streaming body at this connection's wake
+    /// slot. The body's producer fires the slot on every chunk.
+    fn attach_body_wake(&self, stream: &ChannelStream) {
+        let slot = self.wake_slot.clone();
+        stream.install_wake(move || slot.fire());
+    }
+
+    /// Adopt a freshly built response body.
+    ///
+    /// The wake is installed before the body is stored: the producer may
+    /// already have queued a chunk, and a body that missed its wake would
+    /// otherwise wait for the poll deadline.
+    fn set_stream(&mut self, stream: Option<ChannelStream>) {
+        if let Some(stream) = &stream {
+            self.attach_body_wake(stream);
+        }
+        self.stream_rx = stream.map(BodyRx::new);
+    }
+
+    /// Whether this connection is parked on a body chunk whose poll
+    /// deadline has already elapsed.
+    fn body_poll_due(&self, now: Instant) -> bool {
+        self.body_poll_at().is_some_and(|at| at <= now)
+    }
+
+    /// When the parked streaming body must be polled again.
+    fn body_poll_at(&self) -> Option<Instant> {
+        self.stream_rx.as_ref().and_then(|body| body.poll_at)
+    }
+
     /// Process the connection one step (non-blocking). Serves as many
     /// pipelined requests as are fully buffered, then returns how to
     /// continue.
@@ -689,6 +867,12 @@ impl EventConn {
         loop {
             if self.out_pos < self.out.len() {
                 let outcome = self.write_more()?;
+                if !matches!(outcome, StepOutcome::Idle) {
+                    return Ok(outcome);
+                }
+            }
+            if self.stream_rx.is_some() {
+                let outcome = self.pump_body(config)?;
                 if !matches!(outcome, StepOutcome::Idle) {
                     return Ok(outcome);
                 }
@@ -704,6 +888,14 @@ impl EventConn {
                     self.wake_slot.clone(),
                 );
                 return Ok(StepOutcome::Upgrade(Box::new(conn)));
+            }
+            if let Some(plan) = self.pending_tunnel.take() {
+                return Ok(StepOutcome::Tunnel(Box::new(TunnelJob {
+                    plan,
+                    socket: self.socket.clone(),
+                    leftover: self.reader.take_remaining(),
+                    secure: config.tls.is_some(),
+                })));
             }
             let parse = seg_start(trace);
             let request = match self.reader.next_request(
@@ -744,31 +936,26 @@ impl EventConn {
                                 .parse_us
                                 .saturating_add(done.duration_since(first_read).as_micros() as u64);
                         } else {
-                            // Defensive: no read observed (should not
-                            // happen for a completed request); fall back
-                            // to charging the whole span to parse.
                             seg_end(&mut self.parse_us, parse);
                         }
                     } else {
                         seg_end(&mut self.parse_us, parse);
                     }
                     let request_close = courierust_h1::wants_close(&req.headers);
+                    let is_head = req.method == crate::courierust_http::method::Method::HEAD;
 
-                    // RFC 9112 §3.2: an HTTP/1.1 request must carry
-                    // exactly one non-empty `Host`. Refused before the
-                    // WebSocket decision and before the handler, so an
-                    // ambiguous request cannot be routed at all.
                     if let Some(reason) =
                         courierust_h1::host_header_error(req.version, &req.headers)
                     {
                         self.out.clear();
-                        let keep_alive = build_response(
+                        let (keep_alive, stream) = build_response(
                             crate::courierust_server::h1::error_response(400, reason),
-                            config,
                             request_close,
+                            is_head,
                             &mut self.out,
                         )?;
                         self.out_pos = 0;
+                        self.set_stream(stream);
                         self.keep_alive = keep_alive;
                         let outcome = self.write_more()?;
                         match outcome {
@@ -784,13 +971,15 @@ impl EventConn {
                             let handle = seg_start(trace);
                             seg_end(&mut self.handler_us, handle);
                             self.out.clear();
-                            let keep_alive =
-                                build_response(resp, config, request_close, &mut self.out)?;
+                            let (keep_alive, stream) =
+                                build_response(resp, request_close, is_head, &mut self.out)?;
                             self.out_pos = 0;
+                            self.set_stream(stream);
                             self.keep_alive = keep_alive;
                             let outcome = self.write_more()?;
                             match outcome {
                                 StepOutcome::Idle => continue,
+                                StepOutcome::Close if self.stream_rx.is_some() => continue,
                                 other => return Ok(other),
                             }
                         }
@@ -810,6 +999,42 @@ impl EventConn {
                         }
                     }
 
+                    // ---- raw tunnel (CONNECT / custom upgrade) ---------
+                    match handler.tunnel(&req) {
+                        crate::courierust_server::TunnelReply::Pass => {}
+                        crate::courierust_server::TunnelReply::Refuse(resp) => {
+                            let handle = seg_start(trace);
+                            seg_end(&mut self.handler_us, handle);
+                            self.out.clear();
+                            let (keep_alive, stream) =
+                                build_response(resp, request_close, is_head, &mut self.out)?;
+                            self.out_pos = 0;
+                            self.set_stream(stream);
+                            self.keep_alive = keep_alive;
+                            let outcome = self.write_more()?;
+                            match outcome {
+                                StepOutcome::Idle => continue,
+                                StepOutcome::Close if self.stream_rx.is_some() => continue,
+                                other => return Ok(other),
+                            }
+                        }
+                        crate::courierust_server::TunnelReply::Accept(plan) => {
+                            let handle = seg_start(trace);
+                            seg_end(&mut self.handler_us, handle);
+                            self.out.clear();
+                            courierust_h1::write_response_head(
+                                &mut self.out,
+                                plan.status,
+                                Version::HTTP_11,
+                                &plan.headers,
+                            )?;
+                            self.out_pos = 0;
+                            self.keep_alive = false;
+                            self.pending_tunnel = Some(plan);
+                            continue;
+                        }
+                    }
+
                     let handle = seg_start(trace);
                     // The event-driven scheduler is the clear-text path; TLS
                     // connections are served by the blocking loop.
@@ -821,9 +1046,11 @@ impl EventConn {
                     seg_end(&mut self.handler_us, handle);
                     self.out.clear();
                     let build = seg_start(trace);
-                    let keep_alive = build_response(resp, config, request_close, &mut self.out)?;
+                    let (keep_alive, stream) =
+                        build_response(resp, request_close, is_head, &mut self.out)?;
                     seg_end(&mut self.build_us, build);
                     self.out_pos = 0;
+                    self.set_stream(stream);
                     self.keep_alive = keep_alive;
                     let write = seg_start(trace);
                     let outcome = self.write_more()?;
@@ -835,6 +1062,7 @@ impl EventConn {
                         StepOutcome::Idle => {
                             continue;
                         }
+                        StepOutcome::Close if self.stream_rx.is_some() => continue,
                         other => return Ok(other),
                     }
                 }
@@ -849,8 +1077,68 @@ impl EventConn {
         }
     }
 
+<<<<<<< HEAD
     fn header_timeout_remaining(&self, timeout: Duration, now: Instant) -> Option<Duration> {
         self.reader.header_timeout_remaining(timeout, now)
+=======
+    /// Pump a channel response body as chunked encoding.
+    ///
+    /// Each chunk is written as far as the socket allows before the next
+    /// one is pulled, so a long — even endless — stream costs one chunk
+    /// of memory rather than the whole body, and the client sees the
+    /// head immediately instead of after the stream ends. A producer
+    /// that stalls past the read timeout fails the connection *without*
+    /// the terminating chunk, so a truncated body is detectable; that
+    /// matches the blocking driver.
+    ///
+    /// The worker never blocks here. When the queue is empty the
+    /// connection is parked (zero workers held for a stream) and the
+    /// reactor re-dispatches it when the producer fires the wake, or when
+    /// the poll deadline armed below elapses — the latter is the only
+    /// progress path for a producer that installed no wake.
+    fn pump_body(&mut self, config: &ServerConfig) -> Result<StepOutcome> {
+        let Some(mut body) = self.stream_rx.take() else {
+            return Ok(StepOutcome::Idle);
+        };
+        loop {
+            match body.stream.try_recv() {
+                Ok(Ok(chunk)) => {
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    body.wait_started = None;
+                    body.empty_polls = 0;
+                    self.out.clear();
+                    self.out_pos = 0;
+                    courierust_h1::encode_chunk(&chunk, &mut self.out);
+                    if matches!(self.write_more()?, StepOutcome::NeedWrite) {
+                        self.stream_rx = Some(body);
+                        return Ok(StepOutcome::NeedWrite);
+                    }
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(TryRecvError::Empty) => {
+                    if let Some(timeout) = config.read_timeout {
+                        let started = *body.wait_started.get_or_insert_with(Instant::now);
+                        if started.elapsed() >= timeout {
+                            return Err(Error::timeout("body stream timed out"));
+                        }
+                    }
+                    body.empty_polls = body.empty_polls.saturating_add(1);
+                    body.poll_at = Some(Instant::now() + body_poll_delay(&body));
+                    self.stream_rx = Some(body);
+                    return Ok(StepOutcome::Idle);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    body.stream.clear_wake();
+                    self.out.clear();
+                    self.out_pos = 0;
+                    self.out.extend_from_slice(courierust_h1::CHUNKED_END);
+                    return self.write_more();
+                }
+            }
+        }
+>>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
     }
 
     /// Write pending output; returns the continuation.
@@ -942,89 +1230,36 @@ impl EventConn {
     }
 }
 
-/// Serialize a response (head + body, chunked for channel bodies) into
-/// `out` and decide keep-alive. The caller owns the buffer (`out` is the
-/// connection's write buffer), so steady-state responses perform no
-/// per-request allocation. `request_close` reflects a request
-/// `Connection: close` token, which forces the connection closed (RFC
-/// 7230 §6.3).
+/// Serialize the response head (and any in-memory body) into `out`,
+/// returning the keep-alive decision and, for a channel body, the stream
+/// the caller must pump.
+///
+/// The caller owns the buffer (`out` is the connection's write buffer),
+/// so steady-state responses perform no per-request allocation.
+/// `request_close` reflects a request `Connection: close` token, which
+/// forces the connection closed (RFC 7230 §6.3).
+///
+/// A channel body is deliberately *not* buffered here: collecting it
+/// would hold a whole (possibly endless) stream in memory before the
+/// first byte reaches the client, and a producer that stalls would end
+/// up closing the connection as if the response were complete.
 fn build_response(
     resp: Response<Body>,
-    config: &ServerConfig,
     request_close: bool,
+    is_head: bool,
     out: &mut Vec<u8>,
-) -> Result<bool> {
-    let keep_alive = !request_close
-        && courierust_h1::keep_alive_requested(resp.version, &resp.headers)
-        && resp.version != Version::HTTP_10;
-
-    let mut out_headers = HeaderMap::with_capacity(resp.headers.len() + 3);
-    for (n, v) in resp.headers.iter() {
-        if courierust_h1::is_hop_by_hop(n.as_str()) {
-            continue;
-        }
-        out_headers.append(n.clone(), v.clone());
-    }
-    let chunked = matches!(resp.body, Body::Channel(_));
-    let body_len = match &resp.body {
-        Body::Bytes(b) => Some(b.len()),
-        _ => None,
-    };
-    if chunked {
-        out_headers.insert(
-            HeaderName::from_lowercase("transfer-encoding"),
-            HeaderValue::from_static("chunked"),
-        );
-    } else if let Some(n) = body_len {
-        let cl = courierust_h1::IToA::new(n);
-        out_headers.insert(
-            HeaderName::from_lowercase("content-length"),
-            HeaderValue::from_bytes(cl.as_slice())?,
-        );
-    } else if !(resp.status.is_informational()
-        || resp.status == crate::courierust_http::status::StatusCode::NO_CONTENT
-        || resp.status == crate::courierust_http::status::StatusCode::NOT_MODIFIED)
-    {
-        out_headers.insert(
-            HeaderName::from_lowercase("content-length"),
-            HeaderValue::from_static("0"),
-        );
-    }
-    out_headers.insert(
-        HeaderName::from_lowercase("connection"),
-        HeaderValue::from_static(if keep_alive { "keep-alive" } else { "close" }),
-    );
-
-    courierust_h1::write_response_head(out, resp.status, Version::HTTP_11, &out_headers)?;
+) -> Result<(bool, Option<ChannelStream>)> {
+    let keep_alive = crate::courierust_server::h1::response_wire_head(&resp, request_close, out)?;
     match resp.body {
-        Body::Empty => {}
-        Body::Bytes(b) => out.extend_from_slice(&b),
-        Body::Channel(rx) => {
-            let timeout = config.read_timeout;
-            loop {
-                let chunk = match timeout {
-                    Some(t) => rx.recv_timeout(t).map_err(|_| ()),
-                    None => rx.recv().map_err(|_| ()),
-                };
-                match chunk {
-                    Ok(c) => {
-                        let b = c?;
-                        if b.is_empty() {
-                            continue;
-                        }
-                        let sz = courierust_h1::IToA::new(b.len());
-                        out.extend_from_slice(sz.as_slice());
-                        out.extend_from_slice(b"\r\n");
-                        out.extend_from_slice(&b);
-                        out.extend_from_slice(b"\r\n");
-                    }
-                    Err(()) => break,
-                }
-            }
-            out.extend_from_slice(b"0\r\n\r\n");
+        _ if is_head => Ok((keep_alive, None)),
+        Body::Empty => Ok((keep_alive, None)),
+        Body::Bytes(b) => {
+            out.extend_from_slice(&b);
+            Ok((keep_alive, None))
         }
+        Body::Channel(rx) => Ok((keep_alive, Some(ChannelStream::raw(rx)))),
+        Body::Stream(stream) => Ok((keep_alive, Some(stream))),
     }
-    Ok(keep_alive)
 }
 
 // ---------------------------------------------------------------------
@@ -1040,6 +1275,7 @@ pub(crate) fn serve_event(
     handler: Arc<dyn Handler>,
     config: ServerConfig,
     pool: Arc<crate::courierust_pool::ThreadPool>,
+    stop: crate::courierust_server::ServerStop,
 ) -> std::io::Result<()> {
     let (msg_tx, msg_rx) = channel::<EventMsg>();
     let (ready_tx, ready_rx): (Sender<Vec<usize>>, Receiver<Vec<usize>>) = channel();
@@ -1048,22 +1284,28 @@ pub(crate) fn serve_event(
     let (wake_reader, wake_writer) = wakeup_pair()?;
     let wake_writer = Arc::new(wake_writer);
 
-    // Event loop thread (owns the poller + pending/activity state).
+    stop.install_reactor_wake(wake_writer.try_clone()?);
+    stop.install_listener(listener.try_clone()?);
+
     let loop_handler = handler.clone();
     let loop_config = config.clone();
     let loop_pool = pool.clone();
     let loop_registries = registries.clone();
+    let loop_stop = stop.clone();
     let event_thread = thread::Builder::new()
         .name("courierust-event".into())
         .spawn(move || {
             event_loop(
                 msg_rx,
-                ready_tx,
-                loop_handler,
-                loop_config,
-                loop_pool,
-                loop_registries,
                 wake_reader,
+                LoopContext {
+                    ready_tx,
+                    handler: loop_handler,
+                    config: loop_config,
+                    pool: loop_pool,
+                    registries: loop_registries,
+                    stop: loop_stop,
+                },
             );
         })?;
 
@@ -1102,10 +1344,11 @@ pub(crate) fn serve_event(
     let a_msg_tx = msg_tx.clone();
     let a_wake = wake_writer.clone();
     let a_stats = config.stats.clone();
+    let a_stop = stop.clone();
     let accept_thread = thread::Builder::new()
         .name("courierust-accept".into())
         .spawn(move || {
-            accept_loop(listener, a_msg_tx, &a_wake, a_stats.as_deref());
+            accept_loop(listener, a_msg_tx, &a_wake, a_stats.as_deref(), &a_stop);
         })?;
 
     let _ = accept_thread.join();
@@ -1149,6 +1392,72 @@ pub(crate) fn drain_wake(r: &TcpStream) {
     }
 }
 
+/// The WebSocket connections whose keepalive or close-handshake deadline
+/// has elapsed.
+///
+/// Nothing a silent peer does makes a descriptor ready, so these
+/// connections are dispatched on the clock rather than on readiness.
+fn ws_due_ids(registries: &Registries, now: Instant) -> Vec<usize> {
+    let ws = registries.ws.lock().unwrap();
+    ws.iter()
+        .filter(|(_, conn)| conn.next_deadline().is_some_and(|d| d <= now))
+        .map(|(&id, _)| id)
+        .collect()
+}
+
+/// Parked streaming responses whose poll deadline has elapsed.
+///
+/// A producer that installed no wake can only be noticed by polling, and
+/// the same deadline is what turns a stalled producer into the read
+/// timeout — neither of which socket readiness can deliver.
+fn h1_body_due_ids(registries: &Registries, now: Instant) -> Vec<usize> {
+    registries
+        .h1
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, conn)| conn.body_poll_due(now))
+        .map(|(&id, _)| id)
+        .collect()
+}
+
+/// The earliest streaming-body poll deadline, so the reactor's wait can
+/// end when the first one comes due.
+fn h1_body_next_deadline(registries: &Registries) -> Option<Instant> {
+    registries
+        .h1
+        .lock()
+        .unwrap()
+        .values()
+        .filter_map(|conn| conn.body_poll_at())
+        .min()
+}
+
+/// Re-dispatch a parked connection for a producer-side event.
+///
+/// Nothing is looked up first: the worker that receives the id resolves
+/// it, so a wake that arrives after its connection closed costs one
+/// lookup instead of risking a registration of a recycled descriptor.
+fn wake_connection(id: usize, poller: &mut Poller, ready_tx: &Sender<Vec<usize>>) {
+    if id == WAKE_ID {
+        return;
+    }
+    poller.unregister(id);
+    let _ = ready_tx.send(vec![id]);
+}
+
+/// The earliest keepalive/close deadline across the live WebSocket
+/// connections, so the reactor's wait can end when the first one is due.
+fn ws_next_deadline(registries: &Registries) -> Option<Instant> {
+    registries
+        .ws
+        .lock()
+        .unwrap()
+        .values()
+        .filter_map(|conn| conn.next_deadline())
+        .min()
+}
+
 /// Rebuild the reactor's wait set from the live connections.
 ///
 /// The registries are the source of truth: sockets still being
@@ -1178,18 +1487,35 @@ fn rebuild_wait_set(
     }
 }
 
+/// The reactor's mutable state, borrowed for one control message.
+///
+/// The three tables belong together — a message that registers a socket
+/// also refreshes its activity clock — so they travel as one value
+/// instead of being threaded through every call separately.
+struct Reactor<'a> {
+    poller: &'a mut Poller,
+    pending: &'a mut HashMap<usize, TcpStream>,
+    activity: &'a mut HashMap<usize, Instant>,
+}
+
 /// Apply one control message to the poller / pending / activity state.
 /// Used by both the message-drain path and the block-on-channel path, so
 /// a message consumed from the channel is never dropped.
 fn handle_msg(
     msg: EventMsg,
-    poller: &mut Poller,
-    pending: &mut HashMap<usize, TcpStream>,
-    activity: &mut HashMap<usize, Instant>,
+    reactor: Reactor<'_>,
+    registries: &Registries,
+    ready_tx: &Sender<Vec<usize>>,
     max_connections: usize,
     stats: Option<&Stats>,
 ) {
+    let Reactor {
+        poller,
+        pending,
+        activity,
+    } = reactor;
     match msg {
+        EventMsg::BodyChunk { id } => wake_connection(id, poller, ready_tx),
         EventMsg::NewConn {
             id,
             stream,
@@ -1218,6 +1544,13 @@ fn handle_msg(
             }
         }
         EventMsg::Register { id, fd, want_write } => {
+            let want_write = registries
+                .ws
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|c| c.has_queued_output())
+                .unwrap_or(want_write);
             activity.insert(id, Instant::now());
             poller.register(id, fd, want_write);
         }
@@ -1231,20 +1564,38 @@ fn handle_msg(
             }
             drop(socket);
         }
+        EventMsg::Detach { id, socket } => {
+            poller.unregister(id);
+            pending.remove(&id);
+            drop(socket);
+        }
     }
 }
 
-/// The event loop: polls sockets, classifies new connections, and
-/// dispatches ready HTTP/1.1 and WebSocket connections to workers.
-fn event_loop(
-    msg_rx: Receiver<EventMsg>,
+/// The reactor's shared state: everything the event loop needs that does
+/// not change while it runs. Bundled so the loop takes a channel, the
+/// wake pipe and *one* context — a signature that grows a parameter per
+/// feature is how a loop stops being readable.
+struct LoopContext {
     ready_tx: Sender<Vec<usize>>,
     handler: Arc<dyn Handler>,
     config: ServerConfig,
     pool: Arc<crate::courierust_pool::ThreadPool>,
     registries: Registries,
-    wake_reader: TcpStream,
-) {
+    stop: crate::courierust_server::ServerStop,
+}
+
+/// The event loop: polls sockets, classifies new connections, and
+/// dispatches ready HTTP/1.1 and WebSocket connections to workers.
+fn event_loop(msg_rx: Receiver<EventMsg>, wake_reader: TcpStream, context: LoopContext) {
+    let LoopContext {
+        ready_tx,
+        handler,
+        config,
+        pool,
+        registries,
+        stop,
+    } = context;
     let mut poller = Poller::new();
     let mut pending: HashMap<usize, TcpStream> = HashMap::new();
     let mut activity: HashMap<usize, Instant> = HashMap::new();
@@ -1258,6 +1609,9 @@ fn event_loop(
     let header_timeout = config.request_header_timeout;
 
     loop {
+        if stop.is_requested() {
+            return;
+        }
         let mut drained = 0usize;
         loop {
             match msg_rx.try_recv() {
@@ -1265,9 +1619,13 @@ fn event_loop(
                     drained += 1;
                     handle_msg(
                         msg,
-                        &mut poller,
-                        &mut pending,
-                        &mut activity,
+                        Reactor {
+                            poller: &mut poller,
+                            pending: &mut pending,
+                            activity: &mut activity,
+                        },
+                        &registries,
+                        &ready_tx,
                         config.max_connections,
                         stats,
                     );
@@ -1283,16 +1641,21 @@ fn event_loop(
         }
 
         if poller.is_empty() {
-            match msg_rx.recv() {
+            match msg_rx.recv_timeout(Duration::from_millis(poll_timeout as u64)) {
                 Ok(msg) => handle_msg(
                     msg,
-                    &mut poller,
-                    &mut pending,
-                    &mut activity,
+                    Reactor {
+                        poller: &mut poller,
+                        pending: &mut pending,
+                        activity: &mut activity,
+                    },
+                    &registries,
+                    &ready_tx,
                     config.max_connections,
                     stats,
                 ),
-                Err(_) => return,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => return,
             }
             continue;
         }
@@ -1325,6 +1688,20 @@ fn event_loop(
         let wait_ms = match next_deadline {
             Some(next) => next.as_millis().min(poll_timeout as u128).max(1) as i32,
             None => poll_timeout,
+        };
+        let timed = [
+            ws_next_deadline(&registries),
+            h1_body_next_deadline(&registries),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let wait_ms = match timed {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(now).as_millis();
+                wait_ms.min(remaining.min(poll_timeout as u128).max(1) as i32)
+            }
+            None => wait_ms,
         };
         let ready = match poller.wait(wait_ms, Some(wake_fd)) {
             Ok(r) => {
@@ -1359,9 +1736,13 @@ fn event_loop(
                         drained += 1;
                         handle_msg(
                             msg,
-                            &mut poller,
-                            &mut pending,
-                            &mut activity,
+                            Reactor {
+                                poller: &mut poller,
+                                pending: &mut pending,
+                                activity: &mut activity,
+                            },
+                            &registries,
+                            &ready_tx,
                             config.max_connections,
                             stats,
                         );
@@ -1416,7 +1797,7 @@ fn event_loop(
                         let c = config.clone();
                         let p = pool.clone();
                         p.spawn(move || {
-                            let _ = crate::courierust_server::serve_accepted(stream, &*h, &c);
+                            let _ = crate::courierust_server::serve_connection(stream, &*h, &c);
                         });
                         activity.remove(&id);
                         if let Some(s) = stats {
@@ -1429,7 +1810,7 @@ fn event_loop(
                         let c = config.clone();
                         let p = pool.clone();
                         p.spawn(move || {
-                            let _ = crate::courierust_server::serve_connection(
+                            let _ = crate::courierust_server::dispatch(
                                 crate::courierust_net::ConnStream::plain(stream),
                                 &*h,
                                 &c,
@@ -1470,6 +1851,7 @@ fn event_loop(
                 to_dispatch.push(id);
             }
         }
+<<<<<<< HEAD
         let header_deadline_due = next_header
             .map(|next| next <= Duration::from_millis(poll_timeout as u64))
             .unwrap_or(false);
@@ -1489,12 +1871,24 @@ fn event_loop(
             }
         }
 
+=======
+        let now = Instant::now();
+        for id in ws_due_ids(&registries, now) {
+            poller.unregister(id);
+            activity.insert(id, now);
+            to_dispatch.push(id);
+        }
+        for id in h1_body_due_ids(&registries, now) {
+            poller.unregister(id);
+            activity.insert(id, now);
+            to_dispatch.push(id);
+        }
+>>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
         if !to_dispatch.is_empty() {
             for chunk in to_dispatch.chunks(DISPATCH_BATCH) {
                 let _ = ready_tx.send(chunk.to_vec());
             }
         }
-
         if let Some(t) = idle_timeout {
             let near_idle = next_idle
                 .map(|next| next <= Duration::from_millis(poll_timeout as u64))
@@ -1502,8 +1896,19 @@ fn event_loop(
             if near_idle {
                 let now = Instant::now();
                 let mut expired = Vec::new();
+<<<<<<< HEAD
                 let registered: HashSet<usize> =
                     crate::lock(&registries.h1).keys().copied().collect();
+=======
+                let registered: HashSet<usize> = registries
+                    .h1
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .chain(registries.ws.lock().unwrap().keys())
+                    .copied()
+                    .collect();
+>>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
                 for (&id, &at) in &activity {
                     if header_expired.contains(&id) {
                         continue;
@@ -1518,7 +1923,12 @@ fn event_loop(
                 for id in expired {
                     poller.unregister(id);
                     pending.remove(&id);
+<<<<<<< HEAD
                     crate::lock(&registries.h1).remove(&id);
+=======
+                    registries.h1.lock().unwrap().remove(&id);
+                    registries.ws.lock().unwrap().remove(&id);
+>>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
                     if activity.remove(&id).is_some() {
                         if let Some(s) = stats {
                             Stats::decrement(&s.connections_active, 1);
@@ -1533,15 +1943,13 @@ fn event_loop(
 /// Answer a request that could not be parsed, then linger briefly before
 /// the connection is dropped.
 ///
-/// The blocking driver does the same thing (see `h1::serve`); keeping the
-/// two identical matters because which one runs depends on
-/// `ServerConfig::event_driven`, and a client must not be able to tell
-/// the difference between them by the *absence* of a `400`.
-///
-/// The status is the honest one: a protocol error is a `400`, a header
-/// block or request line over the limit is a `431`, and a body over the
-/// limit is a `413`.
+/// The blocking driver answers through the same status mapping (see
+/// `h1::refusal_status`); keeping the two identical matters because which
+/// one runs depends on `ServerConfig::event_driven`, and a client must not
+/// be able to tell the difference between them by the *absence* of a
+/// `400`.
 fn refuse_malformed(conn: &EventConn, e: &Error) {
+<<<<<<< HEAD
     use crate::courierust_error::ErrorKind;
     let status = match e.kind {
         ErrorKind::Timeout => 408,
@@ -1559,6 +1967,10 @@ fn refuse_malformed(conn: &EventConn, e: &Error) {
             }
         }
         _ => return,
+=======
+    let Some(status) = crate::courierust_server::h1::refusal_status(e) else {
+        return;
+>>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
     };
     let message = if status == 408 {
         "request header timeout"
@@ -1581,25 +1993,40 @@ fn refuse_malformed(conn: &EventConn, e: &Error) {
 }
 
 /// Write `bytes` to a raw accepted socket and linger briefly before the
-/// close, so the answer is not destroyed by the RST Linux sends when a
-/// socket with unread data is closed.
+/// close, so the answer is not destroyed by the RST the kernel sends when
+/// a socket with unread data is closed.
+///
+/// Both phases poll against a deadline because the socket is
+/// non-blocking — that is how the reactor owns it. A plain `write_all`
+/// can lose the entire response to a single would-block, and
+/// `set_read_timeout` has no effect on a non-blocking descriptor (the
+/// linger loop used to exit on its first iteration for that reason).
 fn write_and_linger(socket: &std::net::TcpStream, bytes: &[u8]) {
     use std::io::{Read, Write};
-    {
+    let deadline = Instant::now() + crate::courierust_server::h1::LINGER_DEADLINE;
+    let mut sent = 0usize;
+    while sent < bytes.len() && Instant::now() < deadline {
         let mut writer: &std::net::TcpStream = socket;
-        if writer.write_all(bytes).is_err() || writer.flush().is_err() {
-            return;
+        match writer.write(&bytes[sent..]) {
+            Ok(0) => return,
+            Ok(n) => sent += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(_) => return,
         }
     }
-    let _ = socket.set_read_timeout(Some(crate::courierust_server::h1::LINGER_DEADLINE));
     let mut sink = [0u8; 8 * 1024];
     let mut left = crate::courierust_server::h1::LINGER_BUDGET;
-    let mut reader: &std::net::TcpStream = socket;
-    while left > 0 {
+    while left > 0 && Instant::now() < deadline {
+        let mut reader: &std::net::TcpStream = socket;
         let want = core::cmp::min(left, sink.len());
         match reader.read(&mut sink[..want]) {
             Ok(0) => break,
             Ok(n) => left = left.saturating_sub(n),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(1));
+            }
             Err(_) => break,
         }
     }
@@ -1683,6 +2110,15 @@ fn event_worker(
                 None => continue,
             };
 
+            conn.arm_wake(|| {
+                let tx = msg_tx.clone();
+                let pipe = wake_writer.clone();
+                Arc::new(move || {
+                    let _ = tx.send(EventMsg::BodyChunk { id });
+                    wake_nudge(&pipe);
+                })
+            });
+
             let (handoff_us, fresh_wait_us) = if conn.trace {
                 let pickup_at = Instant::now();
                 let handoff = conn
@@ -1732,6 +2168,33 @@ fn event_worker(
                     });
                     wake_nudge(wake_writer);
                 }
+                StepOutcome::Tunnel(job) => {
+                    emit_trace(&mut conn, id, 0, 0);
+                    let TunnelJob {
+                        plan,
+                        socket,
+                        leftover,
+                        secure,
+                    } = *job;
+                    let _ = msg_tx.send(EventMsg::Detach {
+                        id,
+                        socket: Some(conn.socket.clone()),
+                    });
+                    wake_nudge(wake_writer);
+                    let tx = msg_tx.clone();
+                    let wake = wake_writer.clone();
+                    let spawned = std::thread::Builder::new()
+                        .name("courierust-tunnel".into())
+                        .spawn(move || {
+                            run_tunnel(socket, leftover, secure, plan);
+                            let _ = tx.send(EventMsg::Closed { id, socket: None });
+                            wake_nudge(&wake);
+                        });
+                    if spawned.is_err() {
+                        let _ = msg_tx.send(EventMsg::Closed { id, socket: None });
+                        wake_nudge(wake_writer);
+                    }
+                }
                 StepOutcome::Upgrade(upgraded) => {
                     let mut ws_conn = *upgraded;
                     let fd = fd_of(ws_conn.socket());
@@ -1775,6 +2238,29 @@ fn event_worker(
     }
 }
 
+/// Run one tunnel on the thread that owns it, then close the connection.
+///
+/// The socket was accepted non-blocking (the reactor never blocks on a
+/// read), so it is switched back before the service sees it: a tunnel is a
+/// blocking contract by definition, and `read`/`write` on a non-blocking
+/// socket would report `WouldBlock` instead of waiting.
+fn run_tunnel(
+    socket: Arc<TcpStream>,
+    leftover: Vec<u8>,
+    secure: bool,
+    plan: crate::courierust_server::tunnel::TunnelPlan,
+) {
+    let _ = socket.set_nonblocking(false);
+    let stream = Arc::new(crate::courierust_net::ConnStream::plain_shared(socket));
+    let mut reader =
+        crate::courierust_io::BufReader::new(stream.clone(), leftover.len().max(16 * 1024));
+    if !leftover.is_empty() {
+        reader.seed(&leftover);
+    }
+    let conn = crate::courierust_server::TunnelConn::new(stream, reader, secure);
+    plan.service.run(conn);
+}
+
 /// Accept loop: accept sockets and hand them to the event loop in
 /// non-blocking mode. It never reads, peeks, sleeps or classifies, so a
 /// slow client can never stall the accept path (which would starve every
@@ -1785,9 +2271,13 @@ fn accept_loop(
     msg_tx: Sender<EventMsg>,
     wake_writer: &Arc<TcpStream>,
     stats: Option<&Stats>,
+    stop: &crate::courierust_server::ServerStop,
 ) {
     let mut next_id = 1usize;
     for stream in listener.incoming() {
+        if stop.is_requested() {
+            return;
+        }
         let Ok(stream) = stream else { continue };
         if let Some(s) = stats {
             s.connections_accepted.fetch_add(1, Ordering::Relaxed);
@@ -1805,5 +2295,189 @@ fn accept_loop(
             accepted_at,
         });
         wake_nudge(wake_writer);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::courierust_error::ErrorKind;
+    use std::sync::atomic::AtomicUsize;
+
+    /// An `EventConn` on a connected loopback pair, plus the peer end so a
+    /// test can read what the connection wrote.
+    fn conn_pair() -> (EventConn, TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = TcpStream::connect(addr).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let conn = EventConn::new(
+            socket,
+            1024 * 1024,
+            None,
+            crate::courierust_server::ws::WakeSlot::new(),
+        );
+        (conn, peer)
+    }
+
+    fn test_config() -> ServerConfig {
+        ServerConfig {
+            read_timeout: Some(Duration::from_millis(50)),
+            ..ServerConfig::default()
+        }
+    }
+
+    /// A chunk produced by the handler fires the wake the worker armed
+    /// into the connection, which is what lets the reactor re-dispatch the
+    /// connection immediately instead of on its poll deadline.
+    #[test]
+    fn streaming_body_fires_the_connection_wake() {
+        let (mut conn, _peer) = conn_pair();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let armed = hits.clone();
+        conn.arm_wake(move || {
+            let armed = armed.clone();
+            Arc::new(move || {
+                armed.fetch_add(1, Ordering::Relaxed);
+            })
+        });
+        let (tx, body) = crate::courierust_body::channel();
+        conn.set_stream(body.into_stream());
+        assert!(conn.stream_rx.is_some());
+
+        tx.send(Bytes::from_static(b"chunk")).unwrap();
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            1,
+            "a produced chunk must wake the connection"
+        );
+        tx.send_bytes(b"more").unwrap();
+        assert_eq!(hits.load(Ordering::Relaxed), 2);
+
+        let (_raw_tx, raw) = std::sync::mpsc::channel();
+        conn.set_stream(Some(ChannelStream::raw(raw)));
+        assert!(
+            !conn.stream_rx.as_ref().unwrap().stream.has_wake(),
+            "a raw channel must not claim a wake"
+        );
+        assert_eq!(
+            body_poll_delay(conn.stream_rx.as_ref().unwrap()),
+            Duration::from_millis(BODY_POLL_MIN_MS),
+            "a raw channel is polled, not waited on"
+        );
+    }
+
+    /// Waiting for the next chunk parks the connection instead of holding
+    /// the worker: the pump returns, the receiver survives, and the
+    /// reactor is left a deadline to come back on.
+    #[test]
+    fn a_parked_stream_does_not_block_the_worker() {
+        let (mut conn, mut peer) = conn_pair();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let config = test_config();
+        let (tx, body) = crate::courierust_body::channel();
+        conn.set_stream(body.into_stream());
+
+        assert!(matches!(
+            conn.pump_body(&config).unwrap(),
+            StepOutcome::Idle
+        ));
+        assert!(conn.stream_rx.is_some(), "the receiver must survive a park");
+        let due = conn.body_poll_at().expect("a parked body owes a deadline");
+        assert!(due > Instant::now() && due <= Instant::now() + Duration::from_secs(1));
+
+        // The chunk is written when the reactor comes back…
+        tx.send(Bytes::from_static(b"hello")).unwrap();
+        assert!(matches!(
+            conn.pump_body(&config).unwrap(),
+            StepOutcome::Idle
+        ));
+        // …and the terminating chunk once the producer is done.
+        drop(tx);
+        assert!(matches!(
+            conn.pump_body(&config).unwrap(),
+            StepOutcome::Idle
+        ));
+        assert!(conn.stream_rx.is_none(), "a finished body is released");
+        drop(conn);
+        let mut written = Vec::new();
+        std::io::Read::read_to_end(&mut peer, &mut written).unwrap();
+        assert_eq!(written, b"5\r\nhello\r\n0\r\n\r\n");
+    }
+
+    /// A producer that stalls past `read_timeout` fails the connection
+    /// *without* the terminating chunk, so a truncated body stays
+    /// detectable — the blocking driver's contract.
+    #[test]
+    fn a_stalled_stream_times_out_on_its_poll_deadline() {
+        let (mut conn, _peer) = conn_pair();
+        let config = ServerConfig {
+            read_timeout: Some(Duration::from_millis(20)),
+            ..ServerConfig::default()
+        };
+        let (tx, body) = crate::courierust_body::channel();
+        conn.set_stream(body.into_stream());
+        assert!(matches!(
+            conn.pump_body(&config).unwrap(),
+            StepOutcome::Idle
+        ));
+
+        std::thread::sleep(Duration::from_millis(30));
+        let error = match conn.pump_body(&config) {
+            Err(error) => error,
+            Ok(_) => panic!("a stalled producer must time out"),
+        };
+        assert_eq!(error.kind, ErrorKind::Timeout);
+        drop(tx);
+    }
+
+    /// A producer without a wake is polled: the deadline backs off to the
+    /// cap while the stream stays silent and resets as soon as a chunk
+    /// arrives, so a bursty stream is never charged the backoff.
+    #[test]
+    fn poll_backoff_only_applies_to_a_body_without_a_wake() {
+        let (_tx, raw) = std::sync::mpsc::channel();
+        let mut body = BodyRx::new(ChannelStream::raw(raw));
+        assert_eq!(
+            body_poll_delay(&body),
+            Duration::from_millis(BODY_POLL_MIN_MS)
+        );
+        body.empty_polls = 4;
+        assert_eq!(
+            body_poll_delay(&body),
+            Duration::from_millis(BODY_POLL_MAX_MS)
+        );
+        body.empty_polls = 100;
+        assert_eq!(
+            body_poll_delay(&body),
+            Duration::from_millis(BODY_POLL_MAX_MS),
+            "the backoff is capped"
+        );
+
+        // A wake-capable body is polled coarsely — but only once a
+        // transport has actually installed the wake. The capability alone
+        // changes nothing, so a body nobody adopted polls on the same
+        // backoff as a raw channel.
+        let (_tx, body) = crate::courierust_body::channel();
+        let stream = body.into_stream().unwrap();
+        let mut body = BodyRx::new(stream);
+        body.empty_polls = 100;
+        assert_eq!(
+            body_poll_delay(&body),
+            Duration::from_millis(BODY_POLL_MAX_MS),
+            "an unadopted stream polls on the same backoff as a raw channel"
+        );
+        let (tx, body) = crate::courierust_body::channel();
+        let stream = body.into_stream().unwrap();
+        stream.install_wake(|| {});
+        let mut stream = BodyRx::new(stream);
+        stream.empty_polls = 100;
+        assert_eq!(
+            body_poll_delay(&stream),
+            Duration::from_millis(BODY_POLL_WAKE_MS),
+            "a wake-capable body needs no fast poll"
+        );
+        drop(tx);
     }
 }

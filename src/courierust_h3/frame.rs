@@ -92,7 +92,9 @@ impl Frame {
             Frame::Data(d) => payload.extend_from_slice(d),
             Frame::Headers(h) => payload.extend_from_slice(h),
             Frame::CancelPush(id) => {
-                crate::courierust_h3::qpack::encode_integer(*id, 8, 0, &mut payload);
+                // RFC 9114 Figure 6: the push ID is a QUIC varint, not a
+                // QPACK prefix integer (they only coincide below 64).
+                payload.extend_from_slice(&crate::courierust_quic::varint::encode(*id));
             }
             Frame::Settings(settings) => {
                 // RFC 9114 §7.2.4: SETTINGS identifiers and values are
@@ -104,14 +106,14 @@ impl Frame {
                 }
             }
             Frame::PushPromise { push_id, headers } => {
-                crate::courierust_h3::qpack::encode_integer(*push_id, 8, 0, &mut payload);
+                payload.extend_from_slice(&crate::courierust_quic::varint::encode(*push_id));
                 payload.extend_from_slice(headers);
             }
             Frame::GoAway(id) => {
-                crate::courierust_h3::qpack::encode_integer(*id, 8, 0, &mut payload);
+                payload.extend_from_slice(&crate::courierust_quic::varint::encode(*id));
             }
             Frame::MaxPushId(id) => {
-                crate::courierust_h3::qpack::encode_integer(*id, 8, 0, &mut payload);
+                payload.extend_from_slice(&crate::courierust_quic::varint::encode(*id));
             }
             Frame::Unknown { payload: data, .. } => payload.extend_from_slice(data),
         }
@@ -171,7 +173,9 @@ impl Frame {
             0x01 => Frame::Headers(payload.to_vec()),
             0x03 => {
                 let mut q = 0;
-                let id = crate::courierust_h3::qpack::decode_integer(payload, 8, &mut q)?;
+                let (id, used) = crate::courierust_quic::varint::decode(payload)
+                    .map_err(|e| Error::protocol(e.to_string()))?;
+                q += used;
                 if q != payload.len() {
                     return Err(Error::protocol("trailing bytes in CANCEL_PUSH"));
                 }
@@ -200,16 +204,18 @@ impl Frame {
                 Frame::Settings(settings)
             }
             0x05 => {
-                let mut q = 0;
-                let push_id = crate::courierust_h3::qpack::decode_integer(payload, 8, &mut q)?;
+                let (push_id, used) = crate::courierust_quic::varint::decode(payload)
+                    .map_err(|e| Error::protocol(e.to_string()))?;
                 Frame::PushPromise {
                     push_id,
-                    headers: payload[q..].to_vec(),
+                    headers: payload[used..].to_vec(),
                 }
             }
             0x07 => {
                 let mut q = 0;
-                let id = crate::courierust_h3::qpack::decode_integer(payload, 8, &mut q)?;
+                let (id, used) = crate::courierust_quic::varint::decode(payload)
+                    .map_err(|e| Error::protocol(e.to_string()))?;
+                q += used;
                 if q != payload.len() {
                     return Err(Error::protocol("trailing bytes in GOAWAY"));
                 }
@@ -217,7 +223,9 @@ impl Frame {
             }
             0x0d => {
                 let mut q = 0;
-                let id = crate::courierust_h3::qpack::decode_integer(payload, 8, &mut q)?;
+                let (id, used) = crate::courierust_quic::varint::decode(payload)
+                    .map_err(|e| Error::protocol(e.to_string()))?;
+                q += used;
                 if q != payload.len() {
                     return Err(Error::protocol("trailing bytes in MAX_PUSH_ID"));
                 }
@@ -257,6 +265,7 @@ mod tests {
         round_trip(Frame::Data(b"payload".to_vec()));
         round_trip(Frame::Headers(vec![0x40 | 8, 0x00]));
         round_trip(Frame::CancelPush(3));
+        round_trip(Frame::CancelPush(1000));
         round_trip(Frame::Settings(vec![
             (SETTINGS_QPACK_MAX_TABLE_CAPACITY, 4096),
             (SETTINGS_MAX_FIELD_SECTION_SIZE, 16384),
@@ -266,7 +275,50 @@ mod tests {
             headers: vec![0x40 | 8],
         });
         round_trip(Frame::GoAway(1000));
+        round_trip(Frame::GoAway((1u64 << 62) - 4));
         round_trip(Frame::MaxPushId(0));
+        round_trip(Frame::MaxPushId(u64::from(u32::MAX)));
+    }
+
+    /// RFC 9114 Figures 6, 8, 9 and 10: the ID inside CANCEL_PUSH,
+    /// GOAWAY, PUSH_PROMISE and MAX_PUSH_ID is a QUIC varint. A QPACK
+    /// prefix integer only coincides with a varint below 64, and — this
+    /// is the trap — it round-trips against a decoder that makes the
+    /// same mistake, so the assertion has to be on the bytes.
+    #[test]
+    fn id_frames_use_quic_varints() {
+        assert_eq!(Frame::GoAway(0).to_bytes(), vec![0x07, 0x01, 0x00]);
+        assert_eq!(Frame::GoAway(63).to_bytes(), vec![0x07, 0x01, 0x3f]);
+        // 64 needs the two-byte form (`01` prefix).
+        assert_eq!(Frame::GoAway(64).to_bytes(), vec![0x07, 0x02, 0x40, 0x40]);
+        // 2^62-4 is the value RFC 9114 §5.2 recommends for the first
+        // GOAWAY of a graceful shutdown: eight bytes, not one.
+        assert_eq!(
+            Frame::GoAway((1u64 << 62) - 4).to_bytes(),
+            vec![0x07, 0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfc],
+        );
+        assert_eq!(Frame::MaxPushId(1).to_bytes(), vec![0x0d, 0x01, 0x01]);
+        assert_eq!(
+            Frame::CancelPush(1000).to_bytes(),
+            vec![0x03, 0x02, 0x43, 0xe8]
+        );
+        assert_eq!(
+            Frame::PushPromise {
+                push_id: 300,
+                headers: vec![0x00],
+            }
+            .to_bytes(),
+            vec![0x05, 0x03, 0x41, 0x2c, 0x00],
+        );
+        // The large-server-GOAWAY case must decode back exactly; a QPACK
+        // integer reader would stop after one byte and reject the tail.
+        let wire = Frame::GoAway((1u64 << 62) - 4).to_bytes();
+        let mut pos = 0;
+        assert_eq!(
+            Frame::decode(&wire, &mut pos).unwrap(),
+            Some(Frame::GoAway((1u64 << 62) - 4))
+        );
+        assert_eq!(pos, wire.len());
     }
 
     #[test]

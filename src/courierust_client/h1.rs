@@ -17,9 +17,11 @@ use crate::courierust_http::response::{Response, ResponseHead};
 use crate::courierust_http::status::StatusCode;
 use crate::courierust_http::version::Version;
 use crate::courierust_io::{BufReader, BufWriter, Scratch};
+use crate::courierust_net::poller::Poller;
 use crate::courierust_net::{self, ConnStream};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// One HTTP/1 connection with persistent buffers.
 pub struct H1Connection {
@@ -29,12 +31,29 @@ pub struct H1Connection {
     scratch: Scratch,
     version: Version,
     reusable: bool,
+    /// Whether the peer produced any part of the *current* response.
+    ///
+    /// A failure after this point is a real answer (a truncated
+    /// response), never a stale connection: the request was processed,
+    /// so replaying it would be a second execution, not a retry.
+    read_started: bool,
+    /// Whether the peer of this connection is an HTTP proxy the request is
+    /// *addressed to* (the plaintext absolute-form hop).
+    ///
+    /// It decides exactly one thing: a `Proxy-Authorization` field belongs
+    /// to that hop, so it survives the hop-by-hop filter there and nowhere
+    /// else — to an origin, and to an origin inside a tunnel, that field
+    /// would be a credential handed to a party it was never meant for.
+    to_proxy: bool,
 }
 
 impl H1Connection {
     /// Connect to `addr` and configure the socket once. When `tls` is
     /// set, wrap the socket in a TLS 1.3 client connection validated
     /// against `hostname`.
+    ///
+    /// This is the direct path; a client with a proxy dials the proxy and
+    /// hands the tunnel to [`Self::from_socket`].
     pub fn connect(
         addr: SocketAddr,
         tls: Option<&crate::courierust_tls::TlsConnector>,
@@ -42,6 +61,45 @@ impl H1Connection {
         cfg: &ClientConfig,
     ) -> Result<Self> {
         let stream = courierust_net::connect(&addr, cfg.connect_timeout)?;
+        Self::from_socket(stream, tls, hostname, cfg)
+    }
+
+    /// Wrap an already-connected socket (a direct connection, or a
+    /// `CONNECT` tunnel to `hostname`), configuring it for the phase it
+    /// is about to run.
+    pub fn from_socket(
+        stream: std::net::TcpStream,
+        tls: Option<&crate::courierust_tls::TlsConnector>,
+        hostname: &str,
+        cfg: &ClientConfig,
+    ) -> Result<Self> {
+        Self::wrap(stream, tls, hostname, cfg, false)
+    }
+
+    /// Wrap a socket whose peer is an HTTP proxy, so the request — written
+    /// in the absolute form by the caller — is addressed *to the proxy*.
+    ///
+    /// The difference from [`Self::from_socket`] is one field: a
+    /// `Proxy-Authorization` is this hop's business, while every other
+    /// hop-by-hop field is still filtered out.
+    pub fn from_proxy_socket(
+        stream: std::net::TcpStream,
+        tls: Option<&crate::courierust_tls::TlsConnector>,
+        hostname: &str,
+        cfg: &ClientConfig,
+    ) -> Result<Self> {
+        Self::wrap(stream, tls, hostname, cfg, true)
+    }
+
+    /// The one wrapping path both constructors share: the peer's identity
+    /// is a flag, everything else about the phase is `cfg`.
+    fn wrap(
+        stream: std::net::TcpStream,
+        tls: Option<&crate::courierust_tls::TlsConnector>,
+        hostname: &str,
+        cfg: &ClientConfig,
+        to_proxy: bool,
+    ) -> Result<Self> {
         let conn = match tls {
             Some(c) => {
                 courierust_net::configure(&stream, cfg.handshake_timeout)?;
@@ -60,7 +118,7 @@ impl H1Connection {
                 ConnStream::plain(stream)
             }
         };
-        let _ = conn.configure(cfg.read_timeout);
+        let _ = conn.set_deadline(cfg.read_timeout);
         let conn = Arc::new(conn);
         Ok(Self {
             reader: BufReader::new(conn.clone(), 16 * 1024),
@@ -69,6 +127,8 @@ impl H1Connection {
             scratch: Scratch::new(),
             version: Version::HTTP_11,
             reusable: true,
+            read_started: false,
+            to_proxy,
         })
     }
 
@@ -81,7 +141,7 @@ impl H1Connection {
         cfg: &ClientConfig,
         seed: &[u8],
     ) -> Result<Self> {
-        let _ = stream.configure(cfg.read_timeout);
+        let _ = stream.set_deadline(cfg.read_timeout);
         let conn = Arc::new(stream);
         let mut reader = BufReader::new(conn.clone(), 16 * 1024);
         if !seed.is_empty() {
@@ -94,12 +154,74 @@ impl H1Connection {
             scratch: Scratch::new(),
             version: Version::HTTP_11,
             reusable: true,
+            read_started: false,
+            to_proxy: false,
         })
     }
 
     /// Whether the connection can be returned to the pool.
     pub fn is_reusable(&self) -> bool {
         self.reusable
+    }
+
+    /// Re-arm the socket deadline for the request in flight.
+    ///
+    /// The pool configures each connection once, at connect time; this is
+    /// the only reason a request would touch it again. The caller that
+    /// overrides the deadline owns restoring it: the connection returns to
+    /// the pool afterwards, where the configured value must be in force
+    /// again — a pooled connection may not carry one caller's deadline
+    /// into another's request.
+    ///
+    /// The deadline is armed with deadline semantics, so its expiry
+    /// surfaces as [`ErrorKind::Timeout`] on every platform rather than
+    /// as the POSIX-only `WouldBlock` a raw `EAGAIN` would produce.
+    pub fn set_read_deadline(&self, timeout: Option<Duration>) -> Result<()> {
+        self.stream.set_deadline(timeout)
+    }
+
+    /// Whether the peer has closed this connection while it sat idle.
+    ///
+    /// A pooled keep-alive connection can die without anyone watching:
+    /// the server's own keep-alive timeout, an intermediary, a restart.
+    /// One zero-timeout poll answers that without consuming anything, and
+    /// nothing else is needed: on an idle HTTP/1.1 connection the peer
+    /// may legally send *nothing*, so a socket that reports readable is
+    /// spent either way — EOF, a reset, an unsolicited record (a TLS
+    /// `close_notify` arrives exactly like that).
+    ///
+    /// Checking *before* a request is what keeps a dead pool entry from
+    /// costing anything: nothing has been written yet, so there is no
+    /// replay question at all — not even for a `POST`.
+    pub fn is_alive(&self) -> bool {
+        thread_local! {
+            /// Reused across probes: the steady state must not allocate.
+            static PROBE: std::cell::RefCell<Poller> =
+                std::cell::RefCell::new(Poller::new());
+        }
+        PROBE.with(|probe| {
+            let mut probe = probe.borrow_mut();
+            probe.clear();
+            probe.register(1, self.stream.raw_fd(), false);
+            probe.wait(0, None).unwrap_or_default().is_empty()
+        })
+    }
+
+    /// Whether the current response has started, i.e. whether the peer
+    /// answered at least in part.
+    pub fn response_started(&self) -> bool {
+        self.read_started
+    }
+
+    /// Whether `error` is the signature of a keep-alive connection that
+    /// was already gone when the request was written: the peer hung up
+    /// without answering anything.
+    ///
+    /// Only meaningful together with [`Self::response_started`] being
+    /// false — a truncated response also ends in an unexpected EOF, but
+    /// there the request *was* processed.
+    pub fn is_stale_failure(&self, error: &Error) -> bool {
+        !self.read_started && matches!(error.kind, ErrorKind::UnexpectedEof | ErrorKind::Canceled)
     }
 
     /// The remote address.
@@ -117,6 +239,7 @@ impl H1Connection {
     ) -> Result<Response<Body>> {
         let mut headers = HeaderMap::with_capacity(req.headers.len() + 4);
         for (n, v) in req.headers.iter() {
+<<<<<<< HEAD
             // `Proxy-Authorization` is hop-by-hop, so it survives exactly
             // when this connection *is* the proxy's: forwarded to an origin
             // it would hand the proxy's credentials to the origin.
@@ -125,6 +248,14 @@ impl H1Connection {
                     continue;
                 }
             } else if courierust_h1::is_hop_by_hop(n.as_str()) {
+=======
+            // `Proxy-Authorization` is hop-by-hop, and the hop it is for is
+            // the proxy the request is addressed to — everywhere else the
+            // field is dropped, so a proxy credential can never be handed
+            // to an origin (directly or inside a tunnel).
+            let proxy_credential = self.to_proxy && n.as_str() == "proxy-authorization";
+            if !proxy_credential && courierust_h1::is_hop_by_hop(n.as_str()) {
+>>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
                 continue;
             }
             headers.append(n.clone(), v.clone());
@@ -144,7 +275,7 @@ impl H1Connection {
         let body = match &req.body {
             Body::Empty => None,
             Body::Bytes(b) => Some(b),
-            Body::Channel(_) => {
+            Body::Channel(_) | Body::Stream(_) => {
                 return Err(Error::protocol("streaming request bodies require h2"));
             }
         };
@@ -158,6 +289,7 @@ impl H1Connection {
 
         let head = self.scratch.body();
         courierust_h1::write_request_head(head, &req.method, &req.uri, Version::HTTP_11, &headers)?;
+        self.read_started = false;
         self.writer.write_all(head)?;
         if let Some(b) = body {
             self.writer.write_all(b)?;
@@ -172,6 +304,9 @@ impl H1Connection {
         let status_line = scratch.line();
         reader.read_until_into(b'\n', 16 * 1024, status_line)?;
         let (status, version) = courierust_h1::parse_status_line(status_line)?;
+        // The peer answered: from here on a failure is a truncated
+        // response, not a stale connection.
+        self.read_started = true;
         self.version = version;
         let mut status = status;
         let mut headers = courierust_h1::read_headers_scratch(reader, scratch)?;
@@ -200,17 +335,23 @@ impl H1Connection {
         method: &Method,
         head: ResponseHead,
     ) -> Result<Response<Body>> {
+        // The caller already consumed the head, so the peer has answered.
+        self.read_started = true;
         let status = head.status;
         let version = head.version;
         let (reader, scratch) = (&mut self.reader, &mut self.scratch);
         let mut close_delimited = false;
         let body = match courierust_h1::body_length(&head.headers, Some(method), Some(status))? {
             courierust_h1::BodyLen::None => {
+                // RFC 9112 §6.3 lists exactly HEAD, 1xx, 204 and 304 as
+                // bodyless. Treating *any* 3xx as empty used to leave a
+                // close-delimited redirect body unread and mark the
+                // connection reusable, so those bytes were parsed as the
+                // next response's status line.
                 if *method == Method::HEAD
                     || status == StatusCode::NO_CONTENT
                     || status == StatusCode::NOT_MODIFIED
                     || status.is_informational()
-                    || status.is_redirection()
                 {
                     Body::Empty
                 } else {
@@ -236,11 +377,12 @@ impl H1Connection {
 /// Read a body delimited by connection close into the scratch body
 /// buffer.
 ///
-/// Only a clean EOF (or a WouldBlock on a non-blocking transport) ends
+/// Only a clean EOF (or a `WouldBlock` on a non-blocking transport) ends
 /// the body. Timeouts and transport resets mid-body are propagated as
 /// errors — previously every read error was treated as EOF, silently
 /// returning a truncated body as a successful response when a server
-/// reset/aborted mid-stream.
+/// reset/aborted mid-stream. A request deadline that expires mid-body is
+/// such an error: it must not be mistaken for the end of the message.
 fn read_until_eof_scratch(
     reader: &mut BufReader<Arc<ConnStream>>,
     max: usize,
@@ -253,7 +395,7 @@ fn read_until_eof_scratch(
             Ok(b) => b,
             Err(e) => match e.kind {
                 ErrorKind::UnexpectedEof => break, // clean close ends the body
-                ErrorKind::WouldBlock => break,    // never on a blocking socket
+                ErrorKind::WouldBlock => break,    // non-blocking transports only
                 _ => return Err(e),
             },
         };

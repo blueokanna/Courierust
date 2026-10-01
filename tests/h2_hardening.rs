@@ -215,6 +215,69 @@ fn h2_rejects_window_update_zero_increment() {
     assert_eq!(code, Some(0x1), "expected PROTOCOL_ERROR GOAWAY");
 }
 
+/// RFC 9113 §6.9: a zero increment on the *connection* window is a
+/// connection error, but the same frame on a stream is a stream error —
+/// answering it with GOAWAY would kill every unrelated in-flight request.
+#[test]
+fn h2_zero_increment_window_update_on_a_stream_is_a_stream_error() {
+    let addr = spawn_h2_server(1 << 20);
+    let mut peer = RawH2Peer::connect(addr).unwrap();
+    peer.send_preface_and_settings();
+    // Open stream 1 with a valid request so the stream is not idle.
+    let block = hpack(&[
+        hdr(":method", "GET"),
+        hdr(":scheme", "http"),
+        hdr(":authority", "localhost"),
+        hdr(":path", "/"),
+    ]);
+    peer.send_frame(0x1, 0x4 | 0x1, 1, &block); // END_HEADERS | END_STREAM
+    peer.send_frame(0x8, 0, 1, &[0u8; 4]); // WINDOW_UPDATE increment 0
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let Some((kind, _flags, _sid, payload)) = peer.read_frame() else {
+            break;
+        };
+        assert_ne!(
+            kind, 0x7,
+            "a stream-scoped error must not become a connection error"
+        );
+        if kind == 0x3 {
+            let code = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            assert_eq!(code, 0x1, "RST_STREAM must carry PROTOCOL_ERROR");
+            return;
+        }
+    }
+    panic!("expected RST_STREAM(PROTOCOL_ERROR) for a zero increment on a stream");
+}
+
+/// RFC 9113 §5.1: WINDOW_UPDATE on a stream that was never opened is a
+/// connection error (it used to be ignored, so the frame was accepted and
+/// the peer's accounting went unchecked).
+#[test]
+fn h2_window_update_on_an_idle_stream_is_a_connection_error() {
+    let addr = spawn_h2_server(1 << 20);
+    let mut peer = RawH2Peer::connect(addr).unwrap();
+    peer.send_preface_and_settings();
+    peer.send_frame(0x8, 0, 99, &1u32.to_be_bytes());
+    let code = peer.wait_goaway(Duration::from_secs(5));
+    assert_eq!(code, Some(0x1), "expected PROTOCOL_ERROR GOAWAY");
+}
+
+/// RFC 9113 §6.2: padding that leaves no room for the field block is a
+/// connection error. The old bound could never fire, so the frame was
+/// accepted as an empty block and answered with a *stream* error.
+#[test]
+fn h2_padded_headers_with_overlong_padding_is_rejected() {
+    let addr = spawn_h2_server(1 << 20);
+    let mut peer = RawH2Peer::connect(addr).unwrap();
+    peer.send_preface_and_settings();
+    // PADDED | END_HEADERS, Pad Length 4, but only two bytes follow it.
+    peer.send_frame(0x1, 0x4 | 0x8, 1, &[0x04, 0x82, 0x86]);
+    let code = peer.wait_goaway(Duration::from_secs(5));
+    assert_eq!(code, Some(0x1), "expected PROTOCOL_ERROR GOAWAY");
+}
+
 #[test]
 fn h2_rejects_data_on_stream_zero() {
     let addr = spawn_h2_server(1 << 20);
@@ -283,6 +346,23 @@ fn h2_rejects_request_missing_pseudo_headers() {
 }
 
 #[test]
+fn h2_rejects_control_characters_in_field_values() {
+    let addr = spawn_h2_server(1 << 20);
+    let mut peer = RawH2Peer::connect(addr).unwrap();
+    peer.send_preface_and_settings();
+    let block = hpack(&[
+        hdr(":method", "GET"),
+        hdr(":path", "/"),
+        hdr(":scheme", "http"),
+        hdr("x-injected", "ok\r\nx-evil: 1"),
+    ]);
+    peer.send_frame(0x1, 0x4, 1, &block);
+    let rst = wait_rst(&mut peer, 1, Duration::from_secs(5));
+    assert_eq!(rst, Some(0x1), "expected PROTOCOL_ERROR RST_STREAM");
+    assert_connection_survives(&mut peer, 3);
+}
+
+#[test]
 fn h2_rejects_hpack_header_list_bomb() {
     // A server that advertises a tiny max header list size must reject an
     // oversized header block with COMPRESSION_ERROR.
@@ -323,15 +403,6 @@ fn h2_rejects_unknown_pseudo_header() {
 
 #[test]
 fn h2_rejects_rfc8441_extended_connect_as_stream_error() {
-    // RFC 8441 extended CONNECT: `:method = CONNECT` plus
-    // `:protocol = websocket`. This stack does not implement WebSocket over
-    // HTTP/2 and never advertises SETTINGS_ENABLE_CONNECT_PROTOCOL, so the
-    // request is malformed (an undefined pseudo-header, RFC 9113 §8.3) —
-    // and RFC 8441 §3 names the outcome for exactly this case: a *stream*
-    // error. What must never happen is the other two behaviours: a 200 that
-    // leaves the caller with a tunnel that carries no frames, or a
-    // connection-wide failure for a request a conforming peer would not
-    // send. The connection and its other streams stay usable.
     let addr = spawn_h2_server(1 << 20);
     let mut peer = RawH2Peer::connect(addr).unwrap();
     peer.send_preface_and_settings();
@@ -355,13 +426,6 @@ fn h2_rejects_rfc8441_extended_connect_as_stream_error() {
 
 #[test]
 fn h2_rejects_websocket_upgrade_header_over_h2() {
-    // A client that tries the RFC 6455 upgrade on an established HTTP/2
-    // connection sends `upgrade` and `connection`: both are
-    // connection-specific fields and therefore malformed in HTTP/2
-    // (RFC 9113 §8.2.2), and HTTP/2 has no 101 to answer with (§8.6).
-    // Resetting the stream is what stops a misdirected WebSocket client
-    // from holding a connection that looks established and never carries a
-    // frame; the connection itself keeps serving other streams.
     let addr = spawn_h2_server(1 << 20);
     let mut peer = RawH2Peer::connect(addr).unwrap();
     peer.send_preface_and_settings();
@@ -385,10 +449,6 @@ fn h2_rejects_websocket_upgrade_header_over_h2() {
 
 #[test]
 fn h2_client_rejects_pseudo_after_regular_response() {
-    // A raw server sends a response whose header block has a regular
-    // field before :status — a malformed response, which is a *stream*
-    // error (RFC 9113 §8.1.1): the client must never accept it, and one
-    // bad response must not take down the connection's other streams.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {

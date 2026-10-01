@@ -84,14 +84,11 @@ mod macos {
 
     pub(super) fn bind_udp(addr: SocketAddr) -> io::Result<UdpSocket> {
         let family = if addr.is_ipv4() { AF_INET } else { AF_INET6 };
-        // SAFETY: `socket(2)` has no preconditions; a negative return is
-        // the only failure signal and becomes `io::Error`.
         let fd = unsafe { socket(family, SOCK_DGRAM, 0) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
         let one: CInt = 1;
-        // SAFETY: `setsockopt` on a descriptor just created by `socket(2)`.
         let rc = unsafe {
             setsockopt(
                 fd,
@@ -102,20 +99,16 @@ mod macos {
             )
         };
         if rc != 0 {
-            // SAFETY: `close` on the descriptor we own.
             unsafe { close(fd) };
             return Err(io::Error::last_os_error());
         }
         let mut storage = SockaddrStorage { bytes: [0u8; 28] };
         let (ptr, len) = sockaddr_of(addr, &mut storage);
-        // SAFETY: `ptr` points at a correctly filled sockaddr of `len` bytes.
         let rc = unsafe { bind(fd, ptr, len) };
         if rc != 0 {
             unsafe { close(fd) };
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: `fd` is a fresh, owned, bound UDP descriptor with no
-        // other owner; wrapping it transfers ownership to the `UdpSocket`.
         Ok(unsafe { UdpSocket::from_raw_fd(fd) })
     }
 
@@ -131,8 +124,6 @@ mod macos {
                     addr: v4.ip().octets(),
                     zero: [0u8; 8],
                 };
-                // SAFETY: `storage` is 28 bytes and 8-aligned; `SockaddrIn`
-                // is 16 bytes with strictly weaker alignment.
                 unsafe {
                     std::ptr::write(storage as *mut SockaddrStorage as *mut SockaddrIn, sa);
                 }
@@ -150,8 +141,6 @@ mod macos {
                     addr: v6.ip().octets(),
                     scope_id: v6.scope_id(),
                 };
-                // SAFETY: as above; `SockaddrIn6` is 28 bytes with weaker
-                // alignment than the 8-aligned storage.
                 unsafe {
                     std::ptr::write(storage as *mut SockaddrStorage as *mut SockaddrIn6, sa);
                 }

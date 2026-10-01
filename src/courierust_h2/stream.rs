@@ -107,9 +107,6 @@ pub struct StreamMap {
     streams: BTreeMap<u32, Stream>,
     /// Next client-initiated stream id we will use.
     next_client_id: u32,
-    /// Next server-initiated stream id we will use (push).
-    #[allow(dead_code)]
-    next_server_id: u32,
     /// Highest peer-initiated stream id seen.
     last_peer_id: u32,
     /// Number of open (non-closed) streams.
@@ -122,7 +119,6 @@ impl StreamMap {
         Self {
             streams: BTreeMap::new(),
             next_client_id: if client { 1 } else { 2 },
-            next_server_id: if client { 2 } else { 1 },
             last_peer_id: 0,
             open_count: 0,
         }

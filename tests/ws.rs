@@ -983,6 +983,8 @@ fn wss_round_trip_over_tls() {
             now: common::NOW,
             min_version: courierust::courierust_tls::TlsVersion::Tls12,
             max_version: courierust::courierust_tls::TlsVersion::Tls13,
+
+            identity: None,
         }),
         ..Default::default()
     };
@@ -1095,6 +1097,7 @@ fn read_frame(sock: &mut TcpStream) -> (u8, Vec<u8>) {
 }
 
 // ---------------------------------------------------------------------
+<<<<<<< HEAD
 // Codec properties
 //
 // The same invariants the `ws_frame` fuzz target asserts, pinned against
@@ -1238,4 +1241,257 @@ fn utf8_validation_survives_every_split_point() {
     let mut broken = bytes.to_vec();
     broken.push(0x80);
     assert!(!Utf8Validator::validate(&broken));
+=======
+// Client handshake validation against a stub server. A real server never
+// produces these responses, so only a hand-written peer can prove the
+// client rejects them.
+// ---------------------------------------------------------------------
+
+/// A one-shot server: reads the opening handshake, then answers with
+/// whatever `build` returns for the client's key. The request head is
+/// recorded so a test can inspect what the client actually sent.
+fn spawn_handshake_stub(
+    build: impl Fn(&str) -> Vec<u8> + Send + 'static,
+) -> (SocketAddr, Arc<Mutex<Option<String>>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
+    let addr = listener.local_addr().expect("addr");
+    let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let recorded = seen.clone();
+    std::thread::spawn(move || {
+        let Ok((mut sock, _)) = listener.accept() else {
+            return;
+        };
+        sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            match sock.read(&mut byte) {
+                Ok(1) => head.push(byte[0]),
+                _ => return,
+            }
+        }
+        let text = String::from_utf8_lossy(&head).to_string();
+        *recorded.lock().unwrap() = Some(text.clone());
+        let key = text
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("sec-websocket-key")
+                    .then(|| value.trim().to_string())
+            })
+            .expect("the client must send Sec-WebSocket-Key");
+        let _ = sock.write_all(&build(&key));
+        let _ = sock.flush();
+        std::thread::sleep(Duration::from_millis(50));
+    });
+    (addr, seen)
+}
+
+/// A `101` response for `key`, with `extra` headers and a chosen status
+/// line version.
+fn switching_response(key: &str, version: &str, extra: &str) -> Vec<u8> {
+    let accept = courierust::courierust_ws::accept_key(key).expect("accept key");
+    format!(
+        "{version} 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {accept}\r\n{extra}\r\n"
+    )
+    .into_bytes()
+}
+
+/// RFC 6455 §4.1: a response naming an extension the client did not offer
+/// fails the connection. With compression disabled the client offered
+/// nothing, so *any* `Sec-WebSocket-Extensions` is a failure — and it must
+/// not silently switch compression on either.
+#[test]
+fn client_rejects_an_extension_it_did_not_offer() {
+    let (addr, _seen) = spawn_handshake_stub(|key| {
+        switching_response(
+            key,
+            "HTTP/1.1",
+            "Sec-WebSocket-Extensions: permessage-deflate; server_max_window_bits=15\r\n",
+        )
+    });
+    let cfg = ClientConfig::default();
+    let opts = WsClientOptions {
+        compression: false,
+        ..Default::default()
+    };
+    let error = match WebSocket::connect_with(&format!("ws://{addr}/echo"), &cfg, &opts) {
+        Ok(_) => panic!("an unoffered extension must fail the handshake"),
+        Err(e) => e,
+    };
+    assert!(format!("{error}").contains("not offered"), "got {error:?}");
+}
+
+/// A protocol switch is an HTTP/1.1 response (RFC 6455 §4.1).
+#[test]
+fn client_rejects_a_non_http11_switch() {
+    let (addr, _seen) = spawn_handshake_stub(|key| switching_response(key, "HTTP/1.0", ""));
+    let error = match WebSocket::connect(&format!("ws://{addr}/echo"), &ClientConfig::default()) {
+        Ok(_) => panic!("an HTTP/1.0 switch must be rejected"),
+        Err(e) => e,
+    };
+    assert!(format!("{error}").contains("HTTP/1.1"), "got {error:?}");
+}
+
+/// A peer that keeps sending informational responses must not be able to
+/// stall the handshake forever.
+#[test]
+fn client_rejects_endless_informational_responses() {
+    let (addr, _seen) = spawn_handshake_stub(|key| {
+        let mut out = Vec::new();
+        for _ in 0..8 {
+            out.extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
+        }
+        out.extend_from_slice(&switching_response(key, "HTTP/1.1", ""));
+        out
+    });
+    let error = match WebSocket::connect(&format!("ws://{addr}/echo"), &ClientConfig::default()) {
+        Ok(_) => panic!("an endless 1xx stream must be rejected"),
+        Err(e) => e,
+    };
+    assert!(
+        format!("{error}").contains("informational"),
+        "got {error:?}"
+    );
+}
+
+/// A few informational responses before the switch are legal.
+#[test]
+fn client_tolerates_a_bounded_number_of_informational_responses() {
+    let (addr, _seen) = spawn_handshake_stub(|key| {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
+        out.extend_from_slice(b"HTTP/1.1 102 Processing\r\n\r\n");
+        out.extend_from_slice(&switching_response(key, "HTTP/1.1", ""));
+        out
+    });
+    WebSocket::connect(&format!("ws://{addr}/echo"), &ClientConfig::default())
+        .expect("two informational responses are fine");
+}
+
+/// An IPv6 literal keeps its brackets in `Host` (RFC 3986 §3.2.2, RFC
+/// 9112 §3.2): `Host: ::1:9001` is not a valid authority.
+#[test]
+fn client_sends_a_bracketed_ipv6_host_header() {
+    let Ok(listener) = std::net::TcpListener::bind("[::1]:0") else {
+        return; // no IPv6 loopback in this environment
+    };
+    let addr = listener.local_addr().expect("addr");
+    let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let recorded = seen.clone();
+    std::thread::spawn(move || {
+        let Ok((mut sock, _)) = listener.accept() else {
+            return;
+        };
+        sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            match sock.read(&mut byte) {
+                Ok(1) => head.push(byte[0]),
+                _ => return,
+            }
+        }
+        *recorded.lock().unwrap() = Some(String::from_utf8_lossy(&head).to_string());
+        // Refuse the upgrade; the request head is all this test needs.
+        let _ = sock.write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n");
+        std::thread::sleep(Duration::from_millis(50));
+    });
+
+    let _ = WebSocket::connect(&format!("ws://{addr}/echo"), &ClientConfig::default());
+    let head = seen
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the stub must see the request head");
+    let host = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("host").then(|| value.trim())
+        })
+        .expect("a Host header");
+    assert!(
+        host.starts_with("[::1]"),
+        "IPv6 authorities need brackets, got {host:?}"
+    );
+}
+
+/// `ClientConfig::default_headers` belong to the client, not to one
+/// transport: a WebSocket handshake is a request from the same client, so
+/// it carries them too — and a default can never displace a field the
+/// handshake itself defines (host, upgrade, connection, sec-websocket-*).
+#[test]
+fn client_default_headers_reach_the_handshake() {
+    use courierust::courierust_http::header::{HeaderMap, HeaderName, HeaderValue};
+
+    #[derive(Default)]
+    struct Probe {
+        seen: Mutex<Vec<(String, String)>>,
+    }
+    struct ProbeHandler {
+        probe: Arc<Probe>,
+        service: Arc<dyn WsService>,
+    }
+    impl Handler for ProbeHandler {
+        fn handle(&self, _req: Request<Body>) -> Response<Body> {
+            Response::with_status(StatusCode::from_u16(404))
+        }
+        fn websocket(&self, req: &Request<Body>) -> WsUpgradeReply {
+            let mut seen = self.probe.seen.lock().unwrap();
+            for (name, value) in req.headers.iter() {
+                seen.push((
+                    name.as_str().to_string(),
+                    value.to_str().unwrap_or("<binary>").to_string(),
+                ));
+            }
+            WsUpgradeReply::Accept(self.service.clone())
+        }
+    }
+
+    let probe = Arc::new(Probe::default());
+    let server = Server::bind_with_config("127.0.0.1:0", ServerConfig::default()).expect("bind");
+    let addr = server.local_addr().expect("addr");
+    let handle = server
+        .serve_background(ProbeHandler {
+            probe: probe.clone(),
+            service: Arc::new(EchoService::default()),
+        })
+        .expect("serve");
+    std::mem::forget(handle);
+
+    let mut defaults = HeaderMap::new();
+    defaults.insert(
+        HeaderName::from_lowercase("x-client"),
+        HeaderValue::from_static("courierust-test"),
+    );
+    // A default that would break the handshake if it could displace the
+    // handshake's own field.
+    defaults.insert(
+        HeaderName::from_lowercase("upgrade"),
+        HeaderValue::from_static("bogus"),
+    );
+    let cfg = ClientConfig {
+        default_headers: defaults,
+        ..ClientConfig::default()
+    };
+
+    let mut ws = WebSocket::connect(&format!("ws://{addr}/echo"), &cfg).expect("handshake");
+    ws.send_text("hi").unwrap();
+    assert_eq!(ws.read_message().unwrap(), Event::Text(String::from("hi")));
+
+    let seen = probe.seen.lock().unwrap().clone();
+    let find = |name: &str| {
+        seen.iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, value)| value.clone())
+    };
+    assert_eq!(find("x-client").as_deref(), Some("courierust-test"));
+    assert_eq!(
+        find("upgrade").as_deref(),
+        Some("websocket"),
+        "a default must not displace the handshake's own fields"
+    );
+>>>>>>> 6d8d312b8a26504bad2505d623172f8cbe2e75d9
 }

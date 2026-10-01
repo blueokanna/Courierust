@@ -1,38 +1,12 @@
 //! Incremental UTF-8 validation for WebSocket text frames.
 //!
-//! RFC 6455 §8.1 requires that a text message be valid UTF-8 *as a
-//! whole*, and §5.6 allows a message to be split at arbitrary byte
-//! boundaries. A validator that only checks each frame in isolation
-//! therefore rejects legal messages (a three-byte character split across
-//! two frames) and, worse, one that only checks at the end accepts
-//! illegal ones long enough to buffer them. This module keeps the
-//! decode state across frames: validation is exact and streaming.
-//!
-//! Two properties make it fast enough to sit in the receive path:
-//!
-//! * Bulk validation is delegated to [`core::str::from_utf8`], which is
-//!   the fastest validator reachable without a dependency (word-at-a-time
-//!   ASCII scan, and SIMD where the target has it). Re-implementing that
-//!   scan here would be slower *and* a second place for the Unicode rules
-//!   to be wrong.
-//! * The state machine runs only where the standard library cannot help:
-//!   finishing a character that started in an earlier frame, and naming
-//!   the offending byte when a message is rejected. Both are bounded by
-//!   a handful of bytes, so the hot path is a single library call.
-//!
-//! The multi-byte path is a 12-state machine with *no table lookups*:
-//! restricted ranges (overlong, surrogate, and > U+10FFFF guards) are
-//! checked with two comparisons on the one continuation byte that needs
-//! them, exactly reproducing the well-formed byte-sequence table of
-//! Unicode §3.9. The oracle tests below cross-check the two
-//! implementations against each other on every two-byte input and on
-//! 20 000 pseudo-random sequences, so "delegate the bulk" cannot turn
-//! into "accept what the standard library rejects".
-//!
-//! The rejection rules implemented here are the strict ones — no
-//! “replacement character”, no lenient surrogate pass-through — because
-//! a WebSocket endpoint that accepts a byte sequence its JSON parser
-//! rejects (or vice versa) is an interop and smuggling surface.
+//! RFC 6455 §8.1 requires a text message to be valid UTF-8 as a whole and
+//! §5.6 allows it to be split at arbitrary byte boundaries, so the decoder
+//! state has to survive a frame boundary. Bulk validation is delegated to
+//! [`core::str::from_utf8`]; the state machine here only finishes a
+//! character opened by an earlier frame and names the offending byte on
+//! rejection. The rules are the strict ones — no replacement character,
+//! no lenient surrogate pass-through.
 
 use crate::courierust_error::Error;
 

@@ -1,7 +1,10 @@
 //! Self-contained cryptographic primitives for TLS 1.3 (RFC 8446).
 //!
 //! Everything here is implemented from the public specifications with
-//! no unsafe code and no third-party crates:
+//! no third-party crates. The only `unsafe` in the module is scoped to
+//! two files — the AES-NI intrinsic wrapper ([`aes`]) and the Windows
+//! system entropy call ([`rng`]) — and neither is reachable from a
+//! `#![deny(unsafe_code)]` path without its own `#[allow]`:
 //!
 //! * [`chacha20`] / [`poly1305`] / [`chacha20poly1305`] — RFC 8439 AEAD
 //! * [`aes`] / [`gcm`] — AES block cipher and GCM mode (RFC 5288 / FIPS

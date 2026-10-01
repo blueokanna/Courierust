@@ -3,8 +3,17 @@
 //! GCM mode (used by the TLS 1.3 AES suites) only ever invokes AES in
 //! the encryption direction (the counter blocks are encrypted to produce
 //! both keystream and the GHASH key), so no decryption path is needed.
-//! The implementation is the standard S-box + xtime MixColumns form,
-//! which is simple to audit; it operates on 16-byte blocks.
+//!
+//! # Timing
+//!
+//! The software rounds below fetch the S-box from a table, and the index
+//! is the byte being encrypted — the classic cache-timing side channel
+//! against table-based AES. Every x86-64 CPU since 2010 implements
+//! AES-NI, so when it is available [`Aes::encrypt_block`] runs the rounds
+//! in hardware: constant time *and* several times faster. The table path
+//! is what other architectures get, which is why it is documented here
+//! rather than left implicit. (Key expansion keeps the table: it runs
+//! once per key on the key itself, with no attacker-chosen input.)
 
 /// The AES S-box (FIPS 197 §5.1.1).
 const SBOX: [u8; 256] = [
@@ -39,6 +48,10 @@ fn xtime(b: u8) -> u8 {
 pub struct Aes {
     /// Round keys as 16-byte blocks.
     round_keys: alloc::vec::Vec<[u8; 16]>,
+    /// Whether the CPU can run the rounds in hardware. Probed once per
+    /// key (std caches the CPUID result).
+    #[cfg(target_arch = "x86_64")]
+    hw: bool,
 }
 
 impl Aes {
@@ -90,30 +103,98 @@ impl Aes {
             }
             round_keys.push(block);
         }
-        Some(Self { round_keys })
+        Some(Self {
+            round_keys,
+            #[cfg(target_arch = "x86_64")]
+            hw: hardware::available(),
+        })
     }
 
     /// Encrypt one 16-byte block in place.
     pub fn encrypt_block(&self, block: &mut [u8; 16]) {
-        add_round_key(block, &self.round_keys[0]);
-        for round in 1..self.round_keys.len() - 1 {
-            for b in block.iter_mut() {
-                *b = SBOX[*b as usize];
-            }
-            shift_rows(block);
-            mix_columns(block);
-            add_round_key(block, &self.round_keys[round]);
+        #[cfg(target_arch = "x86_64")]
+        if self.hw {
+            self.encrypt_block_hardware(block);
+            return;
         }
-        for b in block.iter_mut() {
-            *b = SBOX[*b as usize];
-        }
-        shift_rows(block);
-        add_round_key(block, &self.round_keys[self.round_keys.len() - 1]);
+        encrypt_block_software(&self.round_keys, block);
+    }
+
+    /// The AES-NI path. Kept in its own method so the crate's
+    /// `deny(unsafe_code)` stays in force for everything else in this
+    /// module.
+    #[cfg(target_arch = "x86_64")]
+    #[allow(unsafe_code)]
+    fn encrypt_block_hardware(&self, block: &mut [u8; 16]) {
+        // SAFETY: `self.hw` is only ever set from
+        // `is_x86_feature_detected!("aes")`.
+        unsafe { hardware::encrypt_block(&self.round_keys, block) };
     }
 
     /// Number of rounds (10 for AES-128, 14 for AES-256).
     pub fn rounds(&self) -> usize {
         self.round_keys.len() - 1
+    }
+}
+
+/// The portable rounds: S-box + ShiftRows + MixColumns + AddRoundKey.
+///
+/// A free function so the tests can run both implementations against each
+/// other on any machine, whichever one the CPU selects.
+fn encrypt_block_software(round_keys: &[[u8; 16]], block: &mut [u8; 16]) {
+    let (first, rest) = round_keys.split_first().expect("AES key schedule");
+    let (last, middle) = rest.split_last().expect("AES key schedule");
+    add_round_key(block, first);
+    for key in middle {
+        for b in block.iter_mut() {
+            *b = SBOX[*b as usize];
+        }
+        shift_rows(block);
+        mix_columns(block);
+        add_round_key(block, key);
+    }
+    for b in block.iter_mut() {
+        *b = SBOX[*b as usize];
+    }
+    shift_rows(block);
+    add_round_key(block, last);
+}
+
+/// AES-NI: the same rounds, executed by the CPU (see the module docs).
+#[cfg(target_arch = "x86_64")]
+mod hardware {
+    // Scoped to this module: the intrinsics are the only unsafe code in
+    // the file, and the `#[target_feature]` contract is checked by
+    // `available()` before every call.
+    #![allow(unsafe_code)]
+
+    use core::arch::x86_64::{
+        __m128i, _mm_aesenc_si128, _mm_aesenclast_si128, _mm_loadu_si128, _mm_storeu_si128,
+        _mm_xor_si128,
+    };
+
+    /// Whether this CPU implements AES-NI.
+    pub(super) fn available() -> bool {
+        std::is_x86_feature_detected!("aes")
+    }
+
+    /// Encrypt one block with the round keys produced by the portable key
+    /// schedule (encryption uses the same schedule in both
+    /// implementations).
+    ///
+    /// # Safety
+    ///
+    /// The caller must have confirmed [`available`].
+    #[target_feature(enable = "aes")]
+    pub(super) unsafe fn encrypt_block(round_keys: &[[u8; 16]], block: &mut [u8; 16]) {
+        let load = |key: &[u8; 16]| _mm_loadu_si128(key.as_ptr().cast::<__m128i>());
+        let mut state = _mm_loadu_si128(block.as_ptr().cast::<__m128i>());
+        state = _mm_xor_si128(state, load(&round_keys[0]));
+        for key in &round_keys[1..round_keys.len() - 1] {
+            state = _mm_aesenc_si128(state, load(key));
+        }
+        state = _mm_aesenclast_si128(state, load(&round_keys[round_keys.len() - 1]));
+        _mm_storeu_si128(block.as_mut_ptr().cast::<__m128i>(), state);
     }
 }
 
@@ -259,5 +340,39 @@ mod tests {
         let mut block = plaintext;
         aes.encrypt_block(&mut block);
         assert_eq!(&block[..], &expected[..]);
+    }
+
+    /// The FIPS vectors above run through whichever path the CPU selects,
+    /// so this pins the two implementations to each other: on a machine
+    /// with AES-NI it exercises the portable rounds, and on one without it
+    /// exercises the intrinsics. Together they keep both paths covered
+    /// everywhere.
+    #[test]
+    fn hardware_and_software_rounds_agree() {
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u8
+        };
+        for key_len in [16usize, 32] {
+            let key: Vec<u8> = (0..key_len).map(|_| next()).collect();
+            let aes = Aes::new(&key).unwrap();
+            for round in 0..64 {
+                let mut block = [0u8; 16];
+                for b in block.iter_mut() {
+                    *b = next();
+                }
+                let mut software = block;
+                encrypt_block_software(&aes.round_keys, &mut software);
+                let mut selected = block;
+                aes.encrypt_block(&mut selected);
+                assert_eq!(
+                    software, selected,
+                    "key_len {key_len}, block {round}: the selected path disagrees with the portable rounds"
+                );
+            }
+        }
     }
 }

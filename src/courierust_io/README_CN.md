@@ -19,7 +19,7 @@
 
 - `BufReader`——带精确读取和大小端整数辅助的缓冲读（h1/h2 codec 需要这些）。
 - `BufWriter`——缓冲写。
-- `Scratch`——可复用行缓冲区，让稳态 HTTP/1.1 keep-alive 请求**零按请求分配**。
+- `Scratch`——可复用的行/头缓冲区，让 keep-alive 稳态不必每个请求现分配一块缓冲。
 
 `&mut T` 的 blanket impl 意味着你可以在任何需要 `Read` 的地方传 `&mut stream`，生命周期保持清醒。
 

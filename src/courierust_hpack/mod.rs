@@ -53,6 +53,12 @@ impl HeaderField {
 /// A header block: an ordered list of fields.
 pub type HeaderList = Vec<HeaderField>;
 
+/// Per-field overhead in the header-list size accounting: RFC 9113
+/// §6.5.2 and RFC 9114 §4.2.2 both define a field's size as its name and
+/// value plus 32 bytes, which is what keeps a large limit from being
+/// spent on an enormous number of tiny fields.
+const FIELD_OVERHEAD: usize = 32;
+
 /// Names that are conventionally never compressed (RFC 7541 §7.1.3).
 const SENSITIVE_NAMES: [&str; 4] = [
     "authorization",
@@ -79,14 +85,19 @@ fn read_int(input: &[u8], pos: &mut usize, n: u8, prefix: u8) -> Result<usize> {
         // Checked arithmetic: a hostile integer can exceed usize::MAX
         // (panic in debug / wrap in release); every caller re-validates
         // the result, but reject it here so the parser stays exact.
+        // `checked_shl` also keeps a shift past the machine word width
+        // from panicking on 32-bit targets instead of erroring.
+        let part = ((b & 0x7f) as usize)
+            .checked_shl(shift as u32)
+            .ok_or_else(|| Error::overflow("HPACK: integer too large"))?;
         val = val
-            .checked_add(((b & 0x7f) as usize) << shift)
+            .checked_add(part)
             .ok_or_else(|| Error::overflow("HPACK: integer overflow"))?;
         if b & 0x80 == 0 {
             return Ok(val);
         }
         shift += 7;
-        if shift > 63 {
+        if shift >= usize::BITS as usize {
             return Err(Error::overflow("HPACK: integer too large"));
         }
     }
@@ -142,6 +153,21 @@ pub struct Decoder {
     max_string_size: usize,
 }
 
+/// Wrap raw field-value bytes without a character-class check.
+///
+/// RFC 9113 §8.2.1 makes a value containing NUL, CR or LF *malformed*, which
+/// §8.1.1 turns into a stream error — while §4.3 makes a *decoding* failure a
+/// connection error. Rejecting the value here would report the malformed
+/// message as the harsher of the two and kill every other stream on the
+/// connection, so the check belongs to the message layer
+/// (`courierust_h2::connection::validate_header_block`), which sees the whole
+/// field section and can reset just that stream.
+#[inline]
+fn raw_value(bytes: &[u8]) -> HeaderValue {
+    // `From<Vec<u8>>` deliberately skips validation; see above.
+    HeaderValue::from(bytes.to_vec())
+}
+
 impl Decoder {
     /// New decoder. `max_table_size` is what we advertised to the peer;
     /// `max_header_list_size` is our SETTINGS_MAX_HEADER_LIST_SIZE.
@@ -183,8 +209,8 @@ impl Decoder {
                     .get(idx)
                     .ok_or_else(|| Error::protocol("HPACK: index out of range"))?;
                 let name = HeaderName::from_hpack_bytes(n)?;
-                let value = HeaderValue::from_bytes(v)?;
-                total = checked_add(total, n.len() + v.len())?;
+                let value = raw_value(v);
+                total = checked_add(total, FIELD_OVERHEAD + n.len() + v.len())?;
                 if total > self.max_header_list_size {
                     return Err(Error::overflow("HPACK: header list too large"));
                 }
@@ -207,8 +233,8 @@ impl Decoder {
                 let name = HeaderName::from_hpack_bytes(name_bytes.as_slice())?;
                 let value = read_string(input, &mut pos, self.max_string_size, &self.huff)?;
                 let vbytes = value.as_slice();
-                let value = HeaderValue::from_bytes(vbytes)?;
-                total = checked_add(total, name_len + vbytes.len())?;
+                let value = raw_value(vbytes);
+                total = checked_add(total, FIELD_OVERHEAD + name_len + vbytes.len())?;
                 if total > self.max_header_list_size {
                     return Err(Error::overflow("HPACK: header list too large"));
                 }
@@ -248,8 +274,8 @@ impl Decoder {
                 let name = HeaderName::from_hpack_bytes(name_bytes.as_slice())?;
                 let value = read_string(input, &mut pos, self.max_string_size, &self.huff)?;
                 let vbytes = value.as_slice();
-                let value = HeaderValue::from_bytes(vbytes)?;
-                total = checked_add(total, name_len + vbytes.len())?;
+                let value = raw_value(vbytes);
+                total = checked_add(total, FIELD_OVERHEAD + name_len + vbytes.len())?;
                 if total > self.max_header_list_size {
                     return Err(Error::overflow("HPACK: header list too large"));
                 }
@@ -278,8 +304,9 @@ pub struct Encoder {
     /// The maximum dynamic-table size the PEER advertised; our chosen
     /// size must never exceed it.
     peer_max_table_size: usize,
-    /// Pending size update to emit at the start of the next block.
-    pending_size_update: Option<usize>,
+    /// Pending size update to emit at the start of the next block, as
+    /// `(smallest, newest)` (RFC 7541 §4.2).
+    pending_size_update: Option<(usize, usize)>,
     /// Values longer than this are not indexed (table-poisoning guard).
     max_index_len: usize,
 }
@@ -304,7 +331,16 @@ impl Encoder {
     /// Apply the peer's SETTINGS_HEADER_TABLE_SIZE.
     pub fn set_peer_table_size(&mut self, size: usize) {
         self.peer_max_table_size = size;
-        self.pending_size_update = Some(size);
+        // RFC 7541 §4.2: when the maximum size changes more than once
+        // between two header blocks, the *smallest* value in that interval
+        // MUST be signalled as well as the final one — a decoder that has
+        // already acknowledged the reduction is required to reject a block
+        // whose first update is larger than it. Keeping only the last
+        // value silently skipped the reduction (e.g. 0 then 4096).
+        self.pending_size_update = Some(match self.pending_size_update {
+            Some((min, _)) => (min.min(size), size),
+            None => (size, size),
+        });
     }
 
     /// Current dynamic-table occupancy (bytes).
@@ -315,9 +351,15 @@ impl Encoder {
 
     /// Encode a header block into `out`.
     pub fn encode(&mut self, fields: &[HeaderField], out: &mut BytesMut) {
-        if let Some(new) = self.pending_size_update.take() {
-            write_table_size_update(new, out);
-            self.table.dynamic().set_max_size(new);
+        if let Some((min, newest)) = self.pending_size_update.take() {
+            // At most two updates: the smallest value in the interval and
+            // then the value in effect for this block (RFC 7541 §4.2).
+            if min != newest {
+                write_table_size_update(min, out);
+                self.table.dynamic().set_max_size(min);
+            }
+            write_table_size_update(newest, out);
+            self.table.dynamic().set_max_size(newest);
         }
         for f in fields {
             let name = f.name.as_bytes();
@@ -364,8 +406,12 @@ fn should_index(value: &[u8], max_index_len: usize) -> bool {
 /// Write an integer with an `n`-bit prefix. `prefix` holds the flag bits
 /// already set in the first octet (mask must be `(1<<n)-1`).
 fn write_int(prefix: u8, n: u8, value: usize, out: &mut BytesMut) {
-    let max_prefix = (1u16 << n) - 1;
-    if (value as u16) < max_prefix {
+    let max_prefix = (1usize << n) - 1;
+    // `value as u16` used to truncate every value above 65535, so a
+    // length of 65536 (or of 65536k + r) was written as a much smaller
+    // number and the peer lost sync — a decode-side length cap of 4 MiB
+    // is well inside the range that could round-trip through it.
+    if value < max_prefix {
         out.put_u8(prefix | value as u8);
         return;
     }
@@ -440,6 +486,43 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// RFC 7541 §4.2: when the maximum table size changes more than once
+    /// between two header blocks, the smallest value in that interval MUST
+    /// be signalled as well as the newest one — a decoder that acknowledged
+    /// the reduction is required to reject a block whose first update is
+    /// larger. Keeping only the last value silently skipped the reduction.
+    #[test]
+    fn encoder_signals_the_smallest_size_in_the_interval() {
+        let mut enc = Encoder::new();
+        enc.set_peer_table_size(0);
+        enc.set_peer_table_size(4096);
+        let mut out = BytesMut::new();
+        enc.encode(&headers(&[("a", "b")]), &mut out);
+        let bytes = out.as_slice();
+        // `001` + 5-bit prefix: 0 means "dynamic table size 0".
+        assert_eq!(
+            bytes[0], 0x20,
+            "the interval minimum must be signalled first"
+        );
+        // Then 4096 = 31 + 128*31 + 97.
+        assert_eq!(&bytes[1..4], &[0x3f, 0xe1, 0x1f]);
+        // The final update is the one in force for this block, so the
+        // ("a", "b") entry was indexed: 1 + 1 + 32 bytes.
+        assert_eq!(enc.table_size(), 34);
+    }
+
+    /// A single change keeps emitting exactly one update (the common case),
+    /// and the table ends up at the new size.
+    #[test]
+    fn encoder_emits_one_update_for_a_single_change() {
+        let mut enc = Encoder::new();
+        enc.set_peer_table_size(128);
+        let mut out = BytesMut::new();
+        enc.encode(&headers(&[("a", "b")]), &mut out);
+        // 128 = 31 + 97 → 0x3f then 0x61.
+        assert_eq!(&out.as_slice()[..2], &[0x3f, 0x61]);
     }
 
     fn hex(s: &str) -> Vec<u8> {

@@ -89,6 +89,11 @@ pub enum Frame {
         data: Bytes,
         /// END_STREAM flag.
         end_stream: bool,
+        /// Bytes of the frame payload that are padding rather than body:
+        /// the Pad Length field plus the padding it describes. RFC 9113
+        /// §6.1 counts them against flow control even though they are not
+        /// delivered to the application.
+        padding: usize,
     },
     /// HEADERS (§6.2) — a single fragment; CONTINUATION is handled by
     /// the connection reassembler.
@@ -211,11 +216,18 @@ impl Frame {
                     ));
                 }
                 let (data, pad) = strip_padding(payload, header.flags, flag::PADDED)?;
+                // RFC 9113 §6.1: the *entire* DATA payload counts against
+                // flow control, padding included — a peer could otherwise
+                // spend window with a frame of pure padding. `pad` is the
+                // Pad Length field plus the padding it describes, so the
+                // flow-controlled size is `data.len() + padding`.
+                let padding = payload.len() - data.len();
                 let _ = pad;
                 Ok(Frame::Data {
                     stream_id: sid,
                     data: Bytes::from(data),
                     end_stream: header.flags & flag::END_STREAM != 0,
+                    padding,
                 })
             }
             kind::HEADERS => {
@@ -253,13 +265,18 @@ impl Frame {
                 } else {
                     None
                 };
-                if rest.len() + pad_len > payload.len() {
+                if pad_len > rest.len() {
+                    // RFC 9113 §6.2: padding that exceeds the space left
+                    // for the field block is a protocol error. The old
+                    // `rest.len() + pad_len > payload.len()` form was
+                    // arithmetic that could never fire, so an over-long
+                    // pad silently produced an empty block instead.
                     return Err(Error::h2(
-                        ErrorCode::FrameSizeError.as_u32(),
+                        ErrorCode::ProtocolError.as_u32(),
                         "HEADERS padding overrun",
                     ));
                 }
-                let block_len = rest.len().saturating_sub(pad_len);
+                let block_len = rest.len() - pad_len;
                 Ok(Frame::Headers {
                     stream_id: sid,
                     block: Bytes::from(&rest[..block_len]),
@@ -511,7 +528,12 @@ impl Frame {
                 stream_id,
                 data,
                 end_stream,
+                padding,
             } => {
+                debug_assert_eq!(
+                    *padding, 0,
+                    "the encoder never emits DATA padding; a parsed frame must not be re-encoded blindly"
+                );
                 let mut f = 0u8;
                 if *end_stream {
                     f |= flag::END_STREAM;
@@ -734,6 +756,7 @@ mod tests {
             stream_id: 1,
             data: Bytes::from_static(b"hello"),
             end_stream: true,
+            padding: 0,
         });
         roundtrip(&Frame::Headers {
             stream_id: 3,
@@ -815,5 +838,61 @@ mod tests {
         buf.put_u32(0);
         let header = decode_header(&buf.as_slice()[..9].try_into().unwrap());
         assert!(Frame::parse(header, &buf.as_slice()[9..], 1 << 24).is_err());
+    }
+
+    /// RFC 9113 §6.2: padding that leaves no room for the field block is a
+    /// protocol error. The check used to be `rest.len() + pad_len >
+    /// payload.len()`, which — because the Pad Length octet had already
+    /// been sliced off `rest` — could never be true, so an over-long pad
+    /// was accepted and silently produced an empty block.
+    #[test]
+    fn padded_headers_with_overlong_padding_is_rejected() {
+        let payload = [0x04, 0x82, 0x86]; // pad length 4, two bytes left
+        let header = FrameHeader {
+            len: payload.len() as u32,
+            kind: kind::HEADERS,
+            flags: flag::PADDED | flag::END_HEADERS,
+            stream_id: 1,
+        };
+        assert!(Frame::parse(header, &payload, 1 << 14).is_err());
+    }
+
+    /// The same frame with padding that fits parses, and the padding is
+    /// removed from the block.
+    #[test]
+    fn padded_headers_with_fitting_padding_parses() {
+        let payload = [0x02, 0x82, 0x86, 0x00, 0x00];
+        let header = FrameHeader {
+            len: payload.len() as u32,
+            kind: kind::HEADERS,
+            flags: flag::PADDED | flag::END_HEADERS,
+            stream_id: 1,
+        };
+        match Frame::parse(header, &payload, 1 << 14).unwrap() {
+            Frame::Headers { block, .. } => assert_eq!(block.as_ref(), &[0x82, 0x86]),
+            other => panic!("expected HEADERS, got {other:?}"),
+        }
+    }
+
+    /// RFC 9113 §6.1: the whole DATA payload counts against flow control,
+    /// so the parser reports the padding bytes for the window accounting
+    /// (they are not body).
+    #[test]
+    fn data_padding_is_reported() {
+        let payload = [0x03, b'a', b'b', 0x00, 0x00, 0x00];
+        let header = FrameHeader {
+            len: payload.len() as u32,
+            kind: kind::DATA,
+            flags: flag::PADDED,
+            stream_id: 1,
+        };
+        match Frame::parse(header, &payload, 1 << 14).unwrap() {
+            Frame::Data { data, padding, .. } => {
+                assert_eq!(data.as_ref(), b"ab");
+                assert_eq!(padding, 4, "the Pad Length octet plus 3 pad bytes");
+                assert_eq!(data.len() + padding, payload.len());
+            }
+            other => panic!("expected DATA, got {other:?}"),
+        }
     }
 }
