@@ -1185,7 +1185,11 @@ pub(crate) fn serve_blocking(
 
     loop {
         if let Some(interval) = ws.ping_interval {
-            let _ = stream.configure(Some(interval));
+            // A deadline: the expiry *is* the idle signal the arms below
+            // act on (a ping, then a keepalive close). A poll timeout
+            // would report `WouldBlock`, which the session turns back into
+            // "nothing yet" — and this loop reads that as a dead peer.
+            let _ = stream.set_deadline(Some(interval));
         }
         let polled = session.poll_message();
         if ws.ping_interval.is_some() {

@@ -87,7 +87,11 @@ pub(crate) fn serve(
             }
             Err(e) => return Err(e),
         };
-        stream.configure(config.read_timeout)?;
+        // The application budget replaces the header budget, and it is a
+        // deadline too: a read that expires with a body in flight must
+        // reach `refusal_status` as `Timeout` on every platform, so the
+        // peer gets the same answer it would get on Windows.
+        stream.set_deadline(config.read_timeout)?;
 
         let mut early = courierust_h1::host_header_error(rl.version, &headers)
             .map(|reason| error_response(400, reason));
@@ -283,7 +287,11 @@ fn set_header_read_deadline(stream: &ConnStream, deadline: Option<Instant>) -> R
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
         .ok_or_else(|| Error::timeout("request header timeout"))?;
-    stream.configure(Some(remaining))
+    // A *deadline*, not a poll: the expiry is the outcome this phase
+    // exists to produce (the peer is owed a `408`). Only a deadline makes
+    // POSIX report it as `Timeout`; a poll timeout is `WouldBlock` there —
+    // "nothing yet" — and the caller would close without answering.
+    stream.set_deadline(Some(remaining))
 }
 
 /// Respond to an HTTP/1.x request-head deadline with the RFC 9110 status
@@ -525,4 +533,35 @@ fn stream_response(
     }
     writer.write_all(courierust_h1::CHUNKED_END)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The header budget must be armed with **deadline** semantics.
+    ///
+    /// Windows reports an expired read as `WSAETIMEDOUT`, which the
+    /// transport maps to `Timeout` however the socket was armed, so a
+    /// Windows-only run cannot observe the difference. POSIX reports
+    /// `EAGAIN` — the code for "nothing yet" — so a poll-armed budget
+    /// reaches the driver's error mapping as `WouldBlock`, which is not
+    /// the arm that answers `408`: the peer gets a silent close instead
+    /// of the answer it is owed.
+    #[test]
+    fn the_header_budget_is_armed_as_a_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        let stream = ConnStream::plain(client);
+
+        set_header_read_deadline(&stream, Some(Instant::now() + Duration::from_secs(1)))
+            .expect("a live budget arms the transport");
+        assert!(
+            stream.deadline_is_armed(),
+            "the header phase must classify its expiry as a timeout"
+        );
+    }
 }

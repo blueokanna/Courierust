@@ -249,6 +249,17 @@ impl ConnStream {
         Ok(())
     }
 
+    /// Whether an expiry is currently classified as a deadline.
+    ///
+    /// Test-only. It is what lets a driver's test pin *which* arming it
+    /// used — a distinction a Windows-only run cannot observe, because
+    /// `WSAETIMEDOUT` maps to `Timeout` however the socket was armed,
+    /// while POSIX reports a poll timeout as `WouldBlock`.
+    #[cfg(test)]
+    pub(crate) fn deadline_is_armed(&self) -> bool {
+        self.deadline.load(Ordering::Relaxed)
+    }
+
     /// Shut down the transport's read, write or both halves.
     ///
     /// Both variants share one socket, so this is the socket shutdown either
@@ -271,7 +282,7 @@ impl ConnStream {
     /// budget and the deadline keep this from becoming a slowloris
     /// vector: it is a bounded courtesy, not a promise to read a body.
     pub(crate) fn linger_close(&self, budget: usize, deadline: Duration) {
-        let _ = self.configure(Some(deadline));
+        let _ = self.set_deadline(Some(deadline));
         let mut sink = [0u8; 8 * 1024];
         let mut left = budget;
         while left > 0 {

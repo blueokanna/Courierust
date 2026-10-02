@@ -228,7 +228,10 @@ impl WebSocket {
             net::configure(&stream, cfg.read_timeout)?;
             ConnStream::plain(stream)
         };
-        let _ = conn.configure(cfg.read_timeout);
+        // The handshake read is a deadline: a peer that stops answering
+        // must surface as `Timeout`, not as the `WouldBlock` a POSIX poll
+        // timeout produces.
+        let _ = conn.set_deadline(cfg.read_timeout);
         let stream = Arc::new(conn);
 
         // ---- handshake ------------------------------------------------
@@ -438,7 +441,7 @@ impl WebSocket {
     /// echoes (read then write) never pays it on the write half either.
     pub fn read_message(&mut self) -> Result<Event> {
         if !self.session.is_mid_frame() {
-            self.stream.configure(self.read_timeout.get())?;
+            self.arm_read_timeout()?;
         }
         let header = self.session.poll_header();
         let _ = self.stream.configure(None);
@@ -446,6 +449,20 @@ impl WebSocket {
             return Err(Error::new(ErrorKind::WouldBlock));
         }
         self.session.read_message()
+    }
+
+    /// Arm the transport for the wait for the next frame header.
+    ///
+    /// A *deadline* when one is configured, so its expiry is `Timeout` on
+    /// every platform: POSIX reports a poll timeout as `WouldBlock`, the
+    /// code for "nothing yet", and this wait is not a lull — it is the
+    /// bound the caller asked for. With no deadline configured there is
+    /// nothing to classify, and the arm is cleared outright.
+    fn arm_read_timeout(&self) -> Result<()> {
+        match self.read_timeout.get() {
+            Some(timeout) => self.stream.set_deadline(Some(timeout)),
+            None => self.stream.configure(None),
+        }
     }
 
     /// A non-blocking poll: `Ok(None)` means “nothing complete yet”.
@@ -521,7 +538,7 @@ impl WebSocket {
     /// behaviour and matters to a caller that arms it before its own read.
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<()> {
         self.read_timeout.set(timeout);
-        self.stream.configure(timeout)
+        self.arm_read_timeout()
     }
 }
 
