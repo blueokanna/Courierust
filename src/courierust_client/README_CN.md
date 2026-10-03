@@ -32,7 +32,7 @@
 
 当 `max_connections_per_host` 逼着你做选择时（cap 处所有连接都忙），h2 池选的是**加权负载**最低的连接，而不是单纯并发流最少的：
 
-```
+```text
 load(c) = active_streams + body_units(c) + ewma_service_ms(c)
 ```
 
@@ -44,14 +44,16 @@ load(c) = active_streams + body_units(c) + ewma_service_ms(c)
 
 ## 用法
 
-```rust
-use courierust::courierust_client::{Client, ClientConfig};
+```rust,no_run
+use courierust::courierust_client::Client;
 
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 let client = Client::new();
 let resp = client.get("http://127.0.0.1:8080/")?;
 println!("{}", String::from_utf8_lossy(&resp.body.collect()?));
 
-let resp = client.post("http://127.0.0.1:8080/submit", b"hello")?;
+let resp = client.post("http://127.0.0.1:8080/submit", "hello")?;
+println!("status={}", resp.status);
 
 let resp = client
     .request("http://127.0.0.1:8080/api/items", courierust::courierust_http::Method::POST)
@@ -61,19 +63,25 @@ let resp = client
     .timeout(std::time::Duration::from_secs(5))
     .body(r#"{"name":"widget"}"#)
     .send()?;
-println!("{}", resp.text()?);
+println!("{}", String::from_utf8_lossy(&resp.body.collect()?));
+# Ok(())
+# }
 ```
 
 ### 访问真实 `https://`
 
 `Client::new()` **不装任何信任锚**，`RootStore::new()` 也是空的——空存储会让每一次验证都失败，而且是响亮地失败。这个默认是对的（一个偷偷信任它能找到的一切的客户端，没人能对它作出推理），但代价是第一次 `https://` 请求必须明确说出信任来自哪里：
 
-```rust
+```rust,no_run
 use courierust::courierust_client::Client;
 
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 // 操作系统信任库：Windows 读 `ROOT`，Unix 读常见的 PEM bundle。
-let client = Client::with_system_roots()?;
+let client = Client::with_system_roots().map_err(|e| e.to_string())?;
 let resp = client.get("https://example.com/")?;
+println!("status={}", resp.status);
+# Ok(())
+# }
 ```
 
 `Client::with_system_roots()` 等价于 `TlsSettings::with_system_roots()` 再加 `http2: true`，所以服务端支持时直接协商 `h2`。要往自己配的客户端里加公共根，用 `Client::with_tls_roots(roots)`，或者自己构造 `TlsSettings` 并保持 `verify: true`。

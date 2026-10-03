@@ -28,9 +28,27 @@ The `&mut T` blanket impls mean you can pass `&mut stream` anywhere a `Read` is 
 ```rust
 use courierust::courierust_io::{Read, Write};
 
+# fn main() {}
 // Your transport just needs these two impls.
-impl Read for MyPipe { /* ... */ }
-impl Write for MyPipe { /* ... */ }
+# #[allow(dead_code)]
+struct MyPipe;
+
+impl Read for MyPipe {
+    fn read(&mut self, buf: &mut [u8]) -> courierust::Result<usize> {
+        let _ = buf; // fill `buf`, return the number of bytes read
+        Ok(0)
+    }
+}
+
+impl Write for MyPipe {
+    fn write(&mut self, buf: &[u8]) -> courierust::Result<usize> {
+        Ok(buf.len()) // write `buf`, return the number of bytes written
+    }
+
+    fn flush(&mut self) -> courierust::Result<()> {
+        Ok(())
+    }
+}
 
 // Then any codec in the stack works over it, unchanged.
 ```

@@ -14,7 +14,7 @@ Worker count defaults to `std::thread::available_parallelism()`. That's what mak
 ## Where it's used
 
 - The server dispatches TLS and HTTP/2 connections (and, in the legacy model, every connection) through the pool.
-- The client's h2 drivers run on it.
+- The HTTP/3 server runtime runs its handler workers on it.
 - Jobs can spawn jobs — a handler that needs to hand off work doesn't deadlock the pool.
 
 ## The subtle bits
@@ -28,7 +28,12 @@ Worker count defaults to `std::thread::available_parallelism()`. That's what mak
 ```rust
 use courierust::courierust_pool::ThreadPool;
 
-let pool = ThreadPool::new();        // defaults to logical cores
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let pool = ThreadPool::new()?;       // defaults to logical cores
 pool.spawn(move || { /* handle a connection */ });
-pool.join();
+
+// Dropping the pool shuts it down and joins every worker.
+drop(pool);
+# Ok(())
+# }
 ```

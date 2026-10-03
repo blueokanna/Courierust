@@ -32,7 +32,7 @@ One h2 connection does **not** scale linearly with caller threads — the driver
 
 When `max_connections_per_host` forces a choice (all connections busy at the cap), the h2 pool picks the connection with the lowest **weighted load**, not merely the fewest concurrent streams:
 
-```
+```text
 load(c) = active_streams + body_units(c) + ewma_service_ms(c)
 ```
 
@@ -44,14 +44,16 @@ The accounting is exact by construction: `reserve(body_bytes)` and `release(body
 
 ## Usage
 
-```rust
-use courierust::courierust_client::{Client, ClientConfig};
+```rust,no_run
+use courierust::courierust_client::Client;
 
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 let client = Client::new();
 let resp = client.get("http://127.0.0.1:8080/")?;
 println!("{}", String::from_utf8_lossy(&resp.body.collect()?));
 
-let resp = client.post("http://127.0.0.1:8080/submit", b"hello")?;
+let resp = client.post("http://127.0.0.1:8080/submit", "hello")?;
+println!("status={}", resp.status);
 
 let resp = client
     .request("http://127.0.0.1:8080/api/items", courierust::courierust_http::Method::POST)
@@ -61,19 +63,25 @@ let resp = client
     .timeout(std::time::Duration::from_secs(5))
     .body(r#"{"name":"widget"}"#)
     .send()?;
-println!("{}", resp.text()?);
+println!("{}", String::from_utf8_lossy(&resp.body.collect()?));
+# Ok(())
+# }
 ```
 
 ### Talking to real servers over real `https://`
 
 `Client::new()` installs **no** trust anchors, and neither does `RootStore::new()` — an empty store fails every verification, loudly. That is the right default (a client that silently trusts whatever it can find is a client nobody can reason about), but it means the first `https://` request needs to say where trust comes from:
 
-```rust
+```rust,no_run
 use courierust::courierust_client::Client;
 
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 // The OS trust store: `ROOT` on Windows, the usual PEM bundles on Unix.
-let client = Client::with_system_roots()?;
+let client = Client::with_system_roots().map_err(|e| e.to_string())?;
 let resp = client.get("https://example.com/")?;
+println!("status={}", resp.status);
+# Ok(())
+# }
 ```
 
 `Client::with_system_roots()` is `TlsSettings::with_system_roots()` plus `http2: true`, so it negotiates `h2` when the server offers it. To add public roots to a client you configured yourself, use `Client::with_tls_roots(roots)` or build the `TlsSettings` directly and keep `verify: true`.

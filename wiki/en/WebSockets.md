@@ -7,7 +7,7 @@ connection that gets upgraded in place: it shares the port, the handler,
 the TLS stack and the event scheduler with plain HTTP — no second
 listener, no third-party dependency, no separate runtime.
 
-```
+```text
 client ── GET /ws  (Upgrade: websocket) ──► Handler::websocket  ── Accept ──► WsService
               │                                                                   │
               └──────────── 101 Switching Protocols ◄───── frames ◄──────────────┘
@@ -19,7 +19,8 @@ client ── GET /ws  (Upgrade: websocket) ──► Handler::websocket  ──
 returning `Pass` keeps the request on the normal HTTP path (so `/ws` stays
 yours and every other path still gets your real handler):
 
-```rust
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 use courierust::courierust_body::Body;
 use courierust::courierust_http::request::Request;
 use courierust::courierust_http::response::Response;
@@ -47,11 +48,11 @@ struct App;
 
 impl Handler for App {
     fn handle(&self, _req: Request<Body>) -> Response<Body> {
-        Response::text("plain HTTP still works")
+        Response::<Body>::with_status(200.into()).with_body(Body::from("plain HTTP still works"))
     }
 
     fn websocket(&self, req: &Request<Body>) -> WsUpgradeReply {
-        if req.path == "/ws" {
+        if req.uri.path() == "/ws" {
             WsUpgradeReply::Accept(Arc::new(Echo))
         } else {
             WsUpgradeReply::Pass
@@ -61,6 +62,8 @@ impl Handler for App {
 
 let server = Server::bind_with_config("127.0.0.1:8080", ServerConfig::default())?;
 server.serve(App)?;
+# Ok(())
+# }
 ```
 
 A `WsService` gets `on_open`, `on_message`, `on_pong`, `on_idle` and
@@ -92,8 +95,8 @@ and nudges the reactor.
 ## The policy: `WsConfig`
 
 ```rust
-use courierust::courierust_server::ws::{PmDeflatePolicy, WsConfig};
-use courierust::courierust_ws::OriginPolicy;
+use courierust::courierust_server::ws::WsConfig;
+use courierust::courierust_ws::{OriginPolicy, PmDeflatePolicy};
 
 let ws = WsConfig {
     // The default: browsers may only open this socket from the same site,
@@ -128,7 +131,8 @@ let ws = WsConfig {
 
 ## The client
 
-```rust
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 use courierust::courierust_client::ClientConfig;
 use courierust::courierust_client::ws::WebSocket;
 
@@ -150,6 +154,8 @@ loop {
     }
 }
 ws.close(1000, "done")?;
+# Ok(())
+# }
 ```
 
 The client speaks `ws://` and `wss://` (the second one rides the crate's own
@@ -196,9 +202,14 @@ location /ws/ {
 Then tell the server it sits behind that proxy:
 
 ```rust
+# use courierust::courierust_server::ws::WsConfig;
+# use courierust::courierust_ws::{IpNet, OriginPolicy};
 let ws = WsConfig {
     origin: OriginPolicy::List(vec!["https://app.example.com".into()]),
-    trusted_proxies: vec![IpNet::parse("127.0.0.1/32")?, IpNet::parse("10.0.0.0/8")?],
+    trusted_proxies: vec![
+        IpNet::parse("127.0.0.1/32").expect("valid CIDR"),
+        IpNet::parse("10.0.0.0/8").expect("valid CIDR"),
+    ],
     ..Default::default()
 };
 ```
@@ -243,7 +254,7 @@ Two mistakes are common enough to name: a proxy `proxy_read_timeout`
 
 ## Where the coverage is
 
-- **27 end-to-end tests** (`tests/ws.rs`) run the real client against the
+- **37 end-to-end tests** (`tests/ws.rs`) run the real client against the
   real server over a real socket, through **both** drivers: the handshake
   (including the RFC 6455 accept-key vector), masking both ways,
   fragmentation with interleaved control frames, RFC 7692 negotiation and

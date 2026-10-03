@@ -4,7 +4,7 @@
 
 除真正需要 socket 的部分（掩码密钥的熵源、`SharedSink`、客户端）之外，全部是 `no_std + alloc`。协议核心除调用方收到的消息负载外，不会按帧分配内存。
 
-```
+```text
 frame.rs      线上格式：帧头、操作码、掩码、输出端（StreamSink / SharedSink / VecSink）
 utf8.rs       增量 UTF-8 校验，不复制消息
 handshake.rs  HTTP 升级：key 校验、Origin 策略、扩展协商、子协议选择
@@ -89,11 +89,20 @@ http:
 然后让服务端配置与之匹配：
 
 ```rust
+use courierust::courierust_server::ws::WsConfig;
+use courierust::courierust_ws::{IpNet, OriginPolicy};
+
+# fn main() {
 let ws = WsConfig {
     origin: OriginPolicy::List(vec!["https://app.example.com".into()]),
-    trusted_proxies: vec![IpNet::parse("127.0.0.1/32")?, IpNet::parse("10.0.0.0/8")?],
+    trusted_proxies: vec![
+        IpNet::parse("127.0.0.1/32").expect("valid CIDR"),
+        IpNet::parse("10.0.0.0/8").expect("valid CIDR"),
+    ],
     ..Default::default()
 };
+# let _ = ws;
+# }
 ```
 
 两条最容易出错的规则：
@@ -117,6 +126,10 @@ let ws = WsConfig {
 use courierust::courierust_server::ws::{WsConn, WsData, WsService, WsUpgradeReply};
 use std::sync::Arc;
 
+# fn main() {
+#     // `App` is what you hand to `Server::serve`.
+#     let _app = App;
+# }
 struct Echo;
 
 impl WsService for Echo {
@@ -136,11 +149,13 @@ impl courierust::courierust_server::Handler for App {
     fn handle(&self, _req: courierust::courierust_http::request::Request<
         courierust::courierust_body::Body>) -> courierust::courierust_http::response::Response<
         courierust::courierust_body::Body> {
-        courierust::courierust_http::response::Response::text("hello")
+        let mut resp = courierust::courierust_http::response::Response::with_status(200.into());
+        resp.body = courierust::courierust_body::Body::from("hello");
+        resp
     }
     fn websocket(&self, req: &courierust::courierust_http::request::Request<
         courierust::courierust_body::Body>) -> WsUpgradeReply {
-        if req.path == "/echo" { WsUpgradeReply::Accept(Arc::new(Echo)) }
+        if req.uri.path() == "/echo" { WsUpgradeReply::Accept(Arc::new(Echo)) }
         else { WsUpgradeReply::Pass }
     }
 }
@@ -148,19 +163,22 @@ impl courierust::courierust_server::Handler for App {
 
 客户端：
 
-```rust
+```rust,no_run
 use courierust::courierust_client::ClientConfig;
 use courierust::courierust_client::ws::WebSocket;
 
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 let mut ws = WebSocket::connect("wss://example.com/ws", &ClientConfig::default())?;
 ws.send_text("hello")?;
 for msg in [ws.read_message()?] {
     println!("{msg:?}");
 }
 ws.close(1000, "done")?;
+# Ok(())
+# }
 ```
 
-可运行版本见 [`examples/ws_echo.rs`](../../examples/ws_echo.rs) 与 [`examples/ws_client.rs`](../../examples/ws_client.rs)；[`tests/ws.rs`](../../tests/ws.rs) 中的 34 个端到端测试针对真实 socket 验证线上协议，包括跨驱动推送、Origin 拒绝、TLS 上的 `wss` 以及各类错误码。
+可运行版本见 [`examples/ws_echo.rs`](../../examples/ws_echo.rs) 与 [`examples/ws_client.rs`](../../examples/ws_client.rs)；[`tests/ws.rs`](../../tests/ws.rs) 中的 37 个端到端测试针对真实 socket 验证线上协议，包括跨驱动推送、Origin 拒绝、TLS 上的 `wss` 以及各类错误码。
 
 ## 一致性证据
 

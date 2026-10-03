@@ -15,8 +15,12 @@ JA3 的全部戏法就是对一个规范化 ClientHello 字符串做 MD5；JA4 �
 ```rust
 use courierust::courierust_crypto::{md5, sha256};
 
+# fn main() {
 let h = md5::md5(b"data");
 let s = sha256::sha256(b"data");
+# assert_eq!(h.len(), 16);
+# assert_eq!(s.len(), 32);
+# }
 ```
 
 或者干脆不用——指纹函数会替你调用。

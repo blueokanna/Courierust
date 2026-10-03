@@ -7,15 +7,22 @@ Servers that care about bot traffic fingerprint the **TLS ClientHello** (JA3 / J
 ```rust
 use courierust::courierust_fingerprint::{chrome_tls_profile, ja3_hash, ja3_string};
 
+# fn main() {
 let profile = chrome_tls_profile(); // a TlsProfile, the ClientHello parameters
 let s = ja3_string(&profile);       // "771,4865-4866-...,0-...,23,0-29-..."
 let hash = ja3_hash(&profile);      // 32 hex chars
+# assert!(s.starts_with("771,") && hash.len() == 32);
+# }
 ```
 
 The Chrome profile is checked against the public record in the test suite:
 
 ```rust
+# use courierust::courierust_fingerprint::{chrome_tls_profile, ja3_hash};
+# fn main() {
+# let profile = chrome_tls_profile();
 assert_eq!(ja3_hash(&profile), "cd08e31494f9531f560d64c695473da9");
+# }
 ```
 
 ## JA4
@@ -23,9 +30,12 @@ assert_eq!(ja3_hash(&profile), "cd08e31494f9531f560d64c695473da9");
 ```rust
 use courierust::courierust_fingerprint::ja4;
 
+# fn main() {
+# let profile = courierust::courierust_fingerprint::chrome_tls_profile();
 let f = ja4(&profile);
 // format: t<version>d<ciphers>h<extensions><alpn>_<SNI hash>_<cipher hash>
 assert_eq!(f, "t13d1516h2_8daaf6152771_e5627efa2ab1");
+# }
 ```
 
 GREASE values are filtered automatically (the JA4 spec requires it), so `chrome_tls_profile()` produces a clean JA4.
@@ -37,6 +47,7 @@ GREASE values are filtered automatically (the JA4 spec requires it), so `chrome_
 ```rust
 use courierust::courierust_fingerprint::TlsProfile;
 
+# fn main() {
 let custom = TlsProfile {
     tls_version: 0x0304, // TLS 1.3
     ciphers: vec![0x1301, 0x1302, 0x1303], // AES-128-GCM, AES-256-GCM, CHACHA
@@ -44,6 +55,8 @@ let custom = TlsProfile {
     alpn: vec!["h2".into(), "http/1.1".into()],
     ..Default::default()
 };
+# assert_eq!(custom.tls_version, 0x0304);
+# }
 ```
 
 Feed these values into your TLS library's ClientHello builder.
@@ -55,6 +68,7 @@ Beyond TLS, Chrome is identified by its HTTP/2 behavior. The `ChromeH2Fingerprin
 ```rust
 use courierust::courierust_fingerprint::h2::ChromeH2Fingerprint;
 
+# fn main() {
 let fp = ChromeH2Fingerprint::chrome();
 
 // SETTINGS entries in the exact order Chrome sends them:
@@ -66,7 +80,12 @@ fp.apply_to_settings(&mut my_settings);
 let h2_cfg = fp.h2_config(); // client-role h2::connection::Config
 
 // Header blocks are ordered pseudo-headers first, then lowercased-sorted:
+# let fields: courierust::courierust_hpack::HeaderList = Default::default();
 let ordered = courierust::courierust_fingerprint::h2::order_headers_chrome(&fields);
+# assert_eq!(entries.len(), 5);
+# assert!(ordered.is_empty());
+# let _ = h2_cfg;
+# }
 ```
 
 The fingerprint fields are all public and configurable (`header_table_size`, `enable_push`, `max_concurrent_streams`, `initial_window_size`, `max_header_list_size`, `connection_window_update`, `sort_headers`), so you can match a specific Chrome build. Chromium tweaks these occasionally — keep them in sync with the build you're impersonating.

@@ -25,7 +25,8 @@ flowchart LR
 `Handler::websocket` 决定哪些路由按 WebSocket 服务；返回 `Pass` 就回到
 普通 HTTP 路径（于是 `/ws` 归你，其它路径仍然由你真正的 handler 回答）：
 
-```rust
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 use courierust::courierust_body::Body;
 use courierust::courierust_http::request::Request;
 use courierust::courierust_http::response::Response;
@@ -44,6 +45,7 @@ impl WsService for Echo {
     }
 
     fn on_close(&self, conn: &mut WsConn, code: Option<u16>, clean: bool) {
+        // `code: None` 表示链路断了，不是对端的错。
         eprintln!("closed code={code:?} clean={clean} path={}", conn.path());
     }
 }
@@ -52,11 +54,11 @@ struct App;
 
 impl Handler for App {
     fn handle(&self, _req: Request<Body>) -> Response<Body> {
-        Response::text("普通 HTTP 照样能用")
+        Response::<Body>::with_status(200.into()).with_body(Body::from("plain HTTP still works"))
     }
 
     fn websocket(&self, req: &Request<Body>) -> WsUpgradeReply {
-        if req.path == "/ws" {
+        if req.uri.path() == "/ws" {
             WsUpgradeReply::Accept(Arc::new(Echo))
         } else {
             WsUpgradeReply::Pass
@@ -66,6 +68,8 @@ impl Handler for App {
 
 let server = Server::bind_with_config("127.0.0.1:8080", ServerConfig::default())?;
 server.serve(App)?;
+# Ok(())
+# }
 ```
 
 `WsService` 提供 `on_open`、`on_message`、`on_pong`、`on_idle` 与
@@ -94,8 +98,8 @@ reactor 里值得知道的一点：空闲的 WebSocket **不占 worker**，所�
 ## 策略：`WsConfig`
 
 ```rust
-use courierust::courierust_server::ws::{PmDeflatePolicy, WsConfig};
-use courierust::courierust_ws::OriginPolicy;
+use courierust::courierust_server::ws::WsConfig;
+use courierust::courierust_ws::{OriginPolicy, PmDeflatePolicy};
 
 let ws = WsConfig {
     // 默认值：浏览器只能从同站点打开这个 socket，
@@ -130,7 +134,8 @@ let ws = WsConfig {
 
 ## 客户端
 
-```rust
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 use courierust::courierust_client::ClientConfig;
 use courierust::courierust_client::ws::WebSocket;
 
@@ -152,6 +157,8 @@ loop {
     }
 }
 ws.close(1000, "done")?;
+# Ok(())
+# }
 ```
 
 客户端同时支持 `ws://` 与 `wss://`（后者走本 crate 自带的 TLS 1.2/1.3
@@ -197,9 +204,14 @@ location /ws/ {
 然后告诉服务端它「身后有代理」：
 
 ```rust
+# use courierust::courierust_server::ws::WsConfig;
+# use courierust::courierust_ws::{IpNet, OriginPolicy};
 let ws = WsConfig {
     origin: OriginPolicy::List(vec!["https://app.example.com".into()]),
-    trusted_proxies: vec![IpNet::parse("127.0.0.1/32")?, IpNet::parse("10.0.0.0/8")?],
+    trusted_proxies: vec![
+        IpNet::parse("127.0.0.1/32").expect("valid CIDR"),
+        IpNet::parse("10.0.0.0/8").expect("valid CIDR"),
+    ],
     ..Default::default()
 };
 ```

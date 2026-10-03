@@ -4,7 +4,7 @@ A complete RFC 6455 WebSocket implementation — framing, masking, UTF-8 validat
 
 Everything here is `no_std + alloc` except the pieces that genuinely need a socket (entropy for masking keys, `SharedSink`, the client). The protocol core never allocates per frame except for the message payload the caller receives.
 
-```
+```text
 frame.rs      wire format: headers, opcodes, masking, sinks (StreamSink, SharedSink, VecSink)
 utf8.rs       incremental UTF-8 validation that never copies the message
 handshake.rs  the HTTP upgrade: key check, Origin policy, extensions, subprotocol selection
@@ -92,11 +92,20 @@ http:
 Then configure the server to match:
 
 ```rust
+use courierust::courierust_server::ws::WsConfig;
+use courierust::courierust_ws::{IpNet, OriginPolicy};
+
+# fn main() {
 let ws = WsConfig {
     origin: OriginPolicy::List(vec!["https://app.example.com".into()]),
-    trusted_proxies: vec![IpNet::parse("127.0.0.1/32")?, IpNet::parse("10.0.0.0/8")?],
+    trusted_proxies: vec![
+        IpNet::parse("127.0.0.1/32").expect("valid CIDR"),
+        IpNet::parse("10.0.0.0/8").expect("valid CIDR"),
+    ],
     ..Default::default()
 };
+# let _ = ws;
+# }
 ```
 
 Two rules that are easy to get wrong:
@@ -120,6 +129,10 @@ Server:
 use courierust::courierust_server::ws::{WsConn, WsData, WsService, WsUpgradeReply};
 use std::sync::Arc;
 
+# fn main() {
+#     // `App` is what you hand to `Server::serve`.
+#     let _app = App;
+# }
 struct Echo;
 
 impl WsService for Echo {
@@ -139,11 +152,13 @@ impl courierust::courierust_server::Handler for App {
     fn handle(&self, _req: courierust::courierust_http::request::Request<
         courierust::courierust_body::Body>) -> courierust::courierust_http::response::Response<
         courierust::courierust_body::Body> {
-        courierust::courierust_http::response::Response::text("hello")
+        let mut resp = courierust::courierust_http::response::Response::with_status(200.into());
+        resp.body = courierust::courierust_body::Body::from("hello");
+        resp
     }
     fn websocket(&self, req: &courierust::courierust_http::request::Request<
         courierust::courierust_body::Body>) -> WsUpgradeReply {
-        if req.path == "/echo" { WsUpgradeReply::Accept(Arc::new(Echo)) }
+        if req.uri.path() == "/echo" { WsUpgradeReply::Accept(Arc::new(Echo)) }
         else { WsUpgradeReply::Pass }   // let the HTTP handler answer 404
     }
 }
@@ -151,19 +166,22 @@ impl courierust::courierust_server::Handler for App {
 
 Client:
 
-```rust
+```rust,no_run
 use courierust::courierust_client::ClientConfig;
 use courierust::courierust_client::ws::WebSocket;
 
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 let mut ws = WebSocket::connect("wss://example.com/ws", &ClientConfig::default())?;
 ws.send_text("hello")?;
 for msg in [ws.read_message()?] {
     println!("{msg:?}");
 }
 ws.close(1000, "done")?;
+# Ok(())
+# }
 ```
 
-See [`examples/ws_echo.rs`](../../examples/ws_echo.rs) and [`examples/ws_client.rs`](../../examples/ws_client.rs) for runnable versions, and [`tests/ws.rs`](../../tests/ws.rs) for 34 end-to-end tests that exercise the wire protocol against a real socket, including cross-driver push, origin rejection, wss over TLS, and the error codes.
+See [`examples/ws_echo.rs`](../../examples/ws_echo.rs) and [`examples/ws_client.rs`](../../examples/ws_client.rs) for runnable versions, and [`tests/ws.rs`](../../tests/ws.rs) for 37 end-to-end tests that exercise the wire protocol against a real socket, including cross-driver push, origin rejection, wss over TLS, and the error codes.
 
 ## Conformance evidence
 

@@ -9,6 +9,7 @@ use courierust::courierust_client::{Client, ClientConfig};
 use courierust::courierust_http::header::HeaderMap;
 use std::time::Duration;
 
+# fn main() {
 let cfg = ClientConfig {
     // Prefer HTTP/2 (h2c prior knowledge). HTTP/1.1 is used when false.
     http2: true,
@@ -28,40 +29,56 @@ let cfg = ClientConfig {
     // Defensive limits: header list and body size accepted from a peer.
     max_header_list: 1 << 20,
     max_body: 16 * 1024 * 1024,
+    ..Default::default()
 };
 
 let client = Client::with_config(cfg);
 // Client is cheap to clone and shares the pools internally.
 let c2 = client.clone();
+# let _ = c2;
+# }
 ```
 
 `Client::new()` is the same with all defaults.
 
 ## GET
 
-```rust
+```rust,no_run
+# use courierust::courierust_client::Client;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = Client::new();
 let resp = client.get("http://127.0.0.1:8080/health")?;
 println!("status: {}", resp.status.as_u16());
 // Body::collect() blocks until the whole body arrives.
 let body = resp.body.collect()?;
 println!("body: {}", body.to_str()?);
+# Ok(())
+# }
 ```
 
 ## POST
 
 `post` takes anything that converts into a `Body` — `Bytes`, `Vec<u8>`, `String`, `&'static str`, or `&'static [u8]`:
 
-```rust
+```rust,no_run
+# use courierust::courierust_client::Client;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = Client::new();
 let resp = client.post("http://127.0.0.1:8080/submit", "raw text payload")?;
 let resp = client.post("http://127.0.0.1:8080/submit", vec![1u8, 2, 3])?;
+# Ok(())
+# }
 ```
 
 ## Request builder
 
 `Client::request(url, method)` returns a `RequestBuilder`: it builds the same `Request` the hand-written form below sends, and hands it to the same path, so redirects, pools and all three protocols behave identically. `Client::{put, delete, head, patch, options}` are the one-call shorthands.
 
-```rust
+```rust,no_run
 use courierust::courierust_http::Method;
+# use courierust::courierust_client::Client;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = Client::new();
 
 let resp = client
     .request("http://127.0.0.1:8080/api/items", Method::POST)
@@ -72,6 +89,8 @@ let resp = client
     .timeout(std::time::Duration::from_secs(5))
     .send()?;
 println!("{}", resp.text()?);
+# Ok(())
+# }
 ```
 
 - `query` / `form` use the WHATWG `application/x-www-form-urlencoded` encoding (`courierust_http::form`): a space becomes `+`, anything outside `A-Za-z0-9*-._` becomes `%XX`.
@@ -81,7 +100,10 @@ println!("{}", resp.text()?);
 
 ## Request with headers, and inspect the response
 
-```rust
+```rust,no_run
+# use courierust::courierust_client::Client;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = Client::new();
 use courierust::courierust_body::Body;
 use courierust::courierust_bytes::Bytes;
 use courierust::courierust_http::header::{HeaderName, HeaderValue};
@@ -102,6 +124,8 @@ req.body = Body::Bytes(Bytes::from(r#"{"name":"courierust"}"#));
 let resp = client.execute("http://127.0.0.1:8080", req)?;
 println!("version: {}", resp.version);
 println!("x-request-id: {:?}", resp.headers.get("x-request-id"));
+# Ok(())
+# }
 ```
 
 Notes:
@@ -113,23 +137,37 @@ Notes:
 
 Redirects are on by default and capped by `max_redirects`. `301`, `302`, and `303` switch the method to `GET` (RFC 9110) and drop the request body; `307` and `308` keep both the method and the body, and a body that only existed as a stream (so it cannot be replayed) fails the hop with an explicit error rather than being sent empty. Absolute, protocol-relative (`//host/...`), and relative `Location` values are all handled:
 
-```rust
+```rust,no_run
+# use courierust::courierust_client::Client;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = Client::new();
 // Follows up to 10 hops automatically; the final response comes back.
 let resp = client.get("http://short.example/start")?;
+# let _ = resp;
+# Ok(())
+# }
 ```
 
 ## RFC 9218 priorities (HTTP/2)
 
 For HTTP/2 you can attach a priority to each request. The server schedules streams with a WUCS scheduler: urgency `0..=7` (0 = highest), `incremental` for streams that can be consumed as data arrives.
 
-```rust
+```rust,no_run
+# use courierust::courierust_client::Client;
+# use courierust::courierust_http::method::Method;
+# use courierust::courierust_http::request::Request;
 use courierust::courierust_h2::priority::Priority;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = Client::new();
 
 // Parse from the wire format ("u=1, i") or build directly:
 let prio = Priority { urgency: 1, incremental: true };
 
 let mut req = Request::new(Method::GET, "/big-download");
 let resp = client.execute_priority("http://127.0.0.1:8080", req, prio)?;
+# let _ = resp;
+# Ok(())
+# }
 ```
 
 `Priority` also implements `Default` (urgency 3, non-incremental) and `Display` (`u=3`), and can be parsed with `Priority::parse(b"u=1, i")`.
@@ -138,20 +176,28 @@ let resp = client.execute_priority("http://127.0.0.1:8080", req, prio)?;
 
 A streaming (`Channel`) response body is consumed chunk by chunk with `try_next_chunk` — useful for SSE or long downloads without buffering everything:
 
-```rust
+```rust,no_run
+# use courierust::courierust_client::Client;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = Client::new();
 let resp = client.get("http://127.0.0.1:8080/events")?;
 let mut body = resp.body;
 while let Some(chunk) = body.try_next_chunk()? {
     // chunk: courierust::courierust_bytes::Bytes
     eprintln!("chunk: {} bytes", chunk.len());
 }
+# Ok(())
+# }
 ```
 
 ## Error handling
 
 Every fallible call returns `courierust::Result<T>` where the error is `courierust::Error`:
 
-```rust
+```rust,no_run
+# use courierust::courierust_client::Client;
+# fn main() {
+# let client = Client::new();
 match client.get("http://127.0.0.1:9/") {
     Ok(resp) => println!("ok: {}", resp.status),
     Err(e) => {
@@ -159,6 +205,7 @@ match client.get("http://127.0.0.1:9/") {
         println!("message: {}", e);
     }
 }
+# }
 ```
 
 `Error` converts into `std::io::Error` (for use with `?` in io-returning code) and carries a public `kind` field for programmatic handling.
@@ -175,7 +222,8 @@ match client.get("http://127.0.0.1:9/") {
 The same client speaks WebSockets — `ws://` and `wss://`, the second through
 the crate's own TLS stack — with `ClientConfig` supplying the read deadline:
 
-```rust
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 use courierust::courierust_client::ClientConfig;
 use courierust::courierust_client::ws::WebSocket;
 
@@ -183,6 +231,8 @@ let mut ws = WebSocket::connect("wss://example.com/ws", &ClientConfig::default()
 ws.send_text("hello")?;
 println!("{:?}", ws.read_message()?);   // Event::Text("hello")
 ws.close(1000, "done")?;
+# Ok(())
+# }
 ```
 
 It shares the framing / UTF-8 / close-handshake engine with the server, so

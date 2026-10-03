@@ -80,7 +80,7 @@ handler 拥有 WebSocket 路由的方式跟拥有 HTTP 路由完全一样：`Han
 
 `COURIERUST_H1_TRACE=1` 开启每请求分段计时，输出 `H1SEG|...` 行——一条连接建立行（`event=newconn|accept_us`），以及每个已服务请求批一条行，覆盖 1 KiB keep-alive 请求的完整九段分解：
 
-```
+```text
 accept_us    accept → 注册进 poller                      （连接建立）
 fresh_wait_us 注册 → 首次 worker 拾取                    （仅首请求）
 handoff_us   release → 下次拾取（keep-alive 往返         = last_write_to_reregistered
@@ -96,17 +96,21 @@ write_us     首次写入 → 全部写完
 
 ## 用法
 
-```rust
-use courierust::courierust_server::{Server, ServerConfig};
+```rust,no_run
+use courierust::courierust_body::Body;
 use courierust::courierust_http::{Request, Response};
+use courierust::courierust_server::{Server, ServerConfig};
 
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 let mut cfg = ServerConfig::default();
 cfg.http2 = true; // 同端口 h2c + h1.1
 let server = Server::bind_with_config("127.0.0.1:8080", cfg)?;
 
-server.serve(|req: Request<Body>| -> Response<Body> {
+server.serve(|_req: Request<Body>| -> Response<Body> {
     Response::with_status(200.into())
 })?;
+# Ok(())
+# }
 ```
 
 给 `ServerConfig::tls` 配上 `Identity` + ALPN，同一个服务器就说 HTTPS——见 `examples/https.rs`。

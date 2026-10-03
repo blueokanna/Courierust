@@ -22,12 +22,15 @@
 ## 用法
 
 ```rust
-use courierust::courierust_error::{Error, ErrorKind, Result};
+use courierust::courierust_error::{Error, ErrorKind};
 
+# fn main() {
+let err = Error::protocol("the peer sent a malformed request line");
 match err.kind {
-    ErrorKind::WouldBlock => /* 还没就绪，再试 */,
-    ErrorKind::Protocol => /* 对端违反了 RFC */,
-    ErrorKind::H2(code) => /* HTTP/2 错误码原样保留 */,
-    _ => /* 记 err.message */,
+    ErrorKind::WouldBlock => { /* 还没就绪，再试 */ }
+    ErrorKind::Protocol => { /* 对端违反了 RFC */ }
+    ErrorKind::H2(code) => { /* HTTP/2 错误码原样保留 */ let _ = code; }
+    _ => { /* 记 err.message */ }
 }
+# }
 ```

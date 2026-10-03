@@ -17,11 +17,17 @@ h2 服务端路径是流控感知的：channel body **只在连接能接收更�
 ```rust
 use courierust::courierust_body::Body;
 use courierust::courierust_bytes::Bytes;
+use courierust::Result;
 use std::sync::mpsc::channel;
 
+# fn main() -> Result<()> {
 let (tx, rx) = channel::<Result<Bytes>>();
 // 把 `rx` 交给响应，从任何地方推：
-tx.send(Ok(Bytes::from_static(b"chunk 1")));
+let body = Body::Channel(rx);
+tx.send(Ok(Bytes::from_static(b"chunk 1"))).expect("the receiver is alive");
+# let _ = body;
+# Ok(())
+# }
 ```
 
 `Result<Bytes>` 的载荷是故意的：生产者可以在流中报告错误，消费者看到的是错误，而不是被截断的 body。
