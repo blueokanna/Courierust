@@ -96,6 +96,10 @@ pub struct ClientHelloInfo {
 pub enum TlsError {
     /// Underlying transport error.
     Io(String),
+    /// The transport would not take the record right now (a full socket
+    /// send buffer, a non-blocking one). The record is retained for the
+    /// next flush, so this is a reason to park, not to fail.
+    WouldBlock,
     /// The peer sent a malformed or protocol-violating message.
     Protocol(String),
     /// The peer sent an alert.
@@ -121,6 +125,7 @@ impl core::fmt::Display for TlsError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             TlsError::Io(m) => write!(f, "TLS I/O error: {m}"),
+            TlsError::WouldBlock => write!(f, "TLS transport not ready"),
             TlsError::Protocol(m) => write!(f, "TLS protocol error: {m}"),
             TlsError::Alert { level, description } => {
                 write!(f, "TLS alert level={level} description={description}")
@@ -139,6 +144,7 @@ impl From<crate::courierust_error::Error> for TlsError {
         use crate::courierust_error::ErrorKind;
         match e.kind {
             ErrorKind::Timeout => TlsError::Timeout,
+            ErrorKind::WouldBlock => TlsError::WouldBlock,
             ErrorKind::UnexpectedEof => TlsError::UnexpectedEof,
             _ => TlsError::Io(e.to_string()),
         }
@@ -156,6 +162,7 @@ impl From<TlsError> for crate::courierust_error::Error {
         match e {
             TlsError::Io(message) => Error::io(message),
             TlsError::Protocol(message) => Error::protocol(message),
+            TlsError::WouldBlock => Error::new(ErrorKind::WouldBlock),
             TlsError::Timeout => Error::new(ErrorKind::Timeout),
             TlsError::UnexpectedEof => Error::new(ErrorKind::UnexpectedEof),
             other => Error::with_message(ErrorKind::Other, alloc::format!("{other}")),
@@ -683,9 +690,6 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
                             });
                         }
                         record::CONTENT_HANDSHAKE => {
-                            // A post-handshake record may carry several
-                            // messages, so every one is processed
-                            // (RFC 8446 §5.1).
                             let mut rest = &payload[..];
                             while let Some(m) = handshake::peek_complete_hs(rest) {
                                 match m.msg_type {
@@ -815,9 +819,7 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
                         psk,
                         suite,
                         issued_at: self.now,
-                        // Honor the server's lifetime, capped at 7 days.
                         lifetime: (ticket.lifetime as i64).min(session::SESSION_LIFETIME_SECS),
-                        // 0-RTT allowance the ticket carries (0 = none).
                     };
                     if let Some(store) = &self.session_store {
                         cache_session(&mut crate::lock(store), sess);
@@ -997,22 +999,15 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> crate::couri
     for TlsStream<R, W>
 {
     fn write(&mut self, buf: &[u8]) -> crate::courierust_error::Result<usize> {
-        self.write_all(buf).map_err(|e| {
-            crate::courierust_error::Error::with_message(
-                crate::courierust_error::ErrorKind::Other,
-                e.to_string(),
-            )
-        })?;
+        self.write_all(buf)
+            .map_err(crate::courierust_error::Error::from)?;
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> crate::courierust_error::Result<()> {
-        self.io.writer.flush().map_err(|e| {
-            crate::courierust_error::Error::with_message(
-                crate::courierust_error::ErrorKind::Other,
-                e.to_string(),
-            )
-        })
+        // The record layer's own writer already speaks this crate's error
+        // types, so a refusal arrives as `WouldBlock` without a mapping.
+        self.io.writer.flush()
     }
 }
 
@@ -1077,9 +1072,6 @@ impl Default for ClientConfig {
 #[derive(Clone)]
 pub struct TlsConnector {
     config: ClientConfig,
-    /// Resumable sessions (NewSessionTickets), keyed by server name.
-    /// Shared across connects on the same connector and populated lazily
-    /// as tickets are read off connections.
     sessions: std::sync::Arc<std::sync::Mutex<Vec<session::ClientSession>>>,
 }
 
@@ -1132,17 +1124,11 @@ impl TlsConnector {
         let mut io = TlsIo::new(reader, writer);
         let allow13 = self.config.max_version >= TlsVersion::Tls13;
         let allow12 = self.config.min_version <= TlsVersion::Tls12;
-
-        // Build and send a ClientHello covering the configured window. A
-        // fresh resumption session (if any) is offered via psk_dhe_ke.
         let mut random = [0u8; 32];
         handshake::fill_entropy(&mut random)?;
         let mut priv13 = [0u8; 32];
         handshake::fill_entropy(&mut priv13)?;
         let pub13 = crypto::x25519::x25519(&priv13, &crypto::x25519::BASE_POINT);
-        // A profile-pinned ClientHello cannot carry the PSK binder the
-        // resumption path needs, so resumption is skipped when a profile
-        // is configured.
         let resume_session = if self.config.profile.is_none() {
             allow13.then(|| self.find_session(hostname)).flatten()
         } else {
@@ -1169,22 +1155,10 @@ impl TlsConnector {
                 self.config.profile.as_ref(),
             ),
         };
-        // The initial TLS 1.3 ClientHello record carries the legacy
-        // 0x0301 version (RFC 8446 §5.1; browsers and the BoringSSL /
-        // OpenSSL clients all do this, and record-version
-        // fingerprinting reads it). Records after the ServerHello use
-        // 0x0303 again.
         io.write_plaintext_record(record::CONTENT_HANDSHAKE, &ch)?;
 
-        // Read the first plaintext record and dispatch on the negotiated
-        // version. The full payload is kept: a TLS 1.2 peer may coalesce
-        // the ServerHello with the rest of its flight in one record.
         let (ct, first_payload) = io.read_plaintext_record()?;
         if ct != record::CONTENT_HANDSHAKE {
-            // A peer that refuses the ClientHello answers with an alert
-            // record; naming what arrived (and the alert code, if it is
-            // one) is what makes that refusal visible instead of a bare
-            // "expected handshake record".
             let detail = if ct == record::CONTENT_ALERT && first_payload.len() >= 2 {
                 format!(
                     "a TLS alert (level {}, description {})",
@@ -1201,27 +1175,16 @@ impl TlsConnector {
             return Err(TlsError::Protocol("bad handshake record".into()));
         }
         let sh_body = &first_payload[4..];
-        // HelloRetryRequest (RFC 8446 §4.1.4). This client always offers
-        // an X25519 share and implements only X25519 TLS 1.3 key
-        // exchange, so a well-formed HRR either requests a group already
-        // offered (a server protocol error — the retry would change
-        // nothing) or a group this client cannot provide. Both cases
-        // abort with the RFC-mandated fatal alert rather than mis-parsing
-        // the HRR as a ServerHello.
         if handshake::is_hello_retry_request(sh_body) {
             let hrr = handshake::parse_hello_retry_request(sh_body)?;
             if hrr.selected_group == handshake::GROUP_X25519
                 || (hrr.selected_group != tls12::GROUP_SECP256R1)
             {
-                // Selected group already offered, or not in our
-                // supported_groups at all.
                 let _ = io.write_plaintext_record(record::CONTENT_ALERT, &[2, 47]); // illegal_parameter
                 return Err(TlsError::Protocol(
                     "HelloRetryRequest selected an invalid key exchange group".into(),
                 ));
             }
-            // secp256r1 is supported but this client has no TLS 1.3
-            // P-256 ECDHE implementation.
             let _ = io.write_plaintext_record(record::CONTENT_ALERT, &[2, 40]); // handshake_failure
             return Err(TlsError::Unsupported(format!(
                 "HelloRetryRequest requested unsupported group 0x{:04x}",
@@ -1300,9 +1263,6 @@ impl TlsConnector {
                 &first_payload,
                 allow13,
             )?;
-            // TLS 1.2 keeps one key generation for the whole connection:
-            // the Finished already consumed sequence number 0, so the
-            // sequence counters are NOT reset here (unlike TLS 1.3).
             Ok(TlsStream {
                 io,
                 version: TlsVersion::Tls12,
@@ -1478,10 +1438,6 @@ impl TlsAcceptor {
             })
         } else if allow12 {
             if self.config.client_auth.is_some() {
-                // Client authentication is implemented for TLS 1.3:
-                // a TLS 1.2 client would arrive unauthenticated, so the
-                // version is refused instead of the policy being
-                // silently downgraded.
                 return Err(TlsError::Unsupported(
                     "client authentication requires TLS 1.3".into(),
                 ));
@@ -1655,7 +1611,6 @@ mod tests {
         assert!(tls.peer_certificate().is_some());
         tls.write_all(b"ping").unwrap();
         assert_eq!(tls.read_record().unwrap(), b"pong");
-        // Reading the reply also captures the NewSessionTicket behind it.
         tls.close_notify().unwrap();
 
         let stream = TcpStream::connect(addr).unwrap();
@@ -1750,8 +1705,6 @@ mod tests {
             let mut tls = acceptor.accept(&stream, &stream).unwrap();
             assert_eq!(tls.read_record().unwrap(), b"before");
             tls.write_all(b"after").unwrap();
-            // This read processes the client's KeyUpdate (answering it is
-            // owed before the next application record).
             assert_eq!(tls.read_record().unwrap(), b"again");
             tls.write_all(b"end").unwrap();
             assert_eq!(tls.key_generations(), (1, 1));
@@ -1848,10 +1801,6 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let server = std::thread::spawn(move || {
-            // The server completes each handshake regardless of what the
-            // client does; the client's validation failure closes the
-            // connection (surfacing as an I/O error on the server, which
-            // we ignore).
             for _ in 0..2 {
                 let (stream, _) = listener.accept().unwrap();
                 let acceptor = TlsAcceptor::new(ServerConfig {
@@ -1867,7 +1816,6 @@ mod tests {
             }
         });
 
-        // 1. Untrusted root.
         let stream = TcpStream::connect(addr).unwrap();
         let connector = TlsConnector::new(ClientConfig {
             roots: RootStore::new(),
@@ -1885,10 +1833,8 @@ mod tests {
             Err(e) => e,
         };
         assert!(matches!(err, TlsError::Certificate(_)), "got {err:?}");
-        // Close the socket so the server's pending Finished read unblocks.
         drop(stream);
 
-        // 2. Hostname mismatch (certificate is for `localhost`).
         let stream = TcpStream::connect(addr).unwrap();
         let connector = TlsConnector::new(ClientConfig {
             roots: testdata::root_store(),
@@ -2023,9 +1969,6 @@ mod tests {
                     ),
                     "a required certificate must be refused with certificate_required"
                 );
-                // The client has already sent its Finished, so its handshake
-                // completes locally; the refusal arrives as an alert on the
-                // first read.
                 let err = match outcome {
                     Err(e) => e,
                     Ok(mut tls) => tls
@@ -2064,8 +2007,6 @@ mod tests {
 
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            // Trusts the RSA certificate only; the client will present the
-            // Ed25519 one.
             let mut roots = RootStore::new();
             roots.add_der(testdata::RSA_SERVER_CERT_DER.to_vec());
             let acceptor = TlsAcceptor::new(ServerConfig {
@@ -2096,8 +2037,6 @@ mod tests {
             server_outcome.is_err(),
             "an untrusted client chain must be refused"
         );
-        // Same asymmetry: the client finishes locally and learns about the
-        // refusal from the alert the server sends (`bad_certificate`).
         let err = match client_outcome {
             Err(e) => e,
             Ok(mut tls) => tls
@@ -2265,8 +2204,6 @@ mod tests {
         });
         let mut tls = connector.connect("localhost", &stream, &stream).unwrap();
         assert_eq!(tls.version(), TlsVersion::Tls13);
-        // A P-384 identity can only negotiate the SHA-384 suite
-        // (TLS_AES_256_GCM_SHA384 = 0x1302).
         assert_eq!(tls.cipher_suite(), 0x1302);
         assert!(tls.peer_certificate().is_some());
         tls.write_all(b"ping").unwrap();

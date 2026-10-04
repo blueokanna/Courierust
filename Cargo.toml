@@ -16,9 +16,7 @@ categories = [
     "web-programming::http-client",
     "web-programming::http-server",
 ]
-# `lib.rs` embeds the README and the wiki pages with `include_str!` and
-# `build.rs` reads `proto/`, so both ship with the crate. `benches/` and
-# `fuzz/` are separate workspaces that cargo already skips.
+
 exclude = [
     "**/target",
     "**/*.log",

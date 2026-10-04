@@ -19,10 +19,6 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 
-// HTTP/3 (QUIC v1 + TLS 1.3): Courierust H3 client vs quinn+h3 client, same
-// Courierust H3 server, one pooled QUIC connection each — warm per-request cost.
-// Server cert is a CA-signed end entity (CA:FALSE): quinn/rustls reject a
-// self-signed CA:TRUE cert used as end entity (CaUsedAsEndEntity).
 const H3_SERVER_CERT_DER: &[u8] = include_bytes!("../certs/h3_server.der");
 const H3_SERVER_KEY_DER: &[u8] = include_bytes!("../certs/h3_server_key.der");
 const H3_CA_DER: &[u8] = include_bytes!("../certs/h3_ca.der");
@@ -201,19 +197,11 @@ fn hyper_server(protocol: Protocol, payload: Payload) -> SocketAddr {
                 let Ok((stream, _)) = listener.accept().await else {
                     break;
                 };
-                // Fair loopback comparison: the Courierust server and
-                // every client set TCP_NODELAY; hyper's auto builder does
-                // not, and without it the 64 KiB rows stall ~40 ms per
-                // request (Linux delayed-ACK + Nagle) for no protocol
-                // reason.
                 let _ = stream.set_nodelay(true);
                 let body = body.clone();
                 let service = service_fn(move |request: hyper::Request<Incoming>| {
                     let body = body.clone();
                     async move {
-                        // Consume uploads so the h2 flow-control window is
-                        // exercised and a large-body comparison cannot pass
-                        // merely because the peer discarded the request.
                         let _ = BodyExt::collect(request.into_body()).await;
                         Ok::<_, Infallible>(hyper::Response::new(Full::new(body)))
                     }
@@ -285,10 +273,11 @@ enum ReqwestClient {
 
 fn reqwest_client(protocol: Protocol, workers: usize) -> ReqwestClient {
     if protocol.uses_http2() {
-        let builder = reqwest::Client::builder().pool_max_idle_per_host(workers);
+        let builder = courierust_benchmark::reqwest_loopback().pool_max_idle_per_host(workers);
         ReqwestClient::Async(Arc::new(builder.http2_prior_knowledge().build().unwrap()))
     } else {
-        let builder = reqwest::blocking::Client::builder().pool_max_idle_per_host(workers);
+        let builder =
+            courierust_benchmark::reqwest_loopback_blocking().pool_max_idle_per_host(workers);
         ReqwestClient::Blocking(builder.build().unwrap())
     }
 }
@@ -407,7 +396,7 @@ fn run_reqwest_h2_large_body(
     handle: &tokio::runtime::Handle,
 ) -> Timing {
     let client = Arc::new(
-        reqwest::Client::builder()
+        courierust_benchmark::reqwest_loopback()
             .http2_prior_knowledge()
             .pool_max_idle_per_host(1)
             .build()
@@ -433,9 +422,6 @@ fn compare_h2_large_body(
     repetitions: usize,
     handle: &tokio::runtime::Handle,
 ) {
-    // Same hyper h2 server, 64 KiB initial flow-control window: every 64 KiB of
-    // the 1 MiB body costs a WINDOW_UPDATE round trip, so absolute cost is
-    // pacing, not either client's core path. Kept for audit; NOT valid for ratios.
     let request_body = large_h2_body();
     let (courierust_timing, reqwest_timing) = measure_pair(
         repetitions,
@@ -808,32 +794,63 @@ fn run_quinn_h3_client(
     });
 
     let uri = format!("https://{address}/benchmark");
-    let request = |send_request: &mut h3::client::SendRequest<_, _>| {
+    let request = |send_request: &mut h3::client::SendRequest<_, _>| -> Result<(), String> {
         let req = http::Request::builder()
             .uri(&uri)
             .body(())
-            .expect("request built");
+            .map_err(|e| format!("request built: {e}"))?;
         let mut stream = handle
             .block_on(send_request.send_request(req))
-            .expect("send request");
-        handle.block_on(stream.finish()).expect("finish request");
-        let response = handle.block_on(stream.recv_response()).expect("response");
-        assert_eq!(response.status().as_u16(), 200);
+            .map_err(|e| format!("send request: {e}"))?;
+        handle
+            .block_on(stream.finish())
+            .map_err(|e| format!("finish request: {e}"))?;
+        let response = handle
+            .block_on(stream.recv_response())
+            .map_err(|e| format!("recv response: {e}"))?;
+        if response.status().as_u16() != 200 {
+            return Err(format!("status {}", response.status()));
+        }
         let mut total = 0usize;
-        while let Some(chunk) = handle.block_on(stream.recv_data()).expect("recv data") {
+        while let Some(chunk) = handle
+            .block_on(stream.recv_data())
+            .map_err(|e| format!("recv data: {e}"))?
+        {
             total += chunk.remaining();
         }
-        assert_eq!(total, payload.bytes);
+        if total != payload.bytes {
+            return Err(format!(
+                "body was {total} bytes, expected {}",
+                payload.bytes
+            ));
+        }
+        Ok(())
     };
-    request(&mut send_request);
-    Ok(run_sequential(requests, MAX_SAMPLES, || {
-        request(&mut send_request)
-    }))
+    request(&mut send_request).map_err(|reason| format!("first stream: {reason}"))?;
+    // A third-party client that stalls is an interop gap to report, not a
+    // reason to abort the suite: the remaining cases still produce
+    // evidence, and the result line names the gap instead of pretending
+    // the case ran.
+    let failure: core::cell::RefCell<Option<String>> = core::cell::RefCell::new(None);
+    let done = core::cell::Cell::new(0usize);
+    let timing = run_sequential(requests, MAX_SAMPLES, || {
+        if failure.borrow().is_some() {
+            return;
+        }
+        match request(&mut send_request) {
+            Ok(()) => done.set(done.get() + 1),
+            Err(reason) => *failure.borrow_mut() = Some(reason),
+        }
+    });
+    match failure.into_inner() {
+        Some(reason) => Err(format!("stream {} of {requests}: {reason}", done.get() + 1)),
+        None => Ok(timing),
+    }
 }
 
 fn print_quinn_not_available(payload: Payload, repetitions: usize, reason: String) {
     println!(
-        "RESULT|suite=compare|case=quinn_h3_client_to_courierust|layer=client|protocol=h3|client=quinn+h3|server=courierust-h3|payload={}|bytes={}|workers=1|server_threads=4|pool_policy=quinn_single_connection|pool_value=1|repetitions={repetitions}|status=not_available|reason=quinn_handshake_interop_pending:{reason}|requests=0|elapsed_ms=0|rps=0|response_mbps=0|p50_us=na|p75_us=na|p90_us=na|p95_us=na|p99_us=na|min_us=na|mean_us=na|max_us=na|stddev_us=na|p999_us=na|tail_ratio=na|samples=0",
+        "RESULT|suite=compare|case=quinn_h3_client_to_courierust|layer=client|protocol=h3|client=quinn+h3|server=courierust-h3|payload={}|bytes={}|workers=1|server_threads=4|pool_policy=quinn_single_connection|pool_value=1|repetitions={repetitions}|status=not_available|reason=quinn_h3_interop_gap:{reason}|requests=0|elapsed_ms=0|rps=0|response_mbps=0|p50_us=na|p75_us=na|p90_us=na|p95_us=na|p99_us=na|min_us=na|mean_us=na|max_us=na|stddev_us=na|p999_us=na|tail_ratio=na|samples=0",
         payload.name, payload.bytes
     );
 }

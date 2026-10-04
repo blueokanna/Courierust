@@ -139,9 +139,6 @@ fn bench_h1_sequential(payload: Payload, requests: usize, server_threads: usize)
 }
 
 fn bench_h1_parallel(payload: Payload, requests: usize, workers: usize, server_threads: usize) {
-    // On blocking server platforms, one idle keep-alive connection occupies
-    // one server worker. Keep enough workers for the client herd or the
-    // sequential warm-up below can deadlock before measurement starts.
     let server_threads = server_threads.max(workers);
     let address = spawn_server(payload_bytes(payload), false, server_threads, None);
     let base_url = Arc::new(format!("http://{address}"));
@@ -177,9 +174,6 @@ fn print_stats(protocol: &str, case: &str, payload: Payload, workers: usize, sta
 }
 
 fn bench_h2_multiplex(payload: Payload, requests: usize, workers: usize, server_threads: usize) {
-    // Instrument both ends so the >8-worker h2 regression is diagnosable:
-    // a 1-connection multiplex shows `h2_connections=1` with `workers`
-    // concurrent streams (the single-driver serialization point).
     let server_stats = Stats::new();
     let client_stats = Stats::new();
     let address = spawn_server(
@@ -227,9 +221,6 @@ fn bench_h2_multiplex(payload: Payload, requests: usize, workers: usize, server_
     );
 }
 
-/// Load the test identity (self-signed Ed25519, CN=localhost) and return
-/// it. The DER files live under `tests/certs/` and are compiled in, so
-/// the binary runs from any working directory.
 const SERVER_CERT_DER: &[u8] = include_bytes!("../../tests/certs/server_cert.der");
 const SERVER_KEY_DER: &[u8] = include_bytes!("../../tests/certs/server_key.der");
 
@@ -336,6 +327,7 @@ fn tls_verify_evidence(address: std::net::SocketAddr, roots: crate_tls::RootStor
         min_version: TlsVersion::Tls12,
         max_version: TlsVersion::Tls13,
         identity: None,
+        profile: None,
     });
     match connector.connect("127.0.0.1", &stream, &stream) {
         Ok(tls) => {

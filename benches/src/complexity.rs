@@ -243,9 +243,6 @@ fn measure(ops: usize, mut f: impl FnMut()) -> Sample {
         }
         let elapsed = started.elapsed();
         let after = counters();
-        // Allocator traffic is a property of the operation, not of the
-        // repeat, so it is read once instead of being multiplied by the
-        // repeat count.
         if !captured {
             alloc_bytes = after.bytes - before.bytes;
             alloc_calls = after.calls - before.calls;
@@ -388,12 +385,6 @@ fn emit_complexity(
         Some(k) => format!("{k:.3}"),
         None => String::from("n/a"),
     };
-    // A measurement range where the fixed term dwarfs the per-unit term
-    // (a 40 µs request with 1 KiB of payload, 4 extra headers against a
-    // 37 µs round trip) has no meaningful asymptotic class *within that
-    // range*: the honest label is the one that points the reader at
-    // `slope_b` instead of a sublinear-looking exponent that is really
-    // the constant absorbed by the fit.
     let n_max = points.iter().map(|(n, _)| *n).fold(0.0f64, f64::max);
     let per_unit_at_max = slope.max(0.0) * n_max;
     let class = if intercept > 10.0 * per_unit_at_max {
@@ -697,13 +688,6 @@ fn codec_family() {
     ours_masked.emit_fits("codec", "courierust", "encode_masked");
     theirs_masked.emit_fits("codec", "tungstenite", "encode_masked");
 
-    // ---- UTF-8 validation over a realistic text block --------------
-    // The reference is `str::from_utf8` — the platform's own validator —
-    // and it is the right control: a WebSocket validator that is slower
-    // than the standard library call it could be written as would be a
-    // pessimisation, not a feature. What the library adds on top is
-    // resume-across-frames plus a precise offset/reason, and that is
-    // measured by the session tests, not by this row.
     let text = "The quick brown fox jumps over the lazy dog. 日本語テキスト 🦀 ".repeat(64);
     let bytes = text.as_bytes();
     note("codec|utf8_validate_reference=std_str_from_utf8_the_platform_baseline_ours_adds_streaming_state_and_a_precise_offset");
@@ -813,9 +797,6 @@ fn hyper_server(payload: usize) -> SocketAddr {
                 let Ok((stream, _)) = listener.accept().await else {
                     break;
                 };
-                // TCP_NODELAY on both stacks (see `compare.rs`: without it,
-                // Linux Nagle + delayed ACK stalls 64 KiB responses for no
-                // protocol reason).
                 let _ = stream.set_nodelay(true);
                 let body = body.clone();
                 let service = service_fn(move |request: hyper::Request<Incoming>| {
@@ -873,7 +854,9 @@ fn http_family() {
             assert_eq!(response.body.collect().unwrap().len(), size);
         });
 
-        let theirs_client = reqwest::blocking::Client::builder().build().unwrap();
+        let theirs_client = courierust_benchmark::reqwest_loopback_blocking()
+            .build()
+            .unwrap();
         let theirs_url = format!("http://{theirs_addr}/complexity");
         assert_eq!(
             theirs_client
@@ -1022,7 +1005,9 @@ fn http_headers_family() {
             assert_eq!(response.body.collect().unwrap().len(), HEADERS_BODY);
         });
 
-        let theirs_client = reqwest::blocking::Client::builder().build().unwrap();
+        let theirs_client = courierust_benchmark::reqwest_loopback_blocking()
+            .build()
+            .unwrap();
         let theirs_url = format!("http://{theirs_addr}/complexity");
         let theirs = measure(ops, || {
             let mut builder = theirs_client.get(&theirs_url);
@@ -1280,9 +1265,6 @@ impl Pattern {
                 out
             }
             Pattern::Bytes => {
-                // Deterministic pseudo-random bytes: no LZ77 matches, so
-                // this is the match finder's worst case — nothing can be
-                // compressed and the search still runs.
                 let mut state = 0x2545_f491_4f6c_dd1du64;
                 let mut out = Vec::with_capacity(size);
                 while out.len() < size {
@@ -1320,12 +1302,6 @@ fn deflate_family() {
             };
             let mut deflater = Deflater::new();
             let mut compressed = Vec::with_capacity(size + 1024);
-            // `None` is a legitimate outcome, not a failure: the payload
-            // was below the threshold or compression did not pay for
-            // itself, and RFC 7692 says such a message is sent with RSV1
-            // clear. The cost of the decision *and* of the failed match
-            // search is what the measurement reports, and the comment on
-            // the row says which outcome it was.
             let compressed_outcome = deflater
                 .deflate_message(&payload, &mut compressed)
                 .is_some();
@@ -1335,12 +1311,6 @@ fn deflate_family() {
             let fresh = measure(ops, || {
                 std::hint::black_box(deflate_sync(&payload));
             });
-            // The permessage-deflate pair: the encoder strips the
-            // four-octet sync-flush marker and `inflate_message` puts it
-            // back (RFC 7692 §7.2.2), keeping the sliding window across
-            // messages — measuring raw `inflate_into` against a
-            // permessage-deflate stream would be a framing error, not a
-            // speed result. A stored message has nothing to inflate.
             let mut inflater = Inflater::new(15);
             let mut inflated = Vec::with_capacity(size * 2);
             let inflate = compressed_outcome.then(|| {

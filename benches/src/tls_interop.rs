@@ -54,6 +54,7 @@ fn main() {
             min_version,
             max_version,
             identity: None,
+            profile: None,
         }),
         ..Default::default()
     });

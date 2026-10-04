@@ -333,9 +333,22 @@ impl<R: Read> BufReader<R> {
 }
 
 /// Buffered writer that coalesces small writes.
+///
+/// A transport that refuses bytes — a socket send buffer that is full, a
+/// `WouldBlock` from a non-blocking one — must not lose them and must
+/// not see them twice. The rule here is therefore: bytes leave the
+/// buffer exactly as the inner writer takes them, and whatever it
+/// refuses stays for the next [`BufWriter::flush`]. Re-flushing after a
+/// refusal resumes at the tail, so a driver that parks a connection and
+/// retries later keeps the byte stream exact.
 pub struct BufWriter<W> {
     inner: W,
     buf: Vec<u8>,
+    /// Bytes the inner writer has accepted since construction. Lets a
+    /// driver tell "the peer took some of it" from "everything is
+    /// parked", which is what decides whether a stalled connection is
+    /// still making progress.
+    written: u64,
 }
 
 impl<W> BufWriter<W> {
@@ -344,12 +357,19 @@ impl<W> BufWriter<W> {
         Self {
             inner,
             buf: Vec::with_capacity(cap),
+            written: 0,
         }
     }
 
     /// Access the wrapped writer.
     pub fn get_ref(&self) -> &W {
         &self.inner
+    }
+
+    /// Total bytes the inner writer has accepted.
+    #[inline]
+    pub fn written(&self) -> u64 {
+        self.written
     }
 
     /// Number of bytes currently buffered.
@@ -370,7 +390,6 @@ impl<W: Write> BufWriter<W> {
     /// over short writes (a TCP send buffer can fill mid-write; returning
     /// early would silently truncate the response).
     pub fn write_all(&mut self, data: &[u8]) -> Result<()> {
-        // Large writes bypass the buffer when it is empty.
         if self.buf.is_empty() && data.len() >= self.buf.capacity() {
             return self.write_loop(data);
         }
@@ -382,15 +401,28 @@ impl<W: Write> BufWriter<W> {
     }
 
     /// Write all of `data` to the inner writer, looping over partial
-    /// writes. A transport error is fatal (callers drop the connection),
-    /// so no retry/duplication can occur.
-    fn write_loop(&mut self, mut data: &[u8]) -> Result<()> {
-        while !data.is_empty() {
-            let n = self.inner.write(data)?;
-            if n == 0 {
-                return Err(Error::io("write made no progress"));
+    /// writes. On an error the unwritten tail is retained, so the retry
+    /// a caller makes after a refused (non-blocking) write resumes
+    /// mid-slice instead of restarting it.
+    fn write_loop(&mut self, data: &[u8]) -> Result<()> {
+        let mut written = 0usize;
+        let outcome = loop {
+            if written == data.len() {
+                break Ok(());
             }
-            data = &data[n.min(data.len())..];
+            match self.inner.write(&data[written..]) {
+                Ok(0) => break Err(Error::io("write made no progress")),
+                Ok(n) => {
+                    let n = n.min(data.len() - written);
+                    written += n;
+                    self.written += n as u64;
+                }
+                Err(e) => break Err(e),
+            }
+        };
+        if let Err(e) = outcome {
+            self.buf.extend_from_slice(&data[written..]);
+            return Err(e);
         }
         Ok(())
     }
@@ -404,19 +436,35 @@ impl<W: Write> BufWriter<W> {
 impl<W: Write> BufWriter<W> {
     /// Flush the internal buffer to the inner writer, looping over
     /// partial writes, then flush the transport.
+    ///
+    /// Bytes the inner writer takes leave the buffer as they go, so a
+    /// flush that stops half-way retries only its tail: clearing on
+    /// success alone would resend the prefix and corrupt the stream.
     pub fn flush(&mut self) -> Result<()> {
-        if !self.buf.is_empty() {
-            let mut written = 0usize;
-            let len = self.buf.len();
-            while written < len {
-                let n = self.inner.write(&self.buf[written..])?;
-                if n == 0 {
-                    return Err(Error::io("write made no progress"));
+        let mut written = 0usize;
+        let len = self.buf.len();
+        let mut outcome = Ok(());
+        while written < len {
+            match self.inner.write(&self.buf[written..]) {
+                Ok(0) => {
+                    outcome = Err(Error::io("write made no progress"));
+                    break;
                 }
-                written += n;
+                Ok(n) => {
+                    let n = n.min(len - written);
+                    written += n;
+                    self.written += n as u64;
+                }
+                Err(e) => {
+                    outcome = Err(e);
+                    break;
+                }
             }
-            self.buf.clear();
         }
+        if written > 0 {
+            self.buf.drain(..written);
+        }
+        outcome?;
         self.inner.flush()
     }
 }
@@ -579,5 +627,78 @@ mod tests {
         }
         w.flush().unwrap();
         assert_eq!(w.get_ref().out, b"abababababababababab");
+    }
+
+    /// A transport that keeps what it took, then refuses once — the shape
+    /// of a socket send buffer that fills mid-frame. The refused bytes
+    /// have to stay in the buffer, and the retry must resume there: a
+    /// flush that restarts from the head would send the prefix twice.
+    #[test]
+    fn bufwriter_resumes_after_refused_write() {
+        struct Refusing {
+            out: Vec<u8>,
+            budget: usize,
+            calls: usize,
+            refuse_on_call: usize,
+        }
+        impl Write for Refusing {
+            fn write(&mut self, buf: &[u8]) -> Result<usize> {
+                self.calls += 1;
+                if self.calls == self.refuse_on_call {
+                    return Err(Error::new(ErrorKind::WouldBlock));
+                }
+                let n = buf.len().min(self.budget);
+                self.out.extend_from_slice(&buf[..n]);
+                Ok(n)
+            }
+            fn flush(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        // Buffered path: the flush is triggered by a write that would
+        // overrun the buffer, which is refused after it has taken its
+        // first chunk.
+        let mut w = BufWriter::new(
+            Refusing {
+                out: Vec::new(),
+                budget: 4,
+                calls: 0,
+                refuse_on_call: 2,
+            },
+            8,
+        );
+        w.write_all(b"aaaa").unwrap();
+        w.write_all(b"bbbb").unwrap();
+        let err = w.write_all(b"cc").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::WouldBlock);
+        assert_eq!(w.get_ref().out, b"aaaa", "only what the peer took is gone");
+        assert_eq!(w.buffered(), 4, "the refused half stays buffered");
+        w.write_all(b"cc").unwrap();
+        w.flush().unwrap();
+        assert_eq!(w.get_ref().out, b"aaaabbbbcc");
+
+        // Direct path: a large slice is written straight through, so the
+        // unwritten tail has to be retained by the writer itself.
+        let mut w = BufWriter::new(
+            Refusing {
+                out: Vec::new(),
+                budget: 3,
+                calls: 0,
+                refuse_on_call: 3,
+            },
+            4,
+        );
+        let err = w.write_all(&[0x41; 10]).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::WouldBlock);
+        assert_eq!(w.get_ref().out.len(), 6);
+        assert_eq!(w.buffered(), 4);
+        w.flush().unwrap();
+        assert_eq!(
+            w.get_ref().out,
+            [0x41; 10],
+            "the stream is byte-exact after the retry"
+        );
+        assert_eq!(w.buffered(), 0);
     }
 }

@@ -4,14 +4,18 @@
 //! so the same buffered codec drives both loopback tests and real
 //! sockets. Non-blocking `WouldBlock` maps to [`crate::ErrorKind::WouldBlock`].
 //!
-//! A socket read timeout is *not* reported the same way by every kernel:
-//! Windows fails the read with `WSAETIMEDOUT`, POSIX with `EAGAIN` — the
-//! very code that otherwise means "no data right now". The connection
-//! adapter therefore distinguishes the two reasons a read timeout can be
-//! armed: a *deadline* (`ConnStream::set_deadline`, a request or a
-//! shutdown budget, where expiry is an answer of its own) and a *poll*
-//! (`ConnStream::configure`, where the h2/h3 drivers use a short timeout
-//! to regain control and must keep seeing `WouldBlock`).
+//! A socket timeout is *not* spelled the same way by every kernel:
+//! Windows fails the read (or the write) with `WSAETIMEDOUT`, POSIX with
+//! `EAGAIN` — the very code that otherwise means "no data right now".
+//! The raw adapters fold both into [`crate::ErrorKind::WouldBlock`], so a
+//! caller sees the condition rather than this kernel's spelling of it,
+//! and the connection adapter then decides what the expiry *means*: a
+//! *deadline* (`ConnStream::set_deadline`, a request or a shutdown
+//! budget, where expiry is an answer of its own) becomes
+//! [`crate::ErrorKind::Timeout`], while a *poll* (`ConnStream::configure`,
+//! where the h2/h3 drivers use a short timeout to regain control) keeps
+//! `WouldBlock` so the driver can tell "nothing yet" from "gone" and go
+//! round its loop again.
 
 use crate::courierust_error::{Error, ErrorKind, Result};
 use crate::courierust_io::{Read, Write};
@@ -32,7 +36,7 @@ impl Read for &TcpStream {
                 Err(Error::new(ErrorKind::WouldBlock))
             }
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                Err(Error::new(ErrorKind::Timeout))
+                Err(Error::new(ErrorKind::WouldBlock))
             }
             Err(e) if e.raw_os_error() == Some(997) => Err(Error::new(ErrorKind::WouldBlock)),
             Err(e) => Err(e.into()),
@@ -47,6 +51,10 @@ impl Write for &TcpStream {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 Err(Error::new(ErrorKind::WouldBlock))
             }
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                Err(Error::new(ErrorKind::WouldBlock))
+            }
+            Err(e) if e.raw_os_error() == Some(997) => Err(Error::new(ErrorKind::WouldBlock)),
             Err(e) => Err(e.into()),
         }
     }
@@ -93,10 +101,6 @@ pub type Listener = TcpListener;
 /// accepts TLS on the same accept loop as plain HTTP.
 pub(crate) struct ConnStream {
     peer: SocketAddr,
-    /// Whether the socket timeout is a *deadline*: on expiry the read is
-    /// cut short by the kernel and POSIX reports `EAGAIN`, which has to
-    /// be told apart from "no data yet", so the flag decides how
-    /// `WouldBlock` is classified. See the module docs.
     deadline: AtomicBool,
     inner: ConnStreamKind,
 }
@@ -240,9 +244,9 @@ impl ConnStream {
     /// On expiry the read fails with `WSAETIMEDOUT` on Windows and with
     /// `EAGAIN` on POSIX; the second is the same code a non-blocking
     /// socket uses for "nothing yet", so the adapter needs to be told
-    /// which one this is. While a deadline is armed, a read that would
-    /// report `WouldBlock` reports [`ErrorKind::Timeout`] instead — for
-    /// every read path, including the ones buried in a buffered codec.
+    /// which one this is. While a deadline is armed, a read or write that
+    /// would report `WouldBlock` reports [`ErrorKind::Timeout`] instead —
+    /// for every path, including the ones buried in a buffered codec.
     pub(crate) fn set_deadline(&self, read_timeout: Option<Duration>) -> Result<()> {
         self.configure(read_timeout)?;
         self.deadline.store(true, Ordering::Relaxed);
@@ -252,9 +256,8 @@ impl ConnStream {
     /// Whether an expiry is currently classified as a deadline.
     ///
     /// Test-only. It is what lets a driver's test pin *which* arming it
-    /// used — a distinction a Windows-only run cannot observe, because
-    /// `WSAETIMEDOUT` maps to `Timeout` however the socket was armed,
-    /// while POSIX reports a poll timeout as `WouldBlock`.
+    /// used, a state the error kind alone no longer betrays now that the
+    /// raw adapters fold `WSAETIMEDOUT` and `EAGAIN` together.
     #[cfg(test)]
     pub(crate) fn deadline_is_armed(&self) -> bool {
         self.deadline.load(Ordering::Relaxed)
@@ -291,8 +294,6 @@ impl ConnStream {
             match crate::courierust_io::Read::read(&mut reader, &mut sink[..want]) {
                 Ok(0) => break,
                 Ok(n) => left = left.saturating_sub(n),
-                // A timeout, a reset or a TLS error all mean the peer has
-                // nothing more to say: stop waiting for it.
                 Err(_) => break,
             }
         }
@@ -307,17 +308,10 @@ impl crate::courierust_io::Read for &ConnStream {
                 crate::courierust_io::Read::read(&mut r, buf)
             }
             ConnStreamKind::Tls { tls, .. } => {
-                // A poisoned TLS lock would otherwise turn one panicking
-                // handler into a connection that can never be read or
-                // written again.
                 let mut g = crate::lock(tls);
                 crate::courierust_io::Read::read(&mut *g, buf)
             }
         };
-        // A read cut short by an armed deadline is reported as a timeout
-        // whichever way the kernel signals it (see the module docs).
-        // Without this, POSIX callers of `timeout(..)` see `WouldBlock`,
-        // and a close-delimited body treats the expiry as a clean EOF.
         read.map_err(|e| {
             if e.kind == ErrorKind::WouldBlock && self.deadline.load(Ordering::Relaxed) {
                 Error::timeout("read deadline expired")
@@ -330,7 +324,7 @@ impl crate::courierust_io::Read for &ConnStream {
 
 impl crate::courierust_io::Write for &ConnStream {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        match &self.inner {
+        let written = match &self.inner {
             ConnStreamKind::Plain(s) => {
                 let mut w: &TcpStream = s;
                 crate::courierust_io::Write::write(&mut w, buf)
@@ -339,11 +333,18 @@ impl crate::courierust_io::Write for &ConnStream {
                 let mut g = crate::lock(tls);
                 crate::courierust_io::Write::write(&mut *g, buf)
             }
-        }
+        };
+        written.map_err(|e| {
+            if e.kind == ErrorKind::WouldBlock && self.deadline.load(Ordering::Relaxed) {
+                Error::timeout("write deadline expired")
+            } else {
+                e
+            }
+        })
     }
 
     fn flush(&mut self) -> Result<()> {
-        match &self.inner {
+        let flushed = match &self.inner {
             ConnStreamKind::Plain(s) => {
                 let mut w: &TcpStream = s;
                 crate::courierust_io::Write::flush(&mut w)
@@ -352,7 +353,14 @@ impl crate::courierust_io::Write for &ConnStream {
                 let mut g = crate::lock(tls);
                 crate::courierust_io::Write::flush(&mut *g)
             }
-        }
+        };
+        flushed.map_err(|e| {
+            if e.kind == ErrorKind::WouldBlock && self.deadline.load(Ordering::Relaxed) {
+                Error::timeout("write deadline expired")
+            } else {
+                e
+            }
+        })
     }
 }
 
@@ -405,12 +413,6 @@ pub fn configure(stream: &TcpStream, read_timeout: Option<Duration>) -> Result<(
     stream
         .set_read_timeout(read_timeout)
         .map_err(|e| Error::io(e.to_string()))?;
-    // A blocking `write` on a socket whose peer has stopped reading parks
-    // until the kernel gives up — minutes, or never. Every driver loop
-    // here is built around a bounded wait (it has to service timeouts,
-    // ACKs and shutdown while a body is being sent), so the write side
-    // gets the same deadline as the read side: a peer that stops reading
-    // is a liveness failure, not a reason to freeze the thread.
     stream
         .set_write_timeout(read_timeout)
         .map_err(|e| Error::io(e.to_string()))?;
@@ -435,20 +437,13 @@ mod tests {
     use super::*;
 
     /// A read timeout armed as a *deadline* is a timeout on every
-    /// platform: Windows fails the read with `WSAETIMEDOUT`, which the
-    /// raw adapter already maps to [`ErrorKind::Timeout`], while POSIX
-    /// fails it with `EAGAIN`, which means "no data yet" to everyone
-    /// else — the deadline flag is what makes the two agree.
+    /// platform: Windows fails the read with `WSAETIMEDOUT`, POSIX with
+    /// `EAGAIN`, and the raw adapter folds both into `WouldBlock` — the
+    /// deadline flag is what turns that back into `Timeout`, since the
+    /// caller asked for a budget rather than for a lull.
     #[test]
     fn deadline_read_timeout_is_reported_as_timeout() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let client = TcpStream::connect(addr).unwrap();
-        // The peer has to stay open for the whole wait, or the socket
-        // would report a reset instead of an expiry.
-        let (_peer, _) = listener.accept().unwrap();
-
-        let stream = ConnStream::plain(client);
+        let (stream, _peer) = silent_pair();
         stream
             .set_deadline(Some(Duration::from_millis(50)))
             .unwrap();
@@ -464,5 +459,58 @@ mod tests {
             started.elapsed() >= Duration::from_millis(40),
             "the read must wait out the deadline instead of failing at once"
         );
+    }
+
+    /// A connected pair whose peer never reads: writes fill the kernel
+    /// buffers instead of being drained, which is how backpressure is
+    /// reached on purpose.
+    fn silent_pair() -> (ConnStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        client.set_nodelay(true).unwrap();
+        (ConnStream::plain(client), peer)
+    }
+
+    /// Write into a peer that never reads until the kernel refuses, and
+    /// report how it refused.
+    fn write_until_refused(stream: &ConnStream) -> ErrorKind {
+        let chunk = [0x5a_u8; 256 * 1024];
+        let give_up = std::time::Instant::now() + Duration::from_secs(10);
+        let mut writer: &ConnStream = stream;
+        let mut total = 0usize;
+        while std::time::Instant::now() < give_up {
+            match crate::courierust_io::Write::write(&mut writer, &chunk) {
+                Ok(0) => panic!("write reported no progress"),
+                Ok(n) => total += n,
+                Err(e) => return e.kind,
+            }
+        }
+        panic!("no backpressure after {total} bytes");
+    }
+
+    /// Both spellings of an armed timeout — `WSAETIMEDOUT` on Windows,
+    /// `EAGAIN` on POSIX — mean "not ready" while the socket is armed for
+    /// polling, so a driver can park and come back. Read and write halves
+    /// are checked together: a driver that only sees this on one of them
+    /// fails a large upload on Windows and passes on Linux.
+    #[test]
+    fn poll_timeout_is_reported_as_would_block() {
+        let mut sink = [0u8; 16];
+
+        let (stream, _peer) = silent_pair();
+        stream.configure(Some(Duration::from_millis(30))).unwrap();
+        let mut reader: &ConnStream = &stream;
+        let err = reader.read(&mut sink).expect_err("the peer is silent");
+        assert_eq!(err.kind, ErrorKind::WouldBlock, "{err:?}");
+        assert_eq!(write_until_refused(&stream), ErrorKind::WouldBlock);
+
+        let (stream, _peer) = silent_pair();
+        stream
+            .set_deadline(Some(Duration::from_millis(30)))
+            .unwrap();
+        assert_eq!(write_until_refused(&stream), ErrorKind::Timeout);
+        assert!(stream.deadline_is_armed());
     }
 }

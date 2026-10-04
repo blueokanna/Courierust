@@ -28,6 +28,22 @@ pub fn is_preface(buf: &[u8]) -> bool {
     buf == frame::CLIENT_PREFACE
 }
 
+/// Whether an error says "the transport cannot take more right now"
+/// rather than "the connection is gone".
+///
+/// A non-blocking socket reports `WouldBlock`; a blocking one reports
+/// whatever its armed timeout produced, which the net adapter normalises
+/// to the same thing and a TLS record layer may carry as a timeout. Both
+/// are backpressure — a parked frame can be resumed, a discarded one
+/// corrupts the stream — so neither is allowed to end the session. A
+/// peer that never drains its window is still caught: the drivers fail
+/// the request on its deadline and close the connection when the socket
+/// stops making progress altogether.
+#[inline]
+fn is_backpressure(e: &Error) -> bool {
+    matches!(e.kind, ErrorKind::WouldBlock | ErrorKind::Timeout)
+}
+
 /// Connection configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -227,6 +243,18 @@ pub struct Connection<R, W> {
 
     // Outbound
     preface_pending: bool,
+    /// Encoded bytes the transport has not taken yet.
+    ///
+    /// A large upload is paced by the peer's flow-control window, so a
+    /// socket write legitimately comes back "not now" in the middle of a
+    /// body; a frame that is only staged can be resumed, a frame that
+    /// was half-written cannot. Everything destined for the wire is
+    /// therefore encoded here first and leaves only as the transport
+    /// accepts it.
+    out: BytesMut,
+    /// Set when the last flush was refused, so a connection whose staging
+    /// buffer is empty still pushes the bytes an inner layer retained.
+    flush_pending: bool,
     pending_frames: VecDeque<Frame>,
 
     // Inbound header block reassembly
@@ -295,6 +323,8 @@ impl<R: Read, W: Write> Connection<R, W> {
             local,
             peer,
             settings_sent: false,
+            out: BytesMut::new(),
+            flush_pending: false,
             pending_frames: VecDeque::new(),
             pending_headers: None,
             frame: FrameReader::default(),
@@ -439,18 +469,23 @@ impl<R: Read, W: Write> Connection<R, W> {
     /// Flush outbound and process up to `max_frames` buffered inbound
     /// frames in one call (bounded so a busy peer cannot starve command
     /// handling). A transport timeout ends the batch, not the connection.
+    ///
+    /// The returned flag reports *progress*: a frame arrived, or staged
+    /// bytes reached the transport. A peer that has stopped draining its
+    /// window therefore reads as `Ok(false)` rather than as a failure,
+    /// which is what lets a driver keep its idle accounting honest while
+    /// an upload waits in the send buffer.
     pub fn poll_available(&mut self, max_frames: usize) -> Result<bool> {
         if self.closed {
             return Ok(false);
         }
-        let had_pending = !self.pending_frames.is_empty();
-        self.flush_outbound()?;
+        let mut flushed = self.flush_outbound()?;
         let mut read_any = false;
         for _ in 0..max_frames.max(1) {
             match self.read_and_process_one() {
                 Ok(true) => read_any = true,
                 Ok(false) => break,
-                Err(e) if e.kind == ErrorKind::Timeout => break,
+                Err(e) if e.kind == ErrorKind::Timeout || e.kind == ErrorKind::WouldBlock => break,
                 Err(e) if e.kind == ErrorKind::UnexpectedEof => {
                     self.closed = true;
                     return Err(e);
@@ -465,8 +500,8 @@ impl<R: Read, W: Write> Connection<R, W> {
                 break;
             }
         }
-        self.flush_outbound()?;
-        Ok(had_pending || read_any)
+        flushed |= self.flush_outbound()?;
+        Ok(flushed || read_any)
     }
 
     /// Best-effort flush of queued control frames (e.g. GOAWAY) even after
@@ -475,16 +510,14 @@ impl<R: Read, W: Write> Connection<R, W> {
         while let Some(f) = self.pending_frames.pop_front() {
             let mut buf = BytesMut::with_capacity(64);
             f.encode(&mut buf);
-            if self.writer.write_all(buf.as_slice()).is_err() {
-                break;
-            }
+            self.out.extend_from_slice(&buf);
         }
-        let _ = self.writer.flush();
+        let _ = self.drain_out();
     }
 
     /// Flush pending outbound frames to the transport.
     pub fn flush(&mut self) -> Result<()> {
-        self.flush_outbound()
+        self.flush_outbound().map(|_| ())
     }
 
     /// Send a header block on a stream (request on the client, response
@@ -818,12 +851,19 @@ impl<R: Read, W: Write> Connection<R, W> {
     // Outbound flush + scheduling
     // ------------------------------------------------------------------
 
-    fn flush_outbound(&mut self) -> Result<()> {
+    /// Encode everything queued into the outbound buffer and push as much
+    /// of it to the transport as it will take.
+    ///
+    /// Returns whether any byte reached the transport, which is what the
+    /// drivers use to tell a peer that is making progress from one that
+    /// has stopped draining its window. Backpressure is not an error: the
+    /// bytes stay staged and the next poll resumes them.
+    fn flush_outbound(&mut self) -> Result<bool> {
         if self.closed {
-            return Ok(());
+            return Ok(false);
         }
         if self.preface_pending {
-            self.writer.write_all(frame::CLIENT_PREFACE)?;
+            self.out.extend_from_slice(frame::CLIENT_PREFACE);
             self.preface_pending = false;
         }
         if !self.settings_sent {
@@ -835,10 +875,47 @@ impl<R: Read, W: Write> Connection<R, W> {
         while let Some(f) = self.pending_frames.pop_front() {
             let mut buf = BytesMut::with_capacity(64);
             f.encode(&mut buf);
-            self.writer.write_all(buf.as_slice())?;
+            self.out.extend_from_slice(&buf);
         }
-        self.writer.flush()?;
-        Ok(())
+        self.drain_out()
+    }
+
+    /// Hand the staged bytes to the transport, keeping whatever it does
+    /// not take.
+    ///
+    /// The staging buffer is emptied either way: a writer that reports
+    /// backpressure has already retained the refused tail itself, ahead
+    /// of anything staged later, so the byte stream stays ordered and
+    /// lossless without this layer tracking a second offset. What it does
+    /// track is that a refusal happened — the retry has to keep flushing
+    /// a writer that still owes bytes even when nothing new is queued.
+    fn drain_out(&mut self) -> Result<bool> {
+        if self.out.is_empty() && !self.flush_pending {
+            return Ok(false);
+        }
+        let staged = core::mem::take(&mut self.out);
+        let before = self.writer.written();
+        let outcome = if staged.is_empty() {
+            self.writer.flush()
+        } else {
+            self.writer
+                .write_all(&staged)
+                .and_then(|()| self.writer.flush())
+        };
+        let progress = self.writer.written() > before;
+        self.out = staged;
+        self.out.clear();
+        match outcome {
+            Ok(()) => {
+                self.flush_pending = false;
+                Ok(progress)
+            }
+            Err(e) if is_backpressure(&e) => {
+                self.flush_pending = true;
+                Ok(progress)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn queue_settings(&mut self) {
@@ -2279,6 +2356,8 @@ mod tests {
     use super::*;
     use crate::courierust_hpack::HeaderField;
     use crate::courierust_http::header::{HeaderName, HeaderValue};
+    use alloc::rc::Rc;
+    use core::cell::Cell;
 
     struct OneRead {
         data: Vec<u8>,
@@ -2300,6 +2379,120 @@ mod tests {
             HeaderName::from_lowercase(name),
             HeaderValue::from_bytes(value.as_bytes()).unwrap(),
         )
+    }
+
+    /// A reader that behaves like a socket with nothing to say yet.
+    struct Silent;
+
+    impl Read for Silent {
+        fn read(&mut self, _out: &mut [u8]) -> Result<usize> {
+            Err(Error::new(ErrorKind::WouldBlock))
+        }
+    }
+
+    /// A transport that refuses every write while its budget of calls is
+    /// exhausted — the knob the test flips — and otherwise takes
+    /// `max_chunk` bytes at a time.
+    struct Refusing {
+        out: Vec<u8>,
+        calls: Rc<Cell<usize>>,
+        refuse_calls: Rc<Cell<usize>>,
+        max_chunk: usize,
+    }
+
+    impl Refusing {
+        fn unblocked() -> Self {
+            Self {
+                out: Vec::new(),
+                calls: Rc::new(Cell::new(0)),
+                refuse_calls: Rc::new(Cell::new(0)),
+                max_chunk: usize::MAX,
+            }
+        }
+    }
+
+    impl Write for Refusing {
+        fn write(&mut self, buf: &[u8]) -> Result<usize> {
+            self.calls.set(self.calls.get() + 1);
+            if self.calls.get() <= self.refuse_calls.get() {
+                return Err(Error::new(ErrorKind::WouldBlock));
+            }
+            let n = buf.len().min(self.max_chunk);
+            self.out.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The same exchange on both transports: connection setup, then a
+    /// request whose body needs several frames.
+    fn small_upload<W: Write>(conn: &mut Connection<Silent, W>) {
+        let sid = conn.open_request(Priority::default()).unwrap();
+        let fields = vec![
+            hf(":method", "POST"),
+            hf(":scheme", "http"),
+            hf(":path", "/upload"),
+            hf(":authority", "localhost"),
+        ];
+        conn.send_headers(sid, &fields, false).unwrap();
+        conn.send_data(sid, Bytes::from(vec![0x77_u8; 4096]), true)
+            .unwrap();
+    }
+
+    /// A full send buffer is backpressure, not a dead connection. With
+    /// the window closed the driver keeps polling and the bytes stay put;
+    /// once the peer drains, the upload resumes where it stopped, so the
+    /// stream the peer sees matches the one it would have seen without
+    /// the pause, exactly.
+    #[test]
+    fn backpressure_is_resumed_without_touching_the_byte_stream() {
+        let mut reference = Connection::new(Silent, Refusing::unblocked(), Config::default());
+        small_upload(&mut reference);
+        while reference.poll_available(64).unwrap() {}
+        let want = reference.writer.get_ref().out.clone();
+        assert!(want.len() > 4096, "the body is on the wire");
+
+        let blocked = Rc::new(Cell::new(usize::MAX));
+        let mut stalled = Connection::new(
+            Silent,
+            Refusing {
+                out: Vec::new(),
+                calls: Rc::new(Cell::new(0)),
+                refuse_calls: Rc::clone(&blocked),
+                max_chunk: 512,
+            },
+            Config::default(),
+        );
+        small_upload(&mut stalled);
+        for _ in 0..4 {
+            // Refusals are absorbed: no error, no closed session, and no
+            // progress to report — the driver's idle logic stays honest.
+            assert!(!stalled
+                .poll_available(64)
+                .expect("backpressure is not a connection error"));
+        }
+        assert!(!stalled.is_closed());
+        assert!(
+            stalled.writer.get_ref().out.is_empty(),
+            "nothing reached the transport"
+        );
+
+        // The peer drains; the same session picks up from its tail.
+        blocked.set(0);
+        for _ in 0..64 {
+            if stalled.writer.get_ref().out.len() == want.len() {
+                break;
+            }
+            stalled.poll_available(64).unwrap();
+        }
+        assert_eq!(
+            stalled.writer.get_ref().out,
+            want,
+            "the stream is byte-exact after the pause"
+        );
     }
 
     #[test]

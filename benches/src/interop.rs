@@ -78,6 +78,23 @@ fn fail(name: &str, msg: &str) -> ! {
     std::panic::panic_any(format!("{name}: {msg}"));
 }
 
+/// The full error chain of a foreign error.
+///
+/// `reqwest`'s `Display` is a headline ("error sending request for url …")
+/// and the reason — a refused connection, a protocol error, a TLS failure —
+/// lives in `source()`. A CI failure is only actionable with the reason
+/// attached, so every foreign-stack failure is reported through here.
+fn chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut cause = error.source();
+    while let Some(current) = cause {
+        text.push_str(": ");
+        text.push_str(&current.to_string());
+        cause = current.source();
+    }
+    text
+}
+
 // ---------------------------------------------------------------------------
 // Peer servers
 // ---------------------------------------------------------------------------
@@ -463,7 +480,9 @@ fn hyper_client_h2c_to_courierust_h2() {
 /// reqwest (blocking, h1) against the Courierust server.
 fn reqwest_h1_to_courierust_h1() {
     let addr = courierust_server(false);
-    let client = reqwest::blocking::Client::new();
+    let client = courierust_benchmark::reqwest_loopback_blocking()
+        .build()
+        .unwrap();
     for i in 0..10 {
         let resp = client
             .get(format!("http://{addr}/rw-h1-{i}"))
@@ -485,7 +504,7 @@ fn reqwest_h1_to_courierust_h1() {
 /// server, with concurrent threads exercising multiplexing.
 fn reqwest_h2c_to_courierust_h2() {
     let addr = courierust_server(true);
-    let client = reqwest::blocking::Client::builder()
+    let client = courierust_benchmark::reqwest_loopback_blocking()
         .http2_prior_knowledge()
         .build()
         .unwrap();
@@ -499,7 +518,7 @@ fn reqwest_h2c_to_courierust_h2() {
                 let resp = client
                     .get(format!("http://{base}/{tag}"))
                     .send()
-                    .unwrap_or_else(|e| fail("reqwest h2c", &e.to_string()));
+                    .unwrap_or_else(|e| fail("reqwest h2c", &chain(&e)));
                 assert_eq!(resp.status().as_u16(), 200, "reqwest h2c status {tag}");
                 let body = resp.text().unwrap();
                 assert_eq!(body, format!("/{tag}"), "reqwest h2c path echo {tag}");
@@ -690,9 +709,6 @@ fn hyper_h2_server_graceful() -> (std::net::SocketAddr, tokio::sync::watch::Send
     std::thread::spawn(move || {
         rt.block_on(async move {
             let builder = AutoBuilder::new(TokioExecutor::new()).http2_only();
-            // The connection task polls the hyper connection to
-            // completion; on the shutdown signal it drives a graceful
-            // shutdown (GOAWAY) and waits for it to flush.
             let mut spawned: Option<tokio::task::JoinHandle<()>> = None;
             let mut rx_outer = shutdown_rx.clone();
             loop {
@@ -752,20 +768,15 @@ fn courierust_h2_client_survives_peer_goaway() {
     assert_eq!(resp.status.as_u16(), 200, "pre-GOAWAY status");
     assert_eq!(resp.body.collect().unwrap().as_ref(), b"ok");
 
-    // Ask the foreign peer to GOAWAY, then give the driver time to
-    // observe it and mark the connection non-accepting.
     shutdown_tx.send(true).expect("send shutdown signal");
     std::thread::sleep(Duration::from_millis(600));
 
-    // The old connection must not be reused; the server is gone, so the
-    // request must fail fast (a hang would be a driver bug).
     let result = client.get(&base);
     assert!(
         result.is_err(),
         "request after peer GOAWAY must fail fast, got {result:?}"
     );
 
-    // The client object must recover on a fresh server/authority.
     let addr2 = hyper_server(true);
     let resp = client
         .get(&format!("http://{addr2}/recovered"))
@@ -976,7 +987,6 @@ fn main() {
         "courierust_h2_client_survives_peer_goaway",
         courierust_h2_client_survives_peer_goaway,
     );
-    // HTTP/3 self-interop (loopback regression gates for the H3 path).
     case("h3_self_roundtrip", h3_self_roundtrip);
     case("h3_self_connection_reuse", h3_self_connection_reuse);
     case(
