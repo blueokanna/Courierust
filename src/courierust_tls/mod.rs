@@ -2331,8 +2331,6 @@ mod tests {
         });
 
         let stream = TcpStream::connect(addr).unwrap();
-        // Client defaults to offering TLS 1.3 (max_version = TLS 1.3)
-        // and accepting TLS 1.2.
         let connector = TlsConnector::new(ClientConfig {
             roots: testdata::rsa_root_store(),
             verify: true,
@@ -2383,9 +2381,6 @@ mod tests {
             Ok(_) => panic!("TLS 1.3-only client accepted a TLS 1.2 server"),
             Err(e) => e,
         };
-        // The connection must fail (no silent downgrade). The exact
-        // error is a Protocol error (alert record seen) or an
-        // UnexpectedEof (server closed before the client read).
         assert!(
             matches!(
                 err,
@@ -2439,8 +2434,6 @@ mod tests {
         let mut tls = connector.connect("localhost", &stream, &stream).unwrap();
         assert_eq!(tls.version(), TlsVersion::Tls12);
         assert!(tls.peer_certificate().is_some());
-        // The suite must be an ECDHE_ECDSA AEAD suite (Ed25519 signs the
-        // SKE of the ECDSA family, RFC 8422 §4.3).
         let suite = tls.cipher_suite();
         assert!(
             matches!(suite, 0xc02b | 0xc02c | 0xcca9),
@@ -2509,7 +2502,6 @@ mod tests {
         }
         tls.close_notify().unwrap();
 
-        // Second connection: must resume via the PSK.
         let stream = TcpStream::connect(addr).unwrap();
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
@@ -2575,7 +2567,6 @@ mod tests {
         assert_eq!(tls.read_record().unwrap(), b"pong");
         tls.close_notify().unwrap();
 
-        // Corrupt the cached ticket so the server cannot decrypt it.
         {
             let mut sessions = connector.sessions.lock().unwrap();
             let s = sessions.last_mut().unwrap();
@@ -2583,7 +2574,6 @@ mod tests {
             s.ticket[i] ^= 0x01;
         }
 
-        // Second connection: offer is made but must not resume.
         let stream = TcpStream::connect(addr).unwrap();
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
@@ -2633,7 +2623,6 @@ mod tests {
             .unwrap();
         let mut io = TlsIo::new(&stream, &stream);
 
-        // CH1 requests group selection (empty key_share).
         let mut random = [0u8; 32];
         handshake::fill_entropy(&mut random).unwrap();
         let ch1 = handshake::build_client_hello_negotiated(
@@ -2649,14 +2638,12 @@ mod tests {
         io.write_plaintext_record_v(tls12::VERSION_12, record::CONTENT_HANDSHAKE, &ch1)
             .unwrap();
 
-        // The server must answer with a HelloRetryRequest for X25519.
         let (ct, hrr_payload) = io.read_plaintext_record().unwrap();
         assert_eq!(ct, record::CONTENT_HANDSHAKE);
         assert!(handshake::is_hello_retry_request(&hrr_payload[4..]));
         let hrr = handshake::parse_hello_retry_request(&hrr_payload[4..]).unwrap();
         assert_eq!(hrr.selected_group, handshake::GROUP_X25519);
 
-        // CH2: fresh X25519 share, same random.
         let mut priv2 = [0u8; 32];
         handshake::fill_entropy(&mut priv2).unwrap();
         let pub2 = crypto::x25519::x25519(&priv2, &crypto::x25519::BASE_POINT);
