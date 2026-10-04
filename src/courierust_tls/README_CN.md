@@ -38,12 +38,15 @@ TLS 1.2 + TLS 1.3，**从零实现、零依赖**，跑在本 crate 的 `Read`/`W
 
 ## 用法
 
-```rust
+```rust,no_run
 use courierust::courierust_tls::{Identity, RootStore};
 
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 let mut roots = RootStore::new();
-roots.add_der(root_der);            // 无内置 CA——自带根
-roots.add_pem(ca_bundle_pem)?;      // ……或者 PEM 捆绑包（块之外的文本会被忽略）
+let root_der: Vec<u8> = std::fs::read("root.der")?; // 无内置 CA——自带根
+roots.add_der(root_der);
+let ca_bundle_pem = std::fs::read_to_string("ca.pem")?; // ……或者 PEM 捆绑包
+roots.add_pem(&ca_bundle_pem).map_err(|e| e.to_string())?;
 
 // `from_pem_file` 解析证书链与私钥，并证明二者属于同一对；已有内存中的
 // 文本/DER 时用 `Identity::from_pem(cert, key)` 或
@@ -52,7 +55,10 @@ roots.add_pem(ca_bundle_pem)?;      // ……或者 PEM 捆绑包（块之外的
 // （`EC PRIVATE KEY`）——由 DER 自身决定，不看标签。`ENCRYPTED PRIVATE
 // KEY` 会被指名拒绝；与叶子证书不匹配的私钥在加载时报错，而不是每个
 // 握手都失败一次。
-let identity = Identity::from_pem_file("cert.pem", "key.pem")?;
+let identity = Identity::from_pem_file("cert.pem", "key.pem").map_err(|e| e.to_string())?;
+# let _ = identity;
+# Ok(())
+# }
 ```
 
 `Identity` 也是私钥停止流动的地方：它的 `Debug` 只打印证书链条数与私钥**长度**，绝不打印私钥字节，因此进入日志的 `ServerConfig` 不会泄漏私钥。

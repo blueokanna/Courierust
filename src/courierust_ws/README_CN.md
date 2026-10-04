@@ -4,7 +4,7 @@
 
 除真正需要 socket 的部分（掩码密钥的熵源、`SharedSink`、客户端）之外，全部是 `no_std + alloc`。协议核心除调用方收到的消息负载外，不会按帧分配内存。
 
-```
+```text
 frame.rs      线上格式：帧头、操作码、掩码、输出端（StreamSink / SharedSink / VecSink）
 utf8.rs       增量 UTF-8 校验，不复制消息
 handshake.rs  HTTP 升级：key 校验、Origin 策略、扩展协商、子协议选择
@@ -38,10 +38,9 @@ session.rs    双向状态机：读、写、限额、关闭
 
 - **掩码方向双向强制。** 服务端收到未掩码的客户端帧直接断开；客户端收到被掩码的服务端帧直接断开（§5.1）。搞反方向正是中间缓存被投毒的原因。
 - **默认校验 Origin。** 默认 `OriginPolicy::SameOrigin`：其他站点上的页面无法打开带凭证的 WebSocket，因为浏览器会连同会话 Cookie 一起发起升级。非浏览器客户端用 `NoOrigin`，白名单用 `List`，明确放弃校验才用 `Any`。
-- **`X-Forwarded-*` 只信任你指定的代理。** `trusted_proxies: Vec<IpNet>` 决定何时允许 `X-Forwarded-For` / `X-Forwarded-Proto` 覆盖对端地址；来自非可信来源的头部被忽略，客户端无法伪造自己的 IP，也无法谎称链路是 TLS。
+- **`X-Forwarded-*` 只信任你指定的代理。** `trusted_proxies: Vec<IpNet>` 决定何时允许 `X-Forwarded-For` / `X-Forwarded-Proto` 覆盖对端地址；来自非可信来源的头部被忽略，客户端无法伪造自己的 IP，也无法谎称链路是 TLS。**裸地址是主机路由**——IPv4 为 `/32`，IPv6 为 `/128`。把 IPv6 当成 `/32` 不是笔误而是安全漏洞：一个全球单播地址上的 `/32` 覆盖 2^96 个地址，这些地址中的任何一个发来转发头都会被采信。
 - **严格握手校验。** 恰好一个规范 base64 长度的 `Sec-WebSocket-Key`、`Sec-WebSocket-Version: 13`、`Connection: Upgrade` 按 token 列表匹配、最短长度编码、控制帧不可分片且不超过 125 字节、RSV 位需协商后才允许、关闭码按方向合法性校验。
-- **一切都有上限。** `max_frame`、`max_message`、`max_fragments`、`max_send_queue`：对端无法把"声明的大小"变成内存占用；`permessage-deflate` 解压同样受消息上限约束（zip bomb 得到的是 1009，而不是 OOM，且有测试）。
-- **关闭握手是强制约束，不是建议。** "Close 帧之后不得再发任何帧"（RFC 6455 §5.5.1）由一个**连接级共享标志**保证：与应用线程推送竞态的发送会被拒绝（`ErrorKind::Canceled`），而不是写出一个对端有权判定为协议错误的数据帧。同一 socket 上的会话写入器与应用写入器看到的是同一个标志。
+- **一切都有上限。** `max_frame`、`max_message`、`max_fragments`、`max_send_queue`：对端无法把"声明的大小"变成内存占用；`permessage-deflate` 解压同样受消息上限约束（zip bomb 得到的是 1009，而不是 OOM，且有测试）。- **压缩参数是双向承诺。** `*_max_window_bits`（RFC 7692 §7.1.2.1）决定的是**对端**的解压窗口，因此编码端的匹配查找器会被限制到该窗口：512 字节的窗口无法解析 20 KiB 之前的回引用，发出这种引用不是“压缩率变差”，而是对方解码失败。解压端对入向引用施加同样的上限；同时我们总会宣告 `server_no_context_takeover`，因为本编码器在消息之间本就是无状态的——这能让对端也丢掉自己的解压历史。- **关闭握手是强制约束，不是建议。** "Close 帧之后不得再发任何帧"（RFC 6455 §5.5.1）由一个**连接级共享标志**保证：与应用线程推送竞态的发送会被拒绝（`ErrorKind::Canceled`），而不是写出一个对端有权判定为协议错误的数据帧。同一 socket 上的会话写入器与应用写入器看到的是同一个标志。
 - **HTTP/1.1 必须携带 `Host`**（RFC 9112 §3.2），两条服务端驱动路径都在任何 handler 或 WebSocket 策略之前检查：可能被两跳解释成不同 authority 的请求一律以 `400` 拒绝而不是路由。缺失、重复或为空的 `Host` 都失败关闭；`HTTP/1.0` 允许省略。
 - **传输故障不等于协议错误。** 只有对端的协议违规与超限消息才会回送 Close 帧（1002/1007/1009）；socket 断开以 `code = None, clean = false` 报告给应用，而不是粉饰成对端的错。
 - **限额在缓冲之前生效。** 超限帧在写入缓冲区之前就以 1009 失败；非法文本消息在出错的偏移处（1007）被拒绝，原因字符串按 UTF-8 边界截断。
@@ -90,11 +89,20 @@ http:
 然后让服务端配置与之匹配：
 
 ```rust
+use courierust::courierust_server::ws::WsConfig;
+use courierust::courierust_ws::{IpNet, OriginPolicy};
+
+# fn main() {
 let ws = WsConfig {
     origin: OriginPolicy::List(vec!["https://app.example.com".into()]),
-    trusted_proxies: vec![IpNet::parse("127.0.0.1/32")?, IpNet::parse("10.0.0.0/8")?],
+    trusted_proxies: vec![
+        IpNet::parse("127.0.0.1/32").expect("valid CIDR"),
+        IpNet::parse("10.0.0.0/8").expect("valid CIDR"),
+    ],
     ..Default::default()
 };
+# let _ = ws;
+# }
 ```
 
 两条最容易出错的规则：
@@ -106,7 +114,7 @@ let ws = WsConfig {
 
 - **未实现 RFC 8441（WebSocket over HTTP/2）。** 客户端在 ALPN 中**只**提供 `http/1.1`——即使 `ClientConfig::http2` 为 `true`——且如果连接最终落在 h2 上，会在读到任何一帧之前拒绝。服务器侧：在**已建立的** h2 连接上尝试 WebSocket 属于畸形消息，按 RFC 9113 §8.1.1 作为**流级错误（`PROTOCOL_ERROR`）** 拒绝，两种形式都如此：RFC 8441 的扩展 CONNECT（`:method = CONNECT` 配 `:protocol = websocket`，在本栈里是未定义伪首部——正是 RFC 8441 §3 为「对端从未声明 `SETTINGS_ENABLE_CONNECT_PROTOCOL`」定义的拒绝方式），以及 HTTP/1.1 式的 `Upgrade: websocket` / `Connection: Upgrade`（连接专用字段，§8.2.2）。连接与其它流保持可用。绝不会出现的两种失败形态值得点名：对一个不可能成为 WebSocket 的请求回 `200`，以及建立一条看似成功却不承载任何帧的连接。WebSocket 请用 HTTP/1.1 承载，与绝大多数场景一致。
 - **`permessage-deflate` 对每条消息独立压缩。** 我们的编码器从不使用上下文接管（context takeover）——这永远合法（解码器的窗口是超集），并且彻底消除了"某条消息的明文泄漏进另一条消息"这类缺陷。代价是对大量微小重复消息的压缩率有上限损失，收益是服务端不必为每条连接保留 32 KiB 滑动窗口，可以承载数千连接。
-- **`SO_RCVTIMEO` 只在空闲等待时开启。** Windows 会对 socket 的每一次阻塞操作计费，包括写操作：实测 256 KiB 推送循环在发送方设置了截止时间后慢约 2 倍，两端都设置则慢约 10 倍。因此阻塞服务端仅在等待下一帧时开启截止时间，处理消息期间清除（`ping_interval` 仍是存活检测机制）。**客户端** 会按 `ClientConfig::read_timeout` 在整个连接期间保留截止时间——这对交互式流量是合理的默认值，但在 Windows 上对 256 KiB 批量传输约多花一倍时间；批量传输的客户端应设 `read_timeout: None` 并用应用层存活检测，与服务端一致。两项结论的实测数据见 [`benches/WS_BENCHMARK.md`](../../benches/WS_BENCHMARK.md)。
+- **`SO_RCVTIMEO` 只在空闲等待时开启。** Windows 会对 socket 的每一次阻塞操作计费，包括写操作：实测 256 KiB 推送循环在发送方设置了截止时间后慢约 2 倍，两端都设置则慢约 10 倍。因此阻塞服务端仅在等待下一帧时开启截止时间，处理消息期间清除（`ping_interval` 仍是存活检测机制）。**客户端** 采用同样的作用域：`read_message` 只在等待帧**头**时开启截止时间，帧体流式传输期间清除，因此一次“读后写”的回声在两半上都不再付费。设计接受的残留是阻塞套接字上无法消除的那一个：对端发出帧头后**卡在帧体中间**，此时由 TCP 而非套接字截止时间来兜底——这与服务端对“已在传输中的帧体”采取的姿态一致；需要完全消除时可以给批量接收端设 `read_timeout: None`。两项结论的实测数据见 [`benches/WS_BENCHMARK.md`](../../benches/WS_BENCHMARK.md)。
 - **不要在 reactor 回调里做批量推送。** 事件驱动驱动中，服务回调运行在 reactor 工作线程上；在 `on_message` 里循环推送成千上万条消息会阻塞本该排空发送队列的 reactor，队列上限最终会关闭连接。扇出的正确姿势是其他线程使用 `WsConn::sender()`（`WsSender`）排队并唤醒。
 - **URL 解析只覆盖 `ws://` / `wss://`。** `normalise_url` 只做协议名到 `http`/`https` 的映射，其他形式一律拒绝，而不是"理解一半"。
 
@@ -118,6 +126,10 @@ let ws = WsConfig {
 use courierust::courierust_server::ws::{WsConn, WsData, WsService, WsUpgradeReply};
 use std::sync::Arc;
 
+# fn main() {
+#     // `App` is what you hand to `Server::serve`.
+#     let _app = App;
+# }
 struct Echo;
 
 impl WsService for Echo {
@@ -137,31 +149,43 @@ impl courierust::courierust_server::Handler for App {
     fn handle(&self, _req: courierust::courierust_http::request::Request<
         courierust::courierust_body::Body>) -> courierust::courierust_http::response::Response<
         courierust::courierust_body::Body> {
-        courierust::courierust_http::response::Response::text("hello")
+        let mut resp = courierust::courierust_http::response::Response::with_status(200.into());
+        resp.body = courierust::courierust_body::Body::from("hello");
+        resp
     }
     fn websocket(&self, req: &courierust::courierust_http::request::Request<
         courierust::courierust_body::Body>) -> WsUpgradeReply {
-        if req.path == "/echo" { WsUpgradeReply::Accept(Arc::new(Echo)) }
-        else { WsUpgradeReply::Pass }   // 交给 HTTP 处理器返回 404
+        if req.uri.path() == "/echo" { WsUpgradeReply::Accept(Arc::new(Echo)) }
+        else { WsUpgradeReply::Pass }
     }
 }
 ```
 
 客户端：
 
-```rust
+```rust,no_run
 use courierust::courierust_client::ClientConfig;
 use courierust::courierust_client::ws::WebSocket;
 
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 let mut ws = WebSocket::connect("wss://example.com/ws", &ClientConfig::default())?;
 ws.send_text("hello")?;
 for msg in [ws.read_message()?] {
     println!("{msg:?}");
 }
 ws.close(1000, "done")?;
+# Ok(())
+# }
 ```
 
-可运行版本见 [`examples/ws_echo.rs`](../../examples/ws_echo.rs) 与 [`examples/ws_client.rs`](../../examples/ws_client.rs)；[`tests/ws.rs`](../../tests/ws.rs) 中的 34 个端到端测试针对真实 socket 验证线上协议，包括跨驱动推送、Origin 拒绝、TLS 上的 `wss` 以及各类错误码。
+可运行版本见 [`examples/ws_echo.rs`](../../examples/ws_echo.rs) 与 [`examples/ws_client.rs`](../../examples/ws_client.rs)；[`tests/ws.rs`](../../tests/ws.rs) 中的 37 个端到端测试针对真实 socket 验证线上协议，包括跨驱动推送、Origin 拒绝、TLS 上的 `wss` 以及各类错误码。
+
+## 一致性证据
+
+- **仓内套件**：[`tests/ws_conformance.rs`](../../tests/ws_conformance.rs)——把 RFC 6455 / RFC 7692 中“对端可以违反”的规则按 Autobahn 的形态排成表（组帧、分片、控制帧、负载、限额、关闭握手），每例都在真实 socket 上断言 §7.4 规定的关闭码。
+- **第三方套件**：`.\scripts\autobahn_ws.ps1` 会启动 [`examples/ws_autobahn.rs`](../../examples/ws_autobahn.rs)，并对它运行官方 `crossbario/autobahn-testsuite`。证据是 Autobahn 自己产出的 `index.json`，本仓库不对它做二次总结。
+- **互操作**：`benches/src/ws.rs` 在双向与本实现交叉运行 `tungstenite` 并报告数据，WS 基准套件在 CI 中执行。
+- **模糊测试**：`fuzz/fuzz_targets/ws_frame.rs`、`ws_handshake.rs`、`ws_session.rs` 分别覆盖编解码、握手策略与会话状态机，其中最后一个同时覆盖全窗口与 8 位窗口下的 RFC 7692 解压路径。
 
 ## 接下来看哪里
 
@@ -169,3 +193,7 @@ ws.close(1000, "done")?;
 - 可直接运行的示例：`cargo run --example ws_echo`（同进程内服务器 + 客户端）、`cargo run --example ws_client`（带生产级配置的客户端，可连任意端点）。
 - 实测数据与诚实的弱点：[`benches/WS_BENCHMARK.md`](../../benches/WS_BENCHMARK.md)。
 - 服务端/客户端接入细节：[`../courierust_server/README_CN.md`](../courierust_server/README_CN.md)（`Handler::websocket` 钩子与 reactor）与 [`../courierust_client/README_CN.md`](../courierust_client/README_CN.md)。
+
+## 许可证
+
+本项目遵循 Apache-2.0 许可证，详见 [`LICENSE`](LICENSE) 文件。

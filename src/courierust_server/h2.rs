@@ -157,6 +157,12 @@ fn serve_loop(
     stats: Option<&Stats>,
 ) -> Result<()> {
     let mut peer_goaway = false;
+    // Fixed for the connection's lifetime, so a handler that asks for it
+    // does not cost a syscall per request.
+    let connection_info = crate::courierust_server::ConnectionInfo {
+        peer: stream.peer_addr(),
+        secure: stream.is_tls(),
+    };
 
     let started = std::time::Instant::now();
     let mut last_rx = started;
@@ -200,7 +206,7 @@ fn serve_loop(
                         let request = build_request(&headers, Body::Empty)?;
                         let is_head =
                             request.method == crate::courierust_http::method::Method::HEAD;
-                        let resp = handler.handle(request);
+                        let resp = handler.handle_connected(&connection_info, request);
                         send_response(conn, stream_id, resp, is_head, deferred)?;
                     } else {
                         req_bodies.insert(
@@ -234,7 +240,7 @@ fn serve_loop(
                                 let request = build_request(&rb.headers, body)?;
                                 let is_head =
                                     request.method == crate::courierust_http::method::Method::HEAD;
-                                let resp = handler.handle(request);
+                                let resp = handler.handle_connected(&connection_info, request);
                                 send_response(conn, stream_id, resp, is_head, deferred)?;
                             }
                         }

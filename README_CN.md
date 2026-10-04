@@ -1,14 +1,14 @@
-# Courierust - [English Doc](README.md)
+# Courierust - [English Doc](https://github.com/blueokanna/Courierust/blob/main/README.md)
 
 <p align="center">
-  <img src="assets/Courierust.png" alt="高性能 Rust 网络传输栈" width="20%" />
+  <img src="https://raw.githubusercontent.com/blueokanna/Courierust/main/assets/Courierust.png" alt="高性能 Rust 网络传输栈" width="20%" />
 </p>
 
 > 一个零依赖、协议自研的 HTTP/1.1 + HTTP/2 + HTTP/3 + WebSocket + gRPC 协议栈。
 
 > 中英文手把手教程见 [Wiki](https://github.com/blueokanna/Courierust/wiki)。
 
-`courierust` 的协议核心（`courierust_http` / `courierust_hpack` / `courierust_h2` / `courierust_ws` / `courierust_deflate` / `courierust_quic` / `courierust_h3` / `courierust_fingerprint` / `courierust_crypto` / `courierust_bytes` / `courierust_io`）在 `no_std + alloc` 下即可编译，**不依赖任何第三方库**。`std` feature（默认开启）在此基础上补上多线程网络层：工作窃取线程池、TCP 适配、客户端（h1 连接池、h2/h3 驱动与 WebSocket 客户端）、服务器（事件驱动调度器 + WebSocket 升级）与 gRPC。
+`courierust` 的协议核心（`courierust_http` / `courierust_h1` / `courierust_hpack` / `courierust_h2` / `courierust_ws` / `courierust_deflate` / `courierust_quic` / `courierust_h3` / `courierust_fingerprint` / `courierust_crypto` / `courierust_bytes` / `courierust_io` / `courierust_error`）在 `no_std + alloc` 下即可编译，**不依赖任何第三方库**。`std` feature（默认开启）在此基础上补上多线程网络层：工作窃取线程池、TCP 适配、从零实现的 TLS 1.2/1.3 栈、channel 背靠背的流式响应体、客户端（h1 连接池、h2/h3 驱动与 WebSocket 客户端）、服务器（事件驱动调度器 + WebSocket 升级）与 gRPC。
 
 这不是对某个现成库的封装：帧编解码、HPACK/QPACK 头压缩、QUIC 包保护、WebSocket 组帧/掩码/DEFLATE、流状态机、流控、优先级调度、指纹构造全部从头实现，不依赖任何其他 HTTP 栈。
 
@@ -24,7 +24,7 @@
 
 ### 协议核心（no_std + alloc，零依赖）
 
-- **HTTP/1.1**：请求/响应解析与序列化，keep-alive、分块传输、`100-continue` 等语义。
+- **HTTP/1.1**（`courierust_http` 消息模型 + `courierust_h1` 线格式编解码）：请求/响应解析与序列化，keep-alive、分块传输、`100-continue` 等语义。
 - **HTTP/2（RFC 9113）**：
   - 完整帧编解码（DATA / HEADERS / PRIORITY / RST_STREAM / SETTINGS / PUSH_PROMISE / PING / GOAWAY / WINDOW_UPDATE / CONTINUATION）；
   - 每流与连接两级流控，窗口按帧推进；
@@ -48,7 +48,7 @@
   - HTTP/2 连接由独立 driver 多路复用；连接数达到 `max_connections_per_host` 上限时按**加权负载**选连接（活跃流 + 在途请求体字节 + 封顶的 EWMA 服务时间）；
   - 重定向跟随（301/302/303 自动转 GET）、超时、`User-Agent` 等配置项。
 - **服务器**（`courierust_server`）：默认是**事件驱动调度器**——accept 线程只负责 accept，事件循环把连接按前几个字节分类（TLS / h2 / h1），把空闲的明文 HTTP 连接挂在就绪轮询器（Winsock `select` / POSIX `poll`）上，就绪的连接按批交给 event worker。TLS 与 HTTP/2 连接走阻塞工作窃取池。`event_driven: false` 可恢复旧的「每连接一池任务」模型，供对比与调试。
-- **WebSocket**（`courierust_ws` + 服务端/客户端接入）：RFC 6455 组帧、掩码、UTF-8 校验、握手、分片重组、关闭握手，以及 RFC 7692 `permessage-deflate` —— 全部从头实现。服务端在 handler 钩子里把一条活着的 HTTP/1.1 连接升级（`Handler::websocket` → `WsService` + `WsConfig`：Origin 策略、子协议、帧/消息/分片上限、有界发送队列、Ping/Pong 保活），并且**两条驱动路径都支持升级**——事件 reactor 里一个空闲 WebSocket 只占一个 poller 槽位，不占线程。客户端是 `courierust_client::ws::WebSocket`，`ws://` 与 `wss://`（复用本 crate 自带的 TLS 栈）。引擎细节、部署配方与诚实的基准行：[`src/courierust_ws/README_CN.md`](src/courierust_ws/README_CN.md) 与 [`benches/WS_BENCHMARK.md`](benches/WS_BENCHMARK.md)。
+- **WebSocket**（`courierust_ws` + 服务端/客户端接入）：RFC 6455 组帧、掩码、UTF-8 校验、握手、分片重组、关闭握手，以及 RFC 7692 `permessage-deflate` —— 全部从头实现。服务端在 handler 钩子里把一条活着的 HTTP/1.1 连接升级（`Handler::websocket` → `WsService` + `WsConfig`：Origin 策略、子协议、帧/消息/分片上限、有界发送队列、Ping/Pong 保活），并且**两条驱动路径都支持升级**——事件 reactor 里一个空闲 WebSocket 只占一个 poller 槽位，不占线程。客户端是 `courierust_client::ws::WebSocket`，`ws://` 与 `wss://`（复用本 crate 自带的 TLS 栈）。引擎细节、部署配方与诚实的基准行：[`src/courierust_ws/README_CN.md`](https://github.com/blueokanna/Courierust/blob/main/src/courierust_ws/README_CN.md) 与 [`benches/WS_BENCHMARK.md`](https://github.com/blueokanna/Courierust/blob/main/benches/WS_BENCHMARK.md)。
 - **gRPC**（`courierust_grpc`）：HTTP/2 + 长度前缀消息帧 + `grpc-status` / `grpc-message` 处理，两端都支持 unary、服务端流、客户端流与双向流。`gzip` 消息压缩从头实现（RFC 1951/1952：可解压任意标准生产者的 DEFLATE，定长 Huffman LZ77 压缩），并按 gRPC A6 协商。服务端执行 `grpc-timeout` deadline，支持 metadata 与拦截器，`dns:///` 目标可轮询，`grpc.health.v1.Health` 同时提供 `Check` 与 `Watch`。protobuf 刻意留给你（实现 `EncodeMessage` / `DecodeMessage`，或直接用原始字节 API）。
 - **流式响应**（`courierust_body`）：channel 背靠背的 `Body::Channel`，服务器可跨线程推送响应体块。
 
@@ -80,7 +80,7 @@ RFC 9218 用 8 个 urgency 级别替代了旧版依赖树。我们把它实现�
 
 慢连接与空闲羊群的防护在 worker 介入之前就完成：不完整的请求挂在 poller 上（零 worker），超过 `idle_timeout` 的连接被回收，`max_connections` 直接封顶驻留连接数。
 
-等待集合的诚实性是构造保证的：连接结束时 worker 把 socket 句柄交给事件循环，事件循环**先注销描述符再关闭它**，所以等待集合里永远不会出现已关闭的 socket（Winsock 的 `select` 会因一个坏描述符让整个等待集合失败，而 POSIX `poll` 只为该项报错）。万一等待仍然失败，事件循环会按连接注册表重建等待集合并退避，而不是空转——自愈次数计入 `Stats::event_wait_errors`，健康运行恒为 0（详见 [`src/courierust_server/README_CN.md`](src/courierust_server/README_CN.md)）。
+等待集合的诚实性是构造保证的：连接结束时 worker 把 socket 句柄交给事件循环，事件循环**先注销描述符再关闭它**，所以等待集合里永远不会出现已关闭的 socket（Winsock 的 `select` 会因一个坏描述符让整个等待集合失败，而 POSIX `poll` 只为该项报错）。万一等待仍然失败，事件循环会按连接注册表重建等待集合并退避，而不是空转——自愈次数计入 `Stats::event_wait_errors`，健康运行恒为 0（详见 [`src/courierust_server/README_CN.md`](https://github.com/blueokanna/Courierust/blob/main/src/courierust_server/README_CN.md)）。
 
 每请求**分段计时**内置在事件路径里：`COURIERUST_H1_TRACE=1` 输出 `H1SEG|...` 行，把一个请求拆成 accept→注册、注册→首次拾取、keep-alive 的 reactor 往返、worker→首字节读取、解析、handler、构建、写出。环回上占主导的是 reactor 往返与 socket 写出——解析器与 handler 都是个位微秒，这就是「时间花在解析器还是花在交接上」的实测答案。详见 `courierust_server` README。
 
@@ -99,85 +99,122 @@ RFC 9218 用 8 个 urgency 级别替代了旧版依赖树。我们把它实现�
 
 ### 客户端
 
-```rust
-use courierust::courierust_client::{Client, ClientConfig};
+```rust,no_run
+use courierust::courierust_client::Client;
 
-let client = Client::new();
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = Client::new();
 
-// GET
-let resp = client.get("http://127.0.0.1:8080/")?;
-println!("status={} body={}", resp.status, String::from_utf8_lossy(&resp.body.collect()?));
+    // GET
+    let resp = client.get("http://127.0.0.1:8080/")?;
+    println!(
+        "status={} body={}",
+        resp.status,
+        String::from_utf8_lossy(&resp.body.collect()?)
+    );
 
-// POST
-let resp = client.post("http://127.0.0.1:8080/submit", "hello".as_bytes())?;
+    // POST
+    let resp = client.post("http://127.0.0.1:8080/submit", "hello".as_bytes())?;
+    println!("status={}", resp.status);
+    Ok(())
+}
 ```
 
 指定 HTTP/2（h2c 前导知识）与优先级：
 
-```rust
+```rust,no_run
+use courierust::courierust_body::Body;
+use courierust::courierust_client::{Client, ClientConfig};
 use courierust::courierust_h2::priority::Priority;
+use courierust::courierust_http::method::Method;
+use courierust::courierust_http::request::Request;
 
-let mut cfg = ClientConfig::default();
-cfg.http2 = true;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut cfg = ClientConfig::default();
+    cfg.http2 = true; // h2c prior knowledge
 
-let client = Client::with_config(cfg);
-let prio = Priority { urgency: 1, incremental: true };
-let resp = client.execute_priority("http://127.0.0.1:8080/api", request, prio)?;
+    let client = Client::with_config(cfg);
+    let prio = Priority { urgency: 1, incremental: true };
+    let req: Request<Body> = Request::new(Method::from("GET"), "/api");
+    let resp = client.execute_priority("http://127.0.0.1:8080/api", req, prio)?;
+    println!("status={}", resp.status);
+    Ok(())
+}
 ```
 
 ### 服务器
 
-```rust
-use courierust::courierust_server::{Server, ServerConfig};
+```rust,no_run
+use courierust::courierust_body::Body;
 use courierust::courierust_http::request::Request;
 use courierust::courierust_http::response::Response;
-use courierust::courierust_body::Body;
+use courierust::courierust_server::{Server, ServerConfig};
 
-let mut cfg = ServerConfig::default();
-cfg.http2 = true; // 同时服务 h2c 与 h1.1
-let server = Server::bind_with_config("127.0.0.1:8080", cfg)?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut cfg = ServerConfig::default();
+    cfg.http2 = true; // serves h2c and h1.1 on the same port
+    let server = Server::bind_with_config("127.0.0.1:8080", cfg)?;
 
-server.serve(|req: Request<Body>| -> Response<Body> {
-    let mut resp = Response::with_status(200.into());
-    resp.body = Body::Bytes(format!("path: {}", req.uri.as_str()).into());
-    resp
-})?;
+    server.serve(|req: Request<Body>| -> Response<Body> {
+        let mut resp = Response::with_status(200.into());
+        resp.body = Body::Bytes(format!("path: {}", req.uri.as_str()).into());
+        resp
+    })?;
+    Ok(())
+}
 ```
 
 ### gRPC
 
-```rust
-use courierust::courierust_grpc::{GrpcClient, GrpcServer};
+```rust,no_run
 use courierust::courierust_bytes::Bytes;
+use courierust::courierust_grpc::{GrpcClient, GrpcServer};
 
-// 服务器端：实现 Service（或直接传闭包）
-let server = GrpcServer::bind("127.0.0.1:50051", |method: &str, req: Bytes| {
-    Ok(Bytes::from(format!("echo({method}): {}", String::from_utf8_lossy(&req))))
-})?;
-let _h = server.serve_background()?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Server side: implement `Service`, or just pass a closure.
+    let server = GrpcServer::bind(
+        "127.0.0.1:50051",
+        |method: &str, req: Bytes| -> courierust::Result<Bytes> {
+            Ok(Bytes::from(format!(
+                "echo({method}): {}",
+                String::from_utf8_lossy(&req)
+            )))
+        },
+    )?;
+    let _handle = server.serve_background()?;
 
-// 客户端
-let client = GrpcClient::new("http://127.0.0.1:50051")?;
-let reply = client.call("helloworld.Greeter/SayHello", Bytes::from("world"))?;
+    // Client side
+    let client = GrpcClient::new("http://127.0.0.1:50051")?;
+    let reply = client.call("helloworld.Greeter/SayHello", Bytes::from("world"))?;
+    println!("{}", String::from_utf8_lossy(&reply));
+    Ok(())
+}
 ```
 
 ### WebSocket
 
-```rust
+```rust,no_run
 use courierust::courierust_client::ClientConfig;
 use courierust::courierust_client::ws::WebSocket;
 
-// ws:// 或 wss:// —— TLS 那一段走本 crate 自己的栈。
-let mut ws = WebSocket::connect("wss://example.com/ws", &ClientConfig::default())?;
-ws.send_text("hello")?;
-println!("{:?}", ws.read_message()?); // Event::Text("hello")
-ws.close(1000, "done")?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // ws:// or wss:// — the TLS leg is the crate's own stack.
+    let mut ws = WebSocket::connect("wss://example.com/ws", &ClientConfig::default())?;
+    ws.send_text("hello")?;
+    println!("{:?}", ws.read_message()?); // Event::Text("hello")
+    ws.close(1000, "done")?;
+    Ok(())
+}
 ```
 
 服务端是在 handler 钩子里把一条活着的 HTTP/1.1 连接升级：`Handler::websocket` 对自己负责的路由返回 `WsUpgradeReply::Accept(service)`，其余返回 `WsUpgradeReply::Pass`，于是明文 HTTP 与 WebSocket 共用同一端口、同一个 handler。
 
 ```rust
+use courierust::courierust_body::Body;
+use courierust::courierust_http::request::Request;
+use courierust::courierust_http::response::Response;
 use courierust::courierust_server::ws::{WsConn, WsData, WsService, WsUpgradeReply};
+use courierust::courierust_server::Handler;
 use std::sync::Arc;
 
 struct Echo;
@@ -191,13 +228,24 @@ impl WsService for Echo {
     }
 }
 
-impl courierust::courierust_server::Handler for App {
-    // ... handle() 同上 ...
-    fn websocket(&self, req: &courierust::courierust_http::request::Request<
-        courierust::courierust_body::Body>) -> WsUpgradeReply {
-        if req.path == "/ws" { WsUpgradeReply::Accept(Arc::new(Echo)) }
-        else { WsUpgradeReply::Pass }   // 交给 HTTP handler 返回 404
+struct App;
+
+impl Handler for App {
+    fn handle(&self, req: Request<Body>) -> Response<Body> {
+        let mut resp = Response::with_status(200.into());
+        resp.body = Body::Bytes(format!("path: {}", req.uri.as_str()).into());
+        resp
     }
+
+    fn websocket(&self, req: &Request<Body>) -> WsUpgradeReply {
+        if req.uri.path() == "/ws" { WsUpgradeReply::Accept(Arc::new(Echo)) }
+        else { WsUpgradeReply::Pass }   // the HTTP handler answers 404
+    }
+}
+
+fn main() {
+    // `App` is what you hand to `Server::serve`.
+    let _app = App;
 }
 ```
 
@@ -207,38 +255,43 @@ impl courierust::courierust_server::Handler for App {
 
 自 0.1 起，本 crate 自带一套零依赖、从零实现的 TLS 栈——**TLS 1.3（RFC 8446）与 TLS 1.2（RFC 5246 / RFC 8422）**——因此 `https://` 成为同一套客户端/服务端的一等公民能力：
 
-```rust
+```rust,no_run
 use courierust::courierust_client::{Client, ClientConfig, TlsSettings as ClientTls};
 use courierust::courierust_server::{Server, ServerConfig, TlsSettings as ServerTls};
 
-// 服务端：用你的证书链 + 私钥开 HTTPS。
-// `from_pem_file` 解析证书链与私钥（PKCS#8 / PKCS#1 / SEC1），并证明二者
-// 属于同一对——不匹配的私钥在这里、启动时就会失败，而不是每个握手失败一次。
-// 私钥来自内存时用 `Identity::from_pem(cert, key)` 或
-// `Identity::from_der(chain, key)`。
-let server_cfg = ServerConfig {
-    http2: true,                        // TLS 之上同时支持 h2 与 HTTP/1.1（ALPN）
-    tls: Some(ServerTls::from_pem_file(
-        "cert.pem",                     // 证书链，叶子在前
-        "key.pem",                      // PKCS#8 / PKCS#1 / SEC1
-    )?),
-    ..Default::default()
-};
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Server: serve HTTPS from your certificate chain + private key.
+    // `from_pem_file` parses the chain and the key (PKCS#8, PKCS#1 or SEC1)
+    // and proves they belong together — a mismatched pair fails here, at
+    // startup, not on every handshake. Use `Identity::from_pem(cert, key)`
+    // or `Identity::from_der(chain, key)` when the pair comes from memory.
+    let server_cfg = ServerConfig {
+        http2: true, // h2 + HTTP/1.1 over TLS (ALPN)
+        tls: Some(ServerTls::from_pem_file("cert.pem", "key.pem")
+            .map_err(|e| e.to_string())?),
+        ..Default::default()
+    };
 
-// 客户端：信任你的根证书并开启 TLS。
-let mut roots = courierust::courierust_tls::RootStore::new();
-roots.add_der(root_der);                // 或用 RootStore::add_pem(...)
-let client_cfg = ClientConfig {
-    tls: Some(ClientTls {
-        roots,
-        verify: true,
-        alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-        now: unix_now_secs,             // 证书有效期校验用
-    }),
-    ..Default::default()
-};
-let client = Client::with_config(client_cfg);
-let resp = client.get("https://example.com/")?;
+    // Client: trust your roots and enable TLS.
+    let mut roots = courierust::courierust_tls::RootStore::new();
+    roots.add_pem_file("ca.pem").map_err(|e| e.to_string())?; // or add_der / add_pem
+    let client = Client::with_config(ClientConfig {
+        tls: Some(ClientTls {
+            roots,
+            verify: true,
+            alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            now: 1_700_000_000, // certificate validity checks use this
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let resp = client.get("https://example.com/")?;
+    println!("status={}", resp.status);
+
+    // The same config is what a server binds with.
+    let _server = Server::bind_with_config("127.0.0.1:8443", server_cfg)?;
+    Ok(())
+}
 ```
 
 支持的 TLS 配置：
@@ -274,16 +327,25 @@ RSA-PKCS#1 v1.5 / ECDSA P-256 / P-384 / Ed25519 证书签名；完整的 X.509
 TLS 握手参数完全由你掌控（包括内置 TLS 层）：
 
 ```rust
-use courierust::courierust_fingerprint::{chrome_tls_profile, ja3_hash, ja4, h2::ChromeH2Fingerprint};
+use courierust::courierust_fingerprint::{chrome_tls_profile, h2::ChromeH2Fingerprint, ja3_hash, ja4};
+use courierust::courierust_hpack::HeaderField;
 
-let profile = chrome_tls_profile();
-assert_eq!(ja3_hash(&profile), "cd08e31494f9531f560d64c695473da9");
-assert_eq!(ja4(&profile), "t13d1516h2_8daaf6152771_e5627efa2ab1");
+fn main() {
+    let profile = chrome_tls_profile();
+    assert_eq!(ja3_hash(&profile), "23c2f821fd77de621da85a7d154567cb");
+    assert_eq!(ja4(&profile), "t13d1516h2_8daaf6152771_806a8c22fdea");
 
-// HTTP/2 侧：直接得到一套 Chrome 形状的 SETTINGS / 帧序 / 头序
-let fp = ChromeH2Fingerprint::chrome();
-let mut settings = fp.settings_entries(); // 含 WINDOW_UPDATE、MAX_FRAME_SIZE 等
-let ordered = fp.order_headers_chrome(&fields); // 按 Chrome 的头序重排
+    // HTTP/2 side: the Chrome-shaped SETTINGS, the connection WINDOW_UPDATE
+    // and the header order.
+    let fp = ChromeH2Fingerprint::chrome();
+    let settings = fp.settings_entries(); // the 5 SETTINGS entries, in Chrome's order
+    assert_eq!(settings.len(), 5);
+    let _window_update = fp.connection_window_update; // Chrome's ~12 MiB connection WINDOW_UPDATE
+
+    let fields: Vec<HeaderField> = Vec::new();
+    let ordered = courierust::courierust_fingerprint::h2::order_headers_chrome(&fields);
+    assert!(ordered.is_empty());
+}
 ```
 
 ## no_std 用法
@@ -292,7 +354,7 @@ let ordered = fp.order_headers_chrome(&fields); // 按 Chrome 的头序重排
 
 ```toml
 [dependencies]
-courierust = { version = "1.0.6", default-features = false }
+courierust = { version = "1.0.8", default-features = false }
 ```
 
 `--no-default-features` 构建只编译协议核心，可用于嵌入式 / 内核态。网络层需要 `std` feature（默认开启）。
@@ -307,7 +369,7 @@ courierust = { version = "1.0.6", default-features = false }
 - **请求体流式上传目前只在 HTTP/2 下可靠**（h2 天然分帧）。HTTP/1.1 的请求体要么一次性给全（`Body::Bytes`），要么你自己拼 chunked。
 - **gRPC 不含 protobuf、`.proto` 代码生成与 `grpc.reflection`**。消息编解码需要你实现 codec trait 或接你自己的 protobuf 生成代码；reflection 需要 protobuf 模式清单，属外部职责。
 - **长时间阻塞的同步 handler 会占住一个 worker**（事件驱动与否都一样）——任何同步服务器的通病；流式场景用 channel 响应体。worker 占用**按连接而非按流**：一条连接上的任意空闲流只占同一个 worker，慢流不阻塞同连接其他流——两者均有集成测试覆盖。
-- **WebSocket 只实现 RFC 6455 与 RFC 7692。** 未实现 RFC 8441（WebSocket over HTTP/2）：`ws://`/`wss://` 客户端在 ALPN 中**只**提供 `http/1.1`（即使 `ClientConfig::http2 = true`），并在读到任何一帧之前拒绝落在 h2 上的连接；而在已建立的 h2 连接上尝试 WebSocket 会被服务端按畸形消息处理——**流级错误 `PROTOCOL_ERROR`**（RFC 9113 §8.1.1），RFC 8441 扩展 CONNECT（`:protocol = websocket`，即 RFC 8441 §3 定义的拒绝）与 HTTP/1.1 式的 `Upgrade`/`Connection` 字段（§8.2.2）两种形式都如此——因此连接与其它流保持可用。绝不会发生的是：对一个不可能成为 WebSocket 的请求回 `200`，或建立一条看似成功却不承载任何帧的连接。事件驱动驱动中服务回调运行在 reactor 工作线程上，因此在 `on_message` 里做批量推送会阻塞 reactor，最终触发有界发送队列；扇出的正确路径是其他线程使用 `WsConn::sender()`。本 crate 两端之间传输 256 KiB 消息比 tungstenite 的组合慢（原因定位与 Windows socket deadline 的发现见 [`benches/WS_BENCHMARK.md`](benches/WS_BENCHMARK.md)）——小消息与中等消息为持平或领先。
+- **WebSocket 只实现 RFC 6455 与 RFC 7692。** 未实现 RFC 8441（WebSocket over HTTP/2）：`ws://`/`wss://` 客户端在 ALPN 中**只**提供 `http/1.1`（即使 `ClientConfig::http2 = true`），并在读到任何一帧之前拒绝落在 h2 上的连接；而在已建立的 h2 连接上尝试 WebSocket 会被服务端按畸形消息处理——**流级错误 `PROTOCOL_ERROR`**（RFC 9113 §8.1.1），RFC 8441 扩展 CONNECT（`:protocol = websocket`，即 RFC 8441 §3 定义的拒绝）与 HTTP/1.1 式的 `Upgrade`/`Connection` 字段（§8.2.2）两种形式都如此——因此连接与其它流保持可用。绝不会发生的是：对一个不可能成为 WebSocket 的请求回 `200`，或建立一条看似成功却不承载任何帧的连接。事件驱动驱动中服务回调运行在 reactor 工作线程上，因此在 `on_message` 里做批量推送会阻塞 reactor，最终触发有界发送队列；扇出的正确路径是其他线程使用 `WsConn::sender()`。本 crate 两端之间传输 256 KiB 消息比 tungstenite 的组合慢（原因定位与 Windows socket deadline 的发现见 [`benches/WS_BENCHMARK.md`](https://github.com/blueokanna/Courierust/blob/main/benches/WS_BENCHMARK.md)）——小消息与中等消息为持平或领先。
 - **HTTPS 是一等公民**：客户端与服务端内置从零实现的 TLS 1.2 + TLS 1.3；`https://` 需要自备根证书库（无内置 CA）。**ALPN 强制一致**：配置 h2 的客户端连到协商出 `http/1.1` 的服务器，或对方**完全未协商 ALPN**（RFC 9113 §3.3 要求 TLS 上必须用 ALPN `h2`），都会得到明确错误而非静默协议错乱。
 - 客户端重定向、keep-alive 复用等策略以「正确」为先，未做激进调优。
 
@@ -318,68 +380,75 @@ courierust = { version = "1.0.6", default-features = false }
 ```mermaid
 flowchart TB
 
-    ROOT["Courierust"]
-
-    ROOT --> CORE
-    ROOT --> RUNTIME
-
-    subgraph CORE["no_std · Protocol & Core"]
+    %% ==================================================
+    %% 协议核心：no_std + alloc，零依赖
+    %% ==================================================
+    subgraph CORE["no_std + alloc · 协议核心（零依赖）"]
         direction LR
 
-        HTTP["courierust_http<br/>HTTP/1.1 消息模型<br/>请求 · 响应 · Header · URI"]
-
-        HPACK["courierust_hpack<br/>HPACK<br/>Huffman · 静态/动态表"]
-
-        H2["courierust_h2<br/>HTTP/2<br/>帧 · 流状态 · 流控 · WUCS"]
-
-        QUIC["courierust_quic<br/>QUIC v1<br/>Packet · Frame · VarInt · CID"]
-
-        H3["courierust_h3<br/>HTTP/3<br/>QPACK · H3 Frame · Stream"]
-
-        FP["courierust_fingerprint<br/>Fingerprint<br/>JA3 · JA4 · Chrome H2"]
-
-        CRYPTO["courierust_crypto<br/>Cryptography<br/>MD5 · SHA-1 · SHA-256 · Base64"]
-
-        DEFLATE["courierust_deflate<br/>Compression<br/>DEFLATE · gzip · RFC 7692"]
-
-        WS["courierust_ws<br/>WebSocket<br/>RFC 6455 · Masking · Handshake"]
-
-        BYTES["courierust_bytes<br/>Byte Buffers<br/>BytesMut"]
-
-        IO["courierust_io<br/>I/O Traits<br/>Read · Write"]
-
-        ERROR["courierust_error<br/>Unified Error"]
+        HTTP["courierust_http<br/>HTTP 消息模型"]
+        H1["courierust_h1<br/>HTTP/1.1 线格式编解码"]
+        HPACK["courierust_hpack<br/>HPACK"]
+        H2["courierust_h2<br/>HTTP/2"]
+        QUIC["courierust_quic<br/>QUIC v1"]
+        H3["courierust_h3<br/>HTTP/3"]
+        WS["courierust_ws<br/>WebSocket（RFC 6455 / 7692）"]
+        DEFLATE["courierust_deflate<br/>DEFLATE · gzip"]
+        FP["courierust_fingerprint<br/>JA3 · JA4 · Chrome H2"]
+        CRYPTO["courierust_crypto<br/>MD5 · SHA-1 · SHA-256 · Base64"]
+        BYTES["courierust_bytes<br/>Bytes · BytesMut"]
+        IO["courierust_io<br/>Read · Write trait"]
+        ERR["courierust_error<br/>统一错误类型"]
     end
 
-
-    subgraph RUNTIME["std · Runtime & Services"]
+    %% ==================================================
+    %% 运行时：仅 std
+    %% ==================================================
+    subgraph RUNTIME["std · 运行时与服务"]
         direction LR
 
-        TLS["courierust_tls<br/>TLS 1.2 / 1.3<br/>Handshake · Record · X.509 · HTTPS"]
-
-        POOL["courierust_pool<br/>Work-Stealing Pool<br/>Thread Pool"]
-
-        NET["courierust_net<br/>Network Layer<br/>TCP · Poller · I/O Adapter"]
-
-        BODY["courierust_body<br/>Streaming Body<br/>Channel-based"]
-
-        H1["courierust_h1<br/>HTTP/1.1 Wire Codec"]
-
-        CLIENT["courierust_client<br/>HTTP Client<br/>H1 Pool · H2 Driver"]
-
-        SERVER["courierust_server<br/>HTTP Server<br/>Work-Stealing"]
-
-        GRPC["courierust_grpc<br/>gRPC<br/>Frame · Status · Codec"]
+        TLS["courierust_tls<br/>TLS 1.2 / 1.3"]
+        NET["courierust_net<br/>TCP · poller"]
+        POOL["courierust_pool<br/>工作窃取线程池"]
+        BODY["courierust_body<br/>channel 流式响应体"]
+        CLIENT["courierust_client<br/>h1 连接池 · h2/h3 驱动 · WS 客户端"]
+        SERVER["courierust_server<br/>事件调度 · WS 升级"]
+        GRPC["courierust_grpc<br/>gRPC"]
     end
 
+    %% ==================================================
+    %% 依赖关系
+    %% ==================================================
+    HTTP --> H1
+    HPACK -.-> H2
+    QUIC --> H3
+    DEFLATE -.-> WS
+    CRYPTO -.-> FP
 
-    classDef root font-weight:bold,font-size:16px;
+    BYTES -.-> HTTP
+    BYTES -.-> H1
+    BYTES -.-> H2
+    BYTES -.-> H3
+    IO -.-> NET
+
+    H1 --> CLIENT
+    H1 --> SERVER
+    H2 --> CLIENT
+    H2 --> GRPC
+    H3 --> CLIENT
+    TLS --> CLIENT
+    TLS --> SERVER
+    NET --> CLIENT
+    NET --> SERVER
+    POOL --> SERVER
+    BODY --> CLIENT
+    BODY --> SERVER
+
     classDef core font-weight:bold;
     classDef runtime font-weight:bold;
 
-    class ROOT root;
-    class HTTP,HPACK,H2,QUIC,H3,FP,CRYPTO,DEFLATE,WS,BYTES,IO,ERROR core;
-    class TLS,POOL,NET,BODY,H1,CLIENT,SERVER,GRPC runtime;
+    class HTTP,H1,HPACK,H2,QUIC,H3,WS,DEFLATE,FP,CRYPTO,BYTES,IO,ERR core;
+    class TLS,NET,POOL,BODY,CLIENT,SERVER,GRPC runtime;
 ```
 
 ## 基准测试
@@ -389,12 +458,12 @@ flowchart TB
 - HTTP/1.1 keep-alive，顺序与多 worker 并行；
 - HTTP/2 多 worker 多路复用；
 - HTTPS（TLS 1.2/1.3 + h2）经本仓库自带 TLS 栈的端到端；
-- WebSocket（`--bench ws`）：编解码（编码/掩码/解码/UTF-8）、回显往返与单向推送，与 `tungstenite 0.30`、`tokio-tungstenite 0.30` 在同一进程内对比 —— 代码、方法论与诚实行都写在 [`benches/WS_BENCHMARK.md`](benches/WS_BENCHMARK.md)；
-- 复杂度（`--bench complexity`）：**时间与空间复杂度**——每操作的耗时与分配量随规模拟合（`cost = a + b·n`，并以相邻规模对的指数中位数命名量级、同时给出最差的一对；每个测量点取三次重复的最小值），以及一条空闲连接在事件驱动、阻塞与 hyper/tokio 三种服务端形态下的内存代价；有公平对端的地方都与 `tungstenite` / `reqwest`+hyper 对比 —— 方法、一次实测与每条热路径的算法量级见 [`benches/COMPLEXITY.md`](benches/COMPLEXITY.md)；
+- WebSocket（`--bench ws`）：编解码（编码/掩码/解码/UTF-8）、回显往返与单向推送，与 `tungstenite 0.30`、`tokio-tungstenite 0.30` 在同一进程内对比 —— 代码、方法论与诚实行都写在 [`benches/WS_BENCHMARK.md`](https://github.com/blueokanna/Courierust/blob/main/benches/WS_BENCHMARK.md)；
+- 复杂度（`--bench complexity`）：**时间与空间复杂度**——每操作的耗时与分配量随规模拟合（`cost = a + b·n`，并以相邻规模对的指数中位数命名量级、同时给出最差的一对；每个测量点取三次重复的最小值），以及一条空闲连接在事件驱动、阻塞与 hyper/tokio 三种服务端形态下的内存代价；有公平对端的地方都与 `tungstenite` / `reqwest`+hyper 对比 —— 方法、一次实测与每条热路径的算法量级见 [`benches/COMPLEXITY.md`](https://github.com/blueokanna/Courierust/blob/main/benches/COMPLEXITY.md)；
 - RFC 9218 优先级调度；
 - 并发模型对比（空闲连接群 vs worker 池）与慢发送者群基准。
 
-Workflow 还记录跨机 endpoint（含 TLS 与进程内限速场景）、reactor/连接/流证据（`STATS` 行）、TLS 验证证据（`TLSVERIFY` 行：`cert_verified` / `hostname_verified` / `negotiated_alpn` / `session_resumption`）和 `cargo-fuzz` parser 运行结果。生成的 `Github_Action_Benchmark.md` 会在 main 分支 push 后提交到仓库本身，不只存在于 Actions 摘要或 artifact 中。h2c 大 body 行（对同一 hyper h2 服务端的 1 MiB POST）受服务端 64 KiB 初始流控窗口（WINDOW_UPDATE 往返）限速，**不能用于比例论断**——即便换成 **async** reqwest 客户端，固定等待仍然存在（debug 下观测约 5–10 ms、release 约 3–8 ms，Courierust 约 2–4 ms），因此早前“blocking 客户端 harness 配置异常”的说法不成立。h2c 结果只适用于对应连接策略和负载，不能据此宣称全面领先。
+Workflow 还记录跨机 endpoint（含 TLS 与进程内限速场景）、reactor/连接/流证据（`STATS` 行）、TLS 验证证据（`TLSVERIFY` 行：`cert_verified` / `hostname_verified` / `negotiated_alpn` / `session_resumption`）和 `cargo-fuzz` parser 运行结果。生成的 `Github_Action_Benchmark.md` 会在 main 分支 push 后提交到仓库本身，不只存在于 Actions 摘要或 artifact 中。h2c 大 body 行（对同一 hyper h2 服务端的 1 MiB POST）受服务端 64 KiB 初始流控窗口（WINDOW_UPDATE 往返）限速，**不能用于比例论断**——即便换成 **async** reqwest 客户端，固定等待仍然存在，因此早前“blocking 客户端 harness 配置异常”的说法不成立。h2c 结果只适用于对应连接策略和负载，不能据此宣称全面领先。
 
 **连接池语义两个客户端不同，不可混为一谈：** Courierust 的 `max_connections_per_host` 限制的是每个 authority 的*存活*连接数；reqwest 的 `pool_max_idle_per_host` 限制的是*空闲池化*连接数。两者设为相同的 N 只在顺序负载下等价——并发时 reqwest 可能建立超过 N 条存活连接。
 
@@ -409,7 +478,7 @@ cargo bench --manifest-path benches/Cargo.toml --bench ws
 cargo bench --manifest-path benches/Cargo.toml --bench complexity
 cargo bench --manifest-path benches/Cargo.toml --bench interop
 cargo bench --manifest-path benches/Cargo.toml --bench network
-cargo fuzz run h2_frame --fuzz-dir fuzz -- -runs=10000
+cargo fuzz run --fuzz-dir fuzz h2_frame -- -max_total_time=20
 ```
 
 每条 `RESULT|...` 都带 `p50_us` … `p99_us`，报告脚本（`scripts/generate_benchmark_report.sh`）可生成分位表。这些是 loopback 测量；WAN / TLS / 真实 handler 的数字取决于你的部署——这正是套件要报完整尾部而非单一均值的原因。
@@ -435,24 +504,26 @@ cargo fuzz run h2_frame --fuzz-dir fuzz -- -runs=10000
 
 下面的数量按测试二进制区分，可与一次实际运行一一对应：
 
-- **单元测试 439 个**（`cargo test --lib`）：覆盖 HPACK 全部 RFC 向量（C.2/C.3/C.4/C.6）、Huffman 编解码（含解码输出上限）、帧编解码、状态机、流控、WUCS 调度、JA3/JA4 公开记录比对、指纹解析、TLS 1.3 握手与 RFC 8448 密钥调度、TLS 1.2 握手（ECDHE-RSA/ECDSA AEAD 套件、PRF、RFC 5746 重协商回显、Ed25519 ServerKeyExchange 签名/验证）、X.25519/Ed25519/ECDSA/RSA 原语、DEFLATE/gzip 编解码（往返、CRC-32 向量、损坏拒绝、输出上限、与 Python zlib 输出交叉验证，以及覆盖距离码 22-29 的远距离向量）、**WebSocket 引擎**（掩码相位表、最短长度编码、控制帧规则、增量 UTF-8 校验、握手解析、共享关闭标志、RFC 7692 协商）、轮询器 self-pipe（唤醒描述符）语义与「已关闭描述符」契约、h2 池的加权负载记账、`application/x-www-form-urlencoded` 编解码（WHATWG 透传集、`+`/`%XX` 往返、拒绝畸形转义与非 UTF-8）、h1/h2/h3 共用的字段值字符类，以及按 RFC 8446 §4.6.1 逐字段走线的 `NewSessionTicket` 线格式（空的扩展向量仍然是向量）与「武装的读截止时间在每个平台都表现为 `Timeout`」这条契约，PEM 读取器（护甲规则、三种私钥容器）、`Identity` 加载（PEM/DER 校验、私钥与证书不匹配、`Debug` 只打印私钥长度而非字节）、同时带两种分帧时的拒绝判定（RFC 9112 §6.1 / CWE-444），以及按 RFC 3986 §5.4 参考向量核对的重定向解析。
-- **集成测试 76 个**（`tests/integration.rs`）：真实 TCP 环回上的 h1/h2/HTTPS 请求往返、keep-alive 复用、chunked、重定向、h2 并发多路复用、流式响应、大体积流控往返、gRPC unary/服务端流/客户端流/双向流与错误状态/trailers/deadline 执行、gzip 往返、`grpc.health.v1.Health` `Check` + `Watch`、RFC 7540 §3.2 `h2c` Upgrade、并发证明（慢流不阻塞同连接其他流；大量空闲流按连接而非按流占 worker；空闲连接羊群不阻塞新请求；事件调度器回收 slow-loris 并执行 `max_connections`；服务端流式响应按短节奏冲刷；单条 h2 连接并发突发不饥饿）、**请求构建**（`Client::request` 与快捷方法发全部动词、`query`/`form` 编码、basic/bearer 认证、客户端默认头与请求自身字段的优先级、跨源重定向不被带回默认凭据、h1 与 h2 上的每请求截止时间且连接仍可复用、含 CR/LF 的头值在 h1/h2 均被拒绝）、**h1 分帧回归**（`Content-Length: 0` 必须被应答而不是挂起；HEAD 响应到头部块就结束），以及 **TLS 策略/加固**（信任拒绝、过期证书、不可信签发链、自签名但显式信任、主机名不匹配、ALPN 一致、TLS 1.2 与 TLS 1.3 分别用 RSA / P-384 / Ed25519 身份的完整往返、纯 TLS 1.3 客户端拒绝 TLS 1.2 服务器——绝不静默降级——与 RFC 8446 降级哨兵、握手中断失败、畸形 TLS 输入存活、`verify:false`），以及 **PEM 身份加载**（用 `tests/certs/*.pem` 的 OpenSSL 夹具启动的服务端能真的服务请求；带中间证书的链加载为两张证书；取自另一张证书的私钥在加载时被拒绝），以及 **请求走私防护**（同时带两种分帧的请求被**两个驱动**同样以 `400` 回答，其后面流水线发送的字节绝不会被当作第二个请求解析）和相对 `Location` 按请求路径解析（RFC 3986 §5.2）。
+- **单元测试 489 个**（`cargo test --lib`）：覆盖 HPACK 全部 RFC 向量（C.2/C.3/C.4/C.5/C.6）、Huffman 编解码（含解码输出上限）、帧编解码、状态机、流控、WUCS 调度、JA3/JA4 公开记录比对、指纹解析、TLS 1.3 握手与 RFC 8448 密钥调度、TLS 1.2 握手（ECDHE-RSA/ECDSA AEAD 套件、PRF、RFC 5746 重协商回显、Ed25519 ServerKeyExchange 签名/验证）、X25519/Ed25519/ECDSA/RSA 原语、DEFLATE/gzip 编解码（往返、CRC-32 向量、损坏拒绝、输出上限、与 Python zlib 输出交叉验证，以及覆盖距离码 22-29 的远距离向量）、**WebSocket 引擎**（掩码相位表、最短长度编码、控制帧规则、增量 UTF-8 校验、握手解析、共享关闭标志、RFC 7692 协商）、轮询器 self-pipe（唤醒描述符）语义与「已关闭描述符」契约、h2 池的加权负载记账、`application/x-www-form-urlencoded` 编解码（WHATWG 透传集、`+`/`%XX` 往返、拒绝畸形转义与非 UTF-8）、h1/h2/h3 共用的字段值字符类，以及按 RFC 8446 §4.6.1 逐字段走线的 `NewSessionTicket` 线格式（空的扩展向量仍然是向量）与「武装的读截止时间在每个平台都表现为 `Timeout`」这条契约，PEM 读取器（护甲规则、三种私钥容器）、`Identity` 加载（PEM/DER 校验、私钥与证书不匹配、`Debug` 只打印私钥长度而非字节）、同时带两种分帧时的拒绝判定（RFC 9112 §6.1 / CWE-444），以及按 RFC 3986 §5.4 参考向量核对的重定向解析。
+- **集成测试 89 个**（`tests/integration.rs`）：真实 TCP 环回上的 h1/h2/HTTPS 请求往返、keep-alive 复用、chunked、重定向、h2 并发多路复用、流式响应、大体积流控往返、gRPC unary/服务端流/客户端流/双向流与错误状态/trailers/deadline 执行、gzip 往返、`grpc.health.v1.Health` `Check` + `Watch`、RFC 7540 §3.2 `h2c` Upgrade、并发证明（慢流不阻塞同连接其他流；大量空闲流按连接而非按流占 worker；空闲连接羊群不阻塞新请求；事件调度器回收 slow-loris 并执行 `max_connections`；服务端流式响应按短节奏冲刷；单条 h2 连接并发突发不饥饿）、**请求构建**（`Client::request` 与快捷方法发全部动词、`query`/`form` 编码、basic/bearer 认证、客户端默认头与请求自身字段的优先级、跨源重定向不被带回默认凭据、h1 与 h2 上的每请求截止时间且连接仍可复用、含 CR/LF 的头值在 h1/h2 均被拒绝）、**h1 分帧回归**（`Content-Length: 0` 必须被应答而不是挂起；HEAD 响应到头部块就结束），以及 **TLS 策略/加固**（信任拒绝、过期证书、不可信签发链、自签名但显式信任、主机名不匹配、ALPN 一致、TLS 1.2 与 TLS 1.3 分别用 RSA / P-384 / Ed25519 身份的完整往返、纯 TLS 1.3 客户端拒绝 TLS 1.2 服务器——绝不静默降级——与 RFC 8446 降级哨兵、握手中断失败、畸形 TLS 输入存活、`verify:false`），以及 **PEM 身份加载**（用 `tests/certs/*.pem` 的 OpenSSL 夹具启动的服务端能真的服务请求；带中间证书的链加载为两张证书；取自另一张证书的私钥在加载时被拒绝），以及 **请求走私防护**（同时带两种分帧的请求被**两个驱动**同样以 `400` 回答，其后面流水线发送的字节绝不会被当作第二个请求解析）和相对 `Location` 按请求路径解析（RFC 3986 §5.2）。
 - **HTTP/3 测试 14 个**（`tests/h3.rs` + `tests/h3_key_update.rs`）：QUIC v1 + TLS 1.3 真实 UDP 套接字、走公共 `Client`/`Server`：GET/POST 往返、池化连接复用、双向 256 KiB 请求/响应流控、并发多路复用、每请求 deadline 执行、HEAD 响应不等 handler 的流式 body、双向 key update，以及 H3 TLS 安全（不信任 / 过期 / 错误证书链 / 主机名不匹配证书均在握手阶段拒绝）。
 - **HTTP/2 加固测试 39 个**（`tests/h2_hardening.rs`）：恶意帧输入（超长帧、畸形 SETTINGS/PING/WINDOW_UPDATE、填充越界的 PADDED HEADERS、流级零增量 `WINDOW_UPDATE` 必须停留在流级错误、空闲流上的 `WINDOW_UPDATE`、流控窗口溢出、HPACK 头表与 Huffman 炸弹、截断/EOS Huffman、伪头顺序、`content-length` 不一致、非法 `transfer-encoding`/`connection` 系头、含 NUL/CR/LF 的字段值报流错误而非连接错误、两端 `SETTINGS_MAX_CONCURRENT_STREAMS` 强制、`h2c` 存活检测：SETTINGS_TIMEOUT 与 keepalive 死对端检测）。
-- **WebSocket 端到端测试 34 个**（`tests/ws.rs`）：真实服务端 + 真实客户端 + 真实 socket，覆盖升级握手（含 RFC 6455 accept-key 官方向量）、双向掩码、带交错控制帧的分片重组、`permessage-deflate` 协商与 RFC 7692 互操作、UTF-8 失败码、关闭握手的干净性、本 crate TLS 上的 `wss://`、其他线程推送、握手上携带客户端默认头、Origin / 子协议策略、帧/消息/队列上限，以及 reactor 回归（一条连接关闭后仍打开的连接必须继续被服务；健康 reactor 的等待自愈次数为 0）。
+- **WebSocket 端到端测试 37 个**（`tests/ws.rs`）：真实服务端 + 真实客户端 + 真实 socket，覆盖升级握手（含 RFC 6455 accept-key 官方向量）、双向掩码、带交错控制帧的分片重组、`permessage-deflate` 协商与 RFC 7692 互操作、UTF-8 失败码、关闭握手的干净性、本 crate TLS 上的 `wss://`、其他线程推送、握手上携带客户端默认头、Origin / 子协议策略、帧/消息/队列上限，以及 reactor 回归（一条连接关闭后仍打开的连接必须继续被服务；健康 reactor 的等待自愈次数为 0）。
 - **代理测试 6 个**（`tests/proxy.rs`）：客户端对上一个只用标准库写成的 HTTP 代理——被测实现只有客户端自身。`https://` 走 `CONNECT` 隧道且凭据对代理可见、对源站不可见；`http://` 使用绝对请求形式（含 `OPTIONS *` 以空路径绝对形式出行，RFC 9110 §9.3.7）；请求自带的 `Proxy-Authorization` 优先于配置凭据，且该跳上只会出现一个；被拒绝的 `CONNECT` 会带回代理的 `403`；`http3`/`h2c` + 代理在开套接字之前就被拒绝。
-- **4 个 fuzz 目标**（`cargo-fuzz`）：`h2_frame`、`hpack_block`，加上 **`h1_request`**（两个服务端解析器共用 的 request/header/chunked 路径）与 **`h2_connection`**（用恶意帧流在两种角色下驱动完整 h2 状态机）。nightly 长跑工作流给每个目标一个墙钟预算；PR 期在 `benchmark.yml` 里跑同一批目标的冒烟运行。
+- **7 个 fuzz 目标**（`cargo-fuzz`，`fuzz/fuzz_targets`）：`h2_frame`、`hpack_block`、`h1_request`（两个服务端解析器共用的 request/header/chunked 路径）、`h2_connection`（用恶意帧流在两种角色下驱动完整 h2 状态机）、`ws_frame`、`ws_handshake` 与 `ws_session`。`benchmark.yml` 的 PR 期冒烟运行与 nightly 长跑工作流（`fuzz-long.yml`）对前四个目标给墙钟预算；三个 WebSocket 目标由卫星 CI 任务做类型检查，其断言在 `tests/ws.rs` 的确定性属性测试里有对应实现。
+- **文档一致性测试 5 个**（`tests/readme_parity.rs`）：`README.md` 与 `README_CN.md` 必须包含完全相同的可复制代码块（逐字节）、同一张结构图，且只能使用绝对链接（crates.io/docs.rs 不提供相对目标的文件）；每个 `src/<模块>/README.md` / `README_CN.md` 对、以及每个 `wiki/en/*.md` / `wiki/zh/*.md` 对都必须包含相同的代码（注释可翻译）。
+- **README / wiki doctest**：`README.md`、每个 `src/<模块>/README.md` 以及每个 `wiki/en/*.md` 页面里的所有 `rust` 代码块都由 `cargo test --doc` 编译，因此示例一旦失效会在 CI 失败，而不是让用户照抄到坏代码。
 
 `benches/` 与 `fuzz/` 是各自独立的 workspace（自己的 lockfile 与 target 目录）——根目录的 `cargo test` / `cargo check --all-targets` **不会**覆盖它们，而 CI 两个都会构建（`cargo bench --manifest-path benches/Cargo.toml --locked --no-run`、`cargo check --manifest-path fuzz/Cargo.toml --all-targets`）。它们依赖对标的第三方 crate，因此用 stable 而非 1.78 MSRV 构建。给公开结构体加字段时，必须把这两个工作区也编译一遍；编辑器任务 `ci: benches all targets (locked)` 与 `ci: fuzz all targets` 就是干这个的。
 
 ```bash
-cargo test                 # 全部测试
-cargo build --no-default-features   # 验证协议核心零警告编译
+cargo test                 # everything
+cargo build --no-default-features   # confirm the core compiles warning-free
 ```
 
 ## 许可
 
-**PolyForm Perimeter License 1.0.1**——见 [`LICENSE`](LICENSE)：正文是官方 [PolyForm Perimeter
+**PolyForm Perimeter License 1.0.1**——见 [`LICENSE`](https://github.com/blueokanna/Courierust/blob/main/LICENSE)：正文是官方 [PolyForm Perimeter
 1.0.1](https://polyformproject.org/licenses/perimeter/1.0.1)，末尾多出一段由许可人自己增加的附加条款。
 
 实际含义：

@@ -24,18 +24,26 @@ No reflection service (needs a protobuf schema registry — external responsibil
 
 ## Usage
 
-```rust
+```rust,no_run
+use courierust::courierust_bytes::Bytes;
 use courierust::courierust_grpc::{GrpcClient, GrpcServer};
 
-// Server: implement Service, or just pass a closure
-let server = GrpcServer::bind("127.0.0.1:50051", |method: &str, req: Bytes| {
-    Ok(Bytes::from(format!("echo({method}): {}", String::from_utf8_lossy(&req))))
-})?;
-let _h = server.serve_background()?;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+// Server: implement `Service`, or just pass a closure
+let server = GrpcServer::bind(
+    "127.0.0.1:50051",
+    |method: &str, req: Bytes| -> courierust::Result<Bytes> {
+        Ok(Bytes::from(format!("echo({method}): {}", String::from_utf8_lossy(&req))))
+    },
+)?;
+let _handle = server.serve_background()?;
 
 // Client
 let client = GrpcClient::new("http://127.0.0.1:50051")?;
 let reply = client.call("helloworld.Greeter/SayHello", Bytes::from("world"))?;
+println!("{}", String::from_utf8_lossy(&reply));
+# Ok(())
+# }
 ```
 
 `examples/grpc_streaming.rs` demos all four call shapes, deadlines, gzip negotiation, metadata and interceptors; `examples/grpc_health.rs` demos `Check` + `Watch`.

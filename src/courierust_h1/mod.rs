@@ -130,13 +130,25 @@ pub fn read_headers_scratch<R: Read>(
     reader: &mut BufReader<R>,
     scratch: &mut crate::courierust_io::Scratch,
 ) -> Result<HeaderMap> {
+    read_headers_scratch_with_limit(reader, scratch, MAX_HEADER_BLOCK, || Ok(()))
+}
+
+/// Like [`read_headers_scratch`], but applies `max_header_list` and
+/// invokes `before_read` immediately before each transport read needed
+/// to finish the header block.
+pub(crate) fn read_headers_scratch_with_limit<R: Read, F: FnMut() -> Result<()>>(
+    reader: &mut BufReader<R>,
+    scratch: &mut crate::courierust_io::Scratch,
+    max_header_list: usize,
+    mut before_read: F,
+) -> Result<HeaderMap> {
     let mut headers = HeaderMap::new();
     let mut total = 0usize;
     loop {
         let line = scratch.line();
-        reader.read_until_into(b'\n', MAX_LINE, line)?;
+        reader.read_until_into_with(b'\n', MAX_LINE, line, &mut before_read)?;
         total += line.len();
-        if total > MAX_HEADER_BLOCK {
+        if total > max_header_list {
             return Err(Error::overflow("header block too large"));
         }
         if line.len() >= MAX_LINE {
@@ -226,14 +238,6 @@ pub fn body_length(
     method: Option<&Method>,
     status: Option<StatusCode>,
 ) -> Result<BodyLen> {
-    // RFC 9112 §6.3: a response to a HEAD request, or any response with
-    // a 1xx/204/304 status, never carries a body regardless of the
-    // framing header fields present. These checks MUST precede
-    // Content-Length/Transfer-Encoding parsing: otherwise a
-    // "204/304 + Content-Length: N" or a "HEAD + Content-Length: N"
-    // response would be mis-framed and a client would wait for bytes
-    // that never arrive (and, behind a proxy, the mismatch becomes a
-    // response-queue-poisoning / smuggling vector).
     let head_response = method == Some(&Method::HEAD);
     let bodyless_status = status.is_some_and(|s| {
         s.is_informational() || s == StatusCode::NO_CONTENT || s == StatusCode::NOT_MODIFIED
@@ -285,8 +289,16 @@ pub fn body_length(
     }
     let cls: Vec<&HeaderValue> = headers.get_all("content-length").collect();
     if !cls.is_empty() {
+        // `Content-Length = 1*DIGIT` (RFC 9110 §8.6) and the surrounding
+        // OWS is already gone (`split_header`), so anything but digits — a
+        // sign, an inner space — is a spelling this stack would accept and
+        // a stricter neighbour would not: exactly the raw material of a
+        // desync (CWE-444).
         let parse_len = |v: &HeaderValue| -> Option<usize> {
-            let s = v.to_str().ok()?.trim();
+            let s = v.to_str().ok()?;
+            if s.is_empty() || s.len() > 20 || !s.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
             s.parse::<usize>().ok()
         };
         let first = parse_len(cls[0]).ok_or_else(|| Error::protocol("invalid content-length"))?;
@@ -472,9 +484,10 @@ pub(crate) fn parse_chunk_size(line: &[u8]) -> Option<usize> {
 
 /// Serialize a request head into `out`.
 ///
-/// When the `COURIERUST_DUMP_REQUEST` environment variable is set, the
-/// exact serialized bytes are also written to that path — a debugging
-/// escape hatch for replaying identical requests through another stack.
+/// With the `std` feature, setting the `COURIERUST_DUMP_REQUEST`
+/// environment variable to a path also appends the exact serialized bytes
+/// there — a debugging escape hatch for replaying identical requests
+/// through another stack.
 pub fn write_request_head(
     out: &mut Vec<u8>,
     method: &Method,
@@ -482,7 +495,8 @@ pub fn write_request_head(
     version: Version,
     headers: &HeaderMap,
 ) -> Result<()> {
-    let start = out.len();
+    #[cfg(feature = "std")]
+    let head_start = out.len();
     out.extend_from_slice(method.as_str().as_bytes());
     out.push(b' ');
     out.extend_from_slice(target.as_str().as_bytes());
@@ -490,6 +504,7 @@ pub fn write_request_head(
     out.extend_from_slice(version.wire_str().as_bytes());
     out.extend_from_slice(b"\r\n");
     write_headers(out, headers)?;
+    #[cfg(feature = "std")]
     if let Ok(path) = std::env::var("COURIERUST_DUMP_REQUEST") {
         use std::io::Write as _;
         if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -498,7 +513,7 @@ pub fn write_request_head(
             .open(path)
         {
             let _ = file.write_all(b"----- request -----\n");
-            let _ = file.write_all(&out[start..]);
+            let _ = file.write_all(&out[head_start..]);
             let _ = file.write_all(b"\n");
         }
     }
@@ -530,9 +545,6 @@ pub fn write_headers(out: &mut Vec<u8>, headers: &HeaderMap) -> Result<()> {
         if n.is_pseudo() {
             continue; // pseudo-headers are not serialized in HTTP/1
         }
-        // Defense in depth: values constructed via `from_static` skip
-        // validation, so reject CR/LF/NUL here rather than letting a
-        // crafted value split the message (header injection).
         if v.as_bytes()
             .iter()
             .any(|&c| c == b'\r' || c == b'\n' || c == 0)
@@ -591,8 +603,6 @@ impl IToA {
     /// The formatted digits.
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
-        // Digits are written right-to-left from the end of the buffer;
-        // the formatted value occupies the trailing `len` bytes.
         &self.buf[self.buf.len() - self.len..]
     }
 }
@@ -691,6 +701,56 @@ mod tests {
             body_length(&h, Some(&Method::POST), None).unwrap(),
             BodyLen::Length(5)
         );
+    }
+
+    /// `Content-Length` is `1*DIGIT`: a sign, an exponent or a thousands
+    /// separator is accepted by some parsers and rejected by others, and
+    /// the disagreement is a desync primitive.
+    #[test]
+    fn non_digit_content_length_rejected() {
+        for spelling in ["+5", "-5", "5e3", "0x10", "1_0", ""] {
+            let h = headers(&[("content-length", spelling)]);
+            assert!(
+                body_length(&h, Some(&Method::POST), None).is_err(),
+                "{spelling:?} must not frame a body"
+            );
+        }
+        // Overflow for `usize` is refused rather than wrapping.
+        let h = headers(&[("content-length", "99999999999999999999999")]);
+        assert!(body_length(&h, Some(&Method::POST), None).is_err());
+    }
+
+    /// Surrounding OWS is not part of the field value (RFC 9110 §5.5) and
+    /// is stripped where the header block is read, so the same value with
+    /// and without it frames the same body.
+    #[test]
+    fn content_length_ows_is_stripped_by_the_reader() {
+        let mut reader = BufReader::new(
+            SliceReader::new(b"Content-Length: 5 \t\r\nHost: example.test\r\n\r\n"),
+            64,
+        );
+        let h = read_headers(&mut reader).unwrap();
+        assert_eq!(h.get("content-length").unwrap().as_bytes(), b"5");
+        assert_eq!(
+            body_length(&h, Some(&Method::POST), None).unwrap(),
+            BodyLen::Length(5)
+        );
+    }
+
+    /// A header block whose field list exceeds the caller's cap is
+    /// refused as an overflow instead of being read unbounded.
+    #[test]
+    fn custom_header_list_limit_is_enforced() {
+        let mut reader = BufReader::new(SliceReader::new(b"Host: example.test\r\n\r\n"), 64);
+        let mut scratch = crate::courierust_io::Scratch::new();
+        let result = read_headers_scratch_with_limit(&mut reader, &mut scratch, 8, || Ok(()));
+        assert!(matches!(
+            result,
+            Err(Error {
+                kind: ErrorKind::Overflow,
+                ..
+            })
+        ));
     }
 
     /// RFC 9112 §6.1 / CWE-444: a message carrying both framings is a

@@ -4,7 +4,8 @@ gRPC is HTTP/2 + length-prefixed binary messages + a status carried in trailers 
 
 ## Unary call with raw bytes
 
-```rust
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 use courierust::courierust_bytes::Bytes;
 use courierust::courierust_grpc::GrpcClient;
 
@@ -13,6 +14,8 @@ let client = GrpcClient::new("http://127.0.0.1:50051")?;
 // method is "package.Service/Method"
 let reply = client.call("helloworld.Greeter/SayHello", Bytes::from("world"))?;
 println!("{}", reply.to_str()?);
+# Ok(())
+# }
 ```
 
 `GrpcClient::new` builds an HTTP/2 (h2c) client for you. There is no connection handshake — the first call opens the connection.
@@ -21,9 +24,14 @@ println!("{}", reply.to_str()?);
 
 `String` and `Vec<u8>` already implement the codec traits, so this works today:
 
-```rust
+```rust,no_run
+# use courierust::courierust_grpc::GrpcClient;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = GrpcClient::new("http://127.0.0.1:50051")?;
 let reply: String = client.call_unary::<String, String>("/echo.Echo/Say", &"ping".into())?;
 assert_eq!(reply, "echo:ping"); // whatever your server returns
+# Ok(())
+# }
 ```
 
 For your own protobuf types, implement the two traits:
@@ -53,7 +61,8 @@ Then `client.call_unary::<HelloRequest, HelloResponse>(...)`.
 
 ## Server-streaming (multiple messages in one response)
 
-```rust
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 use courierust::courierust_grpc::GrpcClient;
 
 let client = GrpcClient::new("http://127.0.0.1:50051")?;
@@ -62,6 +71,8 @@ let mut stream = client.call_stream("/chat.Chat/Updates", courierust::courierust
 while let Some(msg) = stream.next_message()? {
     println!("msg: {}", msg.to_str()?);
 }
+# Ok(())
+# }
 ```
 
 `next_message()` returns `None` once the stream is exhausted and the `grpc-status` has been checked (a non-OK status surfaces as an `Err`).
@@ -70,7 +81,8 @@ while let Some(msg) = stream.next_message()? {
 
 A gRPC service is any `Fn(&str, Bytes) -> Result<Bytes> + Send + Sync + 'static` (or a type implementing the `Service` trait):
 
-```rust
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 use courierust::courierust_bytes::Bytes;
 use courierust::courierust_grpc::GrpcServer;
 
@@ -85,13 +97,20 @@ let server = GrpcServer::bind("127.0.0.1:50051", |method: &str, req: Bytes| {
 })?;
 let addr = server.local_addr()?;
 let _handle = server.serve_background()?; // or server.serve()? to block
+# let _ = addr;
+# Ok(())
+# }
 ```
 
 Returning `Err` with a `grpc` error code maps to `grpc-status` / `grpc-message` on the wire. All standard codes are in `courierust::courierust_grpc::status` (`OK`, `CANCELLED`, `INVALID_ARGUMENT`, `NOT_FOUND`, `INTERNAL`, `UNIMPLEMENTED`, `UNAVAILABLE`, …).
 
 ## Error handling on the client
 
-```rust
+```rust,no_run
+# use courierust::courierust_bytes::Bytes;
+# use courierust::courierust_grpc::GrpcClient;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = GrpcClient::new("http://127.0.0.1:50051")?;
 match client.call("/x.Y/Z", Bytes::from("x")) {
     Ok(_) => {}
     Err(e) => {
@@ -100,6 +119,8 @@ match client.call("/x.Y/Z", Bytes::from("x")) {
         }
     }
 }
+# Ok(())
+# }
 ```
 
 `Error::grpc(code, msg)` builds a gRPC error; `e.grpc_code()` reads it back. For returning errors from your own handler, the `grpc::grpc_error_response(code, message)` helper builds a ready-made error `Response`.

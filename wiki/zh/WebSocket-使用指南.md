@@ -25,7 +25,8 @@ flowchart LR
 `Handler::websocket` 决定哪些路由按 WebSocket 服务；返回 `Pass` 就回到
 普通 HTTP 路径（于是 `/ws` 归你，其它路径仍然由你真正的 handler 回答）：
 
-```rust
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 use courierust::courierust_body::Body;
 use courierust::courierust_http::request::Request;
 use courierust::courierust_http::response::Response;
@@ -44,6 +45,7 @@ impl WsService for Echo {
     }
 
     fn on_close(&self, conn: &mut WsConn, code: Option<u16>, clean: bool) {
+        // `code: None` 表示链路断了，不是对端的错。
         eprintln!("closed code={code:?} clean={clean} path={}", conn.path());
     }
 }
@@ -52,11 +54,11 @@ struct App;
 
 impl Handler for App {
     fn handle(&self, _req: Request<Body>) -> Response<Body> {
-        Response::text("普通 HTTP 照样能用")
+        Response::<Body>::with_status(200.into()).with_body(Body::from("plain HTTP still works"))
     }
 
     fn websocket(&self, req: &Request<Body>) -> WsUpgradeReply {
-        if req.path == "/ws" {
+        if req.uri.path() == "/ws" {
             WsUpgradeReply::Accept(Arc::new(Echo))
         } else {
             WsUpgradeReply::Pass
@@ -66,6 +68,8 @@ impl Handler for App {
 
 let server = Server::bind_with_config("127.0.0.1:8080", ServerConfig::default())?;
 server.serve(App)?;
+# Ok(())
+# }
 ```
 
 `WsService` 提供 `on_open`、`on_message`、`on_pong`、`on_idle` 与
@@ -94,8 +98,8 @@ reactor 里值得知道的一点：空闲的 WebSocket **不占 worker**，所�
 ## 策略：`WsConfig`
 
 ```rust
-use courierust::courierust_server::ws::{PmDeflatePolicy, WsConfig};
-use courierust::courierust_ws::OriginPolicy;
+use courierust::courierust_server::ws::WsConfig;
+use courierust::courierust_ws::{OriginPolicy, PmDeflatePolicy};
 
 let ws = WsConfig {
     // 默认值：浏览器只能从同站点打开这个 socket，
@@ -130,7 +134,8 @@ let ws = WsConfig {
 
 ## 客户端
 
-```rust
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 use courierust::courierust_client::ClientConfig;
 use courierust::courierust_client::ws::WebSocket;
 
@@ -152,6 +157,8 @@ loop {
     }
 }
 ws.close(1000, "done")?;
+# Ok(())
+# }
 ```
 
 客户端同时支持 `ws://` 与 `wss://`（后者走本 crate 自带的 TLS 1.2/1.3
@@ -197,9 +204,14 @@ location /ws/ {
 然后告诉服务端它「身后有代理」：
 
 ```rust
+# use courierust::courierust_server::ws::WsConfig;
+# use courierust::courierust_ws::{IpNet, OriginPolicy};
 let ws = WsConfig {
     origin: OriginPolicy::List(vec!["https://app.example.com".into()]),
-    trusted_proxies: vec![IpNet::parse("127.0.0.1/32")?, IpNet::parse("10.0.0.0/8")?],
+    trusted_proxies: vec![
+        IpNet::parse("127.0.0.1/32").expect("valid CIDR"),
+        IpNet::parse("10.0.0.0/8").expect("valid CIDR"),
+    ],
     ..Default::default()
 };
 ```
@@ -227,21 +239,33 @@ let ws = WsConfig {
   在不为每条连接保留 32 KiB 滑动窗口的前提下承载数千连接的原因；代价是
   大量微小重复消息上压缩率有上限损失。
 - **Windows 上 socket 超时不是免费的。** 阻塞驱动只在空闲等待时 armed
-  读超时；客户端若一直带着 `read_timeout`，256 KiB 批量推送大约**慢 2
-  倍**——批量传输请设 `read_timeout: None`，改用应用层存活判断。实测见
-  [基准测试](基准测试)。
+  读超时；客户端同样只在等待帧**头**时开启截止时间，帧体流式传输时清除，
+  所以一次“读后写”的回声在两半上都不再付费。残留的是阻塞套接字上无法
+  消除的那一种：对端发出帧头后卡在帧体中间，由 TCP 而非套接字截止时间
+  兜底；需要完全消除请设 `read_timeout: None`，改用应用层存活判断。
+  实测见 [基准测试](基准测试)。
 - **本 crate 两端之间传 256 KiB 消息**比 tungstenite 的组合慢（原因已定
   位，其中就包含上面这条 socket 超时发现）；小消息与中等消息为持平或领
   先。基准文档两个方向都如实报告。
 
 ## 覆盖范围在哪
 
-- **27 个端到端测试**（`tests/ws.rs`）：真实客户端 × 真实服务端 × 真实
+- **31 个端到端测试**（`tests/ws.rs`）：真实客户端 × 真实服务端 × 真实
   socket，**两条驱动路径都跑**——握手（含 RFC 6455 accept-key 官方向量）、
   双向掩码、带交错控制帧的分片重组、RFC 7692 协商与互操作、UTF-8 失败
   码、关闭握手的干净性、本 crate TLS 上的 `wss://`、其他线程推送、
   Origin/子协议策略、各类上限，以及 reactor 回归（一条连接关闭后，仍打开
   的连接必须继续被服务）。
+- **协议一致性套件**（`tests/ws_conformance.rs`）：把 RFC 6455 / RFC 7692
+  中“对端可以违反”的规则按 Autobahn 的形态排成表——组帧与长度编码、
+  分片、控制帧、负载与限额、关闭握手——每例都在真实 socket 上断言 §7.4
+  规定的关闭码（1002/1007/1009），失败会一次汇报全部而不是只报第一例。
+- **第三方套件**：`scripts/autobahn_ws.ps1` 启动 `examples/ws_autobahn`
+  并对它运行官方 `crossbario/autobahn-testsuite`；报告就是 Autobahn 自己
+  的 `index.json`，本仓库不做二次总结。
+- **模糊测试**：`fuzz/fuzz_targets/ws_frame.rs`、`ws_handshake.rs`、
+  `ws_session.rs` 分别覆盖编解码、握手策略与会话状态机（含全窗口与 8 位
+  窗口下的 RFC 7692 解压路径）。
 - **示例**：`cargo run --example ws_echo`、`cargo run --example ws_client`。
 - **引擎内部、部署配方与完整安全姿态**：`src/courierust_ws/README_CN.md`。
 - **与 `tungstenite` / `tokio-tungstenite` 的对比**：

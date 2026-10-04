@@ -159,7 +159,7 @@ impl HealthService {
 
     /// Set the overall serving status (returned for the empty service).
     pub fn set_overall(self, s: i32) -> Self {
-        let mut state = self.state.0.lock().unwrap();
+        let mut state = crate::lock(&self.state.0);
         state.overall = s;
         state.version = state.version.wrapping_add(1);
         self.state.1.notify_all();
@@ -169,7 +169,7 @@ impl HealthService {
 
     /// Register a service and its serving status.
     pub fn set_service(self, service: &str, s: i32) -> Self {
-        let mut state = self.state.0.lock().unwrap();
+        let mut state = crate::lock(&self.state.0);
         state.services.insert(service.to_string(), s);
         state.version = state.version.wrapping_add(1);
         self.state.1.notify_all();
@@ -179,7 +179,7 @@ impl HealthService {
 
     /// Update the overall status at runtime (wakes any `Watch` callers).
     pub fn update_overall(&self, s: i32) {
-        let mut state = self.state.0.lock().unwrap();
+        let mut state = crate::lock(&self.state.0);
         state.overall = s;
         state.version = state.version.wrapping_add(1);
         self.state.1.notify_all();
@@ -187,7 +187,7 @@ impl HealthService {
 
     /// Update a service's status at runtime (wakes any `Watch` callers).
     pub fn update_service(&self, service: &str, s: i32) {
-        let mut state = self.state.0.lock().unwrap();
+        let mut state = crate::lock(&self.state.0);
         state.services.insert(service.to_string(), s);
         state.version = state.version.wrapping_add(1);
         self.state.1.notify_all();
@@ -195,7 +195,7 @@ impl HealthService {
 
     /// The current status for a service name (empty = overall).
     fn status(&self, service: &str) -> i32 {
-        let state = self.state.0.lock().unwrap();
+        let state = crate::lock(&self.state.0);
         if service.is_empty() {
             state.overall
         } else {
@@ -245,14 +245,10 @@ impl HealthService {
         let mut last_version = u64::MAX; // force the first send
         loop {
             if tx.is_cancelled() {
-                // The call was abandoned — client gone, deadline passed,
-                // response dropped. Returning here is what keeps a watch
-                // from parking its thread forever after the response is
-                // no longer being read.
                 return Ok(());
             }
             let (st, version) = {
-                let state = self.state.0.lock().unwrap();
+                let state = crate::lock(&self.state.0);
                 let st = if service.is_empty() {
                     state.overall
                 } else {
@@ -271,14 +267,8 @@ impl HealthService {
                 }
                 last_version = version;
             }
-            // Wait for a status change; the timeout also lets this loop
-            // observe a client disconnect (via the send above).
-            let guard = self.state.0.lock().unwrap();
-            let _ = self
-                .state
-                .1
-                .wait_timeout(guard, Duration::from_millis(500))
-                .unwrap();
+            let guard = crate::lock(&self.state.0);
+            let _ = self.state.1.wait_timeout(guard, Duration::from_millis(500));
         }
     }
 }

@@ -28,6 +28,7 @@
 
 pub mod crypto;
 pub(crate) mod session;
+pub mod system_roots;
 pub mod x509;
 
 #[cfg(test)]
@@ -819,7 +820,7 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
                         // 0-RTT allowance the ticket carries (0 = none).
                     };
                     if let Some(store) = &self.session_store {
-                        cache_session(&mut store.lock().unwrap(), sess);
+                        cache_session(&mut crate::lock(store), sess);
                     }
                 }
             }
@@ -828,7 +829,6 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
         Ok(())
     }
 
-    /// Whether this handshake was resumed from a PSK.
     /// Whether this connection was resumed via a PSK (RFC 8446 §2.2).
     /// The first connection after a ticket is issued is a full handshake;
     /// a later connection offering that ticket is resumed.
@@ -1099,17 +1099,17 @@ impl TlsConnector {
 
     /// Forget every cached resumption session.
     pub fn clear_sessions(&self) {
-        self.sessions.lock().unwrap().clear();
+        crate::lock(&self.sessions).clear();
     }
 
     /// Number of cached resumption sessions (diagnostics / tests).
     pub fn session_count(&self) -> usize {
-        self.sessions.lock().unwrap().len()
+        crate::lock(&self.sessions).len()
     }
 
     /// Find a fresh resumption session for `hostname`.
     fn find_session(&self, hostname: &str) -> Option<session::ClientSession> {
-        let sessions = self.sessions.lock().unwrap();
+        let sessions = crate::lock(&self.sessions);
         sessions
             .iter()
             .find(|s| s.hostname == hostname)
@@ -1606,6 +1606,125 @@ mod tests {
         tls.close_notify().unwrap();
 
         server.join().unwrap();
+    }
+
+    /// RFC 8446 §4.6.1: the second connection resumes from the ticket the
+    /// first one received. A PSK handshake authenticates with the PSK, so
+    /// the server sends no Certificate/CertificateVerify (RFC 8446 §4.4.2)
+    /// and the client reports no peer certificate.
+    #[test]
+    fn tls13_session_resumption_omits_the_certificate() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let acceptor = TlsAcceptor::new(ServerConfig {
+                identity: testdata::server_identity(),
+                alpn: Vec::new(),
+                min_version: TlsVersion::Tls13,
+                max_version: TlsVersion::Tls13,
+                session_ticket_key: Some([9u8; 32]),
+                client_auth: None,
+            });
+            let mut resumed = Vec::new();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let mut tls = acceptor.accept(&stream, &stream).unwrap();
+                resumed.push(tls.resumed());
+                assert_eq!(tls.read_record().unwrap(), b"ping");
+                tls.write_all(b"pong").unwrap();
+                tls.close_notify().unwrap();
+            }
+            resumed
+        });
+
+        let connector = TlsConnector::new(ClientConfig {
+            roots: testdata::root_store(),
+            verify: true,
+            alpn: Vec::new(),
+            now: testdata::NOW,
+            min_version: TlsVersion::Tls13,
+            max_version: TlsVersion::Tls13,
+            identity: None,
+            profile: None,
+        });
+
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut tls = connector.connect("localhost", &stream, &stream).unwrap();
+        assert!(!tls.resumed());
+        assert!(tls.peer_certificate().is_some());
+        tls.write_all(b"ping").unwrap();
+        assert_eq!(tls.read_record().unwrap(), b"pong");
+        // Reading the reply also captures the NewSessionTicket behind it.
+        tls.close_notify().unwrap();
+
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut tls = connector.connect("localhost", &stream, &stream).unwrap();
+        assert!(tls.resumed());
+        assert!(tls.peer_certificate().is_none());
+        tls.write_all(b"ping").unwrap();
+        assert_eq!(tls.read_record().unwrap(), b"pong");
+        tls.close_notify().unwrap();
+
+        assert_eq!(server.join().unwrap(), vec![false, true]);
+    }
+
+    /// A server that *requires* client authentication declines an offered
+    /// PSK: a `CertificateRequest` has no place in a resumed handshake
+    /// (RFC 8446 §4.3.2), so the connection falls back to a full
+    /// handshake and still authenticates the client's certificate.
+    #[test]
+    fn tls13_required_client_auth_declines_resumption() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let mut roots = RootStore::new();
+            roots.add_der(testdata::SERVER_CERT_DER.to_vec());
+            let acceptor = TlsAcceptor::new(ServerConfig {
+                identity: testdata::server_identity(),
+                alpn: Vec::new(),
+                min_version: TlsVersion::Tls13,
+                max_version: TlsVersion::Tls13,
+                session_ticket_key: Some([0x3cu8; 32]),
+                client_auth: Some(ClientAuth::required(roots)),
+            });
+            let mut resumed = Vec::new();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let mut tls = acceptor.accept(&stream, &stream).unwrap();
+                assert_eq!(tls.peer_certificate(), Some(testdata::SERVER_CERT_DER));
+                resumed.push(tls.resumed());
+                assert_eq!(tls.read_record().unwrap(), b"ping");
+                tls.write_all(b"pong").unwrap();
+                tls.close_notify().unwrap();
+            }
+            resumed
+        });
+
+        let connector = TlsConnector::new(ClientConfig {
+            roots: testdata::root_store(),
+            verify: true,
+            alpn: Vec::new(),
+            now: testdata::NOW,
+            min_version: TlsVersion::Tls13,
+            max_version: TlsVersion::Tls13,
+            identity: Some(testdata::server_identity()),
+            profile: None,
+        });
+
+        // The second connect offers the ticket the first one captured;
+        // the server declines it and asks for the certificate again.
+        for _ in 0..2 {
+            let stream = TcpStream::connect(addr).unwrap();
+            let mut tls = connector.connect("localhost", &stream, &stream).unwrap();
+            assert!(!tls.resumed());
+            tls.write_all(b"ping").unwrap();
+            assert_eq!(tls.read_record().unwrap(), b"pong");
+            tls.close_notify().unwrap();
+        }
+
+        assert_eq!(server.join().unwrap(), vec![false, false]);
     }
 
     /// RFC 8446 §4.6.3: a `KeyUpdate` rekeys the *sender's* direction, the

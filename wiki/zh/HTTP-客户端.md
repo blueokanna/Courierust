@@ -9,6 +9,7 @@ use courierust::courierust_client::{Client, ClientConfig};
 use courierust::courierust_http::header::HeaderMap;
 use std::time::Duration;
 
+# fn main() {
 let cfg = ClientConfig {
     // 优先用 HTTP/2（h2c 前导知识）；false 则用 HTTP/1.1。
     http2: true,
@@ -27,40 +28,56 @@ let cfg = ClientConfig {
     // 防御性限制：接受的对端头列表与响应体大小上限。
     max_header_list: 1 << 20,
     max_body: 16 * 1024 * 1024,
+    ..Default::default()
 };
 
 let client = Client::with_config(cfg);
 // Client 可廉价 clone，内部共享连接池。
 let c2 = client.clone();
+# let _ = c2;
+# }
 ```
 
 `Client::new()` 等价于全默认配置。
 
 ## GET
 
-```rust
+```rust,no_run
+# use courierust::courierust_client::Client;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = Client::new();
 let resp = client.get("http://127.0.0.1:8080/health")?;
 println!("status: {}", resp.status.as_u16());
 // Body::collect() 阻塞直到整个响应体收完。
 let body = resp.body.collect()?;
 println!("body: {}", body.to_str()?);
+# Ok(())
+# }
 ```
 
 ## POST
 
 `post` 接受任何能转成 `Body` 的类型：`Bytes`、`Vec<u8>`、`String`、`&'static str`、`&'static [u8]`：
 
-```rust
+```rust,no_run
+# use courierust::courierust_client::Client;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = Client::new();
 let resp = client.post("http://127.0.0.1:8080/submit", "raw text payload")?;
 let resp = client.post("http://127.0.0.1:8080/submit", vec![1u8, 2, 3])?;
+# Ok(())
+# }
 ```
 
 ## 请求构建器
 
 `Client::request(url, method)` 返回 `RequestBuilder`：它构造的就是下面手写形式所发的同一个 `Request`，交给同一条路径，所以重定向、连接池与三种协议的行为完全一致。`Client::{put, delete, head, patch, options}` 是一次调用就能用的快捷方法。
 
-```rust
+```rust,no_run
 use courierust::courierust_http::Method;
+# use courierust::courierust_client::Client;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = Client::new();
 
 let resp = client
     .request("http://127.0.0.1:8080/api/items", Method::POST)
@@ -71,6 +88,8 @@ let resp = client
     .timeout(std::time::Duration::from_secs(5))
     .send()?;
 println!("{}", resp.text()?);
+# Ok(())
+# }
 ```
 
 - `query` / `form` 使用 WHATWG `application/x-www-form-urlencoded` 编码（`courierust_http::form`）：空格变 `+`，`A-Za-z0-9*-._` 之外的字节变 `%XX`。
@@ -80,7 +99,10 @@ println!("{}", resp.text()?);
 
 ## 带请求头的 Request 与响应检查
 
-```rust
+```rust,no_run
+# use courierust::courierust_client::Client;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = Client::new();
 use courierust::courierust_body::Body;
 use courierust::courierust_bytes::Bytes;
 use courierust::courierust_http::header::{HeaderName, HeaderValue};
@@ -101,6 +123,8 @@ req.body = Body::Bytes(Bytes::from(r#"{"name":"courierust"}"#));
 let resp = client.execute("http://127.0.0.1:8080", req)?;
 println!("version: {}", resp.version);
 println!("x-request-id: {:?}", resp.headers.get("x-request-id"));
+# Ok(())
+# }
 ```
 
 注意：
@@ -113,23 +137,37 @@ println!("x-request-id: {:?}", resp.headers.get("x-request-id"));
 
 默认开启，由 `max_redirects` 限制次数。`301`/`302`/`303` 自动转为 `GET`（RFC 9110）并丢弃请求体；`307`/`308` 保留方法与请求体，若请求体只以流的形式存在（无法重放），则显式报错而不是发送空体。绝对地址、协议相对（`//host/...`）、相对路径三种 `Location` 都支持：
 
-```rust
+```rust,no_run
+# use courierust::courierust_client::Client;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = Client::new();
 // 最多自动跟随 10 跳，最终响应原样返回。
 let resp = client.get("http://short.example/start")?;
+# let _ = resp;
+# Ok(())
+# }
 ```
 
 ## RFC 9218 优先级（HTTP/2）
 
 HTTP/2 下可以给每个请求指定优先级。服务器端用 WUCS 调度器调度流：urgency `0..=7`（0 最高），`incremental` 表示数据到达即可消费的流。
 
-```rust
+```rust,no_run
+# use courierust::courierust_client::Client;
+# use courierust::courierust_http::method::Method;
+# use courierust::courierust_http::request::Request;
 use courierust::courierust_h2::priority::Priority;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = Client::new();
 
 // 从线上格式解析（"u=1, i"）或直接构造：
 let prio = Priority { urgency: 1, incremental: true };
 
 let mut req = Request::new(Method::GET, "/big-download");
 let resp = client.execute_priority("http://127.0.0.1:8080", req, prio)?;
+# let _ = resp;
+# Ok(())
+# }
 ```
 
 `Priority` 实现了 `Default`（urgency 3、非增量）、`Display`（`u=3`），也支持 `Priority::parse(b"u=1, i")`。
@@ -138,20 +176,28 @@ let resp = client.execute_priority("http://127.0.0.1:8080", req, prio)?;
 
 流式（`Channel`）响应体用 `try_next_chunk` 逐块消费，适合 SSE 或大文件下载，不需要整包缓冲：
 
-```rust
+```rust,no_run
+# use courierust::courierust_client::Client;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = Client::new();
 let resp = client.get("http://127.0.0.1:8080/events")?;
 let mut body = resp.body;
 while let Some(chunk) = body.try_next_chunk()? {
     // chunk: courierust::courierust_bytes::Bytes
     eprintln!("chunk: {} bytes", chunk.len());
 }
+# Ok(())
+# }
 ```
 
 ## 错误处理
 
 所有可失败调用返回 `courierust::Result<T>`，错误类型为 `courierust::Error`：
 
-```rust
+```rust,no_run
+# use courierust::courierust_client::Client;
+# fn main() {
+# let client = Client::new();
 match client.get("http://127.0.0.1:9/") {
     Ok(resp) => println!("ok: {}", resp.status),
     Err(e) => {
@@ -159,6 +205,7 @@ match client.get("http://127.0.0.1:9/") {
         println!("message: {}", e);
     }
 }
+# }
 ```
 
 `Error` 可转换为 `std::io::Error`（用于 `?` 冒泡），并带公开的 `kind` 字段供程序化处理。
@@ -174,7 +221,8 @@ match client.get("http://127.0.0.1:9/") {
 
 同一个客户端也能说 WebSocket——`ws://` 与 `wss://`（后者走本 crate 自带的 TLS 栈），读超时由 `ClientConfig` 提供：
 
-```rust
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 use courierust::courierust_client::ClientConfig;
 use courierust::courierust_client::ws::WebSocket;
 
@@ -182,6 +230,8 @@ let mut ws = WebSocket::connect("wss://example.com/ws", &ClientConfig::default()
 ws.send_text("hello")?;
 println!("{:?}", ws.read_message()?);   // Event::Text("hello")
 ws.close(1000, "done")?;
+# Ok(())
+# }
 ```
 
 它与服务端共用组帧 / UTF-8 / 关闭握手引擎，两端强制的是同一套规则；完整教程（可选项、协商、部署、诚实说明）见 [WebSocket 使用指南](WebSocket-使用指南)。

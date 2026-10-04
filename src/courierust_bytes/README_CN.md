@@ -17,11 +17,14 @@
 ```rust
 use courierust::courierust_bytes::{Bytes, BytesMut};
 
+# fn main() {
 let b = Bytes::from_static(b"hello world");
-let tail = b.slice(6..);          // O(1)，不拷贝
+let tail = b.slice_from(6);       // O(1)，不拷贝
 let clone = tail.clone();         // 引用计数 +1，不拷贝
 
 let mut m = BytesMut::new();
 m.extend_from_slice(b"hello");
 let done: Bytes = m.freeze();
+# let _ = (clone, done);
+# }
 ```

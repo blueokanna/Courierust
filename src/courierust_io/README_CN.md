@@ -28,9 +28,27 @@
 ```rust
 use courierust::courierust_io::{Read, Write};
 
+# fn main() {}
 // 你的传输只需实现这两个 trait。
-impl Read for MyPipe { /* ... */ }
-impl Write for MyPipe { /* ... */ }
+# #[allow(dead_code)]
+struct MyPipe;
+
+impl Read for MyPipe {
+    fn read(&mut self, buf: &mut [u8]) -> courierust::Result<usize> {
+        let _ = buf; // 把数据填进 `buf`，返回读到的字节数
+        Ok(0)
+    }
+}
+
+impl Write for MyPipe {
+    fn write(&mut self, buf: &[u8]) -> courierust::Result<usize> {
+        Ok(buf.len()) // 写出 `buf`，返回写出的字节数
+    }
+
+    fn flush(&mut self) -> courierust::Result<()> {
+        Ok(())
+    }
+}
 
 // 然后栈里任何 codec 都能在它上面跑，原样不动。
 ```

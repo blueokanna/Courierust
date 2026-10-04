@@ -6,12 +6,15 @@ mod common;
 use courierust::courierust_body::Body;
 use courierust::courierust_bytes::Bytes;
 use courierust::courierust_client::{Client, ClientConfig, TlsSettings as ClientTls};
+use courierust::courierust_deflate;
 use courierust::courierust_grpc::GrpcClient;
+use courierust::courierust_http::header::{HeaderName, HeaderValue};
 use courierust::courierust_http::method::Method;
 use courierust::courierust_http::request::Request;
+use courierust::courierust_http::response::Response;
 use courierust::courierust_server::{Server, ServerConfig, TlsSettings as ServerTls};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Spin up an HTTP server on an ephemeral port and return its base URL.
@@ -177,6 +180,33 @@ fn h1_get_and_post_roundtrip() {
     req.body = Body::Bytes(Bytes::from_static(b"payload"));
     let resp = client.execute(&format!("{base}/path?q=1"), req).unwrap();
     assert_eq!(resp.body.collect().unwrap().as_slice(), b"payload");
+}
+
+#[test]
+fn a_zero_length_body_is_a_complete_request() {
+    // `Content-Length: 0` is a body of no bytes, not a promise of one. Most
+    // HTTP clients send exactly this for a body-less `POST`, and `Body::Bytes`
+    // of an empty slice is how this crate produces it — so a peer that waits
+    // for the body it was told not to expect never answers.
+    let base = spawn_server(ServerConfig::default(), echo_handler);
+    let client = Client::with_config(ClientConfig {
+        read_timeout: Some(Duration::from_secs(3)),
+        ..Default::default()
+    });
+    let resp = client
+        .post(&format!("{base}/empty"), String::new())
+        .expect("a request with Content-Length: 0 must be answered");
+    assert_eq!(resp.status.as_u16(), 200);
+    assert!(resp.body.is_empty());
+
+    // The same announcement on a GET, which is the shape a proxy produces
+    // when it forwards a body-less request through `Body::Bytes`.
+    let mut req = Request::new(Method::GET, "/empty");
+    req.body = Body::Bytes(Bytes::from(Vec::new()));
+    let resp = client
+        .execute(&format!("{base}/empty"), req)
+        .expect("a GET with Content-Length: 0 must be answered");
+    assert_eq!(resp.status.as_u16(), 200);
 }
 
 #[test]
@@ -825,8 +855,6 @@ fn h2_client_enforces_max_body() {
 /// redirect (RFC 9110 credential-leakage guidance).
 #[test]
 fn redirect_strips_credentials_cross_origin() {
-    use std::sync::Mutex;
-
     let got_auth = Arc::new(Mutex::new(false));
     let got_auth_b = got_auth.clone();
     let base_b = Arc::new(spawn_server(ServerConfig::default(), move |req| {
@@ -1693,6 +1721,41 @@ fn http11_requires_exactly_one_non_empty_host_header() {
     }
 }
 
+/// `max_header_list` is a server-wide safety policy: HTTP/1.1 must honor
+/// it exactly as HTTP/2 and HTTP/3 do, rather than retaining a hidden
+/// fixed one-megabyte allowance after a protocol downgrade.
+#[test]
+fn h1_enforces_configured_header_list_limit_on_both_drivers() {
+    use std::io::Write;
+    use std::net::TcpStream;
+
+    for event_driven in [true, false] {
+        let base = spawn_server(
+            ServerConfig {
+                http2: false,
+                event_driven,
+                threads: 1,
+                event_workers: 1,
+                max_header_list: 32,
+                ..Default::default()
+            },
+            |_req| courierust::courierust_http::response::Response::<Body>::with_status(200.into()),
+        );
+        let addr = base.trim_start_matches("http://").to_string();
+        let mut conn = RawConn::new(TcpStream::connect(addr).unwrap());
+        conn.stream()
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nX-Long: 0123456789abcdef\r\n\r\n")
+            .unwrap();
+        let response = conn
+            .try_read_response()
+            .unwrap_or_else(|| panic!("event_driven={event_driven}: no response"));
+        assert!(
+            response.starts_with("HTTP/1.1 431"),
+            "event_driven={event_driven}: got {response}"
+        );
+    }
+}
+
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
@@ -1763,6 +1826,10 @@ fn server_defaults_to_event_driven_scheduler() {
     let d = ServerConfig::default();
     assert!(d.event_driven, "event_driven must default to true");
     assert_eq!(d.event_poll_timeout_ms, 50);
+    assert_eq!(
+        d.request_header_timeout,
+        Some(std::time::Duration::from_secs(15))
+    );
     assert_eq!(d.idle_timeout, Some(std::time::Duration::from_secs(300)));
     assert_eq!(d.h2_idle_timeout, Some(std::time::Duration::from_secs(300)));
 }
@@ -1865,6 +1932,56 @@ fn event_idle_timeout_reaps_slowloris() {
     );
 }
 
+/// A peer cannot keep a request slot forever by sending a byte more often
+/// than the idle timeout. The absolute header deadline applies to both
+/// server drivers and answers with RFC 9110's 408 before closing.
+#[test]
+fn request_header_timeout_stops_trickling_slowloris() {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    for event_driven in [true, false] {
+        let server_cfg = ServerConfig {
+            http2: false,
+            event_driven,
+            event_workers: 1,
+            threads: 1,
+            request_header_timeout: Some(Duration::from_millis(300)),
+            idle_timeout: Some(Duration::from_secs(10)),
+            event_poll_timeout_ms: 10,
+            ..Default::default()
+        };
+        let base = spawn_server(server_cfg, |_req| {
+            courierust::courierust_http::response::Response::<Body>::with_status(200.into())
+        });
+        let addr = base.trim_start_matches("http://").to_string();
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        stream.write_all(b"GET / HTTP/1.1\r\nHost: ").unwrap();
+        for _ in 0..4 {
+            std::thread::sleep(Duration::from_millis(50));
+            if stream.write_all(b"x").is_err() {
+                break;
+            }
+        }
+        let mut response = Vec::new();
+        let mut buffer = [0u8; 256];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => response.extend_from_slice(&buffer[..n]),
+            }
+        }
+        let response = String::from_utf8(response).unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 408"),
+            "event_driven={event_driven}: got {response:?}"
+        );
+    }
+}
+
 /// The connection cap bounds the event path: connections beyond
 /// `max_connections` are closed immediately (a herd cannot grow without
 /// bound), and once the admitted connections go away the server keeps
@@ -1895,9 +2012,6 @@ fn event_connection_cap_limits_herd() {
     });
     let addr = base.trim_start_matches("http://").to_string();
 
-    // Open 8 connections that never complete a request (parked). The
-    // first `max_connections` are admitted; the rest are closed by the
-    // cap.
     let mut herd = Vec::new();
     for _ in 0..8 {
         let mut s = TcpStream::connect(&addr).unwrap();
@@ -1908,9 +2022,6 @@ fn event_connection_cap_limits_herd() {
         herd.push(s);
     }
 
-    // Wait for the event loop to apply the cap, then count how many of
-    // the herd were closed by it. The admitted (parked) connections stay
-    // open, so exactly the excess should read EOF/error.
     std::thread::sleep(std::time::Duration::from_millis(500));
     let mut closed = 0usize;
     let mut open = 0usize;
@@ -1929,8 +2040,6 @@ fn event_connection_cap_limits_herd() {
         "connection cap did not close the excess (closed {closed}, open {open})"
     );
 
-    // Close the admitted herd, then a fresh request must be served — the
-    // cap only rejects while it is full.
     drop(herd);
     std::thread::sleep(std::time::Duration::from_millis(300));
     let client = Client::new();
@@ -1965,7 +2074,6 @@ fn event_slow_sender_resumes_partial_request() {
     let addr = base.trim_start_matches("http://").to_string();
 
     let mut c = RawConn::new(TcpStream::connect(addr).unwrap());
-    // Send a partial request, then stall well beyond any poll timeout.
     c.stream()
         .write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\n")
         .unwrap();
@@ -2271,18 +2379,12 @@ fn grpc_gzip_compression_roundtrip() {
     })
     .unwrap();
 
-    // Unary with a highly compressible payload: the server must
-    // decompress the gzip request, echo it, and (because our client
-    // advertised gzip) compress the response; the client must
-    // decompress it.
     let big = "compress me compress me compress me ".repeat(500);
     let resp = client
         .call("/echo.Echo/Say", Bytes::from(big.as_bytes().to_vec()))
         .unwrap();
     assert_eq!(resp.to_str().unwrap(), format!("echo:{big}"));
 
-    // Server-streaming with compression, and verify the negotiated
-    // `grpc-encoding` is reported as gzip on the response head.
     let mut stream = client
         .call_stream("/echo.Echo/ServerStream", Bytes::from_static(b"z"))
         .unwrap();
@@ -2301,11 +2403,6 @@ fn grpc_gzip_compression_roundtrip() {
     }
     assert_eq!(got.len(), 4, "got {got:?}");
 
-    // An over-limit message is rejected at the client before it is sent
-    // (outbound size enforcement — this is what also defeats
-    // compression-smuggling, since the uncompressed size is checked).
-    // The server-side decompression bomb cap is covered by the
-    // `compress` module's `gunzip_enforces_output_cap` unit test.
     let err = client
         .call("/echo.Echo/Say", Bytes::from(vec![b'x'; 8 * 1024 * 1024]))
         .unwrap_err();
@@ -2350,9 +2447,7 @@ fn grpc_metadata_and_interceptor() {
                 );
             },
         )),
-        // Generous: the full suite runs many servers in parallel, so a
-        // tight deadline would spuriously trip DEADLINE_EXCEEDED under
-        // load. Deadline *enforcement* is tested separately.
+
         timeout: Some(std::time::Duration::from_secs(5)),
         compress: false,
         http_client: Client::with_config(ClientConfig {
@@ -2399,8 +2494,6 @@ fn grpc_health_watch() {
     let addr = bind_grpc_streaming(service.clone());
 
     let client = GrpcClient::new(&format!("http://{addr}")).unwrap();
-    // Watch is a server-streaming call: the stream stays open and pushes
-    // status changes.
     let mut stream = client
         .call_stream(health::WATCH_METHOD, Bytes::new())
         .unwrap();
@@ -2412,7 +2505,6 @@ fn grpc_health_watch() {
         .expect("watch must stream the initial status");
     assert_eq!(first[1], health::serving_status::SERVING as u8);
 
-    // A runtime status change must be pushed to the open stream.
     service.update_overall(health::serving_status::NOT_SERVING);
     let second = stream
         .next_message()
@@ -2420,7 +2512,6 @@ fn grpc_health_watch() {
         .expect("watch must stream the updated status");
     assert_eq!(second[1], health::serving_status::NOT_SERVING as u8);
 
-    // A service appearing after the watch started is also pushed.
     service.update_service("svc.Late", health::serving_status::SERVING);
     let req = [0x0A, 8]; // field 1, len 8
     let req = Bytes::from([&req[..], b"svc.Late"].concat());
@@ -2509,12 +2600,9 @@ fn h1_client_head_response_with_content_length_has_no_body() {
             }
         }
         assert!(head.starts_with("HEAD "), "unexpected request: {head}");
-        // A standard HEAD response: 200 with Content-Length but no body.
         let mut w = stream;
         w.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
             .unwrap();
-        // A subsequent GET on the same keep-alive connection must not be
-        // poisoned by the "missing" HEAD body: answer it normally.
         let mut l = String::new();
         if reader.read_line(&mut l).unwrap_or(0) > 0 {
             let mut got_head = false;
@@ -2550,12 +2638,378 @@ fn h1_client_head_response_with_content_length_has_no_body() {
         resp.body.collect().unwrap().is_empty(),
         "a HEAD response has no body"
     );
-    // Reuse the same pooled connection for a GET; if the HEAD body were
-    // mis-framed the connection would desync and this would fail/hang.
+
     let resp = client
         .get(&format!("http://{addr}/"))
         .expect("GET after HEAD");
     assert_eq!(resp.body.collect().unwrap().to_str().unwrap(), "abc");
+}
+
+// ---------------------------------------------------------------------
+// Content coding: the client advertises exactly what it decodes, and a
+// caller is never handed bytes it did not ask to interpret.
+// ---------------------------------------------------------------------
+
+/// Adler-32 over the *uncompressed* data (RFC 1950 §9).
+///
+/// Computed here rather than taken from the crate, so a bug in the crate's
+/// own checksum cannot make the zlib test pass.
+fn zlib_adler32(data: &[u8]) -> u32 {
+    let (mut a, mut b) = (1u32, 0u32);
+    for &x in data {
+        a = (a + u32::from(x)) % 65_521;
+        b = (b + a) % 65_521;
+    }
+    (b << 16) | a
+}
+
+/// Build a zlib (RFC 1950) stream around raw DEFLATE.
+fn zlib_wrap(raw: &[u8], uncompressed: &[u8]) -> Vec<u8> {
+    // 0x78 0x9c = DEFLATE, 32 KiB window, header check bits satisfied.
+    let mut out = vec![0x78, 0x9c];
+    out.extend_from_slice(raw);
+    out.extend_from_slice(&zlib_adler32(uncompressed).to_be_bytes());
+    out
+}
+
+/// Serve a fixed body with a fixed `content-encoding`, and echo the
+/// request's `accept-encoding` back in `x-seen` so the test can assert on
+/// what the client actually offered.
+fn spawned_coded_server(
+    encoding: &'static str,
+    body: Vec<u8>,
+    observed: Arc<Mutex<Option<String>>>,
+) -> String {
+    spawn_server(ServerConfig::default(), move |req| {
+        *observed.lock().unwrap() = req
+            .headers
+            .get("accept-encoding")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let mut resp = Response::<Body>::with_status(200.into());
+        resp.headers.insert(
+            HeaderName::from_lowercase("content-encoding"),
+            HeaderValue::from_static(encoding),
+        );
+        resp.headers.insert(
+            HeaderName::from_lowercase("content-length"),
+            HeaderValue::from_bytes(body.len().to_string().as_bytes()).unwrap(),
+        );
+        resp.body = Body::Bytes(Bytes::from(body.clone()));
+        resp
+    })
+}
+
+#[test]
+fn a_gzip_response_is_decoded_and_loses_its_encoding_label() {
+    let payload = "the quick brown fox jumps over the lazy dog\n".repeat(64);
+    let compressed = courierust_deflate::gzip(payload.as_bytes());
+    assert!(
+        compressed.len() < payload.len() / 2,
+        "the test payload must actually be compressed"
+    );
+    let seen = Arc::new(Mutex::new(None));
+    let base = spawned_coded_server("gzip", compressed, seen.clone());
+
+    let client = Client::new();
+    let resp = client.get(&format!("{base}/gz")).unwrap();
+    assert_eq!(resp.status.as_u16(), 200);
+    assert_eq!(
+        seen.lock().unwrap().as_deref(),
+        Some("gzip, deflate"),
+        "the offer must be exactly the supported set"
+    );
+    assert_eq!(resp.body.collect().unwrap().to_str().unwrap(), payload);
+    assert!(
+        resp.headers.get("content-encoding").is_none(),
+        "a decoded body must not still claim an encoding"
+    );
+    assert!(
+        resp.headers.get("content-length").is_none(),
+        "content-length described the compressed bytes, not these"
+    );
+}
+
+#[test]
+fn both_deflate_dialects_are_decoded() {
+    let payload = "deflate is zlib, except when it is not\n".repeat(64);
+    let raw = courierust_deflate::deflate(payload.as_bytes());
+
+    let seen = Arc::new(Mutex::new(None));
+    let wrapped =
+        spawned_coded_server("deflate", zlib_wrap(&raw, payload.as_bytes()), seen.clone());
+
+    let seen2 = Arc::new(Mutex::new(None));
+    let bare = spawned_coded_server("deflate", raw, seen2.clone());
+
+    let client = Client::new();
+    for base in [wrapped, bare] {
+        let resp = client.get(&format!("{base}/d")).unwrap();
+        assert_eq!(resp.status.as_u16(), 200, "{base}");
+        assert_eq!(resp.body.collect().unwrap().to_str().unwrap(), payload);
+        assert!(resp.headers.get("content-encoding").is_none());
+    }
+}
+
+/// An encoding the client never offered is not guessed at: the response is
+/// passed through byte-for-byte with its label intact, so the caller can
+/// see what it is holding instead of receiving data it cannot interpret.
+#[test]
+fn an_unadvertised_encoding_is_left_alone() {
+    let body = b"not actually brotli".to_vec();
+    let seen = Arc::new(Mutex::new(None));
+    let base = spawned_coded_server("br", body.clone(), seen.clone());
+
+    let client = Client::new();
+    let resp = client.get(&format!("{base}/br")).unwrap();
+    assert!(
+        !seen
+            .lock()
+            .unwrap()
+            .as_deref()
+            .unwrap_or_default()
+            .contains("br"),
+        "`br` must never be offered"
+    );
+    assert_eq!(
+        resp.headers
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok()),
+        Some("br"),
+        "the label must survive so the caller knows the body is not plain"
+    );
+    assert_eq!(resp.body.collect().unwrap().as_slice(), body.as_slice());
+}
+
+/// `identity` is not a transform worth a header; leaving it in place is
+/// noise that makes callers branch for no reason.
+#[test]
+fn an_identity_encoding_is_removed_not_decoded() {
+    let body = b"plain bytes".to_vec();
+    let seen = Arc::new(Mutex::new(None));
+    let base = spawned_coded_server("identity", body.clone(), seen);
+
+    let client = Client::new();
+    let resp = client.get(&format!("{base}/plain")).unwrap();
+    assert!(resp.headers.get("content-encoding").is_none());
+    assert_eq!(resp.body.collect().unwrap().as_slice(), body.as_slice());
+}
+
+/// Turning the feature off must turn off *both* halves. Offering a coding
+/// and then not decoding it is the failure mode that makes this setting
+/// dangerous to get wrong.
+#[test]
+fn disabling_accept_encoding_removes_the_offer_and_the_decode() {
+    let payload = "compress me ".repeat(128);
+    let compressed = courierust_deflate::gzip(payload.as_bytes());
+    let seen = Arc::new(Mutex::new(None));
+    let base = spawned_coded_server("gzip", compressed.clone(), seen.clone());
+
+    let client = Client::with_config(ClientConfig {
+        accept_encoding: false,
+        ..Default::default()
+    });
+    let resp = client.get(&format!("{base}/gz")).unwrap();
+    assert!(
+        seen.lock().unwrap().is_none(),
+        "nothing may be advertised when decoding is off"
+    );
+    assert_eq!(
+        resp.headers
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok()),
+        Some("gzip")
+    );
+    assert_eq!(
+        resp.body.collect().unwrap().as_slice(),
+        compressed.as_slice(),
+        "the bytes are handed over exactly as they arrived"
+    );
+}
+
+/// A caller that picks its own coding list means it: the header is never
+/// rewritten. A server that compresses anyway is still answered — the
+/// client understands `gzip`, so the caller gets plain bytes instead of
+/// bytes it said it could not handle.
+#[test]
+fn a_caller_supplied_accept_encoding_is_respected() {
+    let payload = "identity please ".repeat(64);
+    let compressed = courierust_deflate::gzip(payload.as_bytes());
+    let seen = Arc::new(Mutex::new(None));
+    let base = spawned_coded_server("gzip", compressed, seen.clone());
+
+    let client = Client::new();
+    let mut req = Request::new(Method::GET, "/gz");
+    req.headers.insert(
+        HeaderName::from_lowercase("accept-encoding"),
+        HeaderValue::from_static("identity"),
+    );
+    let resp = client.execute(&format!("{base}/gz"), req).unwrap();
+    assert_eq!(
+        seen.lock().unwrap().as_deref(),
+        Some("identity"),
+        "the caller's header must not be overwritten"
+    );
+    assert_eq!(resp.body.collect().unwrap().to_str().unwrap(), payload);
+    assert!(resp.headers.get("content-encoding").is_none());
+}
+
+/// Security: decoding is where a hostile peer turns a small body into an
+/// unbounded allocation, so it must obey the same limit as reading one.
+#[test]
+fn a_compression_bomb_is_stopped_by_max_body() {
+    let bomb = courierust_deflate::gzip(&vec![0u8; 8 * 1024 * 1024]);
+    assert!(
+        bomb.len() < 256 * 1024,
+        "the point of the test is a small body that expands hugely, got {}",
+        bomb.len()
+    );
+    let seen = Arc::new(Mutex::new(None));
+    let base = spawned_coded_server("gzip", bomb, seen);
+
+    let client = Client::with_config(ClientConfig {
+        max_body: 64 * 1024,
+        ..Default::default()
+    });
+    let err = client.get(&format!("{base}/bomb")).unwrap_err();
+    assert!(
+        matches!(err.kind, courierust::ErrorKind::Overflow),
+        "a decode must not be allowed to exceed max_body: {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Redirects: a follow-up is a different request, and must not carry the
+// old one's framing.
+// ---------------------------------------------------------------------
+
+/// A `302` turns a `POST` into a `GET`. The follow-up has no body, so it
+/// must not claim one: a `Content-Length` with no bytes behind it is how a
+/// request desynchronises the connection it is written on.
+#[test]
+fn a_bodyless_redirect_follow_up_does_not_claim_a_body() {
+    let base = spawn_server(ServerConfig::default(), |req| {
+        if req.uri.as_str() == "/start" {
+            let mut resp = Response::<Body>::with_status(302.into());
+            resp.headers.insert(
+                HeaderName::from_lowercase("location"),
+                HeaderValue::from_static("/end"),
+            );
+            return resp;
+        }
+        let mut resp = Response::<Body>::with_status(200.into());
+        resp.headers.insert(
+            HeaderName::from_lowercase("x-method"),
+            HeaderValue::from_bytes(req.method.as_str().as_bytes()).unwrap(),
+        );
+        let cl = req
+            .headers
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-");
+        resp.headers.insert(
+            HeaderName::from_lowercase("x-content-length"),
+            HeaderValue::from_bytes(cl.as_bytes()).unwrap(),
+        );
+        resp
+    });
+
+    let client = Client::with_config(ClientConfig {
+        read_timeout: Some(Duration::from_secs(5)),
+        ..Default::default()
+    });
+    let mut req = Request::new(Method::POST, "/start");
+    req.headers.insert(
+        HeaderName::from_lowercase("content-length"),
+        HeaderValue::from_static("7"),
+    );
+    req.headers.insert(
+        HeaderName::from_lowercase("content-type"),
+        HeaderValue::from_static("text/plain"),
+    );
+    req.body = Body::Bytes(Bytes::from_static(b"payload"));
+
+    let resp = client.execute(&format!("{base}/start"), req).unwrap();
+    assert_eq!(resp.status.as_u16(), 200);
+    assert_eq!(
+        resp.headers.get("x-method").unwrap().to_str().unwrap(),
+        "GET",
+        "a 302 turns POST into GET"
+    );
+    assert_eq!(
+        resp.headers
+            .get("x-content-length")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "-",
+        "the body-less follow-up must not announce a body"
+    );
+}
+
+/// A `307`/`308` means "same request, different place". Without the body
+/// that is not the same request, so the redirect is handed back rather
+/// than followed into something the caller never wrote.
+#[test]
+fn a_redirect_that_would_have_to_replay_the_body_is_handed_back() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_b = hits.clone();
+    let base = spawn_server(ServerConfig::default(), move |req| {
+        if req.uri.as_str() == "/start" {
+            let mut resp = Response::<Body>::with_status(307.into());
+            resp.headers.insert(
+                HeaderName::from_lowercase("location"),
+                HeaderValue::from_static("/end"),
+            );
+            return resp;
+        }
+        hits_b.fetch_add(1, Ordering::SeqCst);
+        Response::<Body>::with_status(200.into())
+    });
+
+    let client = Client::new();
+    let mut req = Request::new(Method::PUT, "/start");
+    req.body = Body::Bytes(Bytes::from_static(b"payload"));
+    let resp = client.execute(&format!("{base}/start"), req).unwrap();
+    assert_eq!(
+        resp.status.as_u16(),
+        307,
+        "the redirect is the answer: the body cannot be replayed"
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "the redirect target must not be contacted with a different request"
+    );
+}
+
+/// The same `307` on a body-less request is followable, and still is.
+#[test]
+fn a_307_without_a_body_is_still_followed() {
+    let base = spawn_server(ServerConfig::default(), |req| {
+        if req.uri.as_str() == "/start" {
+            let mut resp = Response::<Body>::with_status(307.into());
+            resp.headers.insert(
+                HeaderName::from_lowercase("location"),
+                HeaderValue::from_static("/end"),
+            );
+            return resp;
+        }
+        let mut resp = Response::<Body>::with_status(200.into());
+        resp.headers.insert(
+            HeaderName::from_lowercase("x-final"),
+            HeaderValue::from_static("yes"),
+        );
+        resp
+    });
+
+    let client = Client::new();
+    let resp = client.get(&format!("{base}/start")).unwrap();
+    assert_eq!(resp.status.as_u16(), 200);
+    assert_eq!(
+        resp.headers.get("x-final").unwrap().to_str().unwrap(),
+        "yes"
+    );
 }
 
 // ---------------------------------------------------------------------

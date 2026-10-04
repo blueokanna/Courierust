@@ -516,6 +516,10 @@ fn fixed_litlen_lens() -> [u8; 288] {
     litlen
 }
 
+/// The largest back-reference any DEFLATE stream may contain (RFC 1951:
+/// a 32 KiB window and a 15-bit distance field).
+const MAX_DISTANCE: usize = 32_768;
+
 /// Copy `len` bytes from `distance` back, where the history is
 /// `window` (older) followed by `out` (the current message).
 ///
@@ -523,15 +527,31 @@ fn fixed_litlen_lens() -> [u8; 288] {
 /// `distance < len` the source advances into the bytes being written, so
 /// the copy repeats with period `distance`. Non-overlapping copies take
 /// a single `memmove`.
+///
+/// `max_dist` is the negotiated window (`1 << *_max_window_bits`, RFC
+/// 7692 §7.1.2.1) and is enforced **here**, before any byte is produced,
+/// for two reasons that a length check alone does not cover: a peer that
+/// promised a 512-byte window and then references 4 KiB back is
+/// non-conformant, and this decoder holds the whole current message in
+/// `out`, so without the check it would silently resolve references its
+/// peer's own decoder could not — accepting a stream that no other
+/// implementation will accept is the same class of leniency as accepting
+/// a non-minimal frame length.
 fn copy_match(
     out: &mut Vec<u8>,
     window: &[u8],
     distance: usize,
     len: usize,
     max_out: usize,
+    max_dist: usize,
 ) -> Result<()> {
     if out.len().checked_add(len).map_or(true, |t| t > max_out) {
         return Err(Error::overflow("deflate: output exceeds limit"));
+    }
+    if distance > max_dist {
+        return Err(Error::protocol(
+            "deflate: back-reference beyond the negotiated window",
+        ));
     }
     let out_len = out.len();
     if distance <= out_len {
@@ -597,6 +617,7 @@ fn inflate_huffman(
     window: &[u8],
     out: &mut Vec<u8>,
     max_out: usize,
+    max_dist: usize,
 ) -> Result<()> {
     let lit_table = DecodeTable::build(litlen, false)?;
     let dist_table = DecodeTable::build(dist, true)?;
@@ -627,7 +648,7 @@ fn inflate_huffman(
             if distance == 0 {
                 return Err(Error::protocol("deflate: zero distance"));
             }
-            copy_match(out, window, distance, len, max_out)?;
+            copy_match(out, window, distance, len, max_out, max_dist)?;
         } else {
             return Err(Error::protocol("deflate: invalid length symbol"));
         }
@@ -644,6 +665,7 @@ fn inflate_dynamic(
     window: &[u8],
     out: &mut Vec<u8>,
     max_out: usize,
+    max_dist: usize,
 ) -> Result<()> {
     let hlit = br.take(5)? as usize + 257;
     let hdist = br.take(5)? as usize + 1;
@@ -714,7 +736,7 @@ fn inflate_dynamic(
     litlen[..hlit].copy_from_slice(&lens[..hlit]);
     let mut dist = [0u8; 30];
     dist[..hdist].copy_from_slice(&lens[hlit..hlit + hdist]);
-    inflate_huffman(br, &litlen, &dist, window, out, max_out)
+    inflate_huffman(br, &litlen, &dist, window, out, max_out, max_dist)
 }
 
 /// Decode blocks until the final one (or until the input runs out when
@@ -725,6 +747,7 @@ fn inflate_blocks(
     out: &mut Vec<u8>,
     max_out: usize,
     truncated_ok: bool,
+    max_dist: usize,
 ) -> Result<()> {
     loop {
         let bfinal = match br.take(1) {
@@ -742,9 +765,9 @@ fn inflate_blocks(
             1 => {
                 let litlen = fixed_litlen_lens();
                 let dist = [5u8; 30];
-                inflate_huffman(br, &litlen, &dist, window, out, max_out)
+                inflate_huffman(br, &litlen, &dist, window, out, max_out, max_dist)
             }
-            2 => inflate_dynamic(br, window, out, max_out),
+            2 => inflate_dynamic(br, window, out, max_out, max_dist),
             _ => Err(Error::protocol("deflate: reserved block type 3")),
         };
         if let Err(e) = block {
@@ -781,12 +804,19 @@ pub fn inflate(data: &[u8], max_out: usize) -> Result<Vec<u8>> {
 /// Decompress into a caller-owned buffer (reused across calls).
 pub fn inflate_into(data: &[u8], out: &mut Vec<u8>, max_out: usize) -> Result<()> {
     let mut br = BitReader::new(data);
-    inflate_blocks(&mut br, &[], out, max_out, false)
+    inflate_blocks(&mut br, &[], out, max_out, false, MAX_DISTANCE)
 }
 
 // ---------------------------------------------------------------------
 // DEFLATE compression (fixed Huffman + LZ77)
 // ---------------------------------------------------------------------
+
+/// Default cap on the match finder, just under DEFLATE's 32 KiB window.
+///
+/// It is deliberately a little below 32768 so a proposed distance can
+/// always be expressed by the 15-bit distance code; a negotiation that
+/// reduces the window caps it further (see [`Deflater::set_window_bits`]).
+const WINDOW: usize = 28_672;
 
 /// The largest LZ77 window DEFLATE allows (RFC 1951 §3.2.5: distances
 /// reach 32768 bytes back).
@@ -820,7 +850,6 @@ fn hash3(a: u8, b: u8, c: u8) -> usize {
 /// * Clearing records the hash slots that were written and resets only
 ///   those. The cost of a reset is therefore proportional to the number
 ///   of *insertions* (≤ message length), not to the table size.
-#[derive(Default)]
 struct MatchFinder {
     /// hash → most recent position, `EMPTY` when unset.
     head: Vec<u32>,
@@ -828,6 +857,25 @@ struct MatchFinder {
     prev: Vec<u32>,
     /// Hash slots written since the last reset.
     touched: Vec<u32>,
+    /// Longest back-reference the compressor may emit, in bytes.
+    ///
+    /// Set from the negotiated `*_max_window_bits`. A peer that allocated
+    /// a 512-byte inflate window cannot resolve a reference 20 KiB back,
+    /// so emitting one is not "worse ratio", it is a decode failure
+    /// (RFC 7692 §7.1.2.1 makes the parameter a promise about the
+    /// *encoder*).
+    max_dist: usize,
+}
+
+impl Default for MatchFinder {
+    fn default() -> Self {
+        Self {
+            head: Vec::new(),
+            prev: Vec::new(),
+            touched: Vec::new(),
+            max_dist: WINDOW,
+        }
+    }
 }
 
 impl MatchFinder {
@@ -892,7 +940,11 @@ fn encode_lz77(w: &mut BitWriter, data: &[u8], mf: &mut MatchFinder, window: usi
         if i + MIN_MATCH <= data.len() {
             let h = hash3(data[i], data[i + 1], data[i + 2]);
             let mut candidate = mf.head[h];
-            let limit = i.saturating_sub(window) as u32;
+            // Two bounds apply and the tighter one wins: `window` is the
+            // absolute maximum this entry point reaches back, and
+            // `mf.max_dist` is what the peer's negotiation promised
+            // (RFC 7692 §7.2.1 — a longer match is undecodable there).
+            let limit = i.saturating_sub(window.min(mf.max_dist)) as u32;
             let mut steps = 0usize;
             while candidate != EMPTY && candidate >= limit && steps < MAX_CHAIN {
                 steps += 1;
@@ -1090,6 +1142,8 @@ pub fn gunzip(data: &[u8], max_out: usize) -> Result<Vec<u8>> {
     }
     let mut out = Vec::new();
     inflate_into(&data[pos..body_end], &mut out, max_out)?;
+    // RFC 1952 §2.3.1: ISIZE is the input size modulo 2^32, so a multi-GiB
+    // stream wraps on purpose. `max_out` bounds the buffer long before that.
     if out.len() as u32 != expected_size {
         return Err(Error::protocol("gzip: size mismatch"));
     }
@@ -1200,7 +1254,14 @@ impl Inflater {
         self.scratch.extend_from_slice(&[0x00, 0x00, 0xff, 0xff]);
 
         let mut br = BitReader::new(&self.scratch);
-        let result = inflate_blocks(&mut br, &self.window, out, max_out, true);
+        let result = inflate_blocks(
+            &mut br,
+            &self.window,
+            out,
+            max_out,
+            true,
+            1usize << self.window_bits,
+        );
         if let Err(e) = result {
             // A failed message must not poison the context: a partially
             // decoded message would corrupt every later back-reference.
@@ -1221,7 +1282,14 @@ impl Inflater {
         max_out: usize,
     ) -> Result<()> {
         let mut br = BitReader::new(input);
-        inflate_blocks(&mut br, &self.window, out, max_out, false)
+        inflate_blocks(
+            &mut br,
+            &self.window,
+            out,
+            max_out,
+            false,
+            1usize << self.window_bits,
+        )
     }
 
     /// Retain the tail of the decoded stream as history.
@@ -1269,8 +1337,11 @@ pub struct Deflater {
     /// state compression allocates nothing (not even on the
     /// "compression did not pay" path).
     writer: BitWriter,
-    /// LZ77 window bound in bits (8..=15). Zero never survives:
-    /// [`Deflater::default`] forwards to [`Deflater::new`].
+    /// Window this compressor is allowed to reference, in bits.
+    ///
+    /// Zero never survives: [`Deflater::new`] starts at the maximum and
+    /// [`Deflater::set_window_bits`] clamps whatever is configured into
+    /// the range RFC 7692 admits.
     window_bits: u8,
 }
 
@@ -1289,12 +1360,14 @@ impl Deflater {
     /// small-message writers should set the threshold to taste (`0`
     /// compresses everything).
     pub fn new() -> Self {
-        Self {
+        let mut deflater = Self {
             threshold: 128,
             finder: MatchFinder::default(),
             writer: BitWriter::new(),
             window_bits: MAX_WINDOW_BITS,
-        }
+        };
+        deflater.apply_window_bits();
+        deflater
     }
 
     /// Set the minimum payload size that is worth compressing.
@@ -1302,20 +1375,30 @@ impl Deflater {
         self.threshold = bytes;
     }
 
-    /// Bound the compressor's LZ77 window.
+    /// Constrain the compressor to the negotiated window.
     ///
-    /// RFC 7692 §7.2.1 requires the window to stay within the negotiated
-    /// `server_max_window_bits` / `client_max_window_bits` of the
-    /// direction being written; a longer match is not merely a poor
-    /// choice, it is undecodable by the peer.
+    /// RFC 7692 §7.1.2.1 makes `*_max_window_bits` a promise the
+    /// **encoder** makes: the peer sizes its inflate window from it. A
+    /// back-reference farther than `1 << bits` therefore cannot be
+    /// resolved on the peer and the message fails to decode, so the
+    /// match finder is capped rather than the output validated after the
+    /// fact.
     pub fn set_window_bits(&mut self, bits: u8) {
-        self.window_bits = bits.clamp(MIN_WINDOW_BITS, MAX_WINDOW_BITS);
+        let bits = bits.clamp(MIN_WINDOW_BITS, MAX_WINDOW_BITS);
+        if bits != self.window_bits {
+            self.window_bits = bits;
+            self.apply_window_bits();
+        }
     }
 
-    /// The window bound in bits.
+    /// The window this compressor is constrained to, in bits.
     #[inline]
     pub fn window_bits(&self) -> u8 {
         self.window_bits
+    }
+
+    fn apply_window_bits(&mut self) {
+        self.finder.max_dist = WINDOW.min(1usize << self.window_bits);
     }
 
     /// Drop history (no-op for this encoder; present so the API mirrors

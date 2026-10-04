@@ -17,11 +17,17 @@ The h2 server path is flow-control-aware: channel bodies are **only drained when
 ```rust
 use courierust::courierust_body::Body;
 use courierust::courierust_bytes::Bytes;
+use courierust::Result;
 use std::sync::mpsc::channel;
 
+# fn main() -> Result<()> {
 let (tx, rx) = channel::<Result<Bytes>>();
 // hand `rx` to the response, push from anywhere:
-tx.send(Ok(Bytes::from_static(b"chunk 1")));
+let body = Body::Channel(rx);
+tx.send(Ok(Bytes::from_static(b"chunk 1"))).expect("the receiver is alive");
+# let _ = body;
+# Ok(())
+# }
 ```
 
 The `Result<Bytes>` payload is deliberate: a producer can signal an error mid-stream, and the consumer sees it as an error, not a truncated body.

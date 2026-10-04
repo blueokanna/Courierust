@@ -4,7 +4,8 @@ gRPC = HTTP/2 + 长度前缀的二进制消息 + 由 trailer（`grpc-status` / `
 
 ## 原始字节 unary 调用
 
-```rust
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 use courierust::courierust_bytes::Bytes;
 use courierust::courierust_grpc::GrpcClient;
 
@@ -13,6 +14,8 @@ let client = GrpcClient::new("http://127.0.0.1:50051")?;
 // method 格式为 "package.Service/Method"
 let reply = client.call("helloworld.Greeter/SayHello", Bytes::from("world"))?;
 println!("{}", reply.to_str()?);
+# Ok(())
+# }
 ```
 
 `GrpcClient::new` 内部为你构造一个 HTTP/2（h2c）客户端。没有握手步骤——第一次调用自动建连。
@@ -21,9 +24,14 @@ println!("{}", reply.to_str()?);
 
 `String` 和 `Vec<u8>` 已经实现 codec trait，开箱即用：
 
-```rust
+```rust,no_run
+# use courierust::courierust_grpc::GrpcClient;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = GrpcClient::new("http://127.0.0.1:50051")?;
 let reply: String = client.call_unary::<String, String>("/echo.Echo/Say", &"ping".into())?;
 assert_eq!(reply, "echo:ping"); // 取决于服务器返回
+# Ok(())
+# }
 ```
 
 自己的 protobuf 类型实现两个 trait 即可：
@@ -53,7 +61,8 @@ impl DecodeMessage for HelloRequest {
 
 ## 服务端流（一个响应多条消息）
 
-```rust
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 use courierust::courierust_grpc::GrpcClient;
 
 let client = GrpcClient::new("http://127.0.0.1:50051")?;
@@ -62,6 +71,8 @@ let mut stream = client.call_stream("/chat.Chat/Updates", courierust::courierust
 while let Some(msg) = stream.next_message()? {
     println!("msg: {}", msg.to_str()?);
 }
+# Ok(())
+# }
 ```
 
 `next_message()` 在流耗尽且 `grpc-status` 校验通过后返回 `None`；非 OK 状态会以 `Err` 形式暴露。
@@ -70,7 +81,8 @@ while let Some(msg) = stream.next_message()? {
 
 gRPC 服务是任意 `Fn(&str, Bytes) -> Result<Bytes> + Send + Sync + 'static`（或实现 `Service` trait 的类型）：
 
-```rust
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 use courierust::courierust_bytes::Bytes;
 use courierust::courierust_grpc::GrpcServer;
 
@@ -85,13 +97,20 @@ let server = GrpcServer::bind("127.0.0.1:50051", |method: &str, req: Bytes| {
 })?;
 let addr = server.local_addr()?;
 let _handle = server.serve_background()?; // 或 server.serve()? 阻塞
+# let _ = addr;
+# Ok(())
+# }
 ```
 
 返回带 `grpc` 错误码的 `Err` 会映射为线上的 `grpc-status` / `grpc-message`。全部标准错误码都在 `courierust::courierust_grpc::status` 里（`OK`、`CANCELLED`、`INVALID_ARGUMENT`、`NOT_FOUND`、`INTERNAL`、`UNIMPLEMENTED`、`UNAVAILABLE` 等）。
 
 ## 客户端错误处理
 
-```rust
+```rust,no_run
+# use courierust::courierust_bytes::Bytes;
+# use courierust::courierust_grpc::GrpcClient;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = GrpcClient::new("http://127.0.0.1:50051")?;
 match client.call("/x.Y/Z", Bytes::from("x")) {
     Ok(_) => {}
     Err(e) => {
@@ -100,6 +119,8 @@ match client.call("/x.Y/Z", Bytes::from("x")) {
         }
     }
 }
+# Ok(())
+# }
 ```
 
 `Error::grpc(code, msg)` 构造 gRPC 错误；`e.grpc_code()` 读回错误码。在 handler 里要返回错误响应，可用 `grpc::grpc_error_response(code, message)` 直接拿到现成的错误 `Response`。

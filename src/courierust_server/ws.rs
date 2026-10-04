@@ -123,6 +123,27 @@ impl Default for WsConfig {
 pub enum WsUpgradeReply {
     /// Serve the connection with this service.
     Accept(Arc<dyn WsService>),
+    /// Serve the connection with this service, advertising `protocol`
+    /// instead of whatever this server's own policy would have picked.
+    ///
+    /// A proxy needs this and an origin never does. For an origin the
+    /// subprotocol is a local decision; for a proxy it has already been
+    /// made — by the upstream — and a `101` naming a different one than
+    /// the upstream agreed to is a lie the client then acts on, in both
+    /// directions.
+    ///
+    /// The override is still checked against the client's offer
+    /// (RFC 6455 §4.1: a server may only select from what was offered).
+    /// An override the client never offered refuses the handshake rather
+    /// than answering with a protocol nobody agreed to; `protocol: None`
+    /// advertises no subprotocol, which is what a proxy says when the
+    /// upstream agreed on none.
+    AcceptWith {
+        /// The service that serves the connection.
+        service: Arc<dyn WsService>,
+        /// The subprotocol to advertise in the `101`, if any.
+        protocol: Option<String>,
+    },
     /// Refuse the upgrade and answer with this response instead.
     Refuse(Response<Body>),
     /// Not a WebSocket route: fall through to the normal HTTP handler.
@@ -589,6 +610,35 @@ impl WsPlan {
         self.compression.map(|p| p.server_view())
     }
 
+    /// Advertise `protocol` instead of the subprotocol this plan selected.
+    ///
+    /// See [`WsUpgradeReply::AcceptWith`] for why this exists. The override
+    /// is validated against the client's offer, not trusted: selecting a
+    /// subprotocol the client did not offer is the one thing RFC 6455 §4.1
+    /// forbids here, and a proxy that forwarded a misbehaving upstream's
+    /// choice verbatim would be the one breaking the client.
+    pub fn override_protocol(
+        &mut self,
+        protocol: Option<&str>,
+    ) -> core::result::Result<(), WsRefusal> {
+        match protocol {
+            None => {
+                self.protocol = None;
+                Ok(())
+            }
+            Some(chosen) => {
+                if !self.offer.protocols.iter().any(|o| o == chosen) {
+                    return Err(WsRefusal::new(
+                        502,
+                        "websocket: the origin selected a subprotocol the client did not offer",
+                    ));
+                }
+                self.protocol = Some(alloc::string::String::from(chosen));
+                Ok(())
+            }
+        }
+    }
+
     /// The `101 Switching Protocols` head, fully populated.
     pub fn accept_headers(&self) -> Result<HeaderMap> {
         let mut headers = HeaderMap::with_capacity(4);
@@ -712,9 +762,15 @@ pub fn session_config(ws: &WsConfig, params: Option<CompressionParams>) -> Sessi
 pub fn protocol_close(e: &Error) -> (u16, &'static str) {
     match e.kind {
         ErrorKind::Overflow => (1009, "message too big"),
-        ErrorKind::Protocol if e.message.as_deref().is_some_and(|m| m.contains("UTF-8")) => {
-            (1007, "invalid payload data")
-        }
+        // One owner for "which code does this violation deserve": the
+        // session answers a malformed Close frame with the same rule, and
+        // the message path answers here. Two copies of the rule is how the
+        // same defect ends up reported with two different codes depending
+        // on which path noticed it.
+        ErrorKind::Protocol => match crate::courierust_ws::close::failure_code(e) {
+            crate::courierust_ws::close::INVALID_PAYLOAD => (1007, "invalid payload data"),
+            _ => (1002, "protocol error"),
+        },
         _ => (1002, "protocol error"),
     }
 }
@@ -1129,7 +1185,11 @@ pub(crate) fn serve_blocking(
 
     loop {
         if let Some(interval) = ws.ping_interval {
-            let _ = stream.configure(Some(interval));
+            // A deadline: the expiry *is* the idle signal the arms below
+            // act on (a ping, then a keepalive close). A poll timeout
+            // would report `WouldBlock`, which the session turns back into
+            // "nothing yet" — and this loop reads that as a dead peer.
+            let _ = stream.set_deadline(Some(interval));
         }
         let polled = session.poll_message();
         if ws.ping_interval.is_some() {

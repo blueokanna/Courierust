@@ -1,20 +1,34 @@
 //! I/O readiness poller for the event-driven server: parks thousands of
 //! idle connections without one thread each.
 //!
-//! * **Windows**: Winsock `select` (batches of 64). Only the first batch
-//!   waits for the full timeout; later batches use zero timeout so a
-//!   ready socket in batch *k* is not delayed by earlier batches.
-//! * **Unix**: POSIX `poll` (no batch limit).
+//! **Windows** uses Winsock `WSAPoll`; **Unix** uses POSIX `poll`. They are
+//! the same readiness model with different numbers attached — one flat array
+//! of `pollfd`, no descriptor-set limit, one call — so the loop that uses
+//! them is one implementation, and the platform module is only the constants
+//! and the call itself.
 //!
-//! Both accept an optional *wake* descriptor (the event loop's
-//! self-pipe) watched in every batch, so a worker or the accept thread
-//! can interrupt a blocking poll with one byte — control messages never
-//! wait for a poll tick.
+//! `WSAPoll` is the reason there is no batching here any more. Winsock
+//! `select` is capped at `FD_SETSIZE` (64) descriptors, so a reactor with
+//! more parked connections had to poll them in batches — and a socket in a
+//! batch that was not the one waiting for the full timeout could only be
+//! noticed on the *next* tick, up to a whole timeout late (measured: a probe
+//! round-trip went from 91 µs to 101 ms once the fleet exceeded one batch).
+//!
+//! Both platforms accept an optional *wake* descriptor (the event loop's
+//! self-pipe) watched alongside the connections, so a worker or the accept
+//! thread can interrupt a blocking poll with one byte — control messages
+//! never wait for a poll tick.
+//!
+//! `WSAPoll` does not report a *failed non-blocking connect* (a documented
+//! Winsock defect), which is why this poller is only used for sockets whose
+//! connection is already established: the server's accepted TCP sockets and
+//! the QUIC runtime's bound UDP sockets. Nothing here waits for a connect to
+//! complete, so the defect cannot reach a caller.
 //!
 //! On Windows the process timer resolution is raised to 1 ms for its
-//! lifetime (see [`ensure_high_resolution_timer`]); Winsock `select`
-//! wakeups otherwise align to the coarse default system timer and add
-//! multi-millisecond latency even when a datagram is already queued.
+//! lifetime (see [`ensure_high_resolution_timer`]); poll wakeups otherwise
+//! align to the coarse default system timer and add multi-millisecond
+//! latency even when data is already queued.
 
 #![allow(unsafe_code)]
 
@@ -90,71 +104,48 @@ pub(crate) fn udp_fd_of(socket: &UdpSocket) -> Fd {
 // Platform-specific readiness primitives
 // ---------------------------------------------------------------------
 
-/// Winsock2 `fd_set` / `timeval` and `select` (batches of `FD_SETSIZE`).
+/// Winsock `WSAPOLLFD` and `WSAPoll`.
+///
+/// `WSAPOLLFD` is `{ SOCKET; SHORT; SHORT }` — byte for byte the same layout
+/// as POSIX `struct pollfd` with a socket descriptor — so one `PollFd` type
+/// serves both platforms and only the constants and the call differ.
 #[cfg(windows)]
 mod ws {
     use super::Fd;
-    use std::os::windows::io::RawSocket;
 
-    pub(super) const FD_SETSIZE: usize = 64;
+    pub(super) const READABLE: i16 = 0x0100; // POLLRDNORM
+    pub(super) const WRITABLE: i16 = 0x0010; // POLLWRNORM
+    pub(super) const ERR: i16 = 0x0001;
+    pub(super) const HUP: i16 = 0x0002;
+    pub(super) const NVAL: i16 = 0x0004;
 
-    /// `fd_set` (winsock2.h). Must match the C layout exactly.
+    /// `WSAPOLLFD` (winsock2.h).
     #[repr(C)]
-    pub(super) struct FdSet {
-        fd_count: u32,
-        fd_array: [RawSocket; FD_SETSIZE],
+    pub(super) struct PollFd {
+        pub(super) fd: Fd,
+        pub(super) events: i16,
+        pub(super) revents: i16,
     }
 
-    impl FdSet {
-        pub(super) fn new() -> Self {
-            Self {
-                fd_count: 0,
-                fd_array: [0; FD_SETSIZE],
-            }
-        }
-
-        pub(super) fn insert(&mut self, fd: Fd) {
-            if (self.fd_count as usize) < FD_SETSIZE {
-                self.fd_array[self.fd_count as usize] = fd;
-                self.fd_count += 1;
-            }
-        }
-
-        /// The ready sockets as reported by `select`
-        pub(super) fn ready(&self) -> &[RawSocket] {
-            &self.fd_array[..self.fd_count as usize]
-        }
-    }
-
-    /// `timeval` (winsock2.h).
-    #[repr(C)]
-    pub(super) struct TimeVal {
-        pub(super) tv_sec: i32,
-        pub(super) tv_usec: i32,
-    }
+    /// `ULONG`: the descriptor count `WSAPoll` takes.
+    pub(super) type Nfds = u32;
 
     #[link(name = "ws2_32")]
     extern "system" {
-        pub(super) fn select(
-            nfds: i32,
-            readfds: *mut FdSet,
-            writefds: *mut FdSet,
-            exceptfds: *mut FdSet,
-            timeout: *const TimeVal,
-        ) -> i32;
+        pub(super) fn WSAPoll(fds: *mut PollFd, nfds: Nfds, timeout: i32) -> i32;
     }
 }
 
-/// POSIX `pollfd` and `poll` (no batch limit).
+/// POSIX `pollfd` and `poll`.
 #[cfg(not(windows))]
 mod posix {
     use super::Fd;
 
-    pub(super) const POLLIN: i16 = 0x001;
-    pub(super) const POLLOUT: i16 = 0x004;
-    pub(super) const POLLERR: i16 = 0x008;
-    pub(super) const POLLHUP: i16 = 0x010;
-    pub(super) const POLLNVAL: i16 = 0x020;
+    pub(super) const READABLE: i16 = 0x001; // POLLIN
+    pub(super) const WRITABLE: i16 = 0x004; // POLLOUT
+    pub(super) const ERR: i16 = 0x008;
+    pub(super) const HUP: i16 = 0x010;
+    pub(super) const NVAL: i16 = 0x020;
 
     /// `struct pollfd` (poll.h) — identical on Linux, macOS and the BSDs.
     #[repr(C)]
@@ -167,12 +158,12 @@ mod posix {
     /// `nfds_t`: `unsigned long` on Linux/Android, `unsigned int`
     /// elsewhere (macOS, the BSDs, Solaris).
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    pub(super) type NfdsT = u64;
+    pub(super) type Nfds = u64;
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    pub(super) type NfdsT = u32;
+    pub(super) type Nfds = u32;
 
     extern "C" {
-        pub(super) fn poll(fds: *mut PollFd, nfds: NfdsT, timeout: i32) -> i32;
+        pub(super) fn poll(fds: *mut PollFd, nfds: Nfds, timeout: i32) -> i32;
     }
 }
 
@@ -238,10 +229,15 @@ impl Poller {
     }
 
     /// Wait up to `timeout_ms` for readiness. `wake` is an optional
-    /// descriptor (the event loop's self-pipe) watched for readability in
-    /// every batch; when it fires, [`WAKE_ID`] is included in the result.
-    /// Returns the ids of ready sockets (readable or writable per their
-    /// registered direction, or errored/closed).
+    /// descriptor (the event loop's self-pipe) watched for readability
+    /// alongside the connections; when it fires, [`WAKE_ID`] is included in
+    /// the result. Returns the ids of ready sockets (readable or writable
+    /// per their registered direction, or errored/closed).
+    ///
+    /// One call, one flat array: `WSAPoll` on Windows and POSIX `poll`
+    /// elsewhere have no descriptor-set limit, so the whole registered set is
+    /// watched at once and a socket that becomes ready during the wait is
+    /// reported by *that* wait.
     pub(crate) fn wait(
         &mut self,
         timeout_ms: i32,
@@ -250,146 +246,56 @@ impl Poller {
         if self.fds.is_empty() && wake.is_none() {
             return Ok(Vec::new());
         }
-        #[cfg(windows)]
-        {
-            self.wait_select(timeout_ms, wake)
-        }
         #[cfg(not(windows))]
-        {
-            self.wait_poll(timeout_ms, wake)
-        }
-    }
+        use posix::{poll as poll_call, Nfds, PollFd, ERR, HUP, NVAL, READABLE, WRITABLE};
+        #[cfg(windows)]
+        use ws::{Nfds, PollFd, WSAPoll as poll_call, ERR, HUP, NVAL, READABLE, WRITABLE};
 
-    /// Winsock `select()` implementation, polling in `FD_SETSIZE`-sized
-    /// batches. Only the first batch waits for the full `timeout_ms`;
-    /// every later batch uses a zero timeout so a ready socket in a late
-    /// batch is reported promptly instead of being delayed by every
-    /// earlier batch's timeout. The wake descriptor (when given) is added
-    /// to every batch's read set, so a wakeup byte interrupts the very
-    /// first batch immediately.
-    #[cfg(windows)]
-    fn wait_select(&self, timeout_ms: i32, wake: Option<Fd>) -> std::io::Result<Vec<usize>> {
-        use ws::*;
-        let full_tv = TimeVal {
-            tv_sec: timeout_ms / 1000,
-            tv_usec: (timeout_ms % 1000) * 1000,
-        };
-        let zero_tv = TimeVal {
-            tv_sec: 0,
-            tv_usec: 0,
-        };
-        let mut ready = Vec::new();
-        // When a wake descriptor is present it is inserted into every
-        // batch's read set, so each batch must leave a slot for it:
-        // with a full batch of FD_SETSIZE sockets plus the wake fd the
-        // last socket would be silently dropped (FdSet::insert ignores
-        // overflow) and its readiness delayed by a whole poll tick.
-        let batch_cap = if wake.is_some() {
-            FD_SETSIZE - 1
-        } else {
-            FD_SETSIZE
-        };
-        // At least one batch always runs — when no connection fds are
-        // registered, a single batch holding just the wake descriptor is
-        // still polled, so the wake pipe alone can interrupt the wait.
-        let batches = if self.fds.is_empty() {
-            1
-        } else {
-            self.fds.len().div_ceil(batch_cap).max(1)
-        };
-        for b in 0..batches {
-            let start = b * batch_cap;
-            let end = core::cmp::min(start + batch_cap, self.fds.len());
-            let mut readset = FdSet::new();
-            let mut writeset = FdSet::new();
-            if let Some(w) = wake {
-                readset.insert(w);
-            }
-            let mut wake_ready = false;
-            for &(_, fd, ww) in &self.fds[start..end] {
-                if ww {
-                    writeset.insert(fd);
-                } else {
-                    readset.insert(fd);
-                }
-            }
-
-            let tv = if b == 0 { &full_tv } else { &zero_tv };
-            let n = unsafe { select(0, &mut readset, &mut writeset, std::ptr::null_mut(), tv) };
-            if n < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if n > 0 {
-                for &fd in readset.ready() {
-                    if Some(fd) == wake {
-                        wake_ready = true;
-                        continue;
-                    }
-                    if let Some((id, _, _)) = self.fds[start..end].iter().find(|(_, f, _)| *f == fd)
-                    {
-                        ready.push(*id);
-                    }
-                }
-                for &fd in writeset.ready() {
-                    if let Some((id, _, _)) = self.fds[start..end].iter().find(|(_, f, _)| *f == fd)
-                    {
-                        ready.push(*id);
-                    }
-                }
-            }
-            if wake_ready {
-                ready.push(WAKE_ID);
-            }
-        }
-        ready.sort_unstable();
-        ready.dedup();
-        Ok(ready)
-    }
-
-    /// POSIX `poll()` implementation (single call; no batch limit). The
-    /// wake descriptor (when given) is appended to the poll set.
-    #[cfg(not(windows))]
-    fn wait_poll(&self, timeout_ms: i32, wake: Option<Fd>) -> std::io::Result<Vec<usize>> {
-        use posix::*;
         let mut pfds: Vec<PollFd> = self
             .fds
             .iter()
-            .map(|&(_, fd, ww)| PollFd {
+            .map(|&(_, fd, want_write)| PollFd {
                 fd,
-                events: if ww { POLLOUT } else { POLLIN },
+                events: if want_write { WRITABLE } else { READABLE },
                 revents: 0,
             })
             .collect();
-        let wake_idx = match wake {
-            Some(w) => {
-                pfds.push(PollFd {
-                    fd: w,
-                    events: POLLIN,
-                    revents: 0,
-                });
-                Some(pfds.len() - 1)
-            }
-            None => None,
-        };
-        let n = unsafe { poll(pfds.as_mut_ptr(), pfds.len() as NfdsT, timeout_ms) };
+        let wake_idx = wake.map(|fd| {
+            pfds.push(PollFd {
+                fd,
+                events: READABLE,
+                revents: 0,
+            });
+            pfds.len() - 1
+        });
+
+        // SAFETY: `pfds` is a live, correctly-laid-out `pollfd` array for the
+        // duration of the call, and its length is passed beside it. Both
+        // functions only write `revents` in place.
+        let n = unsafe { poll_call(pfds.as_mut_ptr(), pfds.len() as Nfds, timeout_ms) };
         if n < 0 {
             return Err(std::io::Error::last_os_error());
         }
         if n == 0 {
             return Ok(Vec::new());
         }
+        // A descriptor that errored, hung up or was closed behind us is
+        // reported as ready so the caller's recovery path runs: it rebuilds
+        // the set from its own live-connection tables, which is the only
+        // place that knows the descriptor should be gone.
+        let bad = ERR | HUP | NVAL;
         let mut ready = Vec::new();
         for (idx, pfd) in pfds.iter().enumerate() {
-            if Some(idx) == wake_idx {
-                if pfd.revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL) != 0 {
-                    ready.push(WAKE_ID);
+            let expected = if Some(idx) == wake_idx {
+                READABLE
+            } else {
+                pfds[idx].events
+            };
+            if pfd.revents & (expected | bad) != 0 {
+                match Some(idx) == wake_idx {
+                    true => ready.push(WAKE_ID),
+                    false => ready.push(self.fds[idx].0),
                 }
-                continue;
-            }
-            let (_, _, ww) = self.fds[idx];
-            let expected = if ww { POLLOUT } else { POLLIN };
-            if pfd.revents & (expected | POLLERR | POLLHUP | POLLNVAL) != 0 {
-                ready.push(self.fds[idx].0);
             }
         }
         ready.sort_unstable();
@@ -609,6 +515,60 @@ mod tests {
             "p100 blocked-wait wake latency too high (wake likely lost): {:#?}",
             samples[99]
         );
+    }
+
+    #[test]
+    fn a_socket_beyond_the_old_select_limit_is_reported_by_the_wait_that_saw_it() {
+        // 70 registered sockets: more than one Winsock `select` batch (64),
+        // with the interesting one registered last. Under the old batched
+        // `select` only the first batch waited the timeout and later batches
+        // were polled with a zero timeout, so a socket that became ready
+        // *during* the wait could only be reported by the next call — one
+        // whole timeout late, which is the measured 91 µs → 101 ms cliff.
+        //
+        // The write therefore has to come from another thread, after the
+        // wait has begun: a socket already readable before `wait` is called
+        // is reported correctly even by the batched version.
+        use std::io::{Read as _, Write as _};
+        let mut peers = Vec::new();
+        let mut servers = Vec::new();
+        for _ in 0..70 {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = TcpStream::connect(addr).unwrap();
+            let (server, _) = listener.accept().unwrap();
+            servers.push(server);
+            peers.push(client);
+        }
+        let mut p = Poller::new();
+        for (i, server) in servers.iter().enumerate() {
+            p.register(i + 1, fd_of(server), false);
+        }
+
+        let writer = peers.pop().expect("one peer per socket");
+        let nudge = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let mut w = &writer;
+            w.write_all(b"x").unwrap();
+        });
+
+        let started = std::time::Instant::now();
+        let ready = p.wait(2_000, None).unwrap();
+        let elapsed = started.elapsed();
+        nudge.join().unwrap();
+
+        assert!(
+            ready.contains(&70),
+            "the socket that became ready during the wait was not reported: {ready:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(1_000),
+            "the wait ran for {elapsed:?}: a ready socket was missed by the wait \
+             that should have reported it"
+        );
+        let mut buf = [0u8; 1];
+        let mut s = &servers[69];
+        assert_eq!(s.read(&mut buf).unwrap(), 1);
     }
 
     #[test]

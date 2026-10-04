@@ -65,42 +65,46 @@ pub(crate) fn expect_sequence<'a>(der: &'a [u8], pos: &mut usize) -> Option<&'a 
 /// Parse a UTCTime / GeneralizedTime value into a Unix timestamp.
 fn parse_time(der: &[u8], pos: &mut usize) -> Option<i64> {
     let e = read_element(der, pos)?;
-    match e.tag {
-        0x17 => {
-            let s = core::str::from_utf8(e.content).ok()?;
-            let (year, rest) = if s.len() == 13 && s.ends_with('Z') {
-                (parse2(&s[0..2])?, &s[2..12])
-            } else if s.len() == 15 && s.ends_with('Z') {
-                (parse2(&s[0..2])?, &s[2..14])
-            } else {
-                return None;
-            };
-            let yy = if year < 50 { 2000 + year } else { 1900 + year };
-            let (month, rest) = split2(rest)?;
-            let (day, rest) = split2(rest)?;
-            let (hour, rest) = split2(rest)?;
-            let (min, rest) = split2(rest)?;
-            let (sec, _) = if rest.is_empty() {
-                (0, "")
-            } else {
-                split2(rest)?
-            };
-            to_unix(yy, month, day, hour, min, sec)
+    if e.tag != 0x17 && e.tag != 0x18 {
+        return None;
+    }
+    // RFC 5280 §4.1.2.5: both time forms are ASCII, so every byte index
+    // below lands on a char boundary (a multi-byte char used to panic the
+    // slices on a hostile certificate).
+    let s = core::str::from_utf8(e.content).ok()?;
+    if !s.is_ascii() {
+        return None;
+    }
+    if e.tag == 0x17 {
+        let (year, rest) = if s.len() == 13 && s.ends_with('Z') {
+            (parse2(&s[0..2])?, &s[2..12])
+        } else if s.len() == 15 && s.ends_with('Z') {
+            (parse2(&s[0..2])?, &s[2..14])
+        } else {
+            return None;
+        };
+        let yy = if year < 50 { 2000 + year } else { 1900 + year };
+        let (month, rest) = split2(rest)?;
+        let (day, rest) = split2(rest)?;
+        let (hour, rest) = split2(rest)?;
+        let (min, rest) = split2(rest)?;
+        let (sec, _) = if rest.is_empty() {
+            (0, "")
+        } else {
+            split2(rest)?
+        };
+        to_unix(yy, month, day, hour, min, sec)
+    } else {
+        if s.len() < 15 || !s.ends_with('Z') {
+            return None;
         }
-        0x18 => {
-            let s = core::str::from_utf8(e.content).ok()?;
-            if s.len() < 15 || !s.ends_with('Z') {
-                return None;
-            }
-            let year: i64 = s[0..4].parse().ok()?;
-            let month: i64 = s[4..6].parse().ok()?;
-            let day: i64 = s[6..8].parse().ok()?;
-            let hour: i64 = s[8..10].parse().ok()?;
-            let min: i64 = s[10..12].parse().ok()?;
-            let sec: i64 = s[12..14].parse().ok()?;
-            to_unix(year, month, day, hour, min, sec)
-        }
-        _ => None,
+        let year: i64 = s[0..4].parse().ok()?;
+        let month: i64 = s[4..6].parse().ok()?;
+        let day: i64 = s[6..8].parse().ok()?;
+        let hour: i64 = s[8..10].parse().ok()?;
+        let min: i64 = s[10..12].parse().ok()?;
+        let sec: i64 = s[12..14].parse().ok()?;
+        to_unix(year, month, day, hour, min, sec)
     }
 }
 
@@ -587,5 +591,62 @@ fn strip_int(v: &[u8]) -> &[u8] {
         &v[1..]
     } else {
         v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A single DER TLV with a short-form length.
+    fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag, content.len() as u8];
+        out.extend_from_slice(content);
+        out
+    }
+
+    fn parse(der: &[u8]) -> Option<i64> {
+        let mut pos = 0;
+        let t = parse_time(der, &mut pos);
+        assert_eq!(pos, der.len(), "parse_time must consume the whole element");
+        t
+    }
+
+    #[test]
+    fn time_forms_parse_to_the_same_instant() {
+        // 2023-01-01T00:00:00Z, the anchor the epoch math is checked on.
+        assert_eq!(parse(&tlv(0x17, b"230101000000Z")), Some(1672531200));
+        assert_eq!(parse(&tlv(0x18, b"20230101000000Z")), Some(1672531200));
+        // `yy >= 50` is the 20th century: 49 is 2049, 50 is 1950.
+        assert_eq!(
+            parse(&tlv(0x17, b"490101000000Z")),
+            parse(&tlv(0x18, b"20490101000000Z"))
+        );
+        assert_eq!(
+            parse(&tlv(0x17, b"500101000000Z")),
+            parse(&tlv(0x18, b"19500101000000Z"))
+        );
+    }
+
+    /// A multi-byte UTF-8 character used to panic the byte-index slices
+    /// (`&s[0..2]`) of a hostile certificate's validity date; non-ASCII is
+    /// not a legal time form, so it must be a plain parse failure.
+    #[test]
+    fn non_ascii_time_is_rejected_not_panicked() {
+        assert_eq!(parse(&tlv(0x17, "aé00000000Z".as_bytes())), None);
+        assert_eq!(parse(&tlv(0x18, "202é0101000000Z".as_bytes())), None);
+    }
+
+    #[test]
+    fn malformed_times_are_rejected() {
+        for bad in [
+            &b"230101000000"[..],  // missing Z
+            &b"2301010000Z"[..],   // no seconds
+            &b"231301000000Z"[..], // month 13
+            &b"230101250000Z"[..], // hour 25
+        ] {
+            assert_eq!(parse(&tlv(0x17, bad)), None, "{bad:?}");
+        }
+        assert_eq!(parse(&tlv(0x02, b"230101000000Z")), None); // wrong tag
     }
 }

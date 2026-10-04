@@ -7,9 +7,16 @@ Reproduce with:
 ```text
 cargo bench --manifest-path benches/Cargo.toml --bench ws
 # one section at a time while investigating a number:
-$env:WS_BENCH_SECTION = "codec" | "echo" | "push"
+$env:WS_BENCH_SECTION = "codec" | "echo" | "push" | "scale"
 # per-message server-side trace for the push section:
 $env:WS_BENCH_TRACE = "1"
+# scale section knobs (all optional):
+$env:WS_SCALE_CONNS = "4000"                 # idle fleet size
+$env:WS_SCALE_MAX_CONNECTIONS = "20000"      # server cap for the scale servers
+$env:WS_SCALE_BROADCAST_CONNS = "256"
+$env:WS_SCALE_BROADCAST_MSGS = "64"
+$env:WS_SCALE_SENDER_THREADS = "8"
+$env:WS_SCALE_SENDER_MSGS = "2000"
 ```
 
 The suite runs in CI (`.github/workflows/benchmark.yml`, suite `ws`) on every
@@ -174,6 +181,73 @@ At 16 KiB the four combinations are within 6% of each other — parity, for both
 - **Alternating vs windowed pipeline:** alternating round trips 31.1 µs; 8 outstanding 15.6 µs; 64 outstanding 16.0 µs; 512 outstanding 15.6 µs. So one round trip costs ~31 µs of which ~16 µs is wakeup latency and ~15 µs is the actual work — pipelining roughly halves latency per message and then stops improving, which is what a bounded-window protocol should look like.
 - **permessage-deflate on 64 B:** 33.2 µs vs 26.5 µs uncompressed (1.25× cost) for an incompressible payload — the 128-byte threshold and the "did it actually get smaller?" check are what keep this from being a loss on small messages.
 - **permessage-deflate on 16 KiB:** 58.9 µs vs 39.3 µs. Compression is opt-in and per message; the encoder never uses context takeover (see the module README for why that is a deliberate security choice, and what it costs in ratio).
+
+## 5. Scale
+
+The sections above measure one connection. `WS_BENCH_SECTION=scale` measures the four things an
+operator actually has to plan for, and it **prints its own table** — the numbers are machine and
+load dependent, so they are reported by the run rather than copied into this document:
+
+- **Idle fleet** (`WS_SCALE_CONNS`, default 4 000): how many connections can be held, the open
+  rate, the resident-set delta per connection, and whether a probe is still served promptly while
+  the whole fleet is parked. Read one caveat with the memory figure: the client *and* the server
+  live in this process, so the delta is the cost of both ends, not of the server alone.
+- **A peer that stops reading** (queue cap 256 KiB): the application keeps pushing while the client
+  never reads. The bounded send queue must refuse — and it does — leaving the connection closing
+  instead of the process growing; the section asserts the process grew by less than 64 MiB and
+  prints the actual delta.
+- **One-thread broadcast**: `WS_SCALE_BROADCAST_CONNS` readers, `msgs` each, all enqueued from a
+  single thread. It reports the enqueue latency distribution (p50/p99/max — this is the
+  per-connection write lock under contention) as well as the end-to-end drain time.
+- **Writer-lock contention**: `WS_SCALE_SENDER_THREADS` threads pushing on **one** connection, so
+  the number that decides "one writer thread or many for a hot connection" is measured rather than
+  guessed.
+
+One platform term has to be read with the idle-fleet figure. On Windows the reactor's readiness
+wait is Winsock `select`, which takes at most `FD_SETSIZE` (64) descriptors per call, so a poll
+cycle is `ceil(n/63)` syscalls plus an O(n) rebuild of each set; on Unix it is a single `poll(2)`.
+The section prints the batch count next to the connection count for that reason. Timings were taken
+with the same caveat as the rest of this document: compare rows within one run, never across runs.
+
+### What the first run found
+
+One run on a 20-logical-core Windows machine with the default `event_poll_timeout_ms = 50`, three
+hundred parked connections and nothing else happening:
+
+```text
+opened 300 in 12.28 s (24 conn/s)
+rss 5.3 MiB -> 44.9 MiB (delta 39.6 MiB, 135 KiB per connection; both ends in this process)
+windows select batches per poll cycle: 5 (ceil(300/63))
+probe with the fleet idle: p50 101170 us, p99 103514 us
+```
+
+The same section with the fleet inside **one** batch, everything else unchanged:
+
+```text
+opened 60 in 0.03 s (2042 conn/s)
+rss 5.3 MiB -> 14.3 MiB (delta 9.0 MiB, 154 KiB per connection; both ends in this process)
+windows select batches per poll cycle: 1 (ceil(60/63))
+probe with the fleet idle: p50 91 us, p99 239 us
+```
+
+A probe round trip costs **101 ms at 300 connections** and **91 us at 60** — a 1100x cliff from
+crossing one batch boundary, with a deterministic distribution (p50 and p99 are 2% apart), which is
+the signature of a timer rather than of load. The arithmetic identifies it:
+`101 ms ~ 2 x event_poll_timeout_ms`, because a WebSocket round trip needs two readiness decisions
+(readable, then writable) and `wait_select` only lets **batch 0** wait the full timeout — every
+later batch is polled with a zero timeout *after* batch 0 has returned. A descriptor parked in
+batch 1 or later therefore cannot be seen until batch 0's wait expires, and once the connection
+count passes 63 there is always a later batch.
+
+The connection rate says the same thing — 2042/s inside one batch against 24/s across five, because
+each upgrade waits on average half a poll interval for its request to be noticed and another for the
+reply to be flushed. This is not a WebSocket-only effect: the H1 path shares the reactor and the
+wait. It is invisible in the multi-worker rows of `github_action_benchmark.md` because those runs
+keep the live connection count inside one batch.
+
+This is a *finding*, not a claim about Linux (the `poll(2)` path has no batching and no
+`FD_SETSIZE`). The fix is to stop batching on Windows — `WSAPoll`, or IOCP — because no amount of
+tuning the timeout removes the ceiling: `event_poll_timeout_ms` only sets how bad it is.
 
 ## Summary
 

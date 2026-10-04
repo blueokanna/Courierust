@@ -32,20 +32,7 @@ pub struct H1Connection {
     scratch: Scratch,
     version: Version,
     reusable: bool,
-    /// Whether the peer produced any part of the *current* response.
-    ///
-    /// A failure after this point is a real answer (a truncated
-    /// response), never a stale connection: the request was processed,
-    /// so replaying it would be a second execution, not a retry.
     read_started: bool,
-    /// Whether the peer of this connection is an HTTP proxy the request is
-    /// *addressed to* (the plaintext absolute-form hop).
-    ///
-    /// It decides exactly one thing: a `Proxy-Authorization` field belongs
-    /// to that hop, so it survives the hop-by-hop filter there and nowhere
-    /// else — to an origin, and to an origin inside a tunnel, that field
-    /// would be a credential handed to a party it was never meant for.
-    to_proxy: bool,
 }
 
 impl H1Connection {
@@ -74,7 +61,7 @@ impl H1Connection {
         hostname: &str,
         cfg: &ClientConfig,
     ) -> Result<Self> {
-        Self::wrap(stream, tls, hostname, cfg, false)
+        Self::wrap(stream, tls, hostname, cfg)
     }
 
     /// Wrap a socket whose peer is an HTTP proxy, so the request — written
@@ -89,7 +76,7 @@ impl H1Connection {
         hostname: &str,
         cfg: &ClientConfig,
     ) -> Result<Self> {
-        Self::wrap(stream, tls, hostname, cfg, true)
+        Self::wrap(stream, tls, hostname, cfg)
     }
 
     /// The one wrapping path both constructors share: the peer's identity
@@ -99,7 +86,6 @@ impl H1Connection {
         tls: Option<&crate::courierust_tls::TlsConnector>,
         hostname: &str,
         cfg: &ClientConfig,
-        to_proxy: bool,
     ) -> Result<Self> {
         let conn = match tls {
             Some(c) => {
@@ -129,7 +115,6 @@ impl H1Connection {
             version: Version::HTTP_11,
             reusable: true,
             read_started: false,
-            to_proxy,
         })
     }
 
@@ -156,7 +141,6 @@ impl H1Connection {
             version: Version::HTTP_11,
             reusable: true,
             read_started: false,
-            to_proxy: false,
         })
     }
 
@@ -196,7 +180,6 @@ impl H1Connection {
     /// replay question at all — not even for a `POST`.
     pub fn is_alive(&self) -> bool {
         thread_local! {
-            /// Reused across probes: the steady state must not allocate.
             static PROBE: std::cell::RefCell<Poller> =
                 std::cell::RefCell::new(Poller::new());
         }
@@ -236,6 +219,7 @@ impl H1Connection {
         req: &Request<Body>,
         cfg: &ClientConfig,
         host_header: &str,
+        to_proxy: bool,
     ) -> Result<Response<Body>> {
         let mut headers = HeaderMap::with_capacity(req.headers.len() + 4);
         headers.insert(
@@ -246,8 +230,11 @@ impl H1Connection {
             if n.as_str() == "host" {
                 continue;
             }
-            let proxy_credential = self.to_proxy && n.as_str() == "proxy-authorization";
-            if !proxy_credential && courierust_h1::is_hop_by_hop(n.as_str()) {
+            if n.as_str() == "proxy-authorization" {
+                if !to_proxy {
+                    continue;
+                }
+            } else if courierust_h1::is_hop_by_hop(n.as_str()) {
                 continue;
             }
             headers.append(n.clone(), v.clone());

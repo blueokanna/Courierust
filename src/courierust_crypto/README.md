@@ -15,8 +15,12 @@ JA3's whole trick is MD5 over a canonical ClientHello string; JA4's first half i
 ```rust
 use courierust::courierust_crypto::{md5, sha256};
 
+# fn main() {
 let h = md5::md5(b"data");
 let s = sha256::sha256(b"data");
+# assert_eq!(h.len(), 16);
+# assert_eq!(s.len(), 32);
+# }
 ```
 
 Or don't use it at all — the fingerprint functions call these for you.

@@ -30,6 +30,8 @@ use std::sync::Arc;
 
 // `Db` 是你自己的应用类型，不是 crate 提供的。
 // Handler 要求 Send + Sync，所以 Db 也必须满足。
+# #[allow(dead_code)]
+# trait Db: Send + Sync {}
 struct App {
     db: Arc<dyn Db>,
 }
@@ -62,19 +64,48 @@ let cfg = ServerConfig {
     read_timeout: Some(Duration::from_secs(120)),
     max_header_list: 1 << 20,
     max_body: 16 * 1024 * 1024,
+    ..Default::default()
 };
 ```
 
 ## 阻塞式运行
 
-```rust
+```rust,no_run
+# use courierust::courierust_body::Body;
+# use courierust::courierust_http::request::Request;
+# use courierust::courierust_http::response::Response;
+# use courierust::courierust_server::{Handler, Server, ServerConfig};
+# struct App;
+# impl Handler for App {
+#     fn handle(&self, _req: Request<Body>) -> Response<Body> {
+#         Response::<Body>::with_status(200.into())
+#     }
+# }
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let app = App;
+# let cfg = ServerConfig::default();
 let server = Server::bind_with_config("0.0.0.0:8080", cfg)?;
 server.serve(app)?; // 永久阻塞
+# Ok(())
+# }
 ```
 
 ## 后台运行（测试 / 嵌入场景）
 
-```rust
+```rust,no_run
+# use courierust::courierust_body::Body;
+# use courierust::courierust_http::request::Request;
+# use courierust::courierust_http::response::Response;
+# use courierust::courierust_server::{Handler, Server, ServerConfig};
+# struct App;
+# impl Handler for App {
+#     fn handle(&self, _req: Request<Body>) -> Response<Body> {
+#         Response::<Body>::with_status(200.into())
+#     }
+# }
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let app = App;
+# let cfg = ServerConfig::default();
 let server = Server::bind_with_config("127.0.0.1:0", cfg)?;
 let addr = server.local_addr()?;      // 实际绑定端口
 let handle = server.serve_background(app)?;
@@ -82,13 +113,21 @@ let handle = server.serve_background(app)?;
 // ... 继续做别的事 / 跑测试 ...
 // 丢弃句柄即停止 accept；已建立的连接正常排空。
 drop(handle);
+# let _ = addr;
+# Ok(())
+# }
 ```
 
 ## 流式响应体
 
 返回 `Body::Channel`，服务器带流控背压地流式发送：只有连接有发送窗口时才从 channel 取块。慢客户端不会撑爆内存。
 
-```rust
+```rust,no_run
+# use courierust::courierust_body::Body;
+# use courierust::courierust_bytes::Bytes;
+# use courierust::courierust_http::request::Request;
+# use courierust::courierust_http::response::Response;
+# fn main() {
 let handler = |_req: Request<Body>| -> Response<Body> {
     let (tx, body) = courierust::courierust_body::channel();
     std::thread::spawn(move || {
@@ -102,6 +141,8 @@ let handler = |_req: Request<Body>| -> Response<Body> {
     resp.body = body;
     resp
 };
+#     let _ = handler;
+# }
 ```
 
 中途出错用 `tx.fail(err)` —— 连接会以 `INTERNAL_ERROR` 重置该流。
@@ -120,13 +161,26 @@ let handler = |_req: Request<Body>| -> Response<Body> {
 同一个服务器把 HTTP/1.1 连接就地升级成 WebSocket：实现 `Handler::websocket`，对自己负责的路径返回 `WsUpgradeReply::Accept(service)`（`Pass` 则保持在 HTTP 路径上）。不需要第二个端口、第二个监听线程，也不需要每连接一线程：默认的事件驱动路径下，一个空闲 WebSocket 只占一个 poller 槽位、**零 worker**。
 
 ```rust
+# use courierust::courierust_body::Body;
+# use courierust::courierust_http::request::Request;
+# use courierust::courierust_http::response::Response;
+# use courierust::courierust_server::ws::{WsConn, WsData, WsService};
+# use courierust::courierust_server::Handler;
+# struct App;
+# struct Echo;
+# impl WsService for Echo {
+#     fn on_message(&self, _conn: &mut WsConn, _msg: WsData) {}
+# }
 use courierust::courierust_server::ws::WsUpgradeReply;
 use std::sync::Arc;
 
 impl Handler for App {
+#     fn handle(&self, _req: Request<Body>) -> Response<Body> {
+#         Response::<Body>::with_status(200.into())
+#     }
     // ... handle() 照旧 ...
     fn websocket(&self, req: &Request<Body>) -> WsUpgradeReply {
-        if req.path == "/ws" {
+        if req.uri.path() == "/ws" {
             WsUpgradeReply::Accept(Arc::new(Echo))
         } else {
             WsUpgradeReply::Pass

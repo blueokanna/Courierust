@@ -186,6 +186,11 @@ impl ConnStream {
         self.peer
     }
 
+    /// Whether this transport is TLS.
+    pub(crate) fn is_tls(&self) -> bool {
+        matches!(self.inner, ConnStreamKind::Tls { .. })
+    }
+
     /// The negotiated ALPN protocol (TLS connections only).
     pub(crate) fn alpn(&self) -> Option<Vec<u8>> {
         match &self.inner {
@@ -244,6 +249,17 @@ impl ConnStream {
         Ok(())
     }
 
+    /// Whether an expiry is currently classified as a deadline.
+    ///
+    /// Test-only. It is what lets a driver's test pin *which* arming it
+    /// used — a distinction a Windows-only run cannot observe, because
+    /// `WSAETIMEDOUT` maps to `Timeout` however the socket was armed,
+    /// while POSIX reports a poll timeout as `WouldBlock`.
+    #[cfg(test)]
+    pub(crate) fn deadline_is_armed(&self) -> bool {
+        self.deadline.load(Ordering::Relaxed)
+    }
+
     /// Shut down the transport's read, write or both halves.
     ///
     /// Both variants share one socket, so this is the socket shutdown either
@@ -266,7 +282,7 @@ impl ConnStream {
     /// budget and the deadline keep this from becoming a slowloris
     /// vector: it is a bounded courtesy, not a promise to read a body.
     pub(crate) fn linger_close(&self, budget: usize, deadline: Duration) {
-        let _ = self.configure(Some(deadline));
+        let _ = self.set_deadline(Some(deadline));
         let mut sink = [0u8; 8 * 1024];
         let mut left = budget;
         while left > 0 {
@@ -294,7 +310,7 @@ impl crate::courierust_io::Read for &ConnStream {
                 // A poisoned TLS lock would otherwise turn one panicking
                 // handler into a connection that can never be read or
                 // written again.
-                let mut g = tls.lock().unwrap_or_else(|e| e.into_inner());
+                let mut g = crate::lock(tls);
                 crate::courierust_io::Read::read(&mut *g, buf)
             }
         };
@@ -320,7 +336,7 @@ impl crate::courierust_io::Write for &ConnStream {
                 crate::courierust_io::Write::write(&mut w, buf)
             }
             ConnStreamKind::Tls { tls, .. } => {
-                let mut g = tls.lock().unwrap_or_else(|e| e.into_inner());
+                let mut g = crate::lock(tls);
                 crate::courierust_io::Write::write(&mut *g, buf)
             }
         }
@@ -333,7 +349,7 @@ impl crate::courierust_io::Write for &ConnStream {
                 crate::courierust_io::Write::flush(&mut w)
             }
             ConnStreamKind::Tls { tls, .. } => {
-                let mut g = tls.lock().unwrap_or_else(|e| e.into_inner());
+                let mut g = crate::lock(tls);
                 crate::courierust_io::Write::flush(&mut *g)
             }
         }

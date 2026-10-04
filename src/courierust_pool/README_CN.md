@@ -14,7 +14,7 @@ worker 数默认 `std::thread::available_parallelism()`。这就是连接处理�
 ## 用在哪
 
 - 服务端把 TLS 和 HTTP/2 连接（以及旧模型下的每一条连接）经池派发。
-- 客户端的 h2 driver 跑在它上面。
+- HTTP/3 服务端 runtime 的 handler worker 跑在它上面。
 - 任务可以派生子任务——需要转交工作的 handler 不会把池搞死锁。
 
 ## 微妙的细节
@@ -28,7 +28,12 @@ worker 数默认 `std::thread::available_parallelism()`。这就是连接处理�
 ```rust
 use courierust::courierust_pool::ThreadPool;
 
-let pool = ThreadPool::new();        // 默认逻辑核数
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let pool = ThreadPool::new()?;       // 默认逻辑核数
 pool.spawn(move || { /* 处理一条连接 */ });
-pool.join();
+
+// 池被 drop 时会关闭并 join 所有 worker。
+drop(pool);
+# Ok(())
+# }
 ```

@@ -39,6 +39,8 @@ use std::sync::Arc;
 
 // `Db` here is your own application type, not something from the crate.
 // Handler requires Send + Sync, so Db must satisfy both.
+# #[allow(dead_code)]
+# trait Db: Send + Sync {}
 struct App {
     db: Arc<dyn Db>,
 }
@@ -72,19 +74,48 @@ let cfg = ServerConfig {
     read_timeout: Some(Duration::from_secs(120)),
     max_header_list: 1 << 20,
     max_body: 16 * 1024 * 1024,
+    ..Default::default()
 };
 ```
 
 ## Blocking serve
 
-```rust
+```rust,no_run
+# use courierust::courierust_body::Body;
+# use courierust::courierust_http::request::Request;
+# use courierust::courierust_http::response::Response;
+# use courierust::courierust_server::{Handler, Server, ServerConfig};
+# struct App;
+# impl Handler for App {
+#     fn handle(&self, _req: Request<Body>) -> Response<Body> {
+#         Response::<Body>::with_status(200.into())
+#     }
+# }
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let app = App;
+# let cfg = ServerConfig::default();
 let server = Server::bind_with_config("0.0.0.0:8080", cfg)?;
 server.serve(app)?; // blocks forever
+# Ok(())
+# }
 ```
 
 ## Background serve (for tests and embedding)
 
-```rust
+```rust,no_run
+# use courierust::courierust_body::Body;
+# use courierust::courierust_http::request::Request;
+# use courierust::courierust_http::response::Response;
+# use courierust::courierust_server::{Handler, Server, ServerConfig};
+# struct App;
+# impl Handler for App {
+#     fn handle(&self, _req: Request<Body>) -> Response<Body> {
+#         Response::<Body>::with_status(200.into())
+#     }
+# }
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let app = App;
+# let cfg = ServerConfig::default();
 let server = Server::bind_with_config("127.0.0.1:0", cfg)?;
 let addr = server.local_addr()?;      // real bound port
 let handle = server.serve_background(app)?;
@@ -92,13 +123,21 @@ let handle = server.serve_background(app)?;
 // ... run tests / do other work ...
 // Dropping the handle stops accepting; connections drain.
 drop(handle);
+# let _ = addr;
+# Ok(())
+# }
 ```
 
 ## Streaming a response body
 
 Return a `Body::Channel` and the server streams it with flow-control backpressure: chunks are only drained from the channel when the connection has send window available, so a slow client cannot balloon memory.
 
-```rust
+```rust,no_run
+# use courierust::courierust_body::Body;
+# use courierust::courierust_bytes::Bytes;
+# use courierust::courierust_http::request::Request;
+# use courierust::courierust_http::response::Response;
+# fn main() {
 let handler = |_req: Request<Body>| -> Response<Body> {
     let (tx, body) = courierust::courierust_body::channel();
     std::thread::spawn(move || {
@@ -112,6 +151,8 @@ let handler = |_req: Request<Body>| -> Response<Body> {
     resp.body = body;
     resp
 };
+#     let _ = handler;
+# }
 ```
 
 Send an error mid-stream with `tx.fail(err)` — the connection resets that stream with `INTERNAL_ERROR`.
@@ -138,13 +179,26 @@ no second listener, and no per-connection thread: in the default event
 driver an idle WebSocket holds one poller slot and **zero workers**.
 
 ```rust
+# use courierust::courierust_body::Body;
+# use courierust::courierust_http::request::Request;
+# use courierust::courierust_http::response::Response;
+# use courierust::courierust_server::ws::{WsConn, WsData, WsService};
+# use courierust::courierust_server::Handler;
+# struct App;
+# struct Echo;
+# impl WsService for Echo {
+#     fn on_message(&self, _conn: &mut WsConn, _msg: WsData) {}
+# }
 use courierust::courierust_server::ws::WsUpgradeReply;
 use std::sync::Arc;
 
 impl Handler for App {
+#     fn handle(&self, _req: Request<Body>) -> Response<Body> {
+#         Response::<Body>::with_status(200.into())
+#     }
     // ... handle() as usual ...
     fn websocket(&self, req: &Request<Body>) -> WsUpgradeReply {
-        if req.path == "/ws" {
+        if req.uri.path() == "/ws" {
             WsUpgradeReply::Accept(Arc::new(Echo))
         } else {
             WsUpgradeReply::Pass

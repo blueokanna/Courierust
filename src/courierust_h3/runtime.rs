@@ -1586,10 +1586,15 @@ impl ClientConnection {
                     return Ok(());
                 }
                 if self.tls_server_hello || self.handshake_complete {
-                    return Err(protocol("QUIC Retry arrived after handshake progress"));
+                    // RFC 9000 §17.2.5.2: at most one Retry is processed per
+                    // connection attempt. A retransmitted Initial can draw a
+                    // second Retry out of a server, and the client discards
+                    // it — aborting here would kill a handshake that is
+                    // progressing normally.
+                    return Ok(());
                 }
-                if !self.transport.apply_retry(retry.scid, retry.token)? {
-                    return Err(protocol("multiple QUIC Retry packets are not permitted"));
+                if !self.transport.apply_retry(retry.scid, retry.token) {
+                    return Ok(());
                 }
                 let retry_scid = self.transport.initial_dcid.clone();
                 self.tls.set_retry_source_cid(retry_scid);
@@ -4729,14 +4734,26 @@ impl QuicTransport {
         constant_time_equal(&datagram[datagram.len() - 16..], token)
     }
 
-    fn apply_retry(&mut self, retry_dcid: Vec<u8>, token: Vec<u8>) -> Result<bool> {
+    /// Apply a server's Retry: swap in the connection IDs and token it
+    /// chose and drop every packet number space, since the whole handshake
+    /// restarts.
+    ///
+    /// `false` means "discard this Retry": a second one, or a malformed one
+    /// (a length-zero or oversized connection ID, an empty token). RFC 9000
+    /// §17.2.5.2 makes the *later* Retry a discard, and §17.2 drops long
+    /// header packets with an oversized connection ID — neither is a
+    /// connection error.
+    fn apply_retry(&mut self, retry_dcid: Vec<u8>, token: Vec<u8>) -> bool {
         if self.server || self.retry_seen {
-            return Ok(false);
+            return false;
         }
         if retry_dcid.is_empty() || retry_dcid.len() > 20 || token.is_empty() {
-            return Err(protocol("invalid QUIC Retry connection ID or token"));
+            return false;
         }
-        let (client_initial, server_initial) = protection::initial_pair(&retry_dcid)?;
+        let (client_initial, server_initial) = match protection::initial_pair(&retry_dcid) {
+            Ok(pair) => pair,
+            Err(_) => return false,
+        };
         self.initial_dcid.clone_from(&retry_dcid);
         self.remote_cid = retry_dcid;
         self.initial_send = client_initial;
@@ -4765,7 +4782,7 @@ impl QuicTransport {
         self.smoothed_rtt = None;
         self.rtt_variance = Duration::from_millis(0);
         self.peer_stateless_reset_token = None;
-        Ok(true)
+        true
     }
 
     fn set_local_transport(&mut self, parameters: &TransportParameters) {
@@ -5053,10 +5070,6 @@ impl QuicTransport {
                     unidirectional,
                     max,
                 } => {
-                    // RFC 9000 §4.6/§19.11: the count can never exceed 2^60
-                    // (no stream id above 2^62-1 can be encoded), and a
-                    // frame that permits opening more is a connection
-                    // error of type FRAME_ENCODING_ERROR.
                     if *max > (1u64 << 60) {
                         return Err(protocol("MAX_STREAMS exceeds the stream id space"));
                     }
@@ -5073,10 +5086,6 @@ impl QuicTransport {
                             h3_role(self.server)
                         );
                     }
-                    // MAX_STREAM_DATA only ever raises the limit: it
-                    // cannot go below the transport parameter's initial
-                    // value, so the map entry must not shadow that value
-                    // with a smaller one (RFC 9000 §4.1).
                     let (uni_default, bidi_remote_default, bidi_local_default) =
                         stream_data_defaults;
                     let floor = if stream_id::is_unidirectional(*stream_id) {
@@ -5142,8 +5151,6 @@ impl QuicTransport {
         }
         let _ = self.detect_lost_packets(level, Instant::now());
         if h3_packet_trace() {
-            // ACK event: newly-acknowledged bytes and the cwnd after
-            // growth — the release valve for a cwnd-paced upload.
             let rtt_us = self.latest_rtt.map_or(0, |d| d.as_micros() as u64);
             eprintln!(
                 "H3TRACE|{}|ack acked_bytes={bytes} cwnd={} unacked={} rtt_us={rtt_us}",
@@ -5301,14 +5308,6 @@ impl QuicTransport {
                 .checked_add(bytes.len() as u64)
                 .ok_or_else(|| protocol("QUIC stream send offset overflow"))?;
             if end > self.peer_stream_send_limit(id) {
-                // No stream-level credit yet: block (and let the caller
-                // requeue) instead of killing the whole connection. RFC
-                // 9000 §4.1: exceeding the limit is the *receiver's*
-                // FLOW_CONTROL_ERROR to report; the sender simply waits
-                // for MAX_STREAM_DATA. Previously this was a fatal
-                // protocol error that tore down the connection — and with
-                // it every unrelated in-flight request — whenever a large
-                // upload briefly exhausted the peer's window.
                 return Err(Error::new(ErrorKind::WouldBlock));
             }
             let previous = self.sent_stream_data.get(&id).copied().unwrap_or(0);
@@ -5518,7 +5517,6 @@ impl QuicTransport {
         self.local_max_data = new_limit;
         match self.send_frames(socket, APPLICATION, &[QFrame::MaxData(new_limit)], false) {
             Ok(()) => Ok(()),
-            // A full send buffer defers the update; retry on the next tick.
             Err(error) if error.kind == ErrorKind::WouldBlock => Ok(()),
             Err(error) => Err(error),
         }
@@ -5563,7 +5561,6 @@ impl QuicTransport {
                 false,
             ) {
                 Ok(()) => {}
-                // A full send buffer defers the update; retry next tick.
                 Err(error) if error.kind == ErrorKind::WouldBlock => {}
                 Err(error) => return Err(error),
             }
@@ -5729,9 +5726,11 @@ impl QuicTransport {
                             packet.retransmits,
                         ));
                     }
-                    if earliest_ack_eliciting.is_none()
-                        || packet.sent_at < earliest_ack_eliciting.unwrap().1
-                    {
+                    let precedes = match earliest_ack_eliciting {
+                        Some((_, at)) => packet.sent_at < at,
+                        None => true,
+                    };
+                    if precedes {
                         earliest_ack_eliciting = Some((pn, packet.sent_at));
                     }
                 }
@@ -5954,11 +5953,6 @@ impl QuicTransport {
         if ack_eliciting
             && self.unacknowledged_bytes().saturating_add(wire.len()) > self.congestion_window
         {
-            // The packet was not sent, so everything it carried is still
-            // pending — including a piggybacked ACK that the code above
-            // has already marked consumed. Dropping it would look like
-            // loss to the peer and trigger a retransmission of data we
-            // already hold.
             if due_ack {
                 self.spaces[level].ack_pending = true;
                 self.spaces[level].ack_deadline = Some(Instant::now());
@@ -6033,10 +6027,6 @@ impl QuicTransport {
             if let Some(deadline) = space.ack_deadline {
                 earliest = Some(earliest.map_or(deadline, |e| e.min(deadline)));
             }
-            // Loss detection / PTO: the oldest ack-eliciting packet in
-            // flight sets the timer, and the earlier of the two applies.
-            // `pending_resend` packets have no timer (they are retried on
-            // datagram wakes / the fixed poll), so they are excluded.
             let oldest = space
                 .sent
                 .values()
@@ -6052,8 +6042,6 @@ impl QuicTransport {
             let deadline = sent + PATH_VALIDATION_TIMEOUT;
             earliest = Some(earliest.map_or(deadline, |e| e.min(deadline)));
         }
-        // A deadline already in the past is "due now"; the caller treats
-        // that as an immediate poll return.
         earliest.filter(|deadline| *deadline > now)
     }
 
@@ -6084,8 +6072,6 @@ impl QuicTransport {
         socket: &UdpSocket,
         candidate: SocketAddr,
     ) -> Result<()> {
-        // RFC 9000 §9.6: an endpoint that set disable_active_migration
-        // must not be actively migrated to.
         if self.peer_disable_active_migration && !self.server {
             return Ok(());
         }
@@ -6232,14 +6218,6 @@ fn ack_ranges(received: &BTreeSet<u64>, largest: u64) -> Vec<(u64, u64)> {
         low = *packet_number;
     }
     ranges.push((pending_gap.unwrap_or(0), high.saturating_sub(low)));
-    // RFC 9000 §13.2.3: an ACK frame is expected to fit within a single
-    // packet; older ranges are omitted when it cannot carry them all.
-    // Without a bound, a lossy/reordering peer producing thousands of
-    // fragmented ranges would make the ACK exceed our own
-    // `max_udp_payload_size` and tear the connection down with a
-    // self-inflicted protocol error. 60 ranges is comfortably below the
-    // 1200-byte minimum datagram even with worst-case 8-byte varints;
-    // omitted ranges are re-acknowledged by later ACKs.
     const MAX_ACK_RANGES: usize = 60;
     ranges.truncate(MAX_ACK_RANGES);
     ranges
@@ -6267,12 +6245,6 @@ fn acknowledge(
         for pn in acknowledged {
             if let Some(packet) = sent.remove(&pn) {
                 acknowledged_bytes = acknowledged_bytes.saturating_add(packet.size);
-                // RFC 9002 §5.1: the sample is the time to the *largest*
-                // packet number newly acknowledged — here the high end of
-                // the first range, and only when this ACK is what
-                // acknowledged it. Timing the oldest packet of a burst
-                // inflates the RTT (and with it PTO and every deadline
-                // derived from it) by the spread of the burst.
                 if index == 0 && pn == high && rtt_sample.is_none() {
                     rtt_sample = now.checked_duration_since(packet.sent_at);
                 }
@@ -6294,10 +6266,6 @@ fn acknowledge(
 
 fn decode_quic_frames(buf: &[u8]) -> Result<Vec<QFrame>> {
     if buf.is_empty() {
-        // RFC 9000 §12.4: "An endpoint MUST treat receipt of a packet
-        // containing no frames as a connection error of type
-        // PROTOCOL_VIOLATION." A sender that pads writes at least four
-        // zero bytes, so an empty plaintext is always malformed.
         return Err(protocol("QUIC packet contains no frames"));
     }
     let mut pos = 0usize;
@@ -6347,8 +6315,6 @@ fn open_packet_with_key(
         }
     };
     if let Some(expected_phase) = expected_phase {
-        // Key phase is bit 2 (0x04) of the short header (RFC 9000
-        // §17.3.1); bits 4-3 (0x18) are reserved.
         let phase = datagram[0] & 0x04 != 0;
         if phase != expected_phase {
             if let Some(saved) = &saved {
@@ -6362,9 +6328,6 @@ fn open_packet_with_key(
         if let Some(saved) = &saved {
             datagram[..header_room].copy_from_slice(saved);
         }
-        // Malformed packet (packet number runs past the end): drop it
-        // rather than terminate the connection (RFC 9000 §5.2 — the
-        // header is not authenticated at this point).
         return Ok(None);
     }
     let pn = packet::decode_pn(
@@ -6514,8 +6477,6 @@ mod tests {
         let transport =
             QuicTransport::client(local_cid.clone(), vec![0x22; 8], vec![0x33; 8], None).unwrap();
         let mut transport = transport;
-        // Short header with the client's DCID + a bogus packet number and
-        // random payload that cannot decrypt.
         let mut forged = vec![0x40u8];
         forged.extend_from_slice(&local_cid);
         forged.push(0x00); // packet number 0 (1-byte length)
@@ -6538,7 +6499,6 @@ mod tests {
             QuicTransport::client(vec![0x11; 8], vec![0x22; 8], vec![0x33; 8], None).unwrap();
         conn.smoothed_rtt = Some(Duration::from_millis(10));
         conn.latest_rtt = Some(Duration::from_millis(10));
-        // Reorder window = max(10ms/8, 1ms) = 1.25 ms.
         let reorder_window = Duration::from_micros(1250);
         conn.spaces[APPLICATION].largest_acked = Some(100);
         let now = Instant::now();
@@ -6556,11 +6516,8 @@ mod tests {
                 },
             );
         };
-        // 4 numbers behind the largest ACK but younger than the reorder
-        // window: NOT lost (this is the loopback ACK-coalescing case).
         insert(&mut conn, 96, reorder_window - Duration::from_micros(100));
         assert_eq!(conn.detect_lost_packets(APPLICATION, now), 0);
-        // 4 numbers behind and past the reorder window: lost.
         insert(&mut conn, 96, reorder_window + Duration::from_micros(100));
         assert_eq!(conn.detect_lost_packets(APPLICATION, now), 1);
     }
@@ -6622,14 +6579,10 @@ mod tests {
                 pending_resend: false,
             },
         );
-        // largest_acked = 99, but the highest packet ever sent is 5.
         let err = acknowledge(&mut sent, Some(5), 99, &[(0, 0)])
             .expect_err("unsent ACK must be an error");
         assert!(matches!(err.kind, ErrorKind::Protocol), "got {err:?}");
-        // A legitimate ACK (within the sent range) still succeeds.
         assert!(acknowledge(&mut sent, Some(5), 5, &[(0, 0)]).is_ok());
-        // A duplicate ACK of an already-acknowledged packet (removed from
-        // `sent`) must NOT be treated as a protocol error.
         sent.remove(&5);
         assert!(acknowledge(&mut sent, Some(5), 5, &[(0, 0)]).is_ok());
     }
@@ -6666,12 +6619,9 @@ mod tests {
         )
         .unwrap();
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        // No control stream yet: GOAWAY must be deferred, not sent.
         assert!(!conn.control_sent);
         conn.send_goaway(&socket).unwrap();
         assert!(!conn.goaway_sent, "GOAWAY before control stream is a no-op");
-        // Control stream established; streams 0, 4, 8 have been issued.
-        // Install application keys so the control-stream write succeeds.
         let send_key =
             crate::courierust_quic::protection::PacketKey::from_secret(0x1301, &[0x42; 32])
                 .unwrap();
@@ -6806,8 +6756,6 @@ mod tests {
     #[test]
     fn stream_reassembly_merges_resegmented_retransmission() {
         let mut stream = StreamReassembly::default();
-        // Gap at 0..5; buffer 5..10, then a re-segmented retransmission
-        // spanning 3..9 (overlapping 5..9, same bytes).
         assert!(stream.insert(5, b"fghij", false, 64).unwrap().is_empty());
         assert!(stream.insert(3, b"defghi", false, 64).unwrap().is_empty());
         // Filling the remaining gap yields the full in-order payload.
@@ -6817,13 +6765,8 @@ mod tests {
     #[test]
     fn stream_reassembly_merges_overlap_that_extends_both_sides() {
         let mut stream = StreamReassembly::default();
-        // Buffered 10..12 and 20..22; a retransmission 8..24 overlaps both
-        // (identical bytes) and fills the middle.
         assert!(stream.insert(10, b"kl", false, 64).unwrap().is_empty());
         assert!(stream.insert(20, b"uv", false, 64).unwrap().is_empty());
-        // payload covers offsets 8..24 = "ijklmnopqrstuvwx":
-        //   idx 2..4  -> offsets 10..12 == "kl" (matches buffered)
-        //   idx 12..14 -> offsets 20..22 == "uv" (matches buffered)
         let payload = b"ijklmnopqrstuvwx";
         assert!(stream.insert(8, payload, false, 64).unwrap().is_empty());
         // Fill the head (offsets 0..8) and read the whole stream in order.

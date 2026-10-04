@@ -14,6 +14,7 @@ use crate::courierust_net::ConnStream;
 use crate::courierust_server::{ws, Handler, ServerConfig};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Bytes of unread request data a refusal is willing to drain before the
 /// socket closes (`linger_close`), and how long it is willing to wait.
@@ -30,14 +31,29 @@ pub(crate) fn serve(
     let mut reader = BufReader::new(stream.clone(), 16 * 1024);
     let mut writer = BufWriter::new(stream.clone(), 16 * 1024);
     let mut scratch = Scratch::new();
+    // Fixed for the connection's lifetime, so a handler that asks for it
+    // does not cost a syscall per request.
+    let connection_info = crate::courierust_server::ConnectionInfo {
+        peer: stream.peer_addr(),
+        secure: stream.is_tls(),
+    };
     loop {
+        let header_deadline = config
+            .request_header_timeout
+            .and_then(|timeout| Instant::now().checked_add(timeout));
+        let mut before_header_read = || set_header_read_deadline(stream, header_deadline);
+
         // Request line.
         let line = scratch.line();
-        match reader.read_until_into(b'\n', 16 * 1024, line) {
+        match reader.read_until_into_with(b'\n', 16 * 1024, line, &mut before_header_read) {
             Err(Error {
                 kind: crate::courierust_error::ErrorKind::UnexpectedEof,
                 ..
             }) => return Ok(()),
+            Err(Error {
+                kind: crate::courierust_error::ErrorKind::Timeout,
+                ..
+            }) => return write_header_timeout(&mut writer, stream),
             Err(e) => return Err(e),
             Ok(()) => {}
         }
@@ -52,13 +68,30 @@ pub(crate) fn serve(
                 return Err(e);
             }
         };
-        let headers = match courierust_h1::read_headers_scratch(&mut reader, &mut scratch) {
+        let headers = match courierust_h1::read_headers_scratch_with_limit(
+            &mut reader,
+            &mut scratch,
+            config.max_header_list,
+            &mut before_header_read,
+        ) {
             Ok(headers) => headers,
-            Err(e) => {
-                refuse(&mut writer, stream, &e)?;
+            Err(Error {
+                kind: crate::courierust_error::ErrorKind::Timeout,
+                ..
+            }) => return write_header_timeout(&mut writer, stream),
+            Err(e) if e.kind == crate::courierust_error::ErrorKind::Overflow => {
+                write_early_error(&mut writer, 431, "request header fields too large")?;
+                let _ = writer.flush();
+                stream.linger_close(LINGER_BUDGET, LINGER_DEADLINE);
                 return Err(e);
             }
+            Err(e) => return Err(e),
         };
+        // The application budget replaces the header budget, and it is a
+        // deadline too: a read that expires with a body in flight must
+        // reach `refusal_status` as `Timeout` on every platform, so the
+        // peer gets the same answer it would get on Windows.
+        stream.set_deadline(config.read_timeout)?;
 
         let mut early = courierust_h1::host_header_error(rl.version, &headers)
             .map(|reason| error_response(400, reason));
@@ -112,14 +145,34 @@ pub(crate) fn serve(
             && config.websocket.enabled
             && crate::courierust_ws::is_websocket_upgrade(&req.headers)
         {
-            match handler.websocket(&req) {
-                ws::WsUpgradeReply::Pass => {}
-                ws::WsUpgradeReply::Refuse(resp) => early = Some(resp),
-                ws::WsUpgradeReply::Accept(service) => {
-                    let peer = stream.peer_addr().ip();
-                    let tls_active = config.tls.is_some();
-                    match ws::plan(&req, peer, tls_active, &config.websocket) {
-                        Ok(plan) => {
+            // `None` = the server's own policy picks the subprotocol;
+            // `Some(None)` = advertise none, which is what a proxy says when
+            // the upstream agreed on none. A bare `Accept` must not be read
+            // as the latter, or it would erase a subprotocol this server did
+            // negotiate.
+            let accepted = match handler.websocket(&req) {
+                ws::WsUpgradeReply::Pass => None,
+                ws::WsUpgradeReply::Refuse(resp) => {
+                    early = Some(resp);
+                    None
+                }
+                ws::WsUpgradeReply::Accept(service) => Some((service, None)),
+                ws::WsUpgradeReply::AcceptWith { service, protocol } => {
+                    Some((service, Some(protocol)))
+                }
+            };
+            if let Some((service, protocol)) = accepted {
+                let peer = stream.peer_addr().ip();
+                let tls_active = config.tls.is_some();
+                match ws::plan(&req, peer, tls_active, &config.websocket) {
+                    Ok(mut plan) => {
+                        let applied = match protocol {
+                            Some(protocol) => plan.override_protocol(protocol.as_deref()),
+                            None => Ok(()),
+                        };
+                        if let Err(refusal) = applied {
+                            early = Some(refusal.response());
+                        } else {
                             let mut head = HeaderMap::with_capacity(6);
                             for (n, v) in plan.accept_headers()?.iter() {
                                 head.append(n.clone(), v.clone());
@@ -143,8 +196,8 @@ pub(crate) fn serve(
                                 &config.websocket,
                             );
                         }
-                        Err(refusal) => early = Some(refusal.response()),
                     }
+                    Err(refusal) => early = Some(refusal.response()),
                 }
             }
         }
@@ -176,7 +229,7 @@ pub(crate) fn serve(
         let is_head = req.method == crate::courierust_http::method::Method::HEAD;
         let resp = match early {
             Some(resp) => resp,
-            None => handler.handle(req),
+            None => handler.handle_connected(&connection_info, req),
         };
 
         if upgrade && config.http2 {
@@ -221,6 +274,36 @@ pub(crate) fn serve(
         }
     }
     Ok(())
+}
+
+/// Set the underlying socket deadline to the budget remaining before a
+/// request header must be complete. This runs before every transport
+/// read, so receiving individual bytes never refreshes the budget.
+fn set_header_read_deadline(stream: &ConnStream, deadline: Option<Instant>) -> Result<()> {
+    let Some(deadline) = deadline else {
+        return Ok(());
+    };
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| Error::timeout("request header timeout"))?;
+    // A *deadline*, not a poll: the expiry is the outcome this phase
+    // exists to produce (the peer is owed a `408`). Only a deadline makes
+    // POSIX report it as `Timeout`; a poll timeout is `WouldBlock` there —
+    // "nothing yet" — and the caller would close without answering.
+    stream.set_deadline(Some(remaining))
+}
+
+/// Respond to an HTTP/1.x request-head deadline with the RFC 9110 status
+/// instead of silently closing the connection.
+fn write_header_timeout(
+    writer: &mut BufWriter<Arc<ConnStream>>,
+    stream: &ConnStream,
+) -> Result<()> {
+    write_early_error(writer, 408, "request header timeout")?;
+    let _ = writer.flush();
+    stream.linger_close(LINGER_BUDGET, LINGER_DEADLINE);
+    Err(Error::timeout("request header timeout"))
 }
 
 /// Write the wire head of an HTTP/1.1 response and report how the
@@ -316,6 +399,10 @@ pub(crate) fn error_response(status: u16, message: &str) -> Response<Body> {
 pub(crate) fn refusal_status(e: &Error) -> Option<u16> {
     use crate::courierust_error::ErrorKind;
     match e.kind {
+        // A request that did not arrive in time gets the RFC 9110 status
+        // instead of a silent close; the event driver's header deadline
+        // and the blocking driver's read deadline both land here.
+        ErrorKind::Timeout => Some(408),
         ErrorKind::Protocol => Some(400),
         ErrorKind::Overflow => {
             let header = e
@@ -343,7 +430,12 @@ fn refuse(
     error: &Error,
 ) -> Result<()> {
     if let Some(status) = refusal_status(error) {
-        write_early_error(writer, status, "bad request")?;
+        let message = if status == 408 {
+            "request timeout"
+        } else {
+            "bad request"
+        };
+        write_early_error(writer, status, message)?;
         let _ = writer.flush();
         stream.linger_close(LINGER_BUDGET, LINGER_DEADLINE);
     }
@@ -441,4 +533,35 @@ fn stream_response(
     }
     writer.write_all(courierust_h1::CHUNKED_END)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The header budget must be armed with **deadline** semantics.
+    ///
+    /// Windows reports an expired read as `WSAETIMEDOUT`, which the
+    /// transport maps to `Timeout` however the socket was armed, so a
+    /// Windows-only run cannot observe the difference. POSIX reports
+    /// `EAGAIN` — the code for "nothing yet" — so a poll-armed budget
+    /// reaches the driver's error mapping as `WouldBlock`, which is not
+    /// the arm that answers `408`: the peer gets a silent close instead
+    /// of the answer it is owed.
+    #[test]
+    fn the_header_budget_is_armed_as_a_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        let stream = ConnStream::plain(client);
+
+        set_header_read_deadline(&stream, Some(Instant::now() + Duration::from_secs(1)))
+            .expect("a live budget arms the transport");
+        assert!(
+            stream.deadline_is_armed(),
+            "the header phase must classify its expiry as a timeout"
+        );
+    }
 }

@@ -1051,6 +1051,529 @@ fn push_benchmarks() {
     }
 }
 
+// ---------------------------------------------------------------------
+// Scale: what an operator has to plan for
+//
+// The sections above measure one connection. These measure the three
+// things that decide whether a fleet survives: the per-connection cost of
+// an idle population, what a peer that stops reading does to a process
+// that keeps pushing (a bounded queue is the only thing between that and
+// an OOM), and what a single-threaded fan-out costs when every
+// connection's write lock is the contended resource.
+//
+// One platform term has to be read with the idle-fleet number: on Windows
+// the reactor's readiness wait is Winsock `select`, which takes at most
+// `FD_SETSIZE` (64) descriptors per call, so a poll cycle is
+// `ceil(n/63)` syscalls plus an O(n) rebuild of each set. On Unix it is a
+// single `poll(2)` call. The section prints the batch count so the number
+// can be read for what it is.
+// ---------------------------------------------------------------------
+
+/// Resident set size of this process in bytes, or `None` where the
+/// platform does not expose it cheaply. A guessed memory figure would be
+/// worse than printing `n/a`.
+#[cfg(windows)]
+fn rss_bytes() -> Option<usize> {
+    /// `PROCESS_MEMORY_COUNTERS` (psapi.h). Two `DWORD`s followed by
+    /// `SIZE_T` fields, which is exactly what `repr(C)` produces.
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcessMemoryCounters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        fn K32GetProcessMemoryInfo(
+            process: *mut core::ffi::c_void,
+            counters: *mut ProcessMemoryCounters,
+            cb: u32,
+        ) -> i32;
+    }
+
+    let mut counters = ProcessMemoryCounters {
+        cb: core::mem::size_of::<ProcessMemoryCounters>() as u32,
+        ..Default::default()
+    };
+    let size = core::mem::size_of::<ProcessMemoryCounters>() as u32;
+    let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, size) };
+    if ok == 0 {
+        None
+    } else {
+        Some(counters.working_set_size)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn rss_bytes() -> Option<usize> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: usize = statm.split_whitespace().nth(1)?.parse().ok()?;
+    Some(pages * 4096)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn rss_bytes() -> Option<usize> {
+    None
+}
+
+fn fmt_bytes(bytes: usize) -> String {
+    const KIB: usize = 1024;
+    const MIB: usize = KIB * 1024;
+    if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn scale_env(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Nearest-rank percentile over an unsorted sample. Uses the sample the
+/// caller already collected: no smoothing, no interpolation, so the
+/// printed p99 is a measurement and not a model.
+fn percentile(samples: &mut [f64], p: f64) -> f64 {
+    if samples.is_empty() {
+        return f64::NAN;
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let idx = ((samples.len() as f64 - 1.0) * p).round() as usize;
+    samples[idx]
+}
+
+/// A server that accepts WebSocket upgrades on every path and hands the
+/// connection to `service`.
+struct ScaleHandler {
+    service: Arc<dyn WsService>,
+}
+
+impl Handler for ScaleHandler {
+    fn handle(&self, _req: Request<Body>) -> Response<Body> {
+        Response::with_status(courierust::courierust_http::status::StatusCode::from_u16(
+            404,
+        ))
+    }
+
+    fn websocket(&self, _req: &Request<Body>) -> WsUpgradeReply {
+        WsUpgradeReply::Accept(self.service.clone())
+    }
+}
+
+/// A service that keeps one push handle per connection and echoes, with a
+/// `count` opcode so a test can learn the fleet size from the wire.
+#[derive(Default)]
+struct Fanout {
+    senders: std::sync::Mutex<Vec<courierust::courierust_server::ws::WsSender>>,
+}
+
+impl WsService for Fanout {
+    fn on_open(&self, c: &mut WsConn) {
+        self.senders.lock().unwrap().push(c.sender());
+    }
+
+    fn on_message(&self, c: &mut WsConn, msg: WsData) {
+        match msg {
+            WsData::Text(t) if t == "count" => {
+                let n = self.senders.lock().unwrap().len();
+                let _ = c.send_text(&n.to_string());
+            }
+            WsData::Text(t) => {
+                let _ = c.send_text(&t);
+            }
+            WsData::Binary(b) => {
+                let _ = c.send_binary(&b);
+            }
+        }
+    }
+}
+
+/// Every scale client carries a finite read deadline. It is *not* `None`:
+/// this harness has to be incapable of hanging, and a blocking read with no
+/// deadline turns one dropped echo into a stuck benchmark. The deadline is
+/// generous (30 s), so it bounds a failure without shaping a measurement —
+/// the client arms it only around the wait for a frame, not while a body
+/// streams.
+fn scale_client_config() -> ClientConfig {
+    ClientConfig {
+        read_timeout: Some(Duration::from_secs(30)),
+        ..Default::default()
+    }
+}
+
+/// Make the section's own output visible as it happens.
+///
+/// Rust's stdout is block-buffered when it is a pipe (which is how a
+/// benchmark is usually captured), so a long scale run otherwise shows
+/// nothing until 8 KiB accumulate — and a hang looks like a section that
+/// never started.
+fn flush_out() {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+}
+
+fn start_scale_server(
+    event_driven: bool,
+    service: Arc<dyn WsService>,
+    max_send_queue: usize,
+) -> std::net::SocketAddr {
+    let config = ServerConfig {
+        event_driven,
+        threads: if event_driven { 4 } else { 2 },
+        max_connections: scale_env("WS_SCALE_MAX_CONNECTIONS", 20_000),
+        websocket: courierust::courierust_server::ws::WsConfig {
+            max_send_queue,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let server = Server::bind_with_config("127.0.0.1:0", config).expect("bind");
+    let addr = server.local_addr().expect("addr");
+    std::mem::forget(
+        server
+            .serve_background(ScaleHandler { service })
+            .expect("serve"),
+    );
+    addr
+}
+
+/// An idle fleet: how many connections can be held, at what cost each, and
+/// whether the reactor still answers a probe promptly while they sit
+/// there.
+fn scale_idle_fleet() {
+    let target = scale_env("WS_SCALE_CONNS", 2_000);
+    println!("\n== scale: idle fleet (target {target} connections) ==\n");
+    flush_out();
+
+    let addr = start_scale_server(true, Arc::new(Fanout::default()), 4 * 1024 * 1024);
+    let before = rss_bytes();
+
+    let mut clients = Vec::with_capacity(target);
+    let started = Instant::now();
+    let mut stopped_early = None;
+    for _ in 0..target {
+        match CourierustWs::connect(&format!("ws://{addr}/echo"), &scale_client_config()) {
+            Ok(ws) => clients.push(ws),
+            Err(e) => {
+                stopped_early = Some(e.to_string());
+                break;
+            }
+        }
+    }
+    let opened = clients.len();
+    let open_secs = started.elapsed().as_secs_f64();
+    std::thread::sleep(Duration::from_millis(300));
+    let after = rss_bytes();
+
+    println!(
+        "  opened {opened} in {:.2} s ({:.0} conn/s)",
+        open_secs,
+        opened as f64 / open_secs
+    );
+    flush_out();
+    if let Some(e) = &stopped_early {
+        println!("  stopped early: {e}");
+    }
+    match (before, after) {
+        (Some(before), Some(after)) => {
+            let delta = after.saturating_sub(before);
+            println!(
+                "  rss {} -> {} (delta {}, {} per connection; client and server share this process, so this is both ends)",
+                fmt_bytes(before),
+                fmt_bytes(after),
+                fmt_bytes(delta),
+                fmt_bytes(delta / opened.max(1)),
+            );
+        }
+        _ => println!("  rss n/a on this platform"),
+    }
+    #[cfg(windows)]
+    println!(
+        "  windows select batches per poll cycle: {} (ceil({opened}/63))",
+        opened.div_ceil(63)
+    );
+
+    // A probe must still be served promptly with the whole fleet parked.
+    let mut probe = CourierustWs::connect(&format!("ws://{addr}/probe"), &scale_client_config())
+        .expect("probe");
+    let mut samples = Vec::with_capacity(200);
+    for _ in 0..200 {
+        let t = Instant::now();
+        probe.send_text("probe").unwrap();
+        match probe.read_message().unwrap() {
+            courierust::courierust_ws::Event::Text(t) => assert_eq!(t, "probe"),
+            other => panic!("unexpected {other:?}"),
+        }
+        samples.push(t.elapsed().as_secs_f64() * 1e6);
+    }
+    println!(
+        "  probe with the fleet idle: p50 {:.0} us, p99 {:.0} us",
+        percentile(&mut samples, 0.5),
+        percentile(&mut samples, 0.99),
+    );
+    flush_out();
+    let last = clients.last_mut().expect("at least one connection");
+    last.send_text("still here").unwrap();
+    match last.read_message().unwrap() {
+        courierust::courierust_ws::Event::Text(t) => assert_eq!(t, "still here"),
+        other => panic!("unexpected {other:?}"),
+    }
+    println!("  the fleet is still live after the probe\n");
+    flush_out();
+}
+
+/// A peer that stops reading while the application keeps pushing. The
+/// bounded send queue is the whole defence: the connection must fail
+/// rather than the process grow.
+fn scale_slow_consumer() {
+    const PAYLOAD: usize = 64 * 1024;
+    const QUEUE: usize = 256 * 1024;
+    println!(
+        "\n== scale: a peer that stops reading (queue cap {}) ==\n",
+        fmt_bytes(QUEUE)
+    );
+
+    let service = Arc::new(Fanout::default());
+    let addr = start_scale_server(true, service.clone(), QUEUE);
+    let client = CourierustWs::connect(&format!("ws://{addr}/slow"), &scale_client_config())
+        .expect("connect");
+    let sender = {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(s) = service.senders.lock().unwrap().first().cloned() {
+                break s;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the service never registered a sender"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+
+    let before = rss_bytes();
+    let payload = vec![0x5au8; PAYLOAD];
+    let started = Instant::now();
+    let mut pushed = 0usize;
+    let mut refused = false;
+    while started.elapsed() < Duration::from_secs(20) {
+        match sender.send_binary(&payload) {
+            Ok(()) => pushed += 1,
+            Err(e) => {
+                println!(
+                    "  push refused after {pushed} x {} ({e})",
+                    fmt_bytes(PAYLOAD)
+                );
+                refused = true;
+                break;
+            }
+        }
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let after = rss_bytes();
+    assert!(
+        refused,
+        "the bounded queue must refuse rather than grow the process"
+    );
+    if let (Some(before), Some(after)) = (before, after) {
+        let delta = after.saturating_sub(before);
+        println!("  rss delta while being flooded: {}", fmt_bytes(delta));
+        assert!(
+            delta < 64 * 1024 * 1024,
+            "a flood against a {} queue grew the process by {}",
+            fmt_bytes(QUEUE),
+            fmt_bytes(delta)
+        );
+    } else {
+        println!("  rss n/a on this platform");
+    }
+    assert!(
+        sender.send_text("after the refusal").is_err(),
+        "a closed queue must refuse every later push"
+    );
+    drop(client);
+    println!();
+    flush_out();
+}
+
+/// One thread fanning out to many connections: the per-connection write
+/// lock is the contended resource, so this reports the enqueue latency
+/// distribution as well as the end-to-end fan-out time.
+fn scale_broadcast() {
+    let conns = scale_env("WS_SCALE_BROADCAST_CONNS", 256);
+    let msgs = scale_env("WS_SCALE_BROADCAST_MSGS", 64);
+    const PAYLOAD: usize = 256;
+    println!(
+        "\n== scale: one-thread broadcast to {conns} connections, {msgs} x {} each ==\n",
+        fmt_bytes(PAYLOAD)
+    );
+
+    let service = Arc::new(Fanout::default());
+    let addr = start_scale_server(true, service.clone(), 4 * 1024 * 1024);
+
+    let ready = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut readers = Vec::with_capacity(conns);
+    for _ in 0..conns {
+        let ready = ready.clone();
+        let url = format!("ws://{addr}/fanout");
+        readers.push(std::thread::spawn(move || {
+            let mut ws = CourierustWs::connect(&url, &scale_client_config()).expect("connect");
+            ready.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            for _ in 0..msgs {
+                match ws.read_message().expect("read") {
+                    courierust::courierust_ws::Event::Binary(b) => {
+                        assert_eq!(b.len(), PAYLOAD, "payload corrupted in fan-out")
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            ws.close(1000, "done").ok();
+        }));
+    }
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while ready.load(std::sync::atomic::Ordering::SeqCst) < conns {
+        let now = ready.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            Instant::now() < deadline,
+            "only {now} of {conns} connections came up"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let senders = service.senders.lock().unwrap().clone();
+    assert_eq!(senders.len(), conns, "one push handle per connection");
+    let payload = vec![0x5au8; PAYLOAD];
+    let total = conns * msgs;
+
+    let mut enqueue = Vec::with_capacity(total);
+    let started = Instant::now();
+    let mut refused = 0usize;
+    for _ in 0..msgs {
+        for sender in &senders {
+            let t = Instant::now();
+            if sender.send_binary(&payload).is_err() {
+                refused += 1;
+                continue;
+            }
+            enqueue.push(t.elapsed().as_secs_f64() * 1e6);
+        }
+    }
+    let enqueue_secs = started.elapsed().as_secs_f64();
+    for reader in readers {
+        reader.join().expect("a reader panicked");
+    }
+    let complete_secs = started.elapsed().as_secs_f64();
+
+    let enqueued = enqueue.len();
+    println!(
+        "  enqueue {enqueued} of {total} in {:.3} s ({:.0} msg/s), p50 {:.1} us, p99 {:.1} us, max {:.1} us",
+        enqueue_secs,
+        enqueued as f64 / enqueue_secs.max(f64::EPSILON),
+        percentile(&mut enqueue.clone(), 0.5),
+        percentile(&mut enqueue.clone(), 0.99),
+        enqueue.iter().cloned().fold(0.0f64, f64::max),
+    );
+    println!(
+        "  all {conns} readers drained in {:.3} s end to end ({:.0} msg/s)",
+        complete_secs,
+        enqueued as f64 / complete_secs.max(f64::EPSILON),
+    );
+    if refused > 0 {
+        println!("  {refused} pushes were refused by the bounded queue");
+    }
+    println!();
+    flush_out();
+}
+
+/// Several threads pushing on **one** connection: the frame boundary lives
+/// inside the sink's lock, so this is the cost of that lock under
+/// contention — the number that decides whether a hot connection should
+/// have one writer thread or many.
+fn scale_writer_contention() {
+    let threads = scale_env("WS_SCALE_SENDER_THREADS", 8);
+    let per_thread = scale_env("WS_SCALE_SENDER_MSGS", 2_000);
+    println!("\n== scale: {threads} threads pushing {per_thread} messages on one connection ==\n");
+
+    let service = Arc::new(Fanout::default());
+    let addr = start_scale_server(true, service.clone(), 16 * 1024 * 1024);
+    let mut client = CourierustWs::connect(&format!("ws://{addr}/hot"), &scale_client_config())
+        .expect("connect");
+    let sender = {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(s) = service.senders.lock().unwrap().first().cloned() {
+                break s;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the service never registered a sender"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+
+    let mut pushers = Vec::with_capacity(threads);
+    for t in 0..threads {
+        let sender = sender.clone();
+        pushers.push(std::thread::spawn(move || {
+            let mut samples = Vec::with_capacity(per_thread);
+            for i in 0..per_thread {
+                let body = format!("t{t}-{i}");
+                let start = Instant::now();
+                sender.send_text(&body).expect("push");
+                samples.push(start.elapsed().as_secs_f64() * 1e6);
+            }
+            samples
+        }));
+    }
+    let mut samples: Vec<f64> = pushers
+        .into_iter()
+        .flat_map(|p| p.join().expect("a pusher panicked"))
+        .collect();
+
+    let total = threads * per_thread;
+    let mut received = 0usize;
+    while received < total {
+        match client.read_message().expect("read") {
+            courierust::courierust_ws::Event::Text(_) => received += 1,
+            courierust::courierust_ws::Event::Ping(_)
+            | courierust::courierust_ws::Event::Pong(_) => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    println!(
+        "  {total} pushes from {threads} threads: p50 {:.1} us, p90 {:.1} us, p99 {:.1} us, max {:.1} us",
+        percentile(&mut samples, 0.5),
+        percentile(&mut samples, 0.9),
+        percentile(&mut samples, 0.99),
+        samples.iter().cloned().fold(0.0f64, f64::max),
+    );
+    println!("  all {received} delivered in order across the lock\n");
+    flush_out();
+}
+
+fn scale_benchmarks() {
+    scale_idle_fleet();
+    scale_slow_consumer();
+    scale_broadcast();
+    scale_writer_contention();
+}
+
 fn main() {
     println!("courierust WebSocket benchmark");
     println!(
@@ -1059,8 +1582,7 @@ fn main() {
             .map(|n| n.get())
             .unwrap_or(0)
     );
-    // `WS_BENCH_SECTION=push` (or `codec`, `echo`) runs one section only:
-    // useful while investigating a single number.
+    flush_out();
     match std::env::var("WS_BENCH_SECTION").as_deref() {
         Ok("push") => {
             push_benchmarks();
@@ -1074,6 +1596,10 @@ fn main() {
             codec_benchmarks();
             return;
         }
+        Ok("scale") => {
+            scale_benchmarks();
+            return;
+        }
         _ => {}
     }
     codec_benchmarks();
@@ -1082,6 +1608,7 @@ fn main() {
     read_buffer_sensitivity();
     phase_split();
     timeout_sensitivity();
+    scale_benchmarks();
 }
 
 /// Large-frame cost is dominated by how many bytes each transport read

@@ -103,7 +103,7 @@ its protocol-level guarantees.
 one line per served request batch with the full nine-stage decomposition
 of a 1 KiB keep-alive request:
 
-```
+```text
 accept_us    accept → registered with the poller            (connection setup)
 fresh_wait_us registered → first worker pickup              (first request only)
 handoff_us   release → next pickup (keep-alive round trip   = last_write_to_reregistered
@@ -125,17 +125,21 @@ is gated behind the env var; with it unset the hot path pays no
 
 ## Usage
 
-```rust
-use courierust::courierust_server::{Server, ServerConfig};
+```rust,no_run
+use courierust::courierust_body::Body;
 use courierust::courierust_http::{Request, Response};
+use courierust::courierust_server::{Server, ServerConfig};
 
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 let mut cfg = ServerConfig::default();
 cfg.http2 = true; // h2c + h1.1 on the same port
 let server = Server::bind_with_config("127.0.0.1:8080", cfg)?;
 
-server.serve(|req: Request<Body>| -> Response<Body> {
+server.serve(|_req: Request<Body>| -> Response<Body> {
     Response::with_status(200.into())
 })?;
+# Ok(())
+# }
 ```
 
 Add `ServerConfig::tls` with an `Identity` + ALPN and the same server speaks HTTPS — see `examples/https.rs`.

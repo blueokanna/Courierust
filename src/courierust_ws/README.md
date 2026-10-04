@@ -4,7 +4,7 @@ A complete RFC 6455 WebSocket implementation — framing, masking, UTF-8 validat
 
 Everything here is `no_std + alloc` except the pieces that genuinely need a socket (entropy for masking keys, `SharedSink`, the client). The protocol core never allocates per frame except for the message payload the caller receives.
 
-```
+```text
 frame.rs      wire format: headers, opcodes, masking, sinks (StreamSink, SharedSink, VecSink)
 utf8.rs       incremental UTF-8 validation that never copies the message
 handshake.rs  the HTTP upgrade: key check, Origin policy, extensions, subprotocol selection
@@ -38,9 +38,10 @@ Four decisions carry most of that:
 
 - **Mask direction is enforced in both directions.** A server fails the connection on an unmasked client frame; a client fails on a masked server frame (§5.1). Getting this backwards is how intermediaries get cache-poisoned.
 - **Origin is checked by default.** `OriginPolicy::SameOrigin` is the default: a browser page on another site cannot open an authenticated WebSocket, because the browser will present the session cookies with the upgrade. `OriginPolicy::NoOrigin` is for non-browser clients, `List` for an explicit allow-list, `Any` for a deliberate opt-out.
-- **`X-Forwarded-*` is only believed from a proxy you named.** `trusted_proxies: Vec<IpNet>` decides when `X-Forwarded-For` / `X-Forwarded-Proto` may override the peer address; an untrusted header is ignored, so a client cannot spoof its own IP or claim to be on TLS.
+- **`X-Forwarded-*` is only believed from a proxy you named.** `trusted_proxies: Vec<IpNet>` decides when `X-Forwarded-For` / `X-Forwarded-Proto` may override the peer address; an untrusted header is ignored, so a client cannot spoof its own IP or claim to be on TLS. A **bare address is a host route** — `/32` for IPv4 and `/128` for IPv6 — because getting that wrong is a security defect rather than a typo: a `/32` on a global IPv6 address spans 2^96 addresses, and every one of them would be believed when it sent a forwarded header.
 - **Strict handshake validation.** Exactly one `Sec-WebSocket-Key` of canonical base64 length, `Sec-WebSocket-Version: 13`, `Connection: Upgrade` as a token list, minimal-length length encodings, control frames never fragmented and never longer than 125 bytes, RSV bits gated on negotiation, close codes validated against the legal sets for each direction.
 - **Bounded everything.** `max_frame`, `max_message`, `max_fragments`, `max_send_queue`: a peer cannot make the connection translate a claim into memory, and `permessage-deflate` inflation is bounded by the same message limit (a zip bomb hits 1009, not OOM — tested).
+- **Compression parameters are a promise in both directions.** `*_max_window_bits` (RFC 7692 §7.1.2.1) sizes the *peer's* inflate window, so the encoder's match finder is capped to it: a 512-byte window cannot resolve a reference 20 KiB back, and emitting one is a decode failure rather than a size regression. The inflater enforces the same limit on inbound references, and `server_no_context_takeover` is advertised because this encoder is stateless between messages by construction — which lets the peer drop its own inflate history.
 - **The close handshake is enforced, not suggested.** The “nothing after a Close frame” rule (RFC 6455 §5.5.1) lives on a *shared* flag on the connection, so a push from an application thread that races a close is refused with `ErrorKind::Canceled` instead of writing a data frame the peer could fail the connection over. The session's writer and the application's writer on the same socket see the same flag.
 - **`Host` is required for HTTP/1.1** (RFC 9112 §3.2), in both server drivers and before any handler or WebSocket policy runs: a request that two hops could disagree about is refused with `400` rather than routed. Missing, duplicated, or empty `Host` all fail closed; `HTTP/1.0` may omit it.
 - **A transport failure is not a protocol error.** Only a peer protocol violation or an oversized message is answered with a Close frame (`1002`/`1007`/`1009`); a broken socket is reported to the application as `code = None, clean = false` instead of dressing it up as the peer's fault.
@@ -91,11 +92,20 @@ http:
 Then configure the server to match:
 
 ```rust
+use courierust::courierust_server::ws::WsConfig;
+use courierust::courierust_ws::{IpNet, OriginPolicy};
+
+# fn main() {
 let ws = WsConfig {
     origin: OriginPolicy::List(vec!["https://app.example.com".into()]),
-    trusted_proxies: vec![IpNet::parse("127.0.0.1/32")?, IpNet::parse("10.0.0.0/8")?],
+    trusted_proxies: vec![
+        IpNet::parse("127.0.0.1/32").expect("valid CIDR"),
+        IpNet::parse("10.0.0.0/8").expect("valid CIDR"),
+    ],
     ..Default::default()
 };
+# let _ = ws;
+# }
 ```
 
 Two rules that are easy to get wrong:
@@ -107,7 +117,7 @@ Two rules that are easy to get wrong:
 
 - **RFC 8441 (WebSocket over HTTP/2) is not implemented.** The client offers **only** `http/1.1` in ALPN — even when `ClientConfig::http2` is `true` — and refuses a connection that ends up on h2 before reading a frame. On the server side, a WebSocket attempt on an *established* h2 connection is a malformed message and is rejected as a **stream error (`PROTOCOL_ERROR`, RFC 9113 §8.1.1)**, in both forms: RFC 8441's extended CONNECT (`:method = CONNECT` with `:protocol = websocket`, an undefined pseudo-header for this stack — exactly the rejection RFC 8441 §3 describes for a peer that never advertised `SETTINGS_ENABLE_CONNECT_PROTOCOL`) and the HTTP/1.1-style `Upgrade: websocket` / `Connection: Upgrade` fields (connection-specific fields, §8.2.2). The connection and its other streams keep working. What never happens is the two failure modes worth naming: a `200` on a request that could not become a WebSocket, and a connection that looks established and carries no frame. Use HTTP/1.1 for WebSockets, as almost everyone does.
 - **`permessage-deflate` compresses each message independently.** Context takeover is never used by our encoder, which is always legal (a decoder's window is a superset) and removes the class of bugs where one message's plaintext leaks into another. The cost is a bounded ratio loss on streams of tiny repetitive messages — and it is the reason a server can hold thousands of connections without 32 KiB of sliding window each.
-- **`SO_RCVTIMEO` is armed only while idle.** Windows charges for a socket deadline on every blocking operation, including writes: measured, a 256 KiB push loop is ~2× slower with the deadline armed on the sender's socket and ~10× slower with one armed on both ends. Our blocking server therefore arms the deadline only while waiting for the next frame and clears it while a message is being handled (`ping_interval` stays the liveness mechanism). The **client** keeps the deadline from `ClientConfig::read_timeout` for the whole connection, which is the right default for interactive traffic but costs roughly 2× on 256 KiB bulk transfers on Windows — a bulk-transfer client should set `read_timeout: None` and rely on application-level liveness, exactly as the server does. The numbers behind both statements are in [`benches/WS_BENCHMARK.md`](../../benches/WS_BENCHMARK.md).
+- **`SO_RCVTIMEO` is armed only while idle.** Windows charges for a socket deadline on every blocking operation, including writes: measured, a 256 KiB push loop is ~2× slower with the deadline armed on the sender's socket and ~10× slower with one armed on both ends. Our blocking server therefore arms the deadline only while waiting for the next frame and clears it while a message is being handled (`ping_interval` stays the liveness mechanism). The **client** scopes the same deadline the same way: `read_message` arms it around the wait for a frame *header* and clears it while the body streams, so an echo (read then write) never pays it on either half. The residual the design accepts is the one it cannot fix from a blocking socket: a peer that delivers a header and then stalls *inside* a body is bounded by TCP rather than by the socket deadline, which is the posture a server already takes for a body in flight. A bulk receiver can drop even that with `read_timeout: None`. The numbers behind both statements are in [`benches/WS_BENCHMARK.md`](../../benches/WS_BENCHMARK.md).
 - **Do not push from inside a reactor callback.** In the event-driven driver a service call runs on the reactor worker; a loop that pushes thousands of messages from `on_message` blocks the reactor that is supposed to drain the send queue, and the queue's bound eventually closes the connection. The supported pattern for fan-out is `WsConn::sender()` (`WsSender`) from another thread, which queues and nudges.
 - **`Url` parsing is the caller's job for the `ws://`/`wss://` scheme only.** `normalise_url` maps the scheme to `http`/`https` and nothing else; anything exotic is rejected rather than half-understood.
 
@@ -119,6 +129,10 @@ Server:
 use courierust::courierust_server::ws::{WsConn, WsData, WsService, WsUpgradeReply};
 use std::sync::Arc;
 
+# fn main() {
+#     // `App` is what you hand to `Server::serve`.
+#     let _app = App;
+# }
 struct Echo;
 
 impl WsService for Echo {
@@ -138,11 +152,13 @@ impl courierust::courierust_server::Handler for App {
     fn handle(&self, _req: courierust::courierust_http::request::Request<
         courierust::courierust_body::Body>) -> courierust::courierust_http::response::Response<
         courierust::courierust_body::Body> {
-        courierust::courierust_http::response::Response::text("hello")
+        let mut resp = courierust::courierust_http::response::Response::with_status(200.into());
+        resp.body = courierust::courierust_body::Body::from("hello");
+        resp
     }
     fn websocket(&self, req: &courierust::courierust_http::request::Request<
         courierust::courierust_body::Body>) -> WsUpgradeReply {
-        if req.path == "/echo" { WsUpgradeReply::Accept(Arc::new(Echo)) }
+        if req.uri.path() == "/echo" { WsUpgradeReply::Accept(Arc::new(Echo)) }
         else { WsUpgradeReply::Pass }   // let the HTTP handler answer 404
     }
 }
@@ -150,19 +166,29 @@ impl courierust::courierust_server::Handler for App {
 
 Client:
 
-```rust
+```rust,no_run
 use courierust::courierust_client::ClientConfig;
 use courierust::courierust_client::ws::WebSocket;
 
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 let mut ws = WebSocket::connect("wss://example.com/ws", &ClientConfig::default())?;
 ws.send_text("hello")?;
 for msg in [ws.read_message()?] {
     println!("{msg:?}");
 }
 ws.close(1000, "done")?;
+# Ok(())
+# }
 ```
 
-See [`examples/ws_echo.rs`](../../examples/ws_echo.rs) and [`examples/ws_client.rs`](../../examples/ws_client.rs) for runnable versions, and [`tests/ws.rs`](../../tests/ws.rs) for 34 end-to-end tests that exercise the wire protocol against a real socket, including cross-driver push, origin rejection, wss over TLS, and the error codes.
+See [`examples/ws_echo.rs`](../../examples/ws_echo.rs) and [`examples/ws_client.rs`](../../examples/ws_client.rs) for runnable versions, and [`tests/ws.rs`](../../tests/ws.rs) for 37 end-to-end tests that exercise the wire protocol against a real socket, including cross-driver push, origin rejection, wss over TLS, and the error codes.
+
+## Conformance evidence
+
+- **In-repo suite**: [`tests/ws_conformance.rs`](../../tests/ws_conformance.rs) — the RFC 6455 / RFC 7692 rules a peer can violate, in the shape of the Autobahn suite (framing, fragmentation, control frames, payload, limits, the closing handshake), each asserting the close code §7.4 prescribes, over a real socket.
+- **Third-party suite**: `.\scripts\autobahn_ws.ps1` starts [`examples/ws_autobahn.rs`](../../examples/ws_autobahn.rs) and runs the official `crossbario/autobahn-testsuite` against it. The evidence is Autobahn's own `index.json`; this repository does not summarise it.
+- **Interop**: `benches/src/ws.rs` crosses this implementation with `tungstenite` in both directions and reports the numbers, and the WS benchmark suite runs in CI.
+- **Fuzzing**: `fuzz/fuzz_targets/ws_frame.rs`, `ws_handshake.rs` and `ws_session.rs` cover the codec, the handshake policy and the session state machine — the last one including the RFC 7692 inflate path at both a full and an 8-bit window.
 
 ## Where to go next
 

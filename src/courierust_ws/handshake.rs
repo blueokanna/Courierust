@@ -121,35 +121,87 @@ pub struct IpNet {
 }
 
 impl IpNet {
-    /// Parse `addr`, `addr/len` or a bare address (host route).
-    pub fn parse(s: &str) -> Option<Self> {
-        let (addr, prefix) = match s.split_once('/') {
-            Some((a, p)) => (a.trim(), Some(p.trim().parse::<u8>().ok()?)),
-            None => (s.trim(), None),
-        };
-        let addr: IpAddr = addr.parse().ok()?;
-        let max = if addr.is_ipv4() { 32 } else { 128 };
-        // A bare address is a host route, so its prefix length follows the
-        // address family. Defaulting it to /32 would turn `::1` into a
-        // network that also contains every `::x`, including the IPv4-
-        // mapped addresses a dual-stack listener reports — and a trusted
-        // proxy match is what makes the forwarded headers believed.
-        let prefix = prefix.unwrap_or(max);
-        if prefix > max {
+    /// Build a network from an address and a prefix length.
+    ///
+    /// Returns `None` when `prefix` exceeds what the address family
+    /// admits (32 for IPv4, 128 for IPv6): a `/64` on an IPv4 address or
+    /// a `/255` typo is a configuration error, never a silently
+    /// different network. The stored address is truncated to the prefix,
+    /// so two spellings of one network (`10.1.2.3/8` and `10.0.0.0/8`)
+    /// compare equal and `contains` cannot depend on host bits typed in
+    /// by accident.
+    pub fn new(addr: IpAddr, prefix: u8) -> Option<Self> {
+        if prefix > Self::max_prefix(addr) {
             return None;
         }
-        Some(Self { addr, prefix })
+        let mut net = Self { addr, prefix };
+        net.truncate_to_prefix();
+        Some(net)
     }
 
-    /// A single-host network.
+    /// Parse `addr`, `addr/len` or a bare address.
+    ///
+    /// A bare address is a **host route**: `/32` for IPv4 and `/128` for
+    /// IPv6. Getting the IPv6 length wrong here is a security defect
+    /// rather than a cosmetic one — a `/32` on a global-unicast address
+    /// spans 2^96 addresses, so every one of them would be believed when
+    /// it sent `X-Forwarded-For`, `X-Forwarded-Host` or
+    /// `X-Forwarded-Proto`, which is exactly the material the client
+    /// identity, the HTTPS determination and the `Origin` check are made
+    /// of.
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        let (addr_text, prefix) = match s.split_once('/') {
+            Some((addr, prefix)) => (addr.trim(), Some(prefix.trim().parse::<u8>().ok()?)),
+            None => (s, None),
+        };
+        let addr: IpAddr = addr_text.parse().ok()?;
+        Self::new(addr, prefix.unwrap_or_else(|| Self::max_prefix(addr)))
+    }
+
+    /// A single-host network (`/32` for IPv4, `/128` for IPv6).
     pub fn host(addr: IpAddr) -> Self {
         Self {
             addr,
-            prefix: if addr.is_ipv4() { 32 } else { 128 },
+            prefix: Self::max_prefix(addr),
         }
     }
 
-    /// Whether `ip` falls inside the network.
+    /// The longest prefix the address family admits.
+    #[inline]
+    pub fn max_prefix(addr: IpAddr) -> u8 {
+        match addr {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        }
+    }
+
+    /// Zero every host bit so the stored form is canonical.
+    fn truncate_to_prefix(&mut self) {
+        self.addr = match self.addr {
+            IpAddr::V4(a) => {
+                let bits = self.prefix.min(32);
+                let mask = if bits == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - bits)
+                };
+                IpAddr::V4((u32::from(a) & mask).into())
+            }
+            IpAddr::V6(a) => {
+                let bits = self.prefix.min(128);
+                let mask = if bits == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - bits)
+                };
+                IpAddr::V6((u128::from(a) & mask).into())
+            }
+        };
+    }
+
+    /// Whether `ip` falls inside the network. A different address family
+    /// never matches: an IPv4 network cannot contain an IPv6 address.
     pub fn contains(&self, ip: IpAddr) -> bool {
         match (self.addr, ip) {
             (IpAddr::V4(net), IpAddr::V4(ip)) => {
@@ -190,21 +242,7 @@ pub fn client_ip(peer: IpAddr, headers: &HeaderMap, trusted: &[IpNet]) -> IpAddr
     }
     if let Some(v) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
         for part in v.split(',').rev() {
-            let token = part.trim();
-            if token.is_empty() {
-                continue;
-            }
-            let cleaned = token
-                .trim_start_matches('[')
-                .split_once(']')
-                .map(|(host, _)| host)
-                .unwrap_or(token);
-            let cleaned = if cleaned.contains(':') && cleaned.matches(':').count() == 1 {
-                cleaned.split(':').next().unwrap_or(cleaned)
-            } else {
-                cleaned
-            };
-            if let Ok(ip) = cleaned.parse::<IpAddr>() {
+            if let Some(ip) = parse_forwarded_ip(part) {
                 if !is_trusted_proxy(ip, trusted) {
                     return ip;
                 }
@@ -212,11 +250,45 @@ pub fn client_ip(peer: IpAddr, headers: &HeaderMap, trusted: &[IpNet]) -> IpAddr
         }
     }
     if let Some(v) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        if let Ok(ip) = v.trim().parse::<IpAddr>() {
+        if let Some(ip) = parse_forwarded_ip(v) {
             return ip;
         }
     }
     peer
+}
+
+/// Resolve one forwarded-address token to an address.
+///
+/// Real deployments write a bare address, but proxies in the wild also
+/// emit `1.2.3.4:5678` and `[2001:db8::1]:443`. Rejecting those would
+/// silently drop a hop, and dropping a hop means the policy is applied to
+/// the *proxy's* address instead of the client's — the failure mode is
+/// permissive, not conservative, so both forms are accepted. Anything
+/// that is not an address (including a DNS name, which `X-Forwarded-For`
+/// must never carry here) yields `None` and the caller keeps walking the
+/// chain towards the left.
+fn parse_forwarded_ip(token: &str) -> Option<IpAddr> {
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    let host = match token.strip_prefix('[') {
+        // `[v6]:port` — the bracketed literal is the address.
+        Some(rest) => rest.split_once(']')?.0,
+        None => match token.split_once(':') {
+            // A single colon with a numeric tail is unambiguously a port:
+            // a bare IPv6 literal always has at least two colons.
+            Some((host, port))
+                if !host.contains(':')
+                    && !port.is_empty()
+                    && port.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                host
+            }
+            _ => token,
+        },
+    };
+    host.parse::<IpAddr>().ok()
 }
 
 /// The `Host` the client actually addressed.
@@ -592,9 +664,19 @@ pub struct PmDeflatePolicy {
     pub max_server_window_bits: u8,
     /// Largest window the server will let the client's compressor use.
     pub max_client_window_bits: u8,
-    /// Whether the server wants `no_context_takeover` on both directions
-    /// (lower memory, slightly worse ratio).
+    /// Whether the server *requires* `no_context_takeover` from the
+    /// client as well (lower memory for us, slightly worse ratio for it).
     pub prefer_no_context_takeover: bool,
+    /// Advertise `server_no_context_takeover`, because this encoder does
+    /// not retain context.
+    ///
+    /// True by default, and it is the *truthful* answer: the compressor
+    /// in this crate resets its match state on every message by
+    /// construction, so announcing the parameter costs nothing and lets
+    /// the peer drop its inflate history between messages — a 32 KiB
+    /// saving per connection on the peer, with byte-identical output.
+    /// Only a peer that mis-parses the parameter would want this off.
+    pub advertise_no_context_takeover: bool,
 }
 
 impl Default for PmDeflatePolicy {
@@ -604,6 +686,7 @@ impl Default for PmDeflatePolicy {
             max_server_window_bits: 15,
             max_client_window_bits: 15,
             prefer_no_context_takeover: false,
+            advertise_no_context_takeover: true,
         }
     }
 }
@@ -675,8 +758,14 @@ impl PerMessageDeflate {
             // Without the parameter the client's window is fixed at 15.
             selected.client_max_window_bits = 15;
         }
-        selected.server_no_context_takeover =
-            offer.has_param("server_no_context_takeover") || policy.prefer_no_context_takeover;
+        // `server_no_context_takeover` describes *our* compressor, and
+        // ours is stateless by construction, so it is announced whenever
+        // the policy allows the truth to be told. `client_no_context_takeover`
+        // is a demand on the peer's compressor, which our inflater can
+        // handle either way, so it stays opt-in.
+        selected.server_no_context_takeover = offer.has_param("server_no_context_takeover")
+            || policy.prefer_no_context_takeover
+            || policy.advertise_no_context_takeover;
         selected.client_no_context_takeover =
             offer.has_param("client_no_context_takeover") || policy.prefer_no_context_takeover;
         Some(selected)
@@ -803,16 +892,32 @@ impl PerMessageDeflate {
 }
 
 /// Role-independent compression settings handed to a session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompressionParams {
-    /// Window bits of *our* compressor.
+    /// Window bits of *our* compressor (8..=15).
     pub send_window_bits: u8,
     /// We must not retain compression state across messages.
     pub send_no_context_takeover: bool,
-    /// Window bits the peer's compressor promised.
+    /// Window bits the peer's compressor promised (8..=15).
     pub recv_window_bits: u8,
     /// The peer must not retain compression state across messages.
     pub recv_no_context_takeover: bool,
+}
+
+impl Default for CompressionParams {
+    /// A 15-bit window in both directions with no forced takeover rule —
+    /// the same shape [`PerMessageDeflate::default`] produces. A derived
+    /// `Default` would hand out `0`, which is not a window: the inflater
+    /// clamps it up to 8 while the encoder would be told to emit
+    /// references a peer with a 512-byte window cannot resolve.
+    fn default() -> Self {
+        Self {
+            send_window_bits: 15,
+            send_no_context_takeover: false,
+            recv_window_bits: 15,
+            recv_no_context_takeover: false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1335,12 +1440,45 @@ mod tests {
         let v6 = IpNet::parse("2001:db8::/32").unwrap();
         assert!(v6.contains("2001:db8:1234::1".parse().unwrap()));
         assert!(!v6.contains("2001:db9::1".parse().unwrap()));
-        // A bare address is a host route.
+
+        // A bare address is a host route in *both* families.
         let host = IpNet::parse("127.0.0.1").unwrap();
+        assert_eq!(host.prefix, 32);
         assert!(host.contains("127.0.0.1".parse().unwrap()));
         assert!(!host.contains("127.0.0.2".parse().unwrap()));
+        let host6 = IpNet::parse("2001:db8::1").unwrap();
+        assert_eq!(host6.prefix, 128);
+        assert!(host6.contains("2001:db8::1".parse().unwrap()));
+        assert!(!host6.contains("2001:db8::2".parse().unwrap()));
+        assert_eq!(IpNet::host("::1".parse().unwrap()).prefix, 128);
+        assert_eq!(IpNet::host("127.0.0.1".parse().unwrap()).prefix, 32);
+
+        // Out-of-range lengths are refused, never reinterpreted as some
+        // other network.
         assert!(IpNet::parse("10.0.0.0/33").is_none());
+        assert!(IpNet::parse("10.0.0.1/255").is_none());
+        assert!(IpNet::parse("2001:db8::/129").is_none());
+        assert!(IpNet::parse("10.0.0.0/x").is_none());
         assert!(IpNet::parse("not-an-ip").is_none());
+        assert!(IpNet::new("10.0.0.0".parse().unwrap(), 33).is_none());
+
+        // Host bits are truncated, so two spellings of one network are
+        // the same network.
+        assert_eq!(
+            IpNet::parse("10.1.2.3/8").unwrap(),
+            IpNet::parse("10.0.0.0/8").unwrap()
+        );
+        assert_eq!(
+            IpNet::parse("2001:db8:1234::1/32").unwrap(),
+            IpNet::parse("2001:db8::/32").unwrap()
+        );
+
+        // A `/0` covers its own family and nothing else: the v4/v6
+        // boundary must not leak in either direction.
+        assert!(IpNet::parse("0.0.0.0/0")
+            .unwrap()
+            .contains("255.255.255.255".parse().unwrap()));
+
         // A bare IPv6 address is a host route too: defaulting it to /32
         // (the IPv4 width) would make `::1` match `::2` and every
         // IPv4-mapped address, and a trusted-proxy match is what makes the
@@ -1356,6 +1494,76 @@ mod tests {
         assert!(!IpNet::parse("0.0.0.0/0")
             .unwrap()
             .contains("::1".parse().unwrap()));
+        assert!(!IpNet::parse("::/0")
+            .unwrap()
+            .contains("127.0.0.1".parse().unwrap()));
+    }
+
+    /// The regression that matters: a bare IPv6 proxy address is a
+    /// **/128**, not a /32. With /32 the trusted set spans 2^96 addresses,
+    /// so any host inside that prefix could forge `X-Forwarded-For`,
+    /// `X-Forwarded-Host` and `X-Forwarded-Proto` — the three inputs to
+    /// the client identity, the HTTPS determination and the `Origin`
+    /// check.
+    #[test]
+    fn a_bare_ipv6_proxy_is_a_host_route_not_a_slash32() {
+        let trusted: Vec<IpNet> = vec![IpNet::parse("2001:db8::1").unwrap()];
+        let peer: IpAddr = "2001:db8::1".parse().unwrap();
+        assert!(is_trusted_proxy(peer, &trusted));
+        let impostor: IpAddr = "2001:db8:ffff::9".parse().unwrap();
+        assert!(!is_trusted_proxy(impostor, &trusted));
+
+        let mut headers = HeaderMap::new();
+        headers.append(
+            HeaderName::from_lowercase("x-forwarded-for"),
+            HeaderValue::from_static("203.0.113.7"),
+        );
+        headers.append(
+            HeaderName::from_lowercase("x-forwarded-proto"),
+            HeaderValue::from_static("https"),
+        );
+
+        // The impostor is not a proxy, so its headers are ignored and the
+        // peer address stands: it cannot claim another identity and it
+        // cannot claim TLS.
+        assert_eq!(client_ip(impostor, &headers, &trusted), impostor);
+        assert!(!is_secure(false, &headers, impostor, &trusted));
+
+        // The real proxy's headers are honoured.
+        assert_eq!(
+            client_ip(peer, &headers, &trusted),
+            "203.0.113.7".parse::<IpAddr>().unwrap()
+        );
+        assert!(is_secure(false, &headers, peer, &trusted));
+    }
+
+    /// `X-Forwarded-For` is written by proxies that disagree about port
+    /// syntax, and both forms have to resolve: *dropping* a hop is a
+    /// permissive failure, because the policy then runs against the
+    /// proxy's own address instead of the client's.
+    #[test]
+    fn forwarded_addresses_tolerate_the_forms_proxies_emit() {
+        for (input, expected) in [
+            ("203.0.113.7", "203.0.113.7"),
+            (" 203.0.113.7 ", "203.0.113.7"),
+            ("203.0.113.7:5678", "203.0.113.7"),
+            ("[2001:db8::1]:443", "2001:db8::1"),
+            ("2001:db8::1", "2001:db8::1"),
+            ("::1", "::1"),
+            // A mapped address is a real address, not a `host:port`.
+            ("::ffff:203.0.113.7", "::ffff:203.0.113.7"),
+        ] {
+            assert_eq!(
+                parse_forwarded_ip(input),
+                Some(expected.parse().unwrap()),
+                "{input:?}"
+            );
+        }
+        // Junk is skipped rather than guessed at: a name must never be
+        // accepted where an address is required.
+        for bad in ["", "   ", "unknown", "example.com", "1.2.3.4:abc", "[]"] {
+            assert_eq!(parse_forwarded_ip(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

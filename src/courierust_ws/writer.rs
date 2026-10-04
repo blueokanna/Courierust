@@ -391,6 +391,68 @@ impl<S: FrameSink> FrameWriter<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::courierust_deflate::Inflater;
+
+    /// RFC 7692 §7.1.2.1: `*_max_window_bits` is a promise the *encoder*
+    /// makes and the decoder enforces. A compressor that ignores it emits
+    /// a back-reference the peer cannot resolve — a decode failure, not a
+    /// ratio regression.
+    ///
+    /// The fixture is engineered so the only match worth taking is 4512
+    /// bytes back. With a 15-bit window the encoder must take it, and the
+    /// 9-bit inflater must then reject the stream (that is what makes the
+    /// cap load-bearing); with a 9-bit window the encoder must refuse and
+    /// fall back to an uncompressed frame.
+    #[test]
+    fn the_negotiated_window_is_a_promise_the_encoder_keeps() {
+        fn pseudo_random(len: usize, seed: u32) -> Vec<u8> {
+            let mut state = seed | 1;
+            (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    (state >> 24) as u8
+                })
+                .collect()
+        }
+
+        let head = pseudo_random(512, 0x1234_5678);
+        let filler = pseudo_random(4000, 0x9e37_79b9);
+        let mut data = head.clone();
+        data.extend_from_slice(&filler);
+        data.extend_from_slice(&head);
+        assert_eq!(data.len(), 5024);
+
+        let send = |bits: u8| {
+            let params = CompressionParams {
+                send_window_bits: bits,
+                send_no_context_takeover: true,
+                recv_window_bits: bits,
+                recv_no_context_takeover: true,
+            };
+            let mut w = FrameWriter::new(VecSink::new(), MaskSource::None, Some(params));
+            w.send_binary(&data).unwrap();
+            let bytes = w.sink().bytes.clone();
+            let header = FrameHeader::parse(&bytes).unwrap().unwrap();
+            (header.rsv1, bytes[header.header_len..].to_vec())
+        };
+
+        let (wide_rsv1, wide_body) = send(15);
+        assert!(wide_rsv1, "the far match must be worth taking");
+        assert!(
+            Inflater::new(9)
+                .inflate_message(&wide_body, &mut Vec::new(), 1 << 20)
+                .is_err(),
+            "a 9-bit window must not resolve a 4512-byte reference"
+        );
+
+        let (narrow_rsv1, _) = send(9);
+        assert!(
+            !narrow_rsv1,
+            "an unresolvable reference must not be emitted: the message goes out uncompressed"
+        );
+    }
 
     #[test]
     fn server_frames_carry_no_mask() {

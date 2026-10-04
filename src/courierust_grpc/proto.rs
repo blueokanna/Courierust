@@ -64,27 +64,30 @@ pub fn write_varint(out: &mut Vec<u8>, mut value: u64) {
 }
 
 /// Read a base-128 varint, rejecting over-long encodings and overflow.
+/// Read a base-128 varint.
+///
+/// A `u64` varint is at most ten bytes, and the tenth may carry only its
+/// lowest bit (protobuf's 64-bit bound); anything longer, or a tenth byte
+/// with higher bits set, is rejected instead of being shifted into
+/// oblivion — a silently truncated value is how two decoders end up
+/// disagreeing about the same message.
 pub fn read_varint(buf: &mut &[u8]) -> Result<u64> {
     let mut value: u64 = 0;
-    let mut shift = 0u32;
-    loop {
+    for index in 0..10 {
         let byte = *buf
             .first()
             .ok_or_else(|| Error::protocol("truncated protobuf varint"))?;
         *buf = &buf[1..];
-        if shift >= 64 {
+        let chunk = u64::from(byte & 0x7f);
+        if index == 9 && chunk > 1 {
             return Err(Error::protocol("protobuf varint overflow"));
         }
-        value |= u64::from(byte & 0x7f) << shift;
+        value |= chunk << (index * 7);
         if byte & 0x80 == 0 {
-            break;
-        }
-        shift += 7;
-        if shift >= 64 && byte & 0x80 != 0 {
-            return Err(Error::protocol("protobuf varint too long"));
+            return Ok(value);
         }
     }
-    Ok(value)
+    Err(Error::protocol("protobuf varint too long"))
 }
 
 /// Encode a `field_number` + `wire_type` tag.
@@ -536,6 +539,29 @@ pub fn fixed32_to_u32(value: u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 64-bit bound is exact: ten bytes at most, and a tenth byte may
+    /// only carry bit 0. The old decoder shifted the excess bits away and
+    /// accepted the value, which is a decoder differential.
+    #[test]
+    fn varint_bounds_are_exact() {
+        let mut max = &[0xffu8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01][..];
+        assert_eq!(read_varint(&mut max).unwrap(), u64::MAX);
+
+        let mut wide = &[0x80u8, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02][..];
+        assert!(read_varint(&mut wide).is_err(), "tenth byte above 1");
+
+        let mut overlong = &[0x80u8; 11][..];
+        assert!(read_varint(&mut overlong).is_err(), "eleventh byte");
+
+        let mut truncated = &[0x80u8][..];
+        assert!(read_varint(&mut truncated).is_err());
+
+        // Non-minimal encodings stay legal (protobuf does not require the
+        // shortest form), and zero must not fall out of the loop early.
+        let mut padded = &[0x80u8, 0x00][..];
+        assert_eq!(read_varint(&mut padded).unwrap(), 0);
+    }
 
     #[test]
     fn varint_round_trip_all_widths() {

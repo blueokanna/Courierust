@@ -24,18 +24,26 @@
 
 ## 用法
 
-```rust
+```rust,no_run
+use courierust::courierust_bytes::Bytes;
 use courierust::courierust_grpc::{GrpcClient, GrpcServer};
 
-// 服务端：实现 Service，或直接传闭包
-let server = GrpcServer::bind("127.0.0.1:50051", |method: &str, req: Bytes| {
-    Ok(Bytes::from(format!("echo({method}): {}", String::from_utf8_lossy(&req))))
-})?;
-let _h = server.serve_background()?;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+// 服务端：实现 `Service`，或直接传闭包
+let server = GrpcServer::bind(
+    "127.0.0.1:50051",
+    |method: &str, req: Bytes| -> courierust::Result<Bytes> {
+        Ok(Bytes::from(format!("echo({method}): {}", String::from_utf8_lossy(&req))))
+    },
+)?;
+let _handle = server.serve_background()?;
 
 // 客户端
 let client = GrpcClient::new("http://127.0.0.1:50051")?;
 let reply = client.call("helloworld.Greeter/SayHello", Bytes::from("world"))?;
+println!("{}", String::from_utf8_lossy(&reply));
+# Ok(())
+# }
 ```
 
 `examples/grpc_streaming.rs` 演示四种调用形态、deadline、gzip 协商、元数据与拦截器；`examples/grpc_health.rs` 演示 `Check` + `Watch`。

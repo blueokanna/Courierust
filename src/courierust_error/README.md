@@ -22,12 +22,15 @@ Protocol layers refine the coarse kind with a message (`Error::protocol("invalid
 ## Usage
 
 ```rust
-use courierust::courierust_error::{Error, ErrorKind, Result};
+use courierust::courierust_error::{Error, ErrorKind};
 
+# fn main() {
+let err = Error::protocol("the peer sent a malformed request line");
 match err.kind {
-    ErrorKind::WouldBlock => /* not ready yet, try again */,
-    ErrorKind::Protocol => /* peer violated the RFC */,
-    ErrorKind::H2(code) => /* HTTP/2 error code survived intact */,
-    _ => /* log err.message */,
+    ErrorKind::WouldBlock => { /* not ready yet, try again */ }
+    ErrorKind::Protocol => { /* peer violated the RFC */ }
+    ErrorKind::H2(code) => { /* HTTP/2 error code survived intact */ let _ = code; }
+    _ => { /* log err.message */ }
 }
+# }
 ```

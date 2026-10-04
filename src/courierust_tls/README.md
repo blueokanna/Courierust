@@ -38,12 +38,15 @@ Boundaries, stated rather than implied: TLS 1.2 with `client_auth` is refused at
 
 ## Usage
 
-```rust
+```rust,no_run
 use courierust::courierust_tls::{Identity, RootStore};
 
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 let mut roots = RootStore::new();
-roots.add_der(root_der);            // no bundled CAs — supply your own
-roots.add_pem(ca_bundle_pem)?;      // …or a PEM bundle (text between blocks is ignored)
+let root_der: Vec<u8> = std::fs::read("root.der")?; // no bundled CAs — supply your own
+roots.add_der(root_der);
+let ca_bundle_pem = std::fs::read_to_string("ca.pem")?; // …or a PEM bundle
+roots.add_pem(&ca_bundle_pem).map_err(|e| e.to_string())?;
 
 // `from_pem_file` parses the chain and the key and proves they belong
 // together; `Identity::from_pem(cert, key)` and
@@ -53,7 +56,10 @@ roots.add_pem(ca_bundle_pem)?;      // …or a PEM bundle (text between blocks i
 // not the label. `ENCRYPTED PRIVATE KEY` is refused by name, and a key
 // that does not match the leaf certificate is refused at load time
 // instead of failing every handshake.
-let identity = Identity::from_pem_file("cert.pem", "key.pem")?;
+let identity = Identity::from_pem_file("cert.pem", "key.pem").map_err(|e| e.to_string())?;
+# let _ = identity;
+# Ok(())
+# }
 ```
 
 `Identity` is also where a private key stops travelling: its `Debug`

@@ -58,6 +58,7 @@ pub mod compress;
 pub mod generated;
 pub mod health;
 pub mod proto;
+pub mod reflection;
 pub mod status;
 
 use crate::courierust_body::Body;
@@ -478,7 +479,7 @@ impl MessageStream {
 
     /// Response trailers (populated once the body ends).
     pub fn trailers(&self) -> Option<HeaderMap> {
-        self.trailers.lock().unwrap().clone()
+        crate::lock(&self.trailers).clone()
     }
 
     /// Pull the next raw message payload, blocking until it is available
@@ -538,7 +539,7 @@ impl MessageStream {
     }
 
     fn finish(&self) -> Result<()> {
-        let trailers = self.trailers.lock().unwrap();
+        let trailers = crate::lock(&self.trailers);
         let code = trailers
             .as_ref()
             .and_then(|t| t.get("grpc-status"))
@@ -581,7 +582,14 @@ fn read_frame_header(buf: &[u8], max: usize) -> Result<(bool, usize)> {
     if buf.len() < 5 {
         return Err(Error::protocol("truncated gRPC frame header"));
     }
-    let compressed = buf[0] != 0;
+    // `Compressed-Flag` is 0 or 1; the spec makes anything else a protocol
+    // error, and "2 means compressed" is exactly the kind of guess a
+    // stricter peer would not make.
+    let compressed = match buf[0] {
+        0 => false,
+        1 => true,
+        _ => return Err(Error::protocol("invalid gRPC compressed flag")),
+    };
     let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
     if len > max {
         return Err(Error::overflow("gRPC message too large"));
@@ -1183,4 +1191,28 @@ pub fn grpc_error_response(code: u32, message: &str) -> Response<Body> {
     );
     resp.body = Body::Empty;
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Compressed-Flag` is 0 or 1; a peer that sends anything else is
+    /// malformed rather than "compressed", and the length cap must hold
+    /// before a single byte is allocated for the payload.
+    #[test]
+    fn frame_header_bounds_and_flag() {
+        assert!(matches!(
+            read_frame_header(&[0, 0, 0, 0, 4], 16),
+            Ok((false, 4))
+        ));
+        assert!(matches!(
+            read_frame_header(&[1, 0, 0, 0, 4], 16),
+            Ok((true, 4))
+        ));
+        assert!(read_frame_header(&[2, 0, 0, 0, 4], 16).is_err());
+        assert!(read_frame_header(&[0xff, 0, 0, 0, 4], 16).is_err());
+        assert!(read_frame_header(&[0, 0, 0, 0, 17], 16).is_err());
+        assert!(read_frame_header(&[0, 0, 0, 0], 16).is_err());
+    }
 }

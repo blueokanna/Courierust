@@ -18,9 +18,9 @@
 //!   on a protocol switch is a framing ambiguity, and a client that
 //!   tolerates it is a desynchronised proxy's best friend.
 //! * The `Sec-WebSocket-Protocol` the server selects must be one this
-//!   client offered, and so must be every `Sec-WebSocket-Extensions`
-//!   element — validated against the bytes this client actually sent, not
-//!   against a constant ([`PerMessageDeflate::from_response`]).
+//!   client offered; `Sec-WebSocket-Extensions` parameters must be ones
+//!   it offered, with window sizes no larger than requested
+//!   ([`PerMessageDeflate::from_response`]).
 //!
 //! ```no_run
 //! # #[cfg(feature = "std")]
@@ -52,23 +52,23 @@ use crate::courierust_net as net;
 use crate::courierust_net::ConnStream;
 use crate::courierust_ws::frame::SharedSink;
 use crate::courierust_ws::handshake::{
-    accept_key, generate_key, header_has_token, is_token, parse_extension_value, parse_extensions,
-    ExtensionOffer, PerMessageDeflate, PmDeflatePolicy,
+    accept_key, generate_key, header_has_token, parse_extensions, PerMessageDeflate,
+    PmDeflatePolicy,
 };
 use crate::courierust_ws::session::{MaskSource, Role, Session, SessionConfig, Stats};
 use crate::courierust_ws::writer::FrameWriter;
 use crate::courierust_ws::Event;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// The extension this client drives, in the exact wire form it is
-/// offered in.
+/// The one extension this client offers, in the exact wire form that is
+/// sent **and** used to validate the response.
+///
+/// One constant for both directions is deliberate: a hand-written second
+/// copy of "what we offered" is how a client ends up accepting a
+/// parameter it never offered (or rejecting one it did).
 const PM_DEFLATE_OFFER: &str = "permessage-deflate; client_max_window_bits";
-
-/// How many `1xx` responses may precede the switch before the handshake
-/// is abandoned (a peer that never stops sending them must not stall it).
-const MAX_INFORMATIONAL: usize = 5;
 
 /// Client-side WebSocket options.
 #[derive(Debug, Clone)]
@@ -174,6 +174,17 @@ pub struct WebSocket {
     stream: Arc<ConnStream>,
     info: WsClientInfo,
     close_timeout: Duration,
+    /// Liveness deadline for the **wait for a frame**.
+    ///
+    /// `ClientConfig::read_timeout` is deliberately not left armed on the
+    /// socket for the life of the connection: on Windows `SO_RCVTIMEO` is
+    /// charged on every blocking operation, so a 256 KiB message received
+    /// with it armed runs about twice as slow, and every write on the
+    /// socket pays it too. It is armed around the wait for a frame header
+    /// and cleared while the body streams — the shape the server's
+    /// blocking driver already uses. A `Cell` keeps
+    /// [`WebSocket::set_read_timeout`] taking `&self`, as it always has.
+    read_timeout: std::cell::Cell<Option<Duration>>,
 }
 
 impl WebSocket {
@@ -190,7 +201,6 @@ impl WebSocket {
     ) -> Result<Self> {
         let (secure, http_url) = normalise_url(url)?;
         let parsed = Url::parse(&http_url)?;
-        crate::courierust_client::reject_url_credentials(&parsed)?;
         let host = parsed.host.clone();
         let port = parsed.port;
         let (addr, stream) = connect_to(&host, port, cfg)?;
@@ -200,10 +210,6 @@ impl WebSocket {
                 Error::protocol("ws: a wss:// URL requires ClientConfig::tls to be configured")
             })?;
             net::configure(&stream, cfg.handshake_timeout)?;
-            // Offer only HTTP/1.1: RFC 8441 WebSocket-over-HTTP/2 is a
-            // different handshake, and silently negotiating h2 here would
-            // produce a connection that looks established and never
-            // carries a frame.
             let mut settings = tls.clone();
             settings.alpn = vec![b"http/1.1".to_vec()];
             let connector = crate::courierust_tls::TlsConnector::new(
@@ -222,6 +228,9 @@ impl WebSocket {
             net::configure(&stream, cfg.read_timeout)?;
             ConnStream::plain(stream)
         };
+        // The handshake read is a deadline: a peer that stops answering
+        // must surface as `Timeout`, not as the `WouldBlock` a POSIX poll
+        // timeout produces.
         let _ = conn.set_deadline(cfg.read_timeout);
         let stream = Arc::new(conn);
 
@@ -232,17 +241,20 @@ impl WebSocket {
         let mut scratch = Scratch::new();
 
         let mut headers = HeaderMap::with_capacity(8 + opts.protocols.len());
-        // An IPv6 literal keeps its brackets (RFC 3986 §3.2.2); `Url`
-        // strips them from the host.
-        let literal = if host.contains(':') {
-            alloc::format!("[{host}]")
-        } else {
-            host.clone()
-        };
-        let host_header = if (secure && port == 443) || (!secure && port == 80) {
-            literal
-        } else {
-            alloc::format!("{literal}:{port}")
+        let host_header = {
+            // An IPv6 literal must keep its brackets in `Host` (RFC 3986
+            // §3.2.2, RFC 9112 §3.2): `Host: ::1:9001` is not a valid
+            // authority, and the peer cannot tell where the port starts.
+            let authority = if host.contains(':') {
+                alloc::format!("[{host}]")
+            } else {
+                host.clone()
+            };
+            if (secure && port == 443) || (!secure && port == 80) {
+                authority
+            } else {
+                alloc::format!("{authority}:{port}")
+            }
         };
         push(&mut headers, "host", &host_header)?;
         push(&mut headers, "upgrade", "websocket")?;
@@ -250,30 +262,14 @@ impl WebSocket {
         push(&mut headers, "sec-websocket-key", &key)?;
         push(&mut headers, "sec-websocket-version", "13")?;
         if !opts.protocols.is_empty() {
-            for p in &opts.protocols {
-                if !is_token(p) {
-                    return Err(Error::protocol("ws: subprotocol is not a token"));
-                }
-            }
             push(
                 &mut headers,
                 "sec-websocket-protocol",
                 &opts.protocols.join(", "),
             )?;
         }
-        // What actually goes on the wire: the offer above plus any the
-        // caller added. The response is validated against *this*, never
-        // against a constant (RFC 6455 §4.1: an extension that was not
-        // offered fails the connection).
-        let mut offered: Vec<ExtensionOffer> = Vec::new();
         if opts.compression {
-            offered.extend(parse_extension_value(PM_DEFLATE_OFFER)?);
             push(&mut headers, "sec-websocket-extensions", PM_DEFLATE_OFFER)?;
-        }
-        for (name, value) in &opts.headers {
-            if name.eq_ignore_ascii_case("sec-websocket-extensions") {
-                offered.extend(parse_extension_value(value)?);
-            }
         }
         if let Some(origin) = &opts.origin {
             push(&mut headers, "origin", origin)?;
@@ -281,22 +277,18 @@ impl WebSocket {
         for (name, value) in &opts.headers {
             push(&mut headers, name, value)?;
         }
-        // The client's default fields belong on this request too: it is a
-        // request from the same client to the authority the URL names, and
-        // a handshake that silently drops a tracing header — or an
-        // authorization the caller configured once — is the inconsistency
-        // `default_headers` exists to remove. The handshake's own fields
-        // (host, upgrade, connection, sec-websocket-*) are already set
-        // above, so a default can never displace them, and a field passed
-        // through `WsOptions` wins as it does on the HTTP path.
-        for (name, value) in cfg.default_headers.iter() {
-            if !headers.contains_key(name.as_str()) {
-                headers.append(name.clone(), value.clone());
-            }
-        }
         if !headers.contains_key("user-agent") {
             if let Some(ua) = &cfg.user_agent {
                 push(&mut headers, "user-agent", ua)?;
+            }
+        }
+        // A WebSocket handshake is a request from the same client, so the
+        // configured defaults travel with it — but never at the expense of
+        // a field the handshake itself defines (host, upgrade, connection,
+        // sec-websocket-*).
+        for (name, value) in cfg.default_headers.iter() {
+            if !headers.contains_key(name.as_str()) {
+                headers.insert(name.clone(), value.clone());
             }
         }
 
@@ -312,7 +304,7 @@ impl WebSocket {
         writer.flush()?;
 
         // ---- response -------------------------------------------------
-        let (status, response_headers) = read_response_head(&mut reader, &mut scratch)?;
+        let (status, _version, response_headers) = read_response_head(&mut reader, &mut scratch)?;
         validate_response(status, &response_headers, &key)?;
 
         let protocol = response_headers
@@ -331,24 +323,36 @@ impl WebSocket {
         }
 
         let mut compression = None;
-        for (i, ext) in parse_extensions(&response_headers)?.iter().enumerate() {
-            let offer = offered.iter().find(|o| o.name == ext.name).ok_or_else(|| {
-                Error::protocol("ws: the server selected an extension that was not offered")
-            })?;
-            if i > 0 {
+        if response_headers.get("sec-websocket-extensions").is_some() {
+            // Validate against the offer this client actually sent: with
+            // compression disabled nothing was offered, so any extension
+            // in the response fails the connection (RFC 6455 §4.1).
+            let mut offered = if opts.compression {
+                crate::courierust_ws::handshake::parse_extension_value(PM_DEFLATE_OFFER)?
+            } else {
+                Vec::new()
+            };
+            let offers = parse_extensions(&response_headers)?;
+            if offers.len() > 1 {
                 return Err(Error::protocol(
                     "ws: the server selected more than one extension",
                 ));
             }
-            compression = Some(PerMessageDeflate::from_response(
-                offer,
-                ext,
-                &PmDeflatePolicy::default(),
-            )?);
+            for ext in &offers {
+                let offer = offered
+                    .iter_mut()
+                    .find(|o| o.name == ext.name)
+                    .ok_or_else(|| {
+                        Error::protocol("ws: the server selected an extension that was not offered")
+                    })?;
+                compression = Some(PerMessageDeflate::from_response(
+                    offer,
+                    ext,
+                    &PmDeflatePolicy::default(),
+                )?);
+            }
         }
 
-        // A handshake read may have pulled frame bytes into the reader;
-        // the session takes that reader over, so nothing is lost.
         let params = compression.map(|p| p.client_view());
         let sink = SharedSink::new(stream.clone());
         let frame_writer = FrameWriter::new(sink.clone(), MaskSource::Random, params);
@@ -365,6 +369,7 @@ impl WebSocket {
             },
         );
         let _ = writer.flush();
+        let _ = stream.configure(None);
 
         Ok(Self {
             session,
@@ -380,6 +385,7 @@ impl WebSocket {
                 compression,
             },
             close_timeout: opts.close_timeout,
+            read_timeout: std::cell::Cell::new(cfg.read_timeout),
         })
     }
 
@@ -420,10 +426,43 @@ impl WebSocket {
 
     /// Block until the next message arrives.
     ///
-    /// The transport's read timeout (`ClientConfig::read_timeout`) bounds
-    /// the wait and surfaces as [`ErrorKind::Timeout`].
+    /// [`ClientConfig::read_timeout`](super::ClientConfig::read_timeout)
+    /// bounds the **wait for a frame** and surfaces as
+    /// [`ErrorKind::Timeout`]. It is not left armed while a
+    /// message body transfers: `SO_RCVTIMEO` is charged on every blocking
+    /// operation on Windows, which roughly doubles the cost of a 256 KiB
+    /// receive and taxes every write on the socket. A peer that announces
+    /// a frame and then goes silent is still caught, because the wait for
+    /// the header is bounded; a peer that stalls *inside* a body is left
+    /// to TCP, which is the same posture the crate's blocking server
+    /// takes (a body in flight is not an idle connection).
+    ///
+    /// The deadline is cleared again before returning, so a caller that
+    /// echoes (read then write) never pays it on the write half either.
     pub fn read_message(&mut self) -> Result<Event> {
+        if !self.session.is_mid_frame() {
+            self.arm_read_timeout()?;
+        }
+        let header = self.session.poll_header();
+        let _ = self.stream.configure(None);
+        if !header? {
+            return Err(Error::new(ErrorKind::WouldBlock));
+        }
         self.session.read_message()
+    }
+
+    /// Arm the transport for the wait for the next frame header.
+    ///
+    /// A *deadline* when one is configured, so its expiry is `Timeout` on
+    /// every platform: POSIX reports a poll timeout as `WouldBlock`, the
+    /// code for "nothing yet", and this wait is not a lull — it is the
+    /// bound the caller asked for. With no deadline configured there is
+    /// nothing to classify, and the arm is cleared outright.
+    fn arm_read_timeout(&self) -> Result<()> {
+        match self.read_timeout.get() {
+            Some(timeout) => self.stream.set_deadline(Some(timeout)),
+            None => self.stream.configure(None),
+        }
     }
 
     /// A non-blocking poll: `Ok(None)` means “nothing complete yet”.
@@ -433,16 +472,11 @@ impl WebSocket {
 
     /// A push handle usable from another thread while this one reads.
     pub fn writer(&self) -> WsClientWriter {
-        // The push handle must share the connection's Close flag with the
-        // session: RFC 6455 §5.5.1 — nothing may follow a Close frame — is
-        // a property of the connection, not of one writer.
-        let close_flag = self.session.writer().close_flag();
         WsClientWriter {
-            inner: Arc::new(std::sync::Mutex::new(FrameWriter::with_close_flag(
+            inner: Arc::new(std::sync::Mutex::new(FrameWriter::new(
                 self.sink.clone(),
                 MaskSource::Random,
                 self.session.compression(),
-                close_flag,
             ))),
         }
     }
@@ -466,7 +500,7 @@ impl WebSocket {
         self.session.close(code, reason)?;
         self.session.flush()?;
         let deadline = std::time::Instant::now() + self.close_timeout;
-        let _ = self.stream.set_deadline(Some(self.close_timeout));
+        let _ = self.stream.configure(Some(self.close_timeout));
         loop {
             if std::time::Instant::now() >= deadline {
                 return Ok(());
@@ -494,12 +528,17 @@ impl WebSocket {
         self.info.peer
     }
 
-    /// Change the transport's read timeout (bounds how long
-    /// [`WebSocket::read_message`] blocks) with deadline semantics, so
-    /// its expiry reaches the caller as [`ErrorKind::Timeout`] on every
-    /// platform rather than as a POSIX-only `WouldBlock`.
+    /// Set the liveness deadline for the wait for a frame.
+    ///
+    /// [`WebSocket::read_message`] re-scopes it per frame: it arms the
+    /// deadline for the wait for a header and clears it while a body
+    /// streams, so this bounds how long a wait for *new* data may take,
+    /// not the transfer of a body that has already started. Setting it
+    /// also applies it to the socket immediately, which is the historical
+    /// behaviour and matters to a caller that arms it before its own read.
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<()> {
-        self.stream.set_deadline(timeout)
+        self.read_timeout.set(timeout);
+        self.arm_read_timeout()
     }
 }
 
@@ -519,29 +558,34 @@ fn normalise_url(url: &str) -> Result<(bool, String)> {
     }
 }
 
-/// Connect to the origin, directly or through the configured proxy.
+/// Connect to the first address that accepts.
 ///
 /// A host name that resolves to several addresses (the usual `localhost`
 /// case: `::1` and `127.0.0.1`) must not fail just because the first one
-/// in the list is not the one the server bound: every address is tried,
-/// each with its own connect timeout, and the last failure is reported.
+/// in the list is not the one the server bound. Each attempt keeps its
+/// own connect timeout, and the last failure is reported.
 fn connect_to(
     host: &str,
     port: u16,
     cfg: &crate::courierust_client::ClientConfig,
 ) -> Result<(SocketAddr, std::net::TcpStream)> {
-    match &cfg.proxy {
-        // A proxy is tunnelled to the origin authority with `CONNECT`
-        // (RFC 9110 §9.3.6). The handshake that follows is the same for
-        // `ws://` and `wss://` — the tunnel is byte-transparent, so only
-        // the origin's own protocol differs.
-        Some(proxy) => crate::courierust_client::proxy::connect_through(
-            proxy,
-            &crate::courierust_client::proxy::authority(host, port),
-            cfg.connect_timeout,
-        ),
-        None => crate::courierust_client::proxy::connect_direct(host, port, cfg.connect_timeout),
+    let addresses: Vec<SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| Error::io(alloc::format!("ws: cannot resolve {host}:{port}: {e}")))?
+        .collect();
+    if addresses.is_empty() {
+        return Err(Error::io(alloc::format!(
+            "ws: {host}:{port} resolved to no address"
+        )));
     }
+    let mut last: Option<Error> = None;
+    for addr in addresses {
+        match net::connect(&addr, cfg.connect_timeout) {
+            Ok(stream) => return Ok((addr, stream)),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| Error::io("ws: connect failed")))
 }
 
 fn push(headers: &mut HeaderMap, name: &str, value: &str) -> Result<()> {
@@ -551,12 +595,21 @@ fn push(headers: &mut HeaderMap, name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// The most `1xx` responses a handshake will skip before giving up: a peer
+/// that only ever sends informational responses must not be able to stall
+/// the client for ever.
+const MAX_INFORMATIONAL: usize = 4;
+
 /// Read the response head, skipping up to [`MAX_INFORMATIONAL`] `1xx`
 /// responses.
 fn read_response_head(
     reader: &mut BufReader<Arc<ConnStream>>,
     scratch: &mut Scratch,
-) -> Result<(crate::courierust_http::status::StatusCode, HeaderMap)> {
+) -> Result<(
+    crate::courierust_http::status::StatusCode,
+    Version,
+    HeaderMap,
+)> {
     for _ in 0..=MAX_INFORMATIONAL {
         // The status line borrows the scratch line buffer; it is parsed
         // and released before the header block reuses that buffer.
@@ -571,17 +624,16 @@ fn read_response_head(
         {
             continue;
         }
-        // A protocol switch is an HTTP/1.1 response; a 1.0 status line
-        // means the peer is not following §4.1.
+        // A protocol switch is an HTTP/1.1 response (RFC 6455 §4.1).
         if version != Version::HTTP_11 {
             return Err(Error::protocol(
-                "ws: the handshake response is not HTTP/1.1",
+                "ws: the peer answered a protocol switch over something other than HTTP/1.1",
             ));
         }
-        return Ok((status, headers));
+        return Ok((status, version, headers));
     }
     Err(Error::protocol(
-        "ws: too many informational responses before the switch",
+        "ws: the peer kept sending informational responses",
     ))
 }
 

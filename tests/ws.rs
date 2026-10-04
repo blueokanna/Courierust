@@ -278,6 +278,31 @@ fn large_messages_survive_the_round_trip() {
     assert_eq!(ws.read_message().unwrap(), Event::Text(text));
 }
 
+/// The client arms its socket deadline for the **wait for a frame** and
+/// clears it while the body transfers. The half that must stay bounded is
+/// the wait: a peer that announces nothing has to surface a timeout
+/// instead of parking the calling thread forever.
+///
+/// The second half of the test is what makes it worth having: an expired
+/// deadline is a bound on one wait, not a connection failure, so the same
+/// connection must keep working immediately afterwards.
+#[test]
+fn a_silent_peer_times_out_while_the_client_waits_for_a_frame() {
+    // The echo service only answers, so a client that sends nothing is
+    // waiting for a frame that never comes.
+    let addr = spawn_ws_server(blocking_config(), "/echo", Arc::new(EchoService::default()));
+    let mut ws = connect_within(addr, "/echo", Duration::from_millis(200));
+    let err = ws.read_message().unwrap_err();
+    assert_eq!(err.kind, courierust::ErrorKind::Timeout, "{err}");
+
+    ws.send_text("still here").unwrap();
+    assert_eq!(
+        ws.read_message().unwrap(),
+        Event::Text(String::from("still here"))
+    );
+    ws.close(1000, "done").unwrap();
+}
+
 #[test]
 fn fragmented_client_frames_are_reassembled() {
     let service = Arc::new(EchoService::default());
@@ -1029,6 +1054,152 @@ fn read_frame(sock: &mut TcpStream) -> (u8, Vec<u8>) {
     let mut payload = vec![0u8; len];
     sock.read_exact(&mut payload).expect("frame payload");
     (opcode, payload)
+}
+
+// ---------------------------------------------------------------------
+// Codec properties
+//
+// The same invariants the `ws_frame` fuzz target asserts, pinned against
+// a deterministic corpus so they are checked on every `cargo test` run
+// and not only under a fuzzer with coverage guidance.
+// ---------------------------------------------------------------------
+
+/// A deterministic byte generator (xorshift64): reproducible failures,
+/// no dependency, and no OS entropy in a test.
+struct XorShift(u64);
+
+impl XorShift {
+    fn next_byte(&mut self) -> u8 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 >> 40) as u8
+    }
+
+    fn bytes(&mut self, len: usize) -> Vec<u8> {
+        (0..len).map(|_| self.next_byte()).collect()
+    }
+}
+
+/// A header must re-encode to the exact bytes it was parsed from, the
+/// length hint must agree with the parser, and masking must be both an
+/// involution and the same function whether it runs in 16-byte lanes or
+/// one byte at a time.
+///
+/// These are the three places where a subtle disagreement turns into a
+/// framing bug that two hops can read differently.
+#[test]
+fn frame_codec_properties_hold_on_a_deterministic_corpus() {
+    use courierust::courierust_ws::{FrameHeader, Mask, OpCode, Utf8Validator, MAX_HEADER_LEN};
+
+    let mut rng = XorShift(0x2545_f491_4f6c_dd1d);
+
+    // Length boundaries: the two length-encoding thresholds are 126 and
+    // 65536, and each one is checked from both sides.
+    for len in [0usize, 1, 4, 125, 126, 127, 255, 4096, 65_535, 65_536] {
+        let payload = rng.bytes(len);
+
+        for masked in [false, true] {
+            let key = [rng.next_byte(), rng.next_byte(), rng.next_byte(), 0x5a];
+            let header = FrameHeader {
+                fin: true,
+                rsv1: false,
+                rsv2: false,
+                rsv3: false,
+                opcode: OpCode::Binary,
+                masked,
+                mask_key: key,
+                payload_len: len as u64,
+                header_len: 0,
+            };
+
+            let mut wire = [0u8; MAX_HEADER_LEN];
+            let written = header.write(&mut wire);
+            let parsed = FrameHeader::parse(&wire[..written])
+                .expect("a header this crate wrote must parse")
+                .expect("the whole header is present");
+            assert_eq!(parsed.header_len, written, "len {len} masked {masked}");
+            assert_eq!(parsed.payload_len, len as u64);
+            assert_eq!(parsed.masked, masked);
+            assert_eq!(parsed.opcode, OpCode::Binary);
+            assert_eq!(
+                parsed.mask_key,
+                if masked { key } else { [0; 4] },
+                "an unmasked header carries no key"
+            );
+            assert_eq!(
+                FrameHeader::header_len_hint(&wire[..written]),
+                Some(written)
+            );
+            assert_eq!(
+                parsed.write(&mut [0u8; MAX_HEADER_LEN]),
+                written,
+                "re-encoding a parsed header must produce the same length"
+            );
+        }
+
+        // ---- masking ------------------------------------------------
+        let mask = Mask::new([0x9e, 0x37, 0x79, 0xb9]);
+        let mut bulk = payload.clone();
+        mask.apply(0, &mut bulk);
+        let mut twice = bulk.clone();
+        mask.apply(0, &mut twice);
+        assert_eq!(twice, payload, "masking must be an involution");
+
+        let mut per_byte = payload.clone();
+        let mut one = [0u8; 1];
+        for (offset, byte) in per_byte.iter_mut().enumerate() {
+            one[0] = *byte;
+            mask.apply(offset, &mut one);
+            *byte = one[0];
+        }
+        assert_eq!(
+            per_byte, bulk,
+            "the lane path and the byte-at-a-time definition must agree"
+        );
+
+        // ---- streaming UTF-8 ----------------------------------------
+        let whole = Utf8Validator::validate(&payload);
+        let mut split = Utf8Validator::new();
+        let mut streamed = true;
+        for part in payload.chunks(1.max(len / 7)) {
+            if split.feed(part).is_err() {
+                streamed = false;
+                break;
+            }
+        }
+        assert_eq!(
+            whole,
+            streamed && split.is_complete(),
+            "chunked validation disagreed with a single call on {len} bytes"
+        );
+    }
+}
+
+/// A character split across fragments is legal (RFC 6455 §5.4), so the
+/// validator must accept a message cut at *any* byte offset and still
+/// call it complete at the end.
+#[test]
+fn utf8_validation_survives_every_split_point() {
+    use courierust::courierust_ws::Utf8Validator;
+
+    let text = "aé日本語🦀z".repeat(3);
+    let bytes = text.as_bytes();
+    for split_at in 0..=bytes.len() {
+        let mut v = Utf8Validator::new();
+        assert!(
+            v.feed(&bytes[..split_at]).is_ok(),
+            "first half rejected at split {split_at}"
+        );
+        assert!(v.feed(&bytes[split_at..]).is_ok(), "split {split_at}");
+        assert!(v.is_complete(), "incomplete at split {split_at}");
+    }
+    assert!(Utf8Validator::validate(bytes));
+    // The same message with one byte replaced by a bare continuation byte
+    // must be rejected rather than smoothed over.
+    let mut broken = bytes.to_vec();
+    broken.push(0x80);
+    assert!(!Utf8Validator::validate(&broken));
 }
 
 // ---------------------------------------------------------------------

@@ -633,6 +633,67 @@ mod tests {
         );
     }
 
+    /// RFC 7541 Appendix C.5 — response examples *without* Huffman coding,
+    /// the counterpoint to `rfc_c6_response_sequence_huffman`. The wire
+    /// bytes are the hex dumps of C.5.1/C.5.2/C.5.3 verbatim; the
+    /// dynamic-table evictions C.5.2 and C.5.3 describe (`SETTINGS_
+    /// HEADER_TABLE_SIZE = 256`) are what make it a sequence test rather
+    /// than three independent blocks.
+    #[test]
+    fn rfc_c5_response_sequence_no_huffman() {
+        let mut dec = Decoder::new(256, 1 << 20);
+        let out1 = dec
+            .decode(&hex("4803 3330 3258 0770 7269 7661 7465 611d \
+                 4d6f 6e2c 2032 3120 4f63 7420 3230 3133 \
+                 2032 303a 3133 3a32 3120 474d 546e 1768 \
+                 7474 7073 3a2f 2f77 7777 2e65 7861 6d70 \
+                 6c65 2e63 6f6d"))
+            .unwrap();
+        assert_eq!(
+            out1,
+            headers(&[
+                (":status", "302"),
+                ("cache-control", "private"),
+                ("date", "Mon, 21 Oct 2013 20:13:21 GMT"),
+                ("location", "https://www.example.com"),
+            ])
+        );
+        // The (:status, "302") entry is evicted to make room for "307".
+        let out2 = dec.decode(&hex("4803 3330 37c1 c0bf")).unwrap();
+        assert_eq!(
+            out2,
+            headers(&[
+                (":status", "307"),
+                ("cache-control", "private"),
+                ("date", "Mon, 21 Oct 2013 20:13:21 GMT"),
+                ("location", "https://www.example.com"),
+            ])
+        );
+        let out3 = dec
+            .decode(&hex("88c1 611d 4d6f 6e2c 2032 3120 4f63 7420 \
+                 3230 3133 2032 303a 3133 3a32 3220 474d \
+                 54c0 5a04 677a 6970 7738 666f 6f3d 4153 \
+                 444a 4b48 514b 425a 584f 5157 454f 5049 \
+                 5541 5851 5745 4f49 553b 206d 6178 2d61 \
+                 6765 3d33 3630 303b 2076 6572 7369 6f6e \
+                 3d31"))
+            .unwrap();
+        assert_eq!(
+            out3,
+            headers(&[
+                (":status", "200"),
+                ("cache-control", "private"),
+                ("date", "Mon, 21 Oct 2013 20:13:22 GMT"),
+                ("location", "https://www.example.com"),
+                ("content-encoding", "gzip"),
+                (
+                    "set-cookie",
+                    "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1"
+                ),
+            ])
+        );
+    }
+
     #[test]
     fn rfc_c6_response_sequence_huffman() {
         let mut dec = Decoder::new(256, 1 << 20);
