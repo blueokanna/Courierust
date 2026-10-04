@@ -371,10 +371,27 @@ struct DecodeTable {
     fast: [u32; FAST_SIZE],
 }
 
+/// What an alphabet is allowed to look like when its code is not complete.
+///
+/// RFC 1951 §3.2.7 describes exactly one incomplete code — a distance
+/// alphabet with a single one-bit code and one unused leaf, which is how a
+/// block using one distance is encoded — and that matches the rule zlib's
+/// `inflate_table` applies to every table it builds: an incomplete code is
+/// accepted when its longest code is one bit, and never for the code-length
+/// alphabet (`left > 0 && (type == CODES || max != 1)`). Decoding anything
+/// looser means accepting a stream no other implementation accepts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Completeness {
+    /// The code-length alphabet: a complete prefix code is mandatory.
+    Complete,
+    /// A literal/length or distance alphabet, where the single one-bit code
+    /// is also legal.
+    SingleCodeAllowed,
+}
+
 impl DecodeTable {
-    /// Build from per-symbol code lengths. `allow_incomplete` accepts a
-    /// code with a single unused leaf (legal for the distance alphabet).
-    fn build(lens: &[u8], allow_incomplete: bool) -> Result<Self> {
+    /// Build from per-symbol code lengths, applying `completeness`.
+    fn build(lens: &[u8], completeness: Completeness) -> Result<Self> {
         let mut table = Self {
             count: [0; 16],
             offset: [0; 16],
@@ -391,18 +408,33 @@ impl DecodeTable {
             table.count[l as usize] += 1;
         }
 
-        // Kraft-McMillan check: an over-subscribed code is rejected, an
-        // incomplete one only where the format allows it.
+        // Kraft-McMillan check: an over-subscribed code is rejected, and an
+        // incomplete one unless it has the one shape the format allows.
         let mut left: i32 = 1;
+        let mut max_len = 0usize;
         for len in 1..=15 {
             left <<= 1;
             left -= i32::from(table.count[len]);
             if left < 0 {
                 return Err(Error::protocol("deflate: over-subscribed code"));
             }
+            if table.count[len] != 0 {
+                max_len = len;
+            }
         }
-        if left != 0 && !allow_incomplete {
-            return Err(Error::protocol("deflate: incomplete code"));
+        if left != 0 {
+            // An empty alphabet (`max_len == 0`) is legal — the distance
+            // alphabet uses it to say "this block has no matches" — and is
+            // reported where a symbol is actually needed. Otherwise the only
+            // incomplete code any implementation accepts is a single one-bit
+            // code, so a longer incomplete code is a malformed stream.
+            let allowed = match completeness {
+                Completeness::Complete => max_len == 0,
+                Completeness::SingleCodeAllowed => max_len <= 1,
+            };
+            if !allowed {
+                return Err(Error::protocol("deflate: incomplete code"));
+            }
         }
 
         let mut off = 0u32;
@@ -613,14 +645,14 @@ fn inflate_stored(br: &mut BitReader, out: &mut Vec<u8>, max_out: usize) -> Resu
 fn inflate_huffman(
     br: &mut BitReader,
     litlen: &[u8; 288],
-    dist: &[u8; 30],
+    dist: &[u8; 32],
     window: &[u8],
     out: &mut Vec<u8>,
     max_out: usize,
     max_dist: usize,
 ) -> Result<()> {
-    let lit_table = DecodeTable::build(litlen, false)?;
-    let dist_table = DecodeTable::build(dist, true)?;
+    let lit_table = DecodeTable::build(litlen, Completeness::SingleCodeAllowed)?;
+    let dist_table = DecodeTable::build(dist, Completeness::SingleCodeAllowed)?;
     loop {
         let sym = decode_symbol(br, &lit_table)?;
         if sym < 256 {
@@ -680,7 +712,7 @@ fn inflate_dynamic(
     for i in 0..hclen {
         clen_lens[CLEN_ORDER[i]] = br.take(3)? as u8;
     }
-    let clen_table = DecodeTable::build(&clen_lens, false)?;
+    let clen_table = DecodeTable::build(&clen_lens, Completeness::Complete)?;
     if clen_table.is_empty() {
         return Err(Error::protocol("deflate: empty code-length table"));
     }
@@ -734,7 +766,11 @@ fn inflate_dynamic(
     }
     let mut litlen = [0u8; 288];
     litlen[..hlit].copy_from_slice(&lens[..hlit]);
-    let mut dist = [0u8; 30];
+    // RFC 1951 §3.2.7 encodes 1-32 distance codes in the header, but only
+    // 0-29 have a meaning; as in zlib, a header that declares an impossible
+    // alphabet size (31 or 32) is rejected outright instead of carried into
+    // a table whose extra symbols could never be decoded to anything valid.
+    let mut dist = [0u8; 32];
     dist[..hdist].copy_from_slice(&lens[hlit..hlit + hdist]);
     inflate_huffman(br, &litlen, &dist, window, out, max_out, max_dist)
 }
@@ -764,7 +800,10 @@ fn inflate_blocks(
             0 => inflate_stored(br, out, max_out),
             1 => {
                 let litlen = fixed_litlen_lens();
-                let dist = [5u8; 30];
+                // RFC 1951 §3.2.6: 32 five-bit distance codes. Codes 30-31
+                // never occur in valid data but are part of the code, so the
+                // table is complete; decoding one is rejected below.
+                let dist = [5u8; 32];
                 inflate_huffman(br, &litlen, &dist, window, out, max_out, max_dist)
             }
             2 => inflate_dynamic(br, window, out, max_out, max_dist),
@@ -1902,5 +1941,113 @@ mod tests {
         let mut out = Vec::new();
         i.inflate_message(&comp, &mut out, 1 << 20).unwrap();
         assert_eq!(out, text);
+    }
+
+    /// The set of code shapes this decoder accepts has to be exactly the set
+    /// other implementations accept: a decoder that is more lenient turns a
+    /// malformed stream into a disagreement between peers, and one that is
+    /// stricter rejects streams the peer legitimately produced.
+    #[test]
+    fn huffman_completeness_matches_zlib() {
+        let symbol =
+            |lens: &[u8]| DecodeTable::build(lens, Completeness::SingleCodeAllowed).is_ok();
+        let lengths = |lens: &[u8]| DecodeTable::build(lens, Completeness::Complete).is_ok();
+
+        // Complete codes, including the fixed alphabets' shapes.
+        assert!(symbol(&[1, 1]));
+        assert!(symbol(&[2, 2, 2, 2]));
+        assert!(lengths(&[2, 2, 2, 2]));
+
+        // The one incomplete shape RFC 1951 §3.2.7 names: a single one-bit
+        // code with one unused leaf ("if only one distance code is used, it
+        // is encoded using one bit"), and the empty alphabet that says the
+        // block has no matches at all.
+        assert!(symbol(&[1]));
+        assert!(symbol(&[0u8; 32]));
+
+        // Anything else incomplete is malformed.
+        assert!(!symbol(&[2, 2]));
+        assert!(!symbol(&[3, 3]));
+
+        // The code-length alphabet has no single-code exemption.
+        assert!(!lengths(&[1]));
+
+        // Over-subscribed is rejected under both rules.
+        assert!(!symbol(&[1, 1, 1]));
+        assert!(!lengths(&[1, 1, 1]));
+    }
+
+    /// A dynamic block with no matches is legal and common: the distance
+    /// alphabet is transmitted empty, and its zero-length runs are what the
+    /// code-length symbols 17 and 18 exist for.
+    #[test]
+    fn dynamic_block_without_distances_decodes() {
+        let mut w = BitWriter::new();
+        w.write_bits(1, 1); // BFINAL
+        w.write_bits(2, 2); // BTYPE = dynamic Huffman
+        w.write_bits(0, 5); // HLIT = 257
+        w.write_bits(0, 5); // HDIST = 1
+        w.write_bits(14, 4); // HCLEN = 18 (up to symbol 1 of the CLEN_ORDER)
+
+        // Code lengths of the code-length alphabet, in CLEN_ORDER: symbol
+        // 17, 18, 0 and 1 get two bits each, which is a complete code.
+        for len in [0u32, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2] {
+            w.write_bits(len, 3);
+        }
+        // 257 literal/length codes: only 'a' (97) and end-of-block (256) are
+        // used, the rest are zero runs. Canonical codes: 97 = 0, 256 = 1.
+        w.write_bits_msb(0b11, 2); // symbol 18: 11 + 86 = 97 zeros
+        w.write_bits(86, 7);
+        w.write_bits_msb(0b01, 2); // symbol 1: lens[97] = 1
+        w.write_bits_msb(0b11, 2); // symbol 18: 11 + 127 = 138 zeros
+        w.write_bits(127, 7);
+        w.write_bits_msb(0b10, 2); // symbol 17: 3 + 7 = 10 zeros
+        w.write_bits(7, 3);
+        w.write_bits_msb(0b10, 2);
+        w.write_bits(7, 3);
+        w.write_bits_msb(0b01, 2); // symbol 1: lens[256] = 1
+        w.write_bits_msb(0b00, 2); // symbol 0: the single distance code is 0
+
+        // Data: literal 'a', then end of block.
+        w.write_bits_msb(0, 1);
+        w.write_bits_msb(1, 1);
+        assert_eq!(inflate(&w.finish(), 64).unwrap(), b"a");
+    }
+
+    /// The single-code exemption stops at the code-length alphabet: a table
+    /// with one one-bit code cannot describe the lengths of a block.
+    #[test]
+    fn dynamic_block_rejects_an_incomplete_code_length_code() {
+        let mut w = BitWriter::new();
+        w.write_bits(1, 1); // BFINAL
+        w.write_bits(2, 2); // BTYPE = dynamic Huffman
+        w.write_bits(0, 5); // HLIT = 257
+        w.write_bits(0, 5); // HDIST = 1
+        w.write_bits(0, 4); // HCLEN = 4: symbols 16, 17, 18, 0
+        w.write_bits(0, 3); // symbol 16: unused
+        w.write_bits(0, 3); // symbol 17: unused
+        w.write_bits(1, 3); // symbol 18: a single one-bit code
+        w.write_bits(0, 3); // symbol 0: unused
+        let err = inflate(&w.finish(), 64).unwrap_err();
+        assert!(alloc::format!("{err}").contains("incomplete code"), "{err}");
+    }
+
+    /// RFC 1951 §3.2.6 defines the distance code as 32 five-bit codes;
+    /// 30 and 31 never occur in valid data. They are part of the code (so
+    /// the fixed table is complete) and rejected when decoded.
+    #[test]
+    fn fixed_block_rejects_the_reserved_distance_codes() {
+        let mut w = BitWriter::new();
+        w.write_bits(1, 1); // BFINAL
+        w.write_bits(1, 2); // BTYPE = fixed Huffman
+        let (code, len) = fixed_length_code(257);
+        w.write_bits_msb(code, len); // a length-3 match
+        w.write_bits_msb(30, 5); // distance symbol 30: reserved
+        w.write_bits_msb(0, 7); // end of block, never reached
+        let err = inflate(&w.finish(), 64).unwrap_err();
+        assert!(
+            alloc::format!("{err}").contains("invalid distance code"),
+            "{err}"
+        );
     }
 }

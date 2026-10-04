@@ -38,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: benches
@@ -47,10 +47,6 @@ jobs:
         shell: bash
         env:
           COURIERUST_NETWORK_URL: ${{ secrets.COURIERUST_REMOTE_URL }}
-          # Env-gated H3 diagnostics: printed only on error/cold paths, so
-          # a future connection-close failure carries the server's reason
-          # straight into the captured log instead of a bare "peer closed
-          # HTTP/3".
           COURIERUST_H3_DEBUG: 1
         run: |
           suite_failed=0
@@ -121,10 +117,11 @@ jobs:
           rustup toolchain install nightly --profile minimal
           cargo +nightly install cargo-fuzz --locked
           # PR smoke fuzz: 20 s wall-clock per target for gross crashes;
-          # fuzz-long.yml does deep 30-120 min runs nightly.
-          # h2_frame/hpack_block: legacy. h1_request: shared HTTP/1 parser
-          # (blocking + event-driven). h2_connection: full h2 state machine.
-          for target in h2_frame hpack_block h1_request h2_connection; do
+          # fuzz-long.yml does deep 30-120 min runs nightly. The list must
+          # match fuzz/fuzz_targets/ — the three WebSocket targets were
+          # missing here, so a framing or masking crash could only surface
+          # in the nightly run.
+          for target in h2_frame hpack_block h1_request h2_connection ws_frame ws_handshake ws_session; do
             started=$(date +%s)
             cargo +nightly fuzz run --fuzz-dir fuzz "$target" -- -max_total_time=20 -max_len=16384 -timeout=10 -rss_limit_mb=2048 >> fuzz.log 2>&1
             command_status=$?
@@ -197,7 +194,7 @@ jobs:
   publish-report:
     name: Publish benchmark report
     needs: bench
-    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.bench.result != 'cancelled'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.bench.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write

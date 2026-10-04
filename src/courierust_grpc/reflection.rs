@@ -16,9 +16,10 @@
 //!
 //! The compiled files have no `import`, so a `FileDescriptorResponse` is
 //! always exactly one descriptor and there is no dependency walk to do.
-//! `assert_no_imports` keeps that claim honest: if a future `.proto` gains
-//! an import, the unit tests fail instead of a client receiving a descriptor
-//! whose dependencies it cannot resolve.
+//! `build.rs` is what keeps that claim honest: it rejects `import` outright,
+//! so a `.proto` that gained one fails the build instead of reaching a client
+//! with a dependency set nothing resolves. The test at the end of this file
+//! checks the emitted descriptors agree with that.
 
 use crate::courierust_bytes::Bytes;
 use crate::courierust_error::{Error, ErrorKind, Result};
@@ -58,7 +59,6 @@ pub struct ReflectionService;
 impl ReflectionService {
     /// A reflection service over every file this build compiled.
     pub fn new() -> Self {
-        assert_no_imports();
         Self
     }
 }
@@ -76,10 +76,6 @@ impl crate::courierust_grpc::StreamingService for ReflectionService {
                 format!("reflection: no such method `{method}`"),
             ));
         }
-        // One response per request: `ServerReflectionInfo` is a stream in
-        // both directions, but the protocol is request/response at heart, and
-        // a client that pipelines two lookups gets the second answer as soon
-        // as it asks for it rather than at the end.
         for request in reqs {
             let response = answer(&request?);
             tx.send(Bytes::from(response))?;
@@ -110,12 +106,9 @@ fn answer(request: &[u8]) -> Vec<u8> {
             break;
         };
         match (number, wire) {
-            // host = 1
             (1, WireType::LengthDelimited) => {
                 host = read_string(&mut reader).unwrap_or_default();
             }
-            // file_by_filename = 3, file_containing_symbol = 4,
-            // all_extension_numbers_of_type = 6, list_services = 7
             (3, WireType::LengthDelimited) => {
                 query = read_string(&mut reader)
                     .map(Query::FileByName)
@@ -134,8 +127,6 @@ fn answer(request: &[u8]) -> Vec<u8> {
                 let _ = read_string(&mut reader);
                 query = Query::ListServices;
             }
-            // file_containing_extension = 5 is a message; anything else is
-            // skipped so a newer client's field cannot break the decoder.
             _ => {
                 if skip(&mut reader, wire).is_err() {
                     break;
@@ -147,9 +138,6 @@ fn answer(request: &[u8]) -> Vec<u8> {
     let mut response = Vec::new();
     proto::encode_string_field(&mut response, 1, &host); // valid_host
     proto::encode_bytes_field(&mut response, 2, request); // original_request
-                                                          // Each helper returns its arm already tagged, so this appends rather than
-                                                          // wraps: a second wrap would bury the answer one level deeper than every
-                                                          // client looks for it, and the client would report `nothing there`.
     response.extend_from_slice(&match query {
         Query::ListServices => list_services(),
         Query::FileByName(name) => file_by(&name),
@@ -284,30 +272,6 @@ fn skip(reader: &mut SliceReader<'_>, wire: WireType) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Fail loudly if a compiled `.proto` gained an `import`: this module answers
-/// with one descriptor and no dependency walk, which would silently become a
-/// lie the moment a file imported another.
-fn assert_no_imports() {
-    for (_, descriptor) in descriptors::FILES {
-        let mut reader = SliceReader::new(descriptor);
-        while reader.remaining() > 0 {
-            let Ok((number, wire)) = read_tag(&mut reader) else {
-                return;
-            };
-            // dependency = 3
-            if number == 3 && wire == WireType::LengthDelimited {
-                panic!(
-                    "reflection: a compiled .proto has an import, so file_descriptor_response \
-                     would have to send a dependency set it does not build"
-                );
-            }
-            if skip(&mut reader, wire).is_err() {
-                return;
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -465,7 +429,6 @@ mod tests {
         }
     }
 
-    /// The value of field 1 of a message (its `name`).
     fn first_string(body: &[u8]) -> String {
         fields(body)
             .into_iter()
@@ -527,5 +490,24 @@ mod tests {
             Some(UNIMPLEMENTED),
             "an answer of `nothing here` is not the same as `I cannot answer`"
         );
+    }
+
+    /// Every answer sends one descriptor and never walks a dependency graph,
+    /// so a compiled file must not declare one. `build.rs` rejects `import`
+    /// before this can happen; this asserts the delivered bytes match.
+    #[test]
+    fn compiled_files_declare_no_dependency() {
+        for (name, descriptor) in crate::courierust_grpc::generated::descriptors::FILES {
+            let mut reader = SliceReader::new(descriptor);
+            while reader.remaining() > 0 {
+                let (number, wire) = read_tag(&mut reader).expect("descriptor tag");
+                assert!(
+                    number != 3 || wire != WireType::LengthDelimited,
+                    "{name} declares a dependency, so file_descriptor_response would have to \
+                     send a set it does not build"
+                );
+                skip(&mut reader, wire).expect("descriptor field body");
+            }
+        }
     }
 }

@@ -24,59 +24,70 @@ env:
 
 jobs:
   fuzz:
-    name: Long fuzz (${{ inputs.minutes_per_target || 30 }}m/target)
+    name: Long fuzz (${{ matrix.target }}, ${{ inputs.minutes_per_target || 30 }}m)
     runs-on: ubuntu-latest
-    # 4 targets x up to 120 min each, plus toolchain install + corpus
-    # commit. GitHub's max job timeout is 360 minutes.
+    # One job per target. `minutes_per_target` may be as high as 120 and
+    # GitHub kills a job at 360 minutes, so all targets in a single job could
+    # not honour the documented range — a run at the top of it would be killed
+    # mid-corpus, and a killed job runs no `always()` step, so the log would
+    # be lost with it. Per-target jobs also cost the largest budget rather
+    # than the sum.
     timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        # Must stay in step with fuzz/fuzz_targets/: a target that no workflow
+        # runs is a parser nobody is checking. The three WebSocket targets
+        # were missing here even though the codec, the handshake and the
+        # session state machine are all reachable from the network.
+        target: [h2_frame, hpack_block, h1_request, h2_connection, ws_frame, ws_handshake, ws_session]
     steps:
       - uses: actions/checkout@v4
       - name: Install nightly + cargo-fuzz
         run: |
           rustup toolchain install nightly --profile minimal
           cargo +nightly install cargo-fuzz --locked
-      - name: Fuzz all targets with a time budget
+      - name: Fuzz ${{ matrix.target }} with a time budget
         shell: bash
         env:
           MINUTES: ${{ inputs.minutes_per_target || '30' }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
           if ! [[ "$MINUTES" =~ ^[0-9]+$ ]] || [[ "$MINUTES" -lt 30 || "$MINUTES" -gt 120 ]]; then
             echo "minutes_per_target must be between 30 and 120" >&2
             exit 2
           fi
-          failures=0
-          for target in h2_frame hpack_block h1_request h2_connection; do
-            echo "=== fuzzing $target for ${MINUTES} minutes ==="
-            started=$(date +%s)
-            # `-max_total_time` is the libFuzzer time budget; the run
-            # aborts non-zero on any crash/leak/hang in the target.
-            set +e
-            cargo +nightly fuzz run --fuzz-dir fuzz "$target" -- \
-              -max_total_time="$((MINUTES * 60))" -max_len=16384 \
-              -timeout=10 -rss_limit_mb=2048
-            status=$?
-            set -e
-            duration=$(( $(date +%s) - started ))
-            if [[ "$status" -eq 0 ]]; then
-              result=ok
-            else
-              result=failed
-              failures=1
-            fi
-            echo "FUZZ|target=$target|status=$result|runs=wall_clock|duration_s=$duration|budget_min=${MINUTES}|corpus=fuzz/corpus/$target|reason=command_exit_$status" | tee -a fuzz.log
-          done
-          # Fresh inputs discovered during the runs are committed back to
-          # the corpus only when the whole job passes (corpus growth is
-          # the point of long fuzzing).
-          git status --short fuzz/corpus || true
-          exit "$failures"
-      - name: Upload fuzz logs + corpus diff
+          started=$(date +%s)
+          # `-max_total_time` is the libFuzzer time budget; the run aborts
+          # non-zero on any crash/leak/hang in the target.
+          set +e
+          cargo +nightly fuzz run --fuzz-dir fuzz "$TARGET" -- \
+            -max_total_time="$((MINUTES * 60))" -max_len=16384 \
+            -timeout=10 -rss_limit_mb=2048
+          status=$?
+          set -e
+          duration=$(( $(date +%s) - started ))
+          if [[ "$status" -eq 0 ]]; then
+            result=ok
+          else
+            result=failed
+          fi
+          echo "FUZZ|target=$TARGET|status=$result|runs=wall_clock|duration_s=$duration|budget_min=${MINUTES}|corpus=fuzz/corpus/$TARGET|reason=command_exit_$status" | tee fuzz.log
+          # A crash fails this target's job; `fail-fast: false` keeps the
+          # others running, so one bad target cannot hide the state of the
+          # rest.
+          exit "$status"
+      - name: Upload fuzz log + the inputs this run discovered
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fuzz-long
+          name: fuzz-long-${{ matrix.target }}
           path: |
             fuzz.log
-            fuzz/corpus/**/*.bin
+            fuzz/corpus/${{ matrix.target }}/**
+          # libFuzzer writes the corpus into the (not checked-in) working
+          # directory, so the artifact *is* the corpus diff: the new inputs a
+          # maintainer commits after reviewing them. This job cannot commit
+          # them itself — it holds `contents: read`.
           if-no-files-found: warn

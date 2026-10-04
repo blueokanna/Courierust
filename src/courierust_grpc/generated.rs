@@ -65,6 +65,32 @@ mod tests {
         assert!(decoded.tags.is_empty());
     }
 
+    /// proto3 implicit presence: a scalar field holding its default is not
+    /// written, so an all-default message encodes to nothing — the bytes
+    /// protoc's generated code produces. (The `Encoder` primitives keep
+    /// writing whatever they are handed; the check belongs to the generated
+    /// code, which is where protoc puts it too.)
+    #[test]
+    fn default_scalars_are_not_serialized() {
+        assert!(HelloRequest::default().encode_message().unwrap().is_empty());
+        assert!(HelloReply::default().encode_message().unwrap().is_empty());
+
+        let request = HelloRequest {
+            name: "a".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            request.encode_message().unwrap(),
+            vec![0x0a, 0x01, 0x61],
+            "field 1, length 1, `a`"
+        );
+        assert_eq!(
+            HelloReply::decode_message(&[0x10, 0x00]).unwrap().count,
+            0,
+            "a peer that does send the default still decodes"
+        );
+    }
+
     /// The generated service stub has type-checked methods and the
     /// correct fully-qualified method paths.
     #[test]

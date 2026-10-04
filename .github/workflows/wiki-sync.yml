@@ -24,6 +24,7 @@ on:
   push:
     branches: [main]
     paths:
+      - '.github/workflows/wiki-sync.yml'
       - 'wiki/**'
   workflow_dispatch:
 

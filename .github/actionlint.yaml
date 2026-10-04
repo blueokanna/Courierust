@@ -1,0 +1,10 @@
+# Configuration for `actionlint` (https://github.com/rhysd/actionlint).
+#
+# The cross-machine benchmark runs on two self-hosted runners that are
+# registered with project-specific labels; declaring them here is how the
+# linter learns they exist, so a full run stays silent about labels it cannot
+# know while still catching typos in the standard ones.
+self-hosted-runner:
+  labels:
+    - courierust-server
+    - courierust-client

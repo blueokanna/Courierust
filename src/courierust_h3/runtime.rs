@@ -540,10 +540,8 @@ fn build_client_connection(
         return Err(protocol("HTTP/3 max_body must be non-zero"));
     }
     let socket = UdpSocket::bind(match addr {
-        SocketAddr::V4(_) => "0.0.0.0:0"
-            .parse::<SocketAddr>()
-            .expect("valid IPv4 wildcard"),
-        SocketAddr::V6(_) => "[::]:0".parse::<SocketAddr>().expect("valid IPv6 wildcard"),
+        SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
+        SocketAddr::V6(_) => SocketAddr::from(([0u16; 8], 0)),
     })
     .map_err(|e| io_error(e.to_string()))?;
     // Left unconnected: `recv_from` reports the real source address so a
@@ -1980,16 +1978,18 @@ impl ClientConnection {
     /// Deliver timeout errors to requests whose deadline has passed and
     /// release their streams.
     fn check_timeouts(&mut self, now: Instant) {
-        let mut expired: Vec<usize> = Vec::new();
-        for (index, request) in self.waiting.iter().enumerate() {
+        // Partitioned in one pass instead of collecting indices and
+        // removing them in reverse: no index arithmetic to get wrong, and
+        // expiry order is irrelevant because every reply is an error.
+        let mut live = VecDeque::with_capacity(self.waiting.len());
+        for request in self.waiting.drain(..) {
             if request.deadline <= now {
-                expired.push(index);
+                let _ = request.reply.send(Err(Error::new(ErrorKind::Timeout)));
+            } else {
+                live.push_back(request);
             }
         }
-        for index in expired.into_iter().rev() {
-            let request = self.waiting.remove(index).expect("index in bounds");
-            let _ = request.reply.send(Err(Error::new(ErrorKind::Timeout)));
-        }
+        self.waiting = live;
         let expired: Vec<u64> = self
             .active
             .iter()
@@ -2241,12 +2241,8 @@ impl ClientConnection {
                 request.response.is_some()
             };
             if finished {
-                let mut request = self
-                    .active
-                    .remove(&id)
-                    .expect("request present while receiving its response");
+                let (request, response) = self.take_finished(id)?;
                 self.trace_request(&id, &request, Instant::now());
-                let response = request.response.take().expect("response just completed");
                 let _ = request.reply.send(Ok(response));
                 h3_close_stream(self.stats.as_ref(), &mut self.active_streams, id);
                 // Release the receive-side state now that the response is
@@ -2307,17 +2303,30 @@ impl ClientConnection {
             finished = request.response.is_some();
         }
         if finished {
-            let mut request = self
-                .active
-                .remove(&id)
-                .expect("request present while resuming its response");
-            let response = request.response.take().expect("response just completed");
+            let (request, response) = self.take_finished(id)?;
             let _ = request.reply.send(Ok(response));
             h3_close_stream(self.stats.as_ref(), &mut self.active_streams, id);
         } else if !(stream.reassembly.finished() && stream.completed) {
             self.streams.insert(id, stream);
         }
         Ok(())
+    }
+
+    /// Take the finished request `id` and its response.
+    ///
+    /// Both are guaranteed by the invariant that `finished` is only ever set
+    /// from that same entry's `response` field, so an absent one means the
+    /// bookkeeping is corrupt — a state error, not a reason to panic.
+    fn take_finished(&mut self, id: u64) -> Result<(ActiveRequest, Response<Body>)> {
+        let mut request = self
+            .active
+            .remove(&id)
+            .ok_or_else(|| protocol("HTTP/3 finished response has no active request"))?;
+        let response = request
+            .response
+            .take()
+            .ok_or_else(|| protocol("HTTP/3 finished response carries no response"))?;
+        Ok((request, response))
     }
 
     fn ensure_buffer_budget(&self) -> Result<()> {
@@ -6787,13 +6796,9 @@ mod tests {
     #[test]
     fn crypto_reassembly_merges_resegmented_retransmission() {
         let mut crypto = CryptoReassembly::default();
-        // Gap 0..5; buffer 5..10, then a re-segmented retransmission
-        // 3..9 overlapping 5..9 with identical bytes.
         assert!(crypto.insert(5, b"fghij").unwrap().is_empty());
         assert!(crypto.insert(3, b"defghi").unwrap().is_empty());
-        // Fill the head: the full payload is delivered in order.
         assert_eq!(crypto.insert(0, b"abc").unwrap(), b"abcdefghij");
-        // Conflicting overlap against buffered data is still rejected.
         let mut crypto2 = CryptoReassembly::default();
         assert!(crypto2.insert(5, b"fghij").unwrap().is_empty());
         assert!(crypto2.insert(3, b"deXghi").is_err());

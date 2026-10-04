@@ -9,29 +9,38 @@ name: TLS interop (OpenSSL / nginx)
 on:
   push:
     branches: [main]
+    # Keep this list a superset of everything the interop cases execute: the
+    # h1/h2 client and server crates, the TLS stack and the shared crates all
+    # sit on one of the three paths under test, so `src/**` is the honest
+    # filter — a narrower list silently skips the run that would have caught a
+    # handshake or framing regression.
     paths:
       - '.github/workflows/tls-interop.yml'
       - 'scripts/tls_interop.sh'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - 'proto/**'
       - 'benches/Cargo.toml'
+      - 'benches/Cargo.lock'
       - 'benches/src/tls_interop.rs'
       - 'benches/src/network.rs'
       - 'benches/src/tls_peer.rs'
-      - 'src/courierust_tls/**'
-      - 'src/courierust_net/**'
-      - 'src/courierust_client/**'
-      - 'src/courierust_server/**'
+      - 'src/**'
   pull_request:
     paths:
       - '.github/workflows/tls-interop.yml'
       - 'scripts/tls_interop.sh'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - 'proto/**'
       - 'benches/Cargo.toml'
+      - 'benches/Cargo.lock'
       - 'benches/src/tls_interop.rs'
       - 'benches/src/network.rs'
       - 'benches/src/tls_peer.rs'
-      - 'src/courierust_tls/**'
-      - 'src/courierust_net/**'
-      - 'src/courierust_client/**'
-      - 'src/courierust_server/**'
+      - 'src/**'
   workflow_dispatch:
 
 permissions:
@@ -46,7 +55,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: benches
@@ -55,10 +64,6 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq nginx
           nginx -v
-      # Build-only: executing the benches would run `network` client mode,
-      # which panics without a target URL. `tls_peer` is the rustls + hyper
-      # independent peer sections D/E drive. Binaries land in
-      # target/release/deps/<name>-<hash>; the script locates them.
       - name: Build the interop binaries (release)
         run: cargo bench --manifest-path benches/Cargo.toml --locked --bench tls_interop --bench network --bench tls_peer --no-run
       - name: Run TLS interop (OpenSSL s_server, curl, s_client, nginx)

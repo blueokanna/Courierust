@@ -14,9 +14,13 @@
 //!     <Message>`; `//` line comments and `/* */` block comments
 //!   * `service` with unary and server-streaming `rpc` methods
 //!
-//! Field numbers are validated (1..=2^29-1, unique per message). The
-//! generated code compiles against the crate's own wire codec
-//! (`courierust_grpc::proto`) — no prost, no syn, no third-party crate.
+//! Field numbers are validated (1..=2^29-1, unique per message), a field's
+//! message type must be declared in the same file, and an `import` is
+//! rejected outright: nothing is compiled in alongside, so an imported type
+//! would generate Rust and a reflection descriptor referring to something
+//! this crate never built. A UTF-8 BOM at the start of a file is skipped, as
+//! protoc skips it. The generated code compiles against the crate's own wire
+//! codec (`courierust_grpc::proto`) — no prost, no syn, no third-party crate.
 
 use std::env;
 use std::fs;
@@ -40,7 +44,9 @@ fn main() {
         let mut compiled: Vec<(String, ProtoFile)> = Vec::new();
         for entry in entries {
             let file_name = entry.file_name().to_string_lossy().into_owned();
-            let text = fs::read_to_string(entry.path()).expect("read proto file");
+            let text = fs::read_to_string(entry.path()).unwrap_or_else(|error| {
+                panic!("failed to read {}: {error}", entry.path().display())
+            });
             match parse_proto(&text) {
                 Ok(file) => {
                     generate_file(&mut generated, &file);
@@ -372,6 +378,10 @@ struct ProtoFile {
 // ---------------------------------------------------------------------
 
 fn parse_proto(text: &str) -> Result<ProtoFile, String> {
+    // Most Windows editors (and PowerShell's own `Set-Content`) write a UTF-8
+    // BOM. protoc skips it; without this the tokenizer would meet the BOM's
+    // bytes as a stray non-ASCII character.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut tokens = tokenize(text)?;
     let mut file = ProtoFile::default();
     while !tokens.is_empty() && !matches!(tokens.first(), Some(Token::Eof)) {
@@ -483,18 +493,58 @@ fn parse_proto(text: &str) -> Result<ProtoFile, String> {
                 }
                 file.services.push(Service { name, rpcs });
             }
-            "option" | "import" => {
-                // Skip to the terminating semicolon (imports and options
-                // are not needed by the generator).
+            "import" => {
+                // No dependency resolution happens here, so an imported file
+                // would generate Rust referring to types that were never
+                // emitted and a reflection descriptor whose messages point
+                // outside the file it describes. Both are lies; the build
+                // stops here instead, which is what lets
+                // `courierust_grpc::reflection` answer with a single
+                // descriptor and no dependency walk.
+                let target = match tokens.remove(0) {
+                    Token::Quoted(name) => name,
+                    other => return Err(format!("unsupported import form: {other:?}")),
+                };
+                match tokens.remove(0) {
+                    Token::Semicolon => {}
+                    Token::Eof => return Err(format!("unterminated import of {target}")),
+                    other => return Err(format!("unexpected {other:?} in import of {target}")),
+                }
+                return Err(format!(
+                    "`import {target}` is not supported: every .proto compiles standalone"
+                ));
+            }
+            "option" => {
+                // Options carry no wire or API information the generator
+                // needs, so they are skipped up to their semicolon.
                 loop {
                     match tokens.remove(0) {
                         Token::Semicolon => break,
-                        Token::Eof => return Err("unterminated option/import".to_string()),
+                        Token::Eof => return Err("unterminated option".to_string()),
                         _ => {}
                     }
                 }
             }
             other => return Err(format!("unsupported proto keyword: {other}")),
+        }
+    }
+    // Forward references are legal and nothing else is compiled in, so a
+    // field's message type has to be declared in this same file. Anything
+    // else would generate Rust naming a type that no module emits, and the
+    // error would surface as a syntax error inside the generated file.
+    for message in &file.messages {
+        for field in &message.fields {
+            let referenced = match &field.ty {
+                FieldType::Message(name) | FieldType::RepeatedMessage(name) => name,
+                _ => continue,
+            };
+            if !file.messages.iter().any(|m| &m.name == referenced) {
+                return Err(format!(
+                    "message {}: field {} has type `{}`, which is neither an unsupported-by-design \
+                     scalar (`sfixed32`/`sfixed64`) nor a message declared in this file",
+                    message.name, field.name, referenced
+                ));
+            }
         }
     }
     Ok(file)
@@ -614,14 +664,26 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
                     .map_err(|_| "invalid field number".to_string())?;
                 tokens.push(Token::Number(value));
             }
-            c if c.is_alphabetic() || c == '_' => {
+            c if c.is_ascii_alphabetic() || c == '_' => {
                 let start = i;
                 while i < bytes.len()
-                    && (bytes[i] as char == '_' || (bytes[i] as char).is_alphanumeric())
+                    && (bytes[i] as char == '_' || (bytes[i] as char).is_ascii_alphanumeric())
                 {
                     i += 1;
                 }
                 tokens.push(Token::Ident(text[start..i].to_string()));
+            }
+            other if !other.is_ascii() => {
+                // A byte of a multi-byte character outside a comment or a
+                // string literal — a full-width `；`, say. Slicing at `i` is
+                // what the tokenizer must never do here: `i` may sit inside
+                // the character, and reporting the byte offset is more useful
+                // than the mojibake `bytes[i] as char` view of it.
+                return Err(format!(
+                    "non-ASCII character at offset {i} (0x{:02x}): proto3 source is ASCII \
+                     outside comments and string literals",
+                    bytes[i]
+                ));
             }
             other => return Err(format!("unexpected character `{other}`")),
         }
@@ -765,6 +827,25 @@ fn is_length_delimited(name: &str) -> bool {
     name == "string" || name == "bytes"
 }
 
+/// The expression that decides whether a scalar field is present, i.e. not
+/// equal to its proto3 default.
+///
+/// proto3 has implicit presence: a field holding its default is not written
+/// to the wire, which is what protoc's generated code does too. It is not
+/// only a size question — a proto2 peer, where presence is explicit, would
+/// otherwise report a field that the sender never set as present.
+///
+/// Floats are decided by bit pattern, exactly as protoc decides them: `+0.0`
+/// is the default, `-0.0` and `NaN` are values.
+fn is_present(name: &str, field: &str) -> String {
+    match name {
+        "string" | "bytes" => format!("!self.{field}.is_empty()"),
+        "bool" => format!("self.{field}"),
+        "float" | "double" => format!("self.{field}.to_bits() != 0"),
+        _ => format!("self.{field} != 0"),
+    }
+}
+
 fn generate_message(out: &mut String, message: &Message, level: usize) {
     let ind = indent(level);
     // Struct.
@@ -813,7 +894,10 @@ fn generate_message(out: &mut String, message: &Message, level: usize) {
                 } else {
                     format!("self.{}", field.name)
                 };
-                out.push_str(&format!("{e}proto::Encoder::{s}(out, {n}, {expr});\n"));
+                out.push_str(&format!(
+                    "{e}if {} {{\n{e}    proto::Encoder::{s}(out, {n}, {expr});\n{e}}}\n",
+                    is_present(s, &field.name)
+                ));
             }
             FieldType::Message(m) => out.push_str(&format!(
                 "{e}if let Some(value) = &self.{} {{ proto::Encoder::message::<{m}>(out, {n}, value); }}\n",

@@ -50,7 +50,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: benches
@@ -144,7 +144,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
       - name: Build benches (release)
         run: cargo bench --manifest-path benches/Cargo.toml --locked --no-run
       - name: Serve h1 + h2 + https + throttled on 0.0.0.0
@@ -195,7 +195,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
       - name: Build benches (release)
         run: cargo bench --manifest-path benches/Cargo.toml --locked --no-run
       - name: Benchmark the remote server
@@ -257,12 +257,24 @@ jobs:
   publish-summary:
     name: Publish cross-machine summary
     needs: [loopback-baseline, cross-client]
+    # Runs either way, but only claims a comparison when there is one: on the
+    # weekly schedule (and on a dispatch without `server_host`) the
+    # cross-machine leg is skipped, and a summary that still talked about
+    # "the rps/p99 gap between them" would be reporting a measurement nobody
+    # took.
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Note
         run: |
-          echo "The loopback and cross-machine NETWORK rows above are the
-          same-binary, same-settings comparison. Any rps/p99 gap between
-          them is the cost of the real network path, not the protocol
-          stack." >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${{ needs.loopback-baseline.result }}" == "success" && "${{ needs.cross-client.result }}" == "success" ]]; then
+            echo "The loopback and cross-machine NETWORK rows above are the same-binary," \
+                 "same-settings comparison. Any rps/p99 gap between them is the cost of the" \
+                 "real network path, not the protocol stack." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No cross-machine comparison in this run (loopback-baseline:" \
+                 "${{ needs.loopback-baseline.result }}, cross-client:" \
+                 "${{ needs.cross-client.result }}). Dispatch this workflow with" \
+                 "\`server_host\` set to the IP of the self-hosted \`courierust-server\`" \
+                 "runner to produce one." >> "$GITHUB_STEP_SUMMARY"
+          fi
