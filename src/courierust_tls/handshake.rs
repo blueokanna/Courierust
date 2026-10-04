@@ -10,13 +10,14 @@
 //! the Finished message is then added to the transcript for deriving
 //! the application traffic secrets.
 
-use super::crypto::hash::Digest;
+use super::crypto::hash::{Digest, Sha256};
 use super::crypto::hmac::hmac;
 
 use super::crypto::x25519;
 use super::key_schedule::{CipherSuite, KeySchedule, TrafficKeys, Transcript};
 use super::record::*;
 use super::{TlsError, TlsResult};
+use crate::courierust_fingerprint::profile::TlsProfile;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -234,6 +235,191 @@ pub(crate) struct AppKeys {
 // ClientHello construction
 // ---------------------------------------------------------------------
 
+/// Deterministic filler derived from the hello random: a SHA-256 chain
+/// over `tag || random || counter`. Used for the bytes a real browser
+/// draws from its CSPRNG (session id, GREASE payloads, the placeholder
+/// key share) without giving the builders an entropy source of their
+/// own — outputs stay reproducible under test.
+fn derived_bytes(seed: &[u8; 32], tag: &[u8], len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len);
+    let mut counter = 0u32;
+    while out.len() < len {
+        let mut hasher = Sha256::new();
+        hasher.update(tag);
+        hasher.update(seed);
+        hasher.update(&counter.to_be_bytes());
+        out.extend_from_slice(&hasher.finalize());
+        counter += 1;
+    }
+    out.truncate(len);
+    out
+}
+
+/// Build a ClientHello from a [`TlsProfile`] (§4.1.2): the profile's
+/// suites, extension list (in order), groups, point formats and
+/// signature algorithms go on the wire as given, with a GREASE value
+/// (RFC 8701) interleaved wherever browsers put one. Values derived from
+/// the profile's *contents* — SNI, ALPN, the key share, the OCSP and
+/// ticket requests — get real payloads; the remaining extensions are
+/// present with minimal bodies, which is what fingerprinting reads.
+fn build_profiled_client_hello(
+    random: &[u8; 32],
+    profile: &TlsProfile,
+    key_share: Option<&[u8; 32]>,
+    alpn: &[Vec<u8>],
+    server_name: Option<&str>,
+) -> Vec<u8> {
+    fn grease(nibble: u8) -> u16 {
+        let n = (nibble & 0x0f) as u16;
+        0x0a0a | (n << 12) | (n << 4)
+    }
+    let mut grease_slot = 0usize;
+    let mut next_grease = || {
+        let v = grease(random[grease_slot % random.len()]);
+        grease_slot += 1;
+        v
+    };
+    let mut group_grease: u16 = 0;
+    let mut body = Vec::new();
+    body.extend_from_slice(&profile.tls_version.to_be_bytes());
+    body.extend_from_slice(random);
+    let session_id = derived_bytes(random, b"segmeris-tls13-session-id", 32);
+    body.push(session_id.len() as u8);
+    body.extend_from_slice(&session_id);
+
+    let mut suites = Vec::with_capacity(profile.ciphers.len() + 1);
+    suites.push(next_grease());
+    suites.extend_from_slice(&profile.ciphers);
+    body.extend_from_slice(&(suites.len() as u16 * 2).to_be_bytes());
+    for suite in &suites {
+        body.extend_from_slice(&suite.to_be_bytes());
+    }
+    body.extend_from_slice(&[1, 0]); // null compression
+
+    let mut exts: Vec<(u16, Vec<u8>)> = Vec::new();
+    exts.push((next_grease(), Vec::new()));
+    for &ext in &profile.extensions {
+        if crate::courierust_fingerprint::profile::is_grease(ext) {
+            continue;
+        }
+        let payload: Vec<u8> = match ext {
+            EXT_SERVER_NAME => {
+                let Some(name) = server_name else {
+                    continue;
+                };
+                let name = name.as_bytes();
+                let mut list = Vec::new();
+                list.push(0); // host_name
+                list.extend_from_slice(&(name.len() as u16).to_be_bytes());
+                list.extend_from_slice(name);
+                let mut v = Vec::new();
+                v.extend_from_slice(&(list.len() as u16).to_be_bytes());
+                v.extend_from_slice(&list);
+                v
+            }
+            EXT_SUPPORTED_GROUPS => {
+                let grease_group = next_grease();
+                group_grease = grease_group;
+                let mut groups = Vec::with_capacity(profile.groups.len() + 1);
+                groups.push(grease_group);
+                groups.extend_from_slice(&profile.groups);
+                let mut v = Vec::new();
+                v.extend_from_slice(&(groups.len() as u16 * 2).to_be_bytes());
+                for group in &groups {
+                    v.extend_from_slice(&group.to_be_bytes());
+                }
+                v
+            }
+            EXT_EC_POINT_FORMATS => {
+                let mut v = vec![profile.point_formats.len() as u8];
+                v.extend_from_slice(&profile.point_formats);
+                v
+            }
+            EXT_SIGNATURE_ALGORITHMS => {
+                let mut schemes = Vec::with_capacity(profile.signature_algorithms.len() + 1);
+                schemes.push(next_grease());
+                schemes.extend_from_slice(&profile.signature_algorithms);
+                let mut v = Vec::new();
+                v.extend_from_slice(&(schemes.len() as u16 * 2).to_be_bytes());
+                for scheme in &schemes {
+                    v.extend_from_slice(&scheme.to_be_bytes());
+                }
+                v
+            }
+            EXT_ALPN => {
+                let mut list = Vec::new();
+                for protocol in alpn {
+                    list.push(protocol.len() as u8);
+                    list.extend_from_slice(protocol);
+                }
+                let mut v = Vec::new();
+                v.extend_from_slice(&(list.len() as u16).to_be_bytes());
+                v.extend_from_slice(&list);
+                v
+            }
+            EXT_SUPPORTED_VERSIONS => {
+                let mut versions = Vec::with_capacity(profile.supported_versions.len() + 1);
+                versions.push(next_grease());
+                versions.extend_from_slice(&profile.supported_versions);
+                let mut v = vec![(versions.len() * 2) as u8];
+                for version in &versions {
+                    v.extend_from_slice(&version.to_be_bytes());
+                }
+                v
+            }
+            EXT_KEY_SHARE => {
+                let grease_group = if group_grease != 0 {
+                    group_grease
+                } else {
+                    next_grease()
+                };
+                let mut entries: Vec<(u16, Vec<u8>)> = vec![(grease_group, vec![0u8])];
+                if let Some(share) = key_share {
+                    entries.push((GROUP_X25519, share.to_vec()));
+                }
+                let total: usize = entries.iter().map(|(_, share)| 4 + share.len()).sum();
+                let mut v = Vec::new();
+                v.extend_from_slice(&(total as u16).to_be_bytes());
+                for (group, share) in &entries {
+                    v.extend_from_slice(&group.to_be_bytes());
+                    v.extend_from_slice(&(share.len() as u16).to_be_bytes());
+                    v.extend_from_slice(share);
+                }
+                v
+            }
+            0x0005 => vec![1, 0, 0, 0, 0],
+            0x002d => vec![1, 1],
+            0xff01 => vec![0x00],
+            0x001b => vec![0x02, 0x00, 0x02],
+            0x44cd => vec![0x00, 0x03, 0x02, b'h', b'2'],
+            0x4469 => vec![0x02, b'h', b'2', 0x00, 0x00],
+            0xfe0d => {
+                let filler = derived_bytes(random, b"segmeris-ech-grease", 32 + 240);
+                let mut v = Vec::with_capacity(282);
+                v.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x01, 0x27, 0x00, 0x20]);
+                v.extend_from_slice(&filler[..32]);
+                v.extend_from_slice(&[0x00, 0xf0]);
+                v.extend_from_slice(&filler[32..]);
+                v
+            }
+            _ => Vec::new(),
+        };
+        exts.push((ext, payload));
+    }
+    exts.push((next_grease(), Vec::new()));
+
+    let mut ext_block = Vec::new();
+    let total: usize = exts.iter().map(|(_, v)| v.len() + 4).sum();
+    ext_block.extend_from_slice(&(total as u16).to_be_bytes());
+    for (ext, payload) in &exts {
+        ext_block.extend_from_slice(&ext.to_be_bytes());
+        ext_block.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        ext_block.extend_from_slice(payload);
+    }
+    body.extend_from_slice(&ext_block);
+    encode_hs(HS_CLIENT_HELLO, &body)
+}
+
 /// Build a ClientHello with an optional QUIC transport-parameters
 /// extension. The ordinary TLS path passes `None`. This is the TLS 1.3
 /// client hello used by the QUIC path (RFC 9001 requires TLS 1.3); the
@@ -254,6 +440,7 @@ pub(crate) fn build_client_hello_with_transport_params(
         transport_params,
         true,
         false,
+        None,
     )
 }
 
@@ -268,6 +455,10 @@ pub(crate) fn build_client_hello_with_transport_params(
 /// * `offer12` — also include the TLS 1.2 AEAD ECDHE suites and the
 ///   `ec_point_formats` extension, so a TLS 1.2-only server can
 ///   negotiate TLS 1.2.
+/// * `profile` — a [`TlsProfile`] to reproduce on the wire instead of
+///   the built-in parameter set (see [`build_profiled_client_hello`]);
+///   the version-window flags are not consulted in that mode. `None`
+///   keeps the built-in shape.
 ///
 /// `supported_groups` always lists X25519 and secp256r1 (the latter is
 /// what a TLS 1.2 ECDHE server needs); `signature_algorithms` carries
@@ -281,11 +472,17 @@ pub(crate) fn build_client_hello_negotiated(
     transport_params: Option<&[u8]>,
     offer13: bool,
     offer12: bool,
+    profile: Option<&TlsProfile>,
 ) -> Vec<u8> {
+    if let Some(profile) = profile {
+        return build_profiled_client_hello(random, profile, key_share, alpn, server_name);
+    }
     let mut body = Vec::new();
     body.extend_from_slice(&[0x03, 0x03]);
     body.extend_from_slice(random);
-    body.push(0);
+    let session_id = derived_bytes(random, b"segmeris-tls13-session-id", 32);
+    body.push(session_id.len() as u8);
+    body.extend_from_slice(&session_id);
     let mut suite_wires: Vec<u16> = Vec::new();
     if offer13 {
         suite_wires.extend(CLIENT_SUITES.iter().map(|s| s.wire()));
@@ -325,7 +522,6 @@ pub(crate) fn build_client_hello_negotiated(
     }
     exts.push((EXT_SUPPORTED_GROUPS, groups));
 
-    // signature_algorithms: TLS 1.3 schemes + TLS 1.2 schemes.
     let mut sigs = Vec::new();
     let mut sig_schemes: Vec<u16> = SIGNATURE_SCHEMES.to_vec();
     sig_schemes.extend_from_slice(super::tls12::TLS12_SIGNATURE_ALGORITHMS);
@@ -335,13 +531,11 @@ pub(crate) fn build_client_hello_negotiated(
     }
     exts.push((EXT_SIGNATURE_ALGORITHMS, sigs));
 
-    // ec_point_formats (required by TLS 1.2 ECDHE): uncompressed only.
     if offer12 {
         exts.push((EXT_EC_POINT_FORMATS, vec![1, 0]));
         exts.push((EXT_RENEGOTIATION_INFO, vec![0x00]));
     }
 
-    // supported_versions + key_share only when offering TLS 1.3.
     if offer13 {
         let mut versions = Vec::new();
         versions.extend_from_slice(&[0x02, 0x03, 0x04]);
@@ -355,7 +549,6 @@ pub(crate) fn build_client_hello_negotiated(
                 ks.extend_from_slice(&[0x00, 0x20]); // 32-byte key
                 ks.extend_from_slice(share);
             }
-            // Empty client_shares: ask the server to pick a group.
             None => ks.extend_from_slice(&[0x00, 0x00]),
         }
         exts.push((EXT_KEY_SHARE, ks));
@@ -396,7 +589,6 @@ pub(crate) fn build_client_hello_negotiated(
 /// dispatch between the TLS 1.3 and TLS 1.2 paths.
 pub(crate) fn server_hello_negotiates_tls13(body: &[u8]) -> bool {
     let mut c = Cur::new(body);
-    // legacy_version (must be 0x0303), random (32), session id.
     if c.u16().is_none() || c.take(32).is_none() {
         return false;
     }
@@ -407,7 +599,6 @@ pub(crate) fn server_hello_negotiates_tls13(body: &[u8]) -> bool {
     if c.take(sid_len).is_none() {
         return false;
     }
-    // cipher_suite (2), compression (1), then extensions.
     if c.take(3).is_none() {
         return false;
     }
@@ -440,8 +631,6 @@ pub(crate) fn client_hello_offers_tls13(body: &[u8]) -> TlsResult<bool> {
     c.take(sid_len)
         .ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
     let suites_len = c.u16().ok_or_else(|| TlsError::Protocol("bad CH".into()))? as usize;
-    // `% 2 != 0` is total (usize remainder never overflows; constant
-    // non-zero divisor cannot panic).
     if suites_len < 2 || suites_len % 2 != 0 {
         return Err(TlsError::Protocol("bad CH suites".into()));
     }
@@ -488,6 +677,22 @@ pub(crate) struct ServerHelloInfo {
     pub(crate) session_id: Vec<u8>,
     /// True when the server accepted our resumption PSK.
     pub(crate) resumed: bool,
+}
+
+/// The `legacy_session_id` of a full ClientHello handshake message
+/// (header included), for checking a ServerHello's
+/// `legacy_session_id_echo` (RFC 8446 §4.1.3).
+pub(crate) fn client_hello_session_id(ch: &[u8]) -> TlsResult<Vec<u8>> {
+    let body = ch
+        .get(4..)
+        .ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
+    // legacy_version (2) || random (32) || session_id<1..32>
+    let sid_len = *body
+        .get(34)
+        .ok_or_else(|| TlsError::Protocol("bad CH".into()))? as usize;
+    body.get(35..35 + sid_len)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| TlsError::Protocol("bad CH".into()))
 }
 
 pub(crate) fn parse_server_hello(body: &[u8]) -> TlsResult<ServerHelloInfo> {
@@ -800,48 +1005,55 @@ pub(crate) fn cert_verify_message(handshake_hash: &[u8], client: bool) -> Vec<u8
 
 /// Verify a CertificateVerify signature given the peer's SPKI and the
 /// transcript hash. Returns Ok(()) if valid.
+///
+/// RFC 8446 §4.4.3: the signature scheme carries its own hash — the
+/// cipher suite's transcript hash is independent. A SHA-384 suite
+/// routinely pairs with an `rsa_pss_rsae_sha256` CertificateVerify
+/// (that is what `api.bilibili.com` serves), so the suite takes no
+/// part in the choice here.
 pub(crate) fn verify_cert_verify(
     cv: &CertVerify,
     spki: &super::x509::Spki,
     handshake_hash: &[u8],
     client: bool,
-    suite: CipherSuite,
 ) -> TlsResult<()> {
-    use super::crypto::rsa::{verify_rsa_pkcs1v15, RsaPublicKey};
+    use super::crypto::hash::{hash as digest, Sha256, Sha384};
+    use super::crypto::rsa::{
+        RsaPublicKey, DIGEST_INFO_SHA256, DIGEST_INFO_SHA384, DIGEST_INFO_SHA512,
+    };
     use super::crypto::{ecdsa, ed25519};
     use super::x509::der::{
         parse_rsa_public_key, OID_EC_PUBLIC_KEY, OID_ED25519, OID_RSA_ENCRYPTION,
     };
 
     let msg = cert_verify_message(handshake_hash, client);
-    let hash = {
-        let mut d: super::crypto::hash::BoxDigest = match suite.hash() {
-            super::key_schedule::SuiteHash::Sha256 => Box::<super::crypto::hash::Sha256>::default(),
-            super::key_schedule::SuiteHash::Sha384 => Box::<super::crypto::hash::Sha384>::default(),
-        };
-        d.update(&msg);
-        d.finalize()
-    };
 
     if spki.oid == OID_RSA_ENCRYPTION {
         let (n, e) = parse_rsa_public_key(&spki.key)
             .ok_or_else(|| TlsError::Certificate("bad RSA SPKI".into()))?;
         let key = RsaPublicKey { n, e };
         let ok = match cv.scheme {
-            0x0804 if suite.hash() == super::key_schedule::SuiteHash::Sha256 => {
-                let mut h = super::crypto::hash::Sha256::default();
-                key.verify_pss(&mut h, &msg, 32, &cv.signature)
+            0x0804 => key.verify_pss(&mut Sha256::new(), &msg, 32, &cv.signature),
+            0x0805 => key.verify_pss(&mut Sha384::new(), &msg, 48, &cv.signature),
+            0x0806 => {
+                let mut h = ed25519::Sha512::new();
+                key.verify_pss(&mut h, &msg, 64, &cv.signature)
             }
-            0x0805 if suite.hash() == super::key_schedule::SuiteHash::Sha384 => {
-                let mut h = super::crypto::hash::Sha384::default();
-                key.verify_pss(&mut h, &msg, 48, &cv.signature)
-            }
-            0x0401 if suite.hash() == super::key_schedule::SuiteHash::Sha256 => {
-                verify_rsa_pkcs1v15(&key, false, &hash, &cv.signature)
-            }
-            0x0501 if suite.hash() == super::key_schedule::SuiteHash::Sha384 => {
-                verify_rsa_pkcs1v15(&key, true, &hash, &cv.signature)
-            }
+            0x0401 => key.verify_pkcs1v15(
+                DIGEST_INFO_SHA256,
+                &digest(&mut Sha256::new(), &msg),
+                &cv.signature,
+            ),
+            0x0501 => key.verify_pkcs1v15(
+                DIGEST_INFO_SHA384,
+                &digest(&mut Sha384::new(), &msg),
+                &cv.signature,
+            ),
+            0x0601 => key.verify_pkcs1v15(
+                DIGEST_INFO_SHA512,
+                &digest(&mut ed25519::Sha512::new(), &msg),
+                &cv.signature,
+            ),
             _ => false,
         };
         if ok {
@@ -852,12 +1064,17 @@ pub(crate) fn verify_cert_verify(
             ))
         }
     } else if spki.oid == OID_EC_PUBLIC_KEY {
-        let (curve, expected_scheme) = match suite.hash() {
-            super::key_schedule::SuiteHash::Sha256 => (ecdsa::Curve::P256, 0x0403),
-            super::key_schedule::SuiteHash::Sha384 => (ecdsa::Curve::P384, 0x0503),
+        let (curve, signed_digest) = match cv.scheme {
+            0x0403 => (ecdsa::Curve::P256, digest(&mut Sha256::new(), &msg)),
+            0x0503 => (ecdsa::Curve::P384, digest(&mut Sha384::new(), &msg)),
+            0x0603 => (
+                ecdsa::Curve::P521,
+                digest(&mut ed25519::Sha512::new(), &msg),
+            ),
+            _ => return Err(TlsError::Certificate("unsupported EC signature".into())),
         };
-        if cv.scheme != expected_scheme || spki.ec_curve != Some(curve) {
-            return Err(TlsError::Certificate("unsupported EC signature".into()));
+        if spki.ec_curve != Some(curve) {
+            return Err(TlsError::Certificate("EC curve mismatch".into()));
         }
         let clen = curve.coord_len();
         if spki.key.len() != 1 + 2 * clen || spki.key[0] != 0x04 {
@@ -865,7 +1082,7 @@ pub(crate) fn verify_cert_verify(
         }
         let qx = &spki.key[1..1 + clen];
         let qy = &spki.key[1 + clen..1 + 2 * clen];
-        if ecdsa::verify_der(curve, qx, qy, &hash, &cv.signature) {
+        if ecdsa::verify_der(curve, qx, qy, &signed_digest, &cv.signature) {
             Ok(())
         } else {
             Err(TlsError::Certificate(
@@ -948,10 +1165,7 @@ pub(crate) struct ClientHandshake {
     pub(crate) verify: bool,
     /// A resumption PSK to offer (RFC 8446 §4.2.11), with its suite.
     pub(crate) psk: Option<(Vec<u8>, CipherSuite)>,
-    /// The client certificate to present when the server asks for one
-    /// (mTLS). `None` answers a CertificateRequest with an empty
-    /// Certificate — which a server that *requires* authentication
-    /// rejects, as it should.
+    /// The client certificate to present when the server asks for one (mTLS)
     pub(crate) identity: Option<super::Identity>,
 }
 
@@ -981,7 +1195,7 @@ impl ClientHandshake {
         hrr: Option<(&[u8], &[u8], &[u8])>,
     ) -> TlsResult<HandshakeResult> {
         let sh = parse_server_hello(sh_body)?;
-        if !sh.session_id.is_empty() {
+        if sh.session_id != client_hello_session_id(ch)? {
             return Err(TlsError::Protocol("ServerHello session id mismatch".into()));
         }
 
@@ -1032,9 +1246,6 @@ impl ClientHandshake {
         let mut cv = None;
         let mut negotiated_alpn = None;
         let mut saw_ee = false;
-        // A CertificateRequest (mTLS, RFC 8446 §4.4.2) arrives after
-        // EncryptedExtensions and before the server's Certificate; the
-        // schemes it offers bound what this client may sign with.
         let mut client_auth: Option<Vec<u16>> = None;
         let mut saw_certificate = false;
         for (t, body) in &messages {
@@ -1098,13 +1309,9 @@ impl ClientHandshake {
             }
         }
 
-        // Verify the CertificateVerify signature.
-        verify_cert_verify(&cv, &spki, &cv_hash, false, sh.suite)?;
-
-        // Add CV to transcript.
+        verify_cert_verify(&cv, &spki, &cv_hash, false)?;
         transcript.update(&encode_hs(HS_CERTIFICATE_VERIFY, &cv_body(&messages)));
 
-        // Verify server Finished (hash before Finished).
         let finished_body = messages
             .iter()
             .find(|(t, _)| *t == HS_FINISHED)
@@ -1123,11 +1330,6 @@ impl ClientHandshake {
         let after_fin_hash = transcript.current_hash();
         ks.application(&after_fin_hash)?;
 
-        // mTLS (RFC 8446 §4.4.2): answer a CertificateRequest with the
-        // client certificate and a CertificateVerify over the transcript
-        // that now ends at the server's Finished. With no suitable
-        // certificate the mandated answer is an *empty* Certificate, not
-        // silence — the server decides whether that is acceptable.
         let mut client_flight = Vec::new();
         if let Some(schemes) = client_auth {
             client_flight = match &self.identity {
@@ -1248,19 +1450,8 @@ impl ServerHandshake {
         ch_body: &[u8],
     ) -> TlsResult<HandshakeResult> {
         let suite_hash_pref = super::sign::tls13_suite_hash_pref(&self.identity);
-
-        // 1. Read ClientHello. If the client supports X25519 but did not
-        //    offer a share, send a HelloRetryRequest (RFC 8446 §4.1.4)
-        //    and read the retried ClientHello. The transcript replaces
-        //    ClientHello1 with message_hash(Hash(ClientHello1)) and then
-        //    appends HelloRetryRequest and ClientHello2 (§4.4.1); a PSK
-        //    binder in ClientHello2 is computed over CH1 || HRR ||
-        //    Truncate(CH2) (§4.2.11.2).
         let mut ch = parse_client_hello(ch_body, suite_hash_pref)?;
         let mut transcript = Transcript::new(ch.suite.hash());
-        // The ClientHello body that carries the resumption offer, plus
-        // the (ClientHello1, HelloRetryRequest) pair when a retry
-        // happened (the CH2 binder is over CH1 || HRR || Truncate(CH2)).
         let mut resume_body: Vec<u8> = ch_body.to_vec();
         let mut hrr_prefix: Option<(Vec<u8>, Vec<u8>)> = None;
         if ch.key_share.is_none() {
@@ -1300,11 +1491,6 @@ impl ServerHandshake {
             transcript.update(&encode_hs(HS_CLIENT_HELLO, ch_body));
         }
 
-        // 1b. Resumption: a well-formed pre_shared_key offer whose ticket
-        // decrypts, matches the negotiated suite, and carries a valid
-        // binder resumes the session (RFC 8446 §4.2.11). Any failure
-        // falls back to a full handshake (the client proceeds without the
-        // PSK), except a malformed offer, which is a protocol error.
         let mut resumed = false;
         let mut resume_psk: Option<Vec<u8>> = None;
         if let Some(offer) = super::session::parse_pre_shared_key(&resume_body)? {
@@ -1331,9 +1517,6 @@ impl ServerHandshake {
             }
         }
 
-        // 2. ECDHE + ServerHello. Same fail-closed entropy requirement as
-        //    the client: an all-zero server private key would make the
-        //    session keys predictable to a passive attacker.
         let ch_share = ch.key_share.expect("X25519 share resolved above");
         let mut s_priv = [0u8; 32];
         fill_entropy(&mut s_priv)?;
@@ -1359,10 +1542,7 @@ impl ServerHandshake {
             KeySchedule::handshake(ch.suite, &shared, &th)
         };
 
-        // 3. EncryptedExtensions, Certificate, CertificateVerify, Finished.
         let mut ee_body = Vec::new();
-        // ALPN (RFC 7301): the server selects exactly ONE protocol from
-        // the client's offer, in server-preference order.
         let negotiated_alpn = self
             .alpn
             .iter()
@@ -1387,12 +1567,7 @@ impl ServerHandshake {
         ee_body.extend_from_slice(&(ee_bytes.len() as u16).to_be_bytes());
         ee_body.extend_from_slice(&ee_bytes);
         let ee = encode_hs(HS_ENCRYPTED_EXTENSIONS, &ee_body);
-
-        // Certificate message.
         let cert = build_certificate(&[], &self.identity.cert_chain);
-
-        // mTLS: the CertificateRequest goes between EncryptedExtensions
-        // and Certificate, and the transcript follows the wire order.
         let cr = self
             .client_auth
             .as_ref()
@@ -1403,11 +1578,6 @@ impl ServerHandshake {
         }
         transcript.update(&cert);
 
-        // CertificateVerify: sign the transcript hash. Per RFC 8446
-        // §4.4.3 the signature is computed over the concatenation
-        // `64 x 0x20 || "TLS 1.3, server CertificateVerify" || 0x00 ||
-        // transcript-hash` (the digest schemes hash that content; Ed25519
-        // signs it verbatim).
         let cv_hash = transcript.current_hash();
         let sig_content = cert_verify_message(&cv_hash, false);
         let cv = match super::server_sign(&self.identity, &sig_content, ch.suite)? {
@@ -1419,8 +1589,6 @@ impl ServerHandshake {
                 encode_hs(HS_CERTIFICATE_VERIFY, &cv_body)
             }
             None => {
-                // No signing identity configured — reject (server must
-                // authenticate).
                 return Err(TlsError::Certificate(
                     "no server identity configured".into(),
                 ));
@@ -1428,17 +1596,14 @@ impl ServerHandshake {
         };
         transcript.update(&cv);
 
-        // Finished: hash before adding Finished.
         let fin_hash = transcript.current_hash();
         let fin = finished_verify_data(&ks, ks.server_handshake(), &fin_hash);
         let fin_msg = encode_hs(HS_FINISHED, &fin);
         transcript.update(&fin_msg);
 
-        // Derive app secrets (transcript includes server Finished).
         let after_fin_hash = transcript.current_hash();
         ks.application(&after_fin_hash)?;
 
-        // Send the encrypted flight.
         let s_hs_keys = ks.server_handshake_keys();
         let mut flight = ee;
         if let Some(cr) = &cr {
@@ -1449,8 +1614,6 @@ impl ServerHandshake {
         flight.extend_from_slice(&fin_msg);
         io.write_encrypted_record(ch.suite, &s_hs_keys, CONTENT_HANDSHAKE, &flight)?;
 
-        // 4. Read the client flight: [Certificate, CertificateVerify,]
-        //    Finished (RFC 8446 §4.4.2).
         let c_hs_keys = ks.client_handshake_keys();
         let plaintext = io.read_encrypted_handshake(ch.suite, &c_hs_keys)?;
         let mut off = 0usize;
@@ -1482,9 +1645,7 @@ impl ServerHandshake {
                     }
                     let cv_hash = transcript.current_hash();
                     let leaf = super::x509::parse_certificate(&entries[0])?;
-                    if let Err(e) = verify_cert_verify(&cv, &leaf.spki, &cv_hash, true, ch.suite) {
-                        // bad_certificate (42): the signature does not
-                        // prove possession of the offered certificate.
+                    if let Err(e) = verify_cert_verify(&cv, &leaf.spki, &cv_hash, true) {
                         send_alert(io, ch.suite, &ks.server_application_keys(), 2, 42)?;
                         return Err(e);
                     }
@@ -1504,11 +1665,6 @@ impl ServerHandshake {
             ));
         }
 
-        // mTLS policy. An empty certificate list is the mandated way to
-        // decline (RFC 8446 §4.4.2) — accepted only when this server
-        // asked for authentication without requiring it. A certificate
-        // that *is* offered is always validated: chain against the
-        // configured roots, validity window, and the clientAuth EKU.
         let client_cert = match client_cert {
             Some((_, entries)) if entries.is_empty() => None,
             other => other,
@@ -1533,8 +1689,6 @@ impl ServerHandshake {
                         }
                     });
                 if let Err(e) = refused {
-                    // bad_certificate (42): the chain or its key usage
-                    // does not qualify.
                     send_alert(io, ch.suite, &ks.server_application_keys(), 2, 42)?;
                     return Err(e);
                 }
@@ -1547,7 +1701,6 @@ impl ServerHandshake {
             }
             (Some(auth), None) => {
                 if auth.is_required() {
-                    // RFC 8446 §6.2: `certificate_required` (116).
                     send_alert(io, ch.suite, &ks.server_application_keys(), 2, 116)?;
                     return Err(TlsError::Alert {
                         level: 2,
@@ -1573,15 +1726,8 @@ impl ServerHandshake {
         let write = ks.server_application_keys();
         let read = ks.client_application_keys();
 
-        // The application keys start a fresh record sequence space
-        // (RFC 8446 §5.2: sequence numbers reset at each key change).
         io.reset_sequences();
 
-        // 5. Issue a NewSessionTicket (session resumption, RFC 8446
-        //    §4.6.1). Sent after the handshake, protected by the server
-        //    application keys. The PSK is derived from the resumption
-        //    master secret with a fresh nonce and encrypted inside the
-        //    ticket with the server-held ticket key.
         if let Some(key) = self.ticket_key {
             let mut nonce = [0u8; 8];
             fill_entropy(&mut nonce)?;
@@ -1605,9 +1751,6 @@ impl ServerHandshake {
             },
             alpn: negotiated_alpn,
             server_name: ch.server_name,
-            // The authenticated peer's leaf, for the layer above to
-            // authorize on (mTLS): `None` when no certificate was asked
-            // for, or when the client declined an optional request.
             peer_cert: client_cert.map(|(_, entries)| entries[0].clone()),
             resumed,
             resumption_master: None,
@@ -1798,9 +1941,7 @@ pub(crate) fn parse_client_hello(
     if !saw_versions {
         return Err(TlsError::Protocol("CH missing supported_versions".into()));
     }
-    // Choose the first offered suite we support whose hash matches the
-    // identity key (for EC identities the TLS 1.3 ECDSA scheme is fixed
-    // by the suite hash).
+
     let suite = CLIENT_SUITES
         .iter()
         .copied()
@@ -1885,8 +2026,6 @@ pub(crate) fn parse_hello_retry_request(body: &[u8]) -> Result<HrrInfo, TlsError
                 );
             }
             EXT_COOKIE => {
-                // Validate the stateless cookie's framing; this client has
-                // no re-issue path, so the content is not retained.
                 let mut v = Cur::new(e.content);
                 let len = v
                     .u16()
@@ -1993,4 +2132,94 @@ pub(crate) fn build_server_hello_with_transport_params(
     body.extend_from_slice(&(ext_bytes.len() as u16).to_be_bytes());
     body.extend_from_slice(&ext_bytes);
     encode_hs(HS_SERVER_HELLO, &body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::courierust_fingerprint::profile::{chrome_tls_profile, is_grease};
+
+    /// Walk a ClientHello body and return every extension with its
+    /// payload, in wire order.
+    fn extensions(body: &[u8]) -> Vec<(u16, &[u8])> {
+        let mut p = 2 + 32;
+        let sid = body[p] as usize;
+        p += 1 + sid;
+        let suites = u16::from_be_bytes([body[p], body[p + 1]]) as usize;
+        p += 2 + suites;
+        let comp = body[p] as usize;
+        p += 1 + comp;
+        let ext_total = u16::from_be_bytes([body[p], body[p + 1]]) as usize;
+        p += 2;
+        let end = p + ext_total;
+        let mut out = Vec::new();
+        while p + 4 <= end {
+            let id = u16::from_be_bytes([body[p], body[p + 1]]);
+            let len = u16::from_be_bytes([body[p + 2], body[p + 3]]) as usize;
+            out.push((id, &body[p + 4..p + 4 + len]));
+            p += 4 + len;
+        }
+        out
+    }
+
+    /// The profiled ClientHello must reproduce exactly the Chrome
+    /// parameter set once GREASE is filtered — that equivalence is the
+    /// whole point of the profile path (and what JA3/JA4 record).
+    #[test]
+    fn profiled_client_hello_matches_the_chrome_profile() {
+        let profile = chrome_tls_profile();
+        let random = [0x5au8; 32];
+        let share = [0x77u8; 32];
+        let alpn = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let ch = build_profiled_client_hello(
+            &random,
+            &profile,
+            Some(&share),
+            &alpn,
+            Some("api.bilibili.com"),
+        );
+        let message = parse_hs(&ch).expect("well-formed handshake message");
+        assert_eq!(message.msg_type, HS_CLIENT_HELLO);
+
+        let parsed = super::super::tls12::parse_client_hello12(message.body).expect("parses");
+        let suites: Vec<u16> = parsed
+            .offered_suites
+            .iter()
+            .copied()
+            .filter(|s| !is_grease(*s))
+            .collect();
+        assert_eq!(suites, profile.ciphers);
+        let groups: Vec<u16> = parsed
+            .supported_groups
+            .iter()
+            .copied()
+            .filter(|g| !is_grease(*g))
+            .collect();
+        assert_eq!(groups, profile.groups);
+        let schemes: Vec<u16> = parsed
+            .signature_algorithms
+            .iter()
+            .copied()
+            .filter(|s| !is_grease(*s))
+            .collect();
+        assert_eq!(schemes, profile.signature_algorithms);
+
+        let exts = extensions(message.body);
+        let ids: Vec<u16> = exts
+            .iter()
+            .map(|(id, _)| *id)
+            .filter(|e| !is_grease(*e))
+            .collect();
+        assert_eq!(ids, profile.extensions);
+
+        // The key_share list length must account for whole entries
+        // (group || length || share) — a declared length short of that
+        // makes every server reject the hello.
+        let (_, share_payload) = exts
+            .iter()
+            .find(|(id, _)| *id == EXT_KEY_SHARE)
+            .expect("key_share present");
+        let declared = u16::from_be_bytes([share_payload[0], share_payload[1]]) as usize;
+        assert_eq!(declared, share_payload.len() - 2);
+    }
 }

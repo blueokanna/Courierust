@@ -265,9 +265,6 @@ fn echo_roundtrip_blocking_driver() {
 fn large_messages_survive_the_round_trip() {
     let addr = spawn_ws_server(blocking_config(), "/echo", Arc::new(EchoService::default()));
     let mut ws = connect(addr, "/echo");
-
-    // 1 MiB of semi-compressible binary data (exercise the 64-bit length
-    // form, the masking windows and the reassembly buffers at once).
     let big: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
     ws.send_binary(&big).unwrap();
     match ws.read_message().unwrap() {
@@ -287,8 +284,6 @@ fn fragmented_client_frames_are_reassembled() {
     let observed = service.clone();
     let addr = spawn_ws_server(blocking_config(), "/echo", service);
 
-    // A raw client that fragments one text message into three frames with
-    // a ping interleaved in the middle.
     let mut raw = raw_handshake(addr, "/echo");
     raw.write_all(&masked_frame(0x1, b"frag", false)).unwrap();
     raw.write_all(&masked_frame(0x9, b"ping", true)).unwrap(); // ping
@@ -296,7 +291,6 @@ fn fragmented_client_frames_are_reassembled() {
     raw.write_all(&masked_frame(0x0, b"ed", true)).unwrap();
     raw.flush().unwrap();
 
-    // The ping is answered, then the echo of the complete message.
     raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let pong = read_frame(&mut raw);
     assert_eq!(pong.0, 0xA, "expected a Pong for the Ping");
@@ -329,8 +323,6 @@ fn server_can_push_from_another_thread() {
         service.sender.lock().unwrap().is_some()
     });
 
-    // Push from the test thread while the connection's owner thread is
-    // parked in its read loop.
     let sender = service.sender.lock().unwrap().clone().unwrap();
     sender.send_text("pushed from another thread").unwrap();
 
@@ -444,10 +436,6 @@ fn subprotocols_are_negotiated_by_server_preference() {
     );
     ws.send_text("hi").unwrap();
     assert_eq!(ws.read_message().unwrap(), Event::Text(String::from("hi")));
-
-    // A client that offers only an unsupported protocol is told so:
-    // nothing is selected, and `require_subprotocol` turns that into an
-    // error instead of a silently degraded connection.
     let opts = WsClientOptions {
         protocols: vec![String::from("nope.v9")],
         require_subprotocol: true,
@@ -537,8 +525,6 @@ fn an_allow_list_admits_exactly_the_listed_origin() {
 fn the_upgrade_path_is_per_route() {
     let addr = spawn_ws_server(blocking_config(), "/echo", Arc::new(EchoService::default()));
     let cfg = ClientConfig::default();
-    // `/other` is not a WebSocket route: the handler falls through to
-    // normal HTTP, which answers 404 and never switches protocols.
     let err = match WebSocket::connect(&format!("ws://{addr}/other"), &cfg) {
         Ok(_) => panic!("a non-WebSocket route must not upgrade"),
         Err(e) => e,
@@ -560,8 +546,6 @@ fn a_disabled_websocket_upgrade_falls_through_to_http() {
         Ok(_) => panic!("websockets are disabled"),
         Err(e) => e,
     };
-    // With websockets off the request is ordinary HTTP: the handler's
-    // own 404 is what the client sees, not a protocol switch.
     assert!(err.to_string().contains("404"), "{err}");
 }
 
@@ -582,9 +566,6 @@ fn an_oversized_message_is_closed_with_1009() {
     let addr = spawn_ws_server(config, "/echo", Arc::new(EchoService::default()));
     let mut raw = raw_handshake(addr, "/echo");
     raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-
-    // One frame over the frame limit: the server must refuse before it
-    // buffers the payload.
     raw.write_all(&masked_frame(0x2, &vec![0u8; 2048], true))
         .unwrap();
     raw.flush().unwrap();
@@ -599,8 +580,6 @@ fn an_unmasked_client_frame_is_closed_with_1002() {
     let mut raw = raw_handshake(addr, "/echo");
     raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
-    // RFC 6455 §5.1: a server MUST fail the connection on an unmasked
-    // client frame.
     raw.write_all(&unmasked_frame(0x1, b"cheeky", true))
         .unwrap();
     raw.flush().unwrap();
@@ -625,7 +604,6 @@ fn invalid_utf8_in_a_text_frame_is_closed_with_1007() {
 
 #[test]
 fn reserved_bits_and_bad_opcodes_are_closed_with_1002() {
-    // RSV1 without a negotiated extension.
     let addr = spawn_ws_server(blocking_config(), "/echo", Arc::new(EchoService::default()));
     let mut raw = raw_handshake(addr, "/echo");
     raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -637,7 +615,6 @@ fn reserved_bits_and_bad_opcodes_are_closed_with_1002() {
     assert_eq!(opcode, 0x8);
     assert_eq!(u16::from_be_bytes([payload[0], payload[1]]), 1002);
 
-    // Reserved opcode 0x3.
     let addr = spawn_ws_server(blocking_config(), "/echo", Arc::new(EchoService::default()));
     let mut raw = raw_handshake(addr, "/echo");
     raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -654,9 +631,6 @@ fn a_non_minimal_length_encoding_is_closed_with_1002() {
     let mut raw = raw_handshake(addr, "/echo");
     raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
-    // "hello" in a frame that advertises a 16-bit length it does not
-    // need. A parser that accepts this disagrees with a strict proxy
-    // about where the frame ends.
     let mut frame = vec![0x81u8, 0x80 | 126, 0x00, 0x05, 1, 2, 3, 4];
     let mut body = b"hello".to_vec();
     mask_in_place(&mut body, [1, 2, 3, 4]);
@@ -680,9 +654,6 @@ fn a_hostile_client_cannot_stall_the_server_with_a_partial_frame() {
     let addr = spawn_ws_server(config, "/echo", Arc::new(EchoService::default()));
     let mut raw = raw_handshake(addr, "/echo");
     raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-
-    // Half a frame header, then silence. The driver's keepalive must
-    // eventually close the connection instead of holding it forever.
     raw.write_all(&[0x81]).unwrap();
     raw.flush().unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -741,8 +712,6 @@ fn echo_roundtrip_on_the_event_driven_server() {
         Event::Binary(b) => assert_eq!(b.len(), 4096),
         other => panic!("unexpected {other:?}"),
     }
-    // A large message exercises the queued write path across many poll
-    // iterations.
     let big = "x".repeat(512 * 1024);
     ws.send_text(&big).unwrap();
     assert_eq!(ws.read_message().unwrap(), Event::Text(big));
@@ -779,8 +748,6 @@ fn the_event_server_pushes_from_another_thread() {
     });
     let sender = service.sender.lock().unwrap().clone().unwrap();
 
-    // The connection is parked in the reactor: this push has to travel
-    // through the queue *and* the reactor's wakeup to arrive.
     for i in 0..8 {
         sender.send_text(&format!("push {i}")).unwrap();
     }
@@ -854,8 +821,6 @@ fn a_closed_connection_does_not_stop_the_reactor() {
         Event::Text(String::from("staying"))
     );
 
-    // Close one of them and wait until the server has seen it end, so the
-    // close is really processed while the other connection is parked.
     leaving.close(1000, "bye").unwrap();
     drop(leaving);
     wait_for("the server to observe the close", || {
@@ -873,9 +838,6 @@ fn a_closed_connection_does_not_stop_the_reactor() {
     }
     staying.close(1000, "done").unwrap();
 
-    // The invariant behind that: every close unregisters the descriptor
-    // *before* it is closed, so no wait ever names a closed one and the
-    // reactor never has to recover at all.
     let snapshot = stats.snapshot();
     assert_eq!(
         snapshot.event_wait_errors, 0,
@@ -920,9 +882,6 @@ fn the_event_reactor_enforces_limits_too() {
     };
     let addr = spawn_ws_server(config, "/echo", Arc::new(EchoService::default()));
     let mut ws = connect(addr, "/echo");
-    // An 8 KiB binary message against a 4 KiB limit. The server must
-    // refuse it *before* buffering the payload, and the client sees that
-    // as a `1009` close (the close frame is the last thing that arrives).
     ws.send_binary(&vec![0u8; 8192]).unwrap();
     match ws.read_message() {
         Ok(Event::Close(Some(frame))) => assert_eq!(frame.code, 1009),
@@ -960,6 +919,7 @@ fn wss_round_trip_over_tls() {
             max_version: courierust::courierust_tls::TlsVersion::Tls13,
 
             identity: None,
+            profile: None,
         }),
         ..Default::default()
     };

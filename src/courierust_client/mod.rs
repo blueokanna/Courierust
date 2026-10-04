@@ -50,6 +50,14 @@ pub struct TlsSettings {
     /// (mTLS). `None` (the default) answers a `CertificateRequest` with
     /// an empty certificate list.
     pub identity: Option<crate::courierust_tls::Identity>,
+    /// A `ClientHello` parameter set to reproduce on the wire (see
+    /// [`crate::courierust_fingerprint::profile::chrome_tls_profile`])
+    /// instead of the built-in shape. Servers behind traffic-risk
+    /// engines reject very sparse ClientHellos; a browser profile passes
+    /// because it is what those engines expect. `None` (the default)
+    /// keeps the built-in shape. Configured profiles disable TLS
+    /// session resumption.
+    pub profile: Option<crate::courierust_fingerprint::profile::TlsProfile>,
 }
 
 impl Default for TlsSettings {
@@ -64,6 +72,7 @@ impl Default for TlsSettings {
             min_version: crate::courierust_tls::TlsVersion::Tls12,
             max_version: crate::courierust_tls::TlsVersion::Tls13,
             identity: None,
+            profile: None,
         }
     }
 }
@@ -93,6 +102,7 @@ fn connector_config(t: &TlsSettings) -> crate::courierust_tls::ClientConfig {
         min_version: t.min_version,
         max_version: t.max_version,
         identity: t.identity.clone(),
+        profile: t.profile.clone(),
     }
 }
 
@@ -260,6 +270,21 @@ fn h1_pool_key(secure: bool, authority: &str) -> H1PoolKey {
         secure,
         authority: authority.to_string(),
     }
+}
+
+/// The value of the `Host` field for `authority`.
+///
+/// RFC 9110 §7.2 allows `name:port` in `Host`, and `https://a.b:443/x`
+/// and `https://a.b/x` are the same origin — but browsers never write
+/// the scheme's default port, and an explicit `:443` tells risk
+/// controls the request did not come from one.
+fn host_header_value<'a>(scheme: &str, authority: &'a str) -> &'a str {
+    let default_port = match scheme {
+        "https" => ":443",
+        "http" => ":80",
+        _ => return authority,
+    };
+    authority.strip_suffix(default_port).unwrap_or(authority)
 }
 
 struct ClientInner {
@@ -859,7 +884,11 @@ impl Client {
         if let Some(d) = deadline {
             let _ = owned.set_read_deadline(Some(d));
         }
-        let result = owned.send(&req, &self.inner.config, authority);
+        // The `Host` field omits the scheme's default port: RFC 9110
+        // permits `host:443`, but browsers never send it, and carrying
+        // it marks the request as non-browser traffic.
+        let host_header = host_header_value(&url.scheme, authority);
+        let result = owned.send(&req, &self.inner.config, host_header);
         if deadline.is_some() {
             let _ = owned.set_read_deadline(self.inner.config.read_timeout);
         }
@@ -888,7 +917,7 @@ impl Client {
                     if let Some(d) = deadline {
                         let _ = retry.set_read_deadline(Some(d));
                     }
-                    let resp = retry.send(&req, &self.inner.config, authority);
+                    let resp = retry.send(&req, &self.inner.config, host_header);
                     if deadline.is_some() {
                         let _ = retry.set_read_deadline(self.inner.config.read_timeout);
                     }
@@ -1055,8 +1084,6 @@ impl Client {
                 break;
             }
 
-            // Open outside the pool lock (a QUIC connect + TLS handshake
-            // must not serialize every concurrent requester).
             let opened = (|| -> Result<H3Conn> {
                 let conn = crate::courierust_h3::runtime::start_h3_driver(
                     addr,
@@ -1092,8 +1119,6 @@ impl Client {
             }
         }
 
-        // Rare fallback after a long open race: block on the
-        // least-loaded live connection (its dispatch queue drains).
         let mut pools = self.inner.h3_pool.lock().unwrap();
         let list = pools.entry(authority.to_string()).or_default();
         let conn = list
@@ -1133,11 +1158,8 @@ impl Client {
                 result
             }
             Err(std::sync::mpsc::SendError(cmd)) => {
-                // The driver is gone; open a fresh connection and retry.
                 conn.accepting.store(false, Ordering::Release);
                 conn.release();
-                // `get_h3_conn` already reserves for the retried request;
-                // a second `reserve` here would leak one unit per retry.
                 let fresh = self.get_h3_conn(authority, addr, hostname, &options)?;
                 let (tx2, rx2) = std::sync::mpsc::channel();
                 let cmd2 = match cmd {
@@ -1183,8 +1205,6 @@ impl Client {
             pools.get_mut(authority).and_then(|list| {
                 list.retain(|c| c.accepting.load(Ordering::Acquire));
                 let max_connections = self.inner.config.max_connections_per_host.max(1);
-                // Idle-first (see `get_h2_conn`): a free connection is
-                // reused regardless of its EWMA history.
                 let idle = list
                     .iter()
                     .filter(|c| c.accepting.load(Ordering::Acquire))

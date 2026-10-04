@@ -148,11 +148,13 @@ fn hex_join(v: &[u16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::courierust_fingerprint::profile::chrome_tls_profile;
+    use crate::courierust_fingerprint::profile::fixtures::ja_sample_profile;
 
     #[test]
     fn matches_official_spec_example() {
-        let p = chrome_tls_profile();
+        // Frozen spec sample (see the JA3 vector for why the input is a
+        // fixed literal instead of `chrome_tls_profile()`).
+        let p = ja_sample_profile();
         assert_eq!(ja4(&p), "t13d1516h2_8daaf6152771_e5627efa2ab1");
     }
 

@@ -243,11 +243,6 @@ impl BigInt {
         }
         // result = t[k..2k+1] (k+1 limbs), value < 2m.
         let r_limbs: Vec<u64> = t[k..k * 2 + 1].to_vec();
-        // The value is < 2m, so one subtraction of m is enough — but
-        // "conditional" has to mean *masked*: whether the subtraction was
-        // needed is a function of the value being reduced, and during a
-        // private-key exponentiation that value is secret. This is the
-        // classic Montgomery "extra reduction" timing signal.
         let mut diff: Vec<u64> = Vec::with_capacity(k + 1);
         let mut borrow = 0u64;
         for (i, &low) in r_limbs.iter().enumerate().take(k + 1) {
@@ -257,8 +252,6 @@ impl BigInt {
             diff.push(s2);
             borrow = (b1 as u64) + (b2 as u64);
         }
-        // borrow == 0 → the subtraction was valid, so take `diff`;
-        // borrow == 1 → the value was already < m, so keep `r_limbs`.
         let mask = borrow.wrapping_sub(1);
         let mut out: Vec<u64> = Vec::with_capacity(k);
         for (&below, &above) in r_limbs.iter().zip(diff.iter()).take(k) {
@@ -340,7 +333,6 @@ impl BigInt {
             if r.cmp(&shifted) != core::cmp::Ordering::Less {
                 r = r.sub(&shifted);
             } else if shift > 0 {
-                // shifted overshoots; shift down by one (guaranteed ≤ r).
                 r = r.sub(&m.shl_bits(shift - 1));
             } else {
                 // r < m and no further shift available: done.
@@ -376,7 +368,6 @@ impl BigInt {
         let nprime = mont_nprime(m);
         let r = mont_r(m);
         let r2 = mont_r2(m, &r);
-        // base in Montgomery form.
         let base = self.rem(m);
         let a = {
             let t = base.mul(&r2);
@@ -450,7 +441,7 @@ pub(crate) fn mont_r2(m: &BigInt, r: &BigInt) -> BigInt {
 
 /// `x / 2 mod m` for odd `m` and `0 <= x < 2m`.
 fn half_mod(x: &BigInt, m: &BigInt) -> BigInt {
-    if x.limbs.first().map_or(false, |l| l & 1 == 1) {
+    if x.limbs.first().is_some_and(|l| l & 1 == 1) {
         x.add(m).shr_bits(1)
     } else {
         x.shr_bits(1)
@@ -567,10 +558,6 @@ pub struct RsaPublicKey {
 }
 
 impl RsaPublicKey {
-    /// Max accepted RSA key material (bytes). Real keys are ≤ 8192 bits;
-    /// a hostile cert with a multi-MB modulus/exponent would otherwise
-    /// drive Montgomery setup (quadratic in limb count) into a CPU DoS
-    /// during chain verification.
     const MAX_KEY_BYTES: usize = 1024;
 
     /// RSAVP1: `s^e mod n`.
@@ -587,10 +574,6 @@ impl RsaPublicKey {
             return None;
         }
         let e = BigInt::from_be_bytes(&self.e);
-        // Reject degenerate public exponents (BoringSSL does the same):
-        // with e = 1 any integer s trivially verifies (s^1 = s), and an
-        // even e cannot be coprime to phi(n), marking a malformed or
-        // hostile key.
         if e.is_zero()
             || (e.limbs[0] & 1) == 0
             || e.cmp(&BigInt::from_u64(2)) != core::cmp::Ordering::Greater
@@ -639,7 +622,6 @@ impl RsaPublicKey {
     ) -> bool {
         let h_len = hash.output_len();
         let em_len = self.n.len();
-        // RFC 8017 §9.1.2 step 2: emLen >= hLen + sLen + 2
         if em_len < h_len + salt_len + 2 {
             return false;
         }
@@ -669,11 +651,6 @@ fn verify_pss_em(hash: &mut dyn Digest, em: Vec<u8>, m_hash: Vec<u8>, salt_len: 
     let masked_db_len = em_len - h_len - 1;
     let masked_db = &em[..masked_db_len];
     let h_prime = &em[masked_db_len..em_len - 1];
-
-    // RFC 8017 §9.1.2 step 6: the leftmost 8*emLen - emBits bits of
-    // maskedDB must be zero. emBits = modBits - 1 = 8*emLen - 1, so the
-    // top bit of the first octet of maskedDB (checked BEFORE the XOR)
-    // must be clear.
     if masked_db[0] & 0x80 != 0 {
         return false;
     }
@@ -686,8 +663,6 @@ fn verify_pss_em(hash: &mut dyn Digest, em: Vec<u8>, m_hash: Vec<u8>, salt_len: 
         .map(|(a, b)| a ^ b)
         .collect();
 
-    // RFC 8017 §9.1.2 step 9: clear the leftmost 8*emLen - emBits bits
-    // of DB (top bit of the first octet) before checking PS.
     db[0] &= 0x7f;
 
     // DB = PS || 0x01 || salt ; PS is zeros of length emLen - hLen - sLen - 2.
@@ -700,7 +675,6 @@ fn verify_pss_em(hash: &mut dyn Digest, em: Vec<u8>, m_hash: Vec<u8>, salt_len: 
     }
     let salt = &db[ps_len + 1..ps_len + 1 + salt_len];
 
-    // H = Hash(0x00..0x00 (8) || mHash || salt)
     hash.update(&[0u8; 8]);
     hash.update(&m_hash);
     hash.update(salt);

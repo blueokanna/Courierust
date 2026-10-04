@@ -371,9 +371,6 @@ pub(crate) fn seal_record(
     aad.extend_from_slice(&seq.to_be_bytes());
     aad.push(content_type);
     aad.extend_from_slice(&VERSION_12);
-    // RFC 5246 §6.2.3.3: additional_data = seq || type || version ||
-    // TLSCompressed.length, where TLSCompressed.length is the *plaintext*
-    // length — the explicit nonce and AEAD tag are NOT included.
     aad.extend_from_slice(&(plaintext.len() as u16).to_be_bytes());
 
     let key = &keys.key[..suite.key_len()];
@@ -661,8 +658,6 @@ pub(crate) fn parse_client_hello12(body: &[u8]) -> TlsResult<ClientHello12> {
                     }
                 }
                 EXT_RENEGOTIATION_INFO => {
-                    // RFC 5746 §3.2: a fresh handshake carries an empty
-                    // `renegotiated_connection`; just note the offer.
                     offered_renegotiation = true;
                 }
                 _ => {}
@@ -707,13 +702,8 @@ pub(crate) fn build_server_hello12(
     body.push(session_id.len() as u8);
     body.extend_from_slice(session_id);
     body.extend_from_slice(&suite.wire().to_be_bytes());
-    body.push(0); // compression null
+    body.push(0);
     let mut ext_bytes = Vec::new();
-    // RFC 5746 §3.2: secure renegotiation indicator. TLS 1.2 clients
-    // (OpenSSL s_client) refuse to proceed without it when they offered
-    // it ("unsafe legacy renegotiation disabled"); a fresh handshake's
-    // `renegotiated_connection` is an empty vector, so the extension_data
-    // is a single 0x00 length byte (`ff 01 00 01 00`).
     if renegotiation {
         ext_bytes.extend_from_slice(&EXT_RENEGOTIATION_INFO.to_be_bytes());
         ext_bytes.extend_from_slice(&[0x00, 0x01, 0x00]);
@@ -804,9 +794,7 @@ pub(crate) fn build_server_key_exchange(
 
 /// Parsed ECDHE `ServerKeyExchange` data.
 pub(crate) struct ServerKeyExchange12 {
-    /// The server's ECDHE public point (`0x04 || X || Y`).
     pub(crate) point: [u8; 65],
-    /// The raw `ECParameters || ECPoint` bytes (the signed portion).
     pub(crate) params: Vec<u8>,
     pub(crate) hash_alg: u8,
     pub(crate) sig_alg: u8,
@@ -1039,12 +1027,12 @@ fn verify_server_key_exchange(
     server_random: &[u8; 32],
 ) -> TlsResult<()> {
     use super::crypto::ecdsa;
-    use super::crypto::rsa::{verify_rsa_pkcs1v15, RsaPublicKey};
+    use super::crypto::ed25519::{self, Sha512};
+    use super::crypto::hash::{Sha256, Sha384};
+    use super::crypto::rsa::{verify_rsa_pkcs1v15, RsaPublicKey, DIGEST_INFO_SHA512};
     use super::x509::der::{parse_rsa_public_key, OID_EC_PUBLIC_KEY, OID_RSA_ENCRYPTION};
 
-    // RFC 5246 §7.4.3 / RFC 8422: the SKE digest is hash_alg 4 (SHA-256),
-    // 5 (SHA-384) or 6 (SHA-512) combined with sig_alg 1 (RSA) or
-    // 3 (ECDSA).
+    let scheme = u16::from_be_bytes([ske.hash_alg, ske.sig_alg]);
     let to_sign = {
         let mut v = Vec::with_capacity(64 + ske.params.len());
         v.extend_from_slice(client_random);
@@ -1053,18 +1041,25 @@ fn verify_server_key_exchange(
         v
     };
 
-    if ske.sig_alg == 1 && spki.oid == OID_RSA_ENCRYPTION {
+    if spki.oid == OID_RSA_ENCRYPTION {
         let (n, e) = parse_rsa_public_key(&spki.key)
             .ok_or_else(|| TlsError::Certificate("bad RSA SPKI".into()))?;
         let key = RsaPublicKey { n, e };
-        let ok = match ske.hash_alg {
-            4 => {
-                let digest = sha256_of(&to_sign);
-                verify_rsa_pkcs1v15(&key, false, &digest, &ske.signature)
+        let ok = match scheme {
+            0x0401 => verify_rsa_pkcs1v15(&key, false, &sha256_of(&to_sign), &ske.signature),
+            0x0501 => verify_rsa_pkcs1v15(&key, true, &sha384_of(&to_sign), &ske.signature),
+            0x0601 => key.verify_pkcs1v15(DIGEST_INFO_SHA512, &sha512_of(&to_sign), &ske.signature),
+            0x0804 => {
+                let mut h = Sha256::new();
+                key.verify_pss(&mut h, &to_sign, 32, &ske.signature)
             }
-            5 => {
-                let digest = sha384_of(&to_sign);
-                verify_rsa_pkcs1v15(&key, true, &digest, &ske.signature)
+            0x0805 => {
+                let mut h = Sha384::new();
+                key.verify_pss(&mut h, &to_sign, 48, &ske.signature)
+            }
+            0x0806 => {
+                let mut h = Sha512::new();
+                key.verify_pss(&mut h, &to_sign, 64, &ske.signature)
             }
             _ => false,
         };
@@ -1075,16 +1070,14 @@ fn verify_server_key_exchange(
                 "ServerKeyExchange RSA signature invalid".into(),
             ))
         }
-    } else if ske.sig_alg == 3 && spki.oid == OID_EC_PUBLIC_KEY {
-        // The digest selects the curve (RFC 8422 §5.5): SHA-256 ↔ P-256,
-        // SHA-384 ↔ P-384, SHA-512 ↔ P-521.
-        let curve = match ske.hash_alg {
-            4 => ecdsa::Curve::P256,
-            5 => ecdsa::Curve::P384,
-            6 => ecdsa::Curve::P521,
+    } else if spki.oid == OID_EC_PUBLIC_KEY {
+        let (curve, digest) = match scheme {
+            0x0403 => (ecdsa::Curve::P256, sha256_of(&to_sign).to_vec()),
+            0x0503 => (ecdsa::Curve::P384, sha384_of(&to_sign).to_vec()),
+            0x0603 => (ecdsa::Curve::P521, sha512_of(&to_sign).to_vec()),
             _ => {
                 return Err(TlsError::Certificate(
-                    "unsupported ServerKeyExchange digest".into(),
+                    "unsupported ServerKeyExchange signature scheme".into(),
                 ))
             }
         };
@@ -1099,11 +1092,6 @@ fn verify_server_key_exchange(
         }
         let qx = &spki.key[1..1 + clen];
         let qy = &spki.key[1 + clen..1 + 2 * clen];
-        let digest = match ske.hash_alg {
-            4 => sha256_of(&to_sign).to_vec(),
-            5 => sha384_of(&to_sign).to_vec(),
-            _ => sha512_of(&to_sign).to_vec(),
-        };
         if ecdsa::verify_der(curve, qx, qy, &digest, &ske.signature) {
             Ok(())
         } else {
@@ -1111,10 +1099,7 @@ fn verify_server_key_exchange(
                 "ServerKeyExchange ECDSA signature invalid".into(),
             ))
         }
-    } else if ske.sig_alg == 7 && spki.oid == super::x509::der::OID_ED25519 {
-        // RFC 8422: sig_alg 7 = Ed25519 (the two-byte scheme is 0x0807,
-        // parsed here as hash_alg=0x08, sig_alg=0x07). The signature is
-        // over the raw SKE params (RFC 8032; no separate digest).
+    } else if scheme == 0x0807 && spki.oid == super::x509::der::OID_ED25519 {
         if spki.key.len() != 32 {
             return Err(TlsError::Certificate("bad Ed25519 SPKI".into()));
         }
@@ -1125,7 +1110,7 @@ fn verify_server_key_exchange(
         pk.copy_from_slice(&spki.key);
         let mut sig = [0u8; 64];
         sig.copy_from_slice(&ske.signature);
-        if super::crypto::ed25519::verify(&pk, &to_sign, &sig) {
+        if ed25519::verify(&pk, &to_sign, &sig) {
             Ok(())
         } else {
             Err(TlsError::Certificate(
@@ -1155,10 +1140,6 @@ pub(crate) fn client_handshake<R: crate::courierust_io::Read, W: crate::courieru
     ch: &[u8],
     client_random: &[u8; 32],
     first_record: &[u8],
-    // Whether this client offered TLS 1.3 in the ClientHello. When
-    // true, a TLS 1.2 ServerHello MUST carry the RFC 8446 downgrade
-    // sentinel; when false (TLS 1.2-only client) no sentinel is sent
-    // or required.
     offered_tls13: bool,
 ) -> TlsResult<Tls12HandshakeResult> {
     let mut reader = PlainFlightReader::from_payload(first_record);
@@ -1167,10 +1148,6 @@ pub(crate) fn client_handshake<R: crate::courierust_io::Read, W: crate::courieru
         return Err(TlsError::Protocol("expected ServerHello".into()));
     }
     let sh = parse_server_hello12(&sh_body)?;
-    // RFC 5246 §7.4.1.2: when the client offered an empty session id
-    // (no resumption), the server MAY issue a fresh session id for its
-    // own cache. Accept whatever it sends; we never resume via TLS 1.2
-    // session ids, so the value is carried but unused.
     if offered_tls13 && !sh.random[24..].starts_with(&DOWNGRADE_SENTINEL_12) {
         return Err(TlsError::Protocol(
             "TLS 1.2 ServerHello missing downgrade sentinel".into(),
@@ -1440,8 +1417,6 @@ pub(crate) fn server_handshake<R: crate::courierust_io::Read, W: crate::courieru
         .iter()
         .copied()
         .find(|s| {
-            // The ECDSA suite hash must match the identity curve (RFC
-            // 8422 §5.5: SHA-256 ↔ P-256, SHA-384 ↔ P-384).
             let family_ok = match (s.ecdhe_sig(), key_type) {
                 (EcdheSig::Rsa, super::sign::IdentityKeyType::Rsa) => true,
                 (EcdheSig::Ecdsa, super::sign::IdentityKeyType::Ecdsa(Curve::P256)) => {
@@ -1450,8 +1425,6 @@ pub(crate) fn server_handshake<R: crate::courierust_io::Read, W: crate::courieru
                 (EcdheSig::Ecdsa, super::sign::IdentityKeyType::Ecdsa(Curve::P384)) => {
                     s.hash() == SuiteHash::Sha384
                 }
-                // RFC 8422 §4.3: an Ed25519 identity signs the SKE of an
-                // ECDHE-ECDSA suite (scheme 0x0807).
                 (EcdheSig::Ecdsa, super::sign::IdentityKeyType::Ed25519) => true,
                 _ => false,
             };
@@ -1470,9 +1443,8 @@ pub(crate) fn server_handshake<R: crate::courierust_io::Read, W: crate::courieru
         (EcdheSig::Rsa, _) => 0x0401,
         (EcdheSig::Ecdsa, super::sign::IdentityKeyType::Ecdsa(Curve::P256)) => 0x0403,
         (EcdheSig::Ecdsa, super::sign::IdentityKeyType::Ecdsa(Curve::P384)) => 0x0503,
-        // RFC 8422: Ed25519 signs the SKE with scheme 0x0807.
         (EcdheSig::Ecdsa, super::sign::IdentityKeyType::Ed25519) => 0x0807,
-        _ => 0x0403, // unreachable: P-521 never selects an ECDHE suite
+        _ => 0x0403,
     };
     if !ch.signature_algorithms.contains(&required_sigalg) {
         return Err(TlsError::Protocol(

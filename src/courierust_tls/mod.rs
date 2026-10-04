@@ -1043,6 +1043,17 @@ pub struct ClientConfig {
     /// certificate list, which a server that requires authentication
     /// refuses — exactly what that policy is for.
     pub identity: Option<Identity>,
+    /// A `ClientHello` parameter set to reproduce on the wire (suites,
+    /// extension list and order, groups, signature algorithms, with
+    /// GREASE) instead of the built-in shape — see
+    /// [`crate::courierust_fingerprint`]. Servers behind traffic-risk
+    /// engines (Bilibili's 412, Cloudflare-style challenges) reject the
+    /// built-in, very sparse shape; a browser profile passes because it
+    /// is what those engines expect. `None` keeps the built-in shape.
+    ///
+    /// Configured profiles disable TLS session resumption, whose PSK
+    /// extension would alter the fingerprint.
+    pub profile: Option<crate::courierust_fingerprint::profile::TlsProfile>,
 }
 
 impl Default for ClientConfig {
@@ -1055,6 +1066,7 @@ impl Default for ClientConfig {
             min_version: TlsVersion::Tls12,
             max_version: TlsVersion::Tls13,
             identity: None,
+            profile: None,
         }
     }
 }
@@ -1128,7 +1140,14 @@ impl TlsConnector {
         let mut priv13 = [0u8; 32];
         handshake::fill_entropy(&mut priv13)?;
         let pub13 = crypto::x25519::x25519(&priv13, &crypto::x25519::BASE_POINT);
-        let resume_session = allow13.then(|| self.find_session(hostname)).flatten();
+        // A profile-pinned ClientHello cannot carry the PSK binder the
+        // resumption path needs, so resumption is skipped when a profile
+        // is configured.
+        let resume_session = if self.config.profile.is_none() {
+            allow13.then(|| self.find_session(hostname)).flatten()
+        } else {
+            None
+        };
         let ch = match &resume_session {
             Some(s) => session::build_client_hello_with_psk(
                 &random,
@@ -1147,16 +1166,36 @@ impl TlsConnector {
                 None,
                 allow13,
                 allow12,
+                self.config.profile.as_ref(),
             ),
         };
-        io.write_plaintext_record_v(tls12::VERSION_12, record::CONTENT_HANDSHAKE, &ch)?;
+        // The initial TLS 1.3 ClientHello record carries the legacy
+        // 0x0301 version (RFC 8446 §5.1; browsers and the BoringSSL /
+        // OpenSSL clients all do this, and record-version
+        // fingerprinting reads it). Records after the ServerHello use
+        // 0x0303 again.
+        io.write_plaintext_record(record::CONTENT_HANDSHAKE, &ch)?;
 
         // Read the first plaintext record and dispatch on the negotiated
         // version. The full payload is kept: a TLS 1.2 peer may coalesce
         // the ServerHello with the rest of its flight in one record.
         let (ct, first_payload) = io.read_plaintext_record()?;
         if ct != record::CONTENT_HANDSHAKE {
-            return Err(TlsError::Protocol("expected handshake record".into()));
+            // A peer that refuses the ClientHello answers with an alert
+            // record; naming what arrived (and the alert code, if it is
+            // one) is what makes that refusal visible instead of a bare
+            // "expected handshake record".
+            let detail = if ct == record::CONTENT_ALERT && first_payload.len() >= 2 {
+                format!(
+                    "a TLS alert (level {}, description {})",
+                    first_payload[0], first_payload[1]
+                )
+            } else {
+                format!("content type {ct}")
+            };
+            return Err(TlsError::Protocol(format!(
+                "expected handshake record after ClientHello, got {detail}"
+            )));
         }
         if first_payload.len() < 4 {
             return Err(TlsError::Protocol("bad handshake record".into()));
@@ -1556,6 +1595,7 @@ mod tests {
             max_version: TlsVersion::Tls13,
 
             identity: None,
+            profile: None,
         });
         let mut tls = connector.connect("localhost", &stream, &stream).unwrap();
         assert_eq!(tls.alpn(), Some(&b"h2"[..]));
@@ -1612,6 +1652,7 @@ mod tests {
             max_version: TlsVersion::Tls13,
 
             identity: None,
+            profile: None,
         });
         let mut tls = connector.connect("localhost", &stream, &stream).unwrap();
         tls.write_all(b"before").unwrap();
@@ -1666,6 +1707,7 @@ mod tests {
             max_version: TlsVersion::Tls13,
 
             identity: None,
+            profile: None,
         });
         let mut tls = connector.connect("localhost", &stream, &stream).unwrap();
         tls.set_key_use_limit(2);
@@ -1717,6 +1759,7 @@ mod tests {
             max_version: TlsVersion::Tls13,
 
             identity: None,
+            profile: None,
         });
         let err = match connector.connect("localhost", &stream, &stream) {
             Ok(_) => panic!("untrusted root accepted"),
@@ -1737,6 +1780,7 @@ mod tests {
             max_version: TlsVersion::Tls13,
 
             identity: None,
+            profile: None,
         });
         let err = match connector.connect("not-localhost", &stream, &stream) {
             Ok(_) => panic!("hostname mismatch accepted"),
@@ -1795,6 +1839,7 @@ mod tests {
             min_version: TlsVersion::Tls13,
             max_version: TlsVersion::Tls13,
             identity: Some(testdata::server_identity()),
+            profile: None,
         });
         let mut tls = connector.connect("localhost", &stream, &stream).unwrap();
         tls.write_all(b"ping").unwrap();
@@ -1844,6 +1889,7 @@ mod tests {
                 min_version: TlsVersion::Tls13,
                 max_version: TlsVersion::Tls13,
                 identity: None,
+                profile: None,
             });
             let outcome = connector.connect("localhost", &stream, &stream);
             let server_outcome = server.join().unwrap();
@@ -1923,6 +1969,7 @@ mod tests {
             min_version: TlsVersion::Tls13,
             max_version: TlsVersion::Tls13,
             identity: Some(testdata::server_identity()),
+            profile: None,
         });
         let client_outcome = connector.connect("localhost", &stream, &stream);
         let server_outcome = server.join().unwrap();
@@ -1984,6 +2031,7 @@ mod tests {
             max_version: TlsVersion::Tls13,
 
             identity: None,
+            profile: None,
         });
         let mut tls = connector.connect("localhost", &stream, &stream).unwrap();
         assert_eq!(tls.version(), TlsVersion::Tls13);
@@ -2034,6 +2082,7 @@ mod tests {
             max_version: TlsVersion::Tls12,
 
             identity: None,
+            profile: None,
         });
         let mut tls = connector.connect("localhost", &stream, &stream).unwrap();
         assert_eq!(tls.version(), TlsVersion::Tls12);
@@ -2093,6 +2142,7 @@ mod tests {
             max_version: TlsVersion::Tls13,
 
             identity: None,
+            profile: None,
         });
         let mut tls = connector.connect("localhost", &stream, &stream).unwrap();
         assert_eq!(tls.version(), TlsVersion::Tls13);
@@ -2145,6 +2195,7 @@ mod tests {
             max_version: TlsVersion::Tls12,
 
             identity: None,
+            profile: None,
         });
         let mut tls = connector.connect("localhost", &stream, &stream).unwrap();
         assert_eq!(tls.version(), TlsVersion::Tls12);
@@ -2270,6 +2321,7 @@ mod tests {
             max_version: TlsVersion::Tls13,
 
             identity: None,
+            profile: None,
         });
         let err = match connector.connect("localhost", &stream, &stream) {
             Ok(_) => panic!("TLS 1.3-only client accepted a TLS 1.2 server"),
@@ -2326,6 +2378,7 @@ mod tests {
             max_version: TlsVersion::Tls12,
 
             identity: None,
+            profile: None,
         });
         let mut tls = connector.connect("localhost", &stream, &stream).unwrap();
         assert_eq!(tls.version(), TlsVersion::Tls12);
@@ -2383,6 +2436,7 @@ mod tests {
             max_version: TlsVersion::Tls13,
 
             identity: None,
+            profile: None,
         });
 
         // First connection: full handshake, ticket captured on connect.
@@ -2451,6 +2505,7 @@ mod tests {
             max_version: TlsVersion::Tls13,
 
             identity: None,
+            profile: None,
         });
 
         // First connection: full handshake, captures a ticket.
@@ -2533,6 +2588,7 @@ mod tests {
             None,
             true,
             false,
+            None,
         );
         io.write_plaintext_record_v(tls12::VERSION_12, record::CONTENT_HANDSHAKE, &ch1)
             .unwrap();
@@ -2556,6 +2612,7 @@ mod tests {
             None,
             true,
             false,
+            None,
         );
         io.write_plaintext_record_v(tls12::VERSION_12, record::CONTENT_HANDSHAKE, &ch2)
             .unwrap();

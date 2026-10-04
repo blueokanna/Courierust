@@ -4,6 +4,7 @@
 //! Each connection owns its read/write buffers and a [`Scratch`] once,
 //! so steady-state keep-alive requests perform no per-request buffer
 //! allocation and no per-request socket reconfiguration.
+//! Author: Blueokanna
 
 use crate::courierust_body::Body;
 use crate::courierust_bytes::Bytes;
@@ -237,21 +238,20 @@ impl H1Connection {
         host_header: &str,
     ) -> Result<Response<Body>> {
         let mut headers = HeaderMap::with_capacity(req.headers.len() + 4);
+        headers.insert(
+            HeaderName::from_lowercase("host"),
+            HeaderValue::from_bytes(host_header.as_bytes())?,
+        );
         for (n, v) in req.headers.iter() {
-            // `Proxy-Authorization` is hop-by-hop, and the hop it is for is
-            // the proxy the request is addressed to — everywhere else the
-            // field is dropped, so a proxy credential can never be handed
-            // to an origin (directly or inside a tunnel).
+            if n.as_str() == "host" {
+                continue;
+            }
             let proxy_credential = self.to_proxy && n.as_str() == "proxy-authorization";
             if !proxy_credential && courierust_h1::is_hop_by_hop(n.as_str()) {
                 continue;
             }
             headers.append(n.clone(), v.clone());
         }
-        headers.insert(
-            HeaderName::from_lowercase("host"),
-            HeaderValue::from_bytes(host_header.as_bytes())?,
-        );
         if !headers.contains_key("user-agent") {
             if let Some(ua) = &cfg.user_agent {
                 headers.insert(
@@ -292,8 +292,7 @@ impl H1Connection {
         let status_line = scratch.line();
         reader.read_until_into(b'\n', 16 * 1024, status_line)?;
         let (status, version) = courierust_h1::parse_status_line(status_line)?;
-        // The peer answered: from here on a failure is a truncated
-        // response, not a stale connection.
+
         self.read_started = true;
         self.version = version;
         let mut status = status;
@@ -331,11 +330,6 @@ impl H1Connection {
         let mut close_delimited = false;
         let body = match courierust_h1::body_length(&head.headers, Some(method), Some(status))? {
             courierust_h1::BodyLen::None => {
-                // RFC 9112 §6.3 lists exactly HEAD, 1xx, 204 and 304 as
-                // bodyless. Treating *any* 3xx as empty used to leave a
-                // close-delimited redirect body unread and mark the
-                // connection reusable, so those bytes were parsed as the
-                // next response's status line.
                 if *method == Method::HEAD
                     || status == StatusCode::NO_CONTENT
                     || status == StatusCode::NOT_MODIFIED

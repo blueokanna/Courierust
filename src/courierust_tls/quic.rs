@@ -428,7 +428,7 @@ impl QuicClient {
             ));
         }
         let sh: ServerHelloInfo = parse_server_hello(&message[4..])?;
-        if !sh.session_id.is_empty() {
+        if sh.session_id != super::handshake::client_hello_session_id(&self.client_hello)? {
             return Err(TlsError::Protocol(
                 "QUIC ServerHello session id mismatch".into(),
             ));
@@ -504,8 +504,6 @@ impl QuicClient {
                             "QUIC requires ALPN h3; server did not negotiate it".into(),
                         ));
                     }
-                    // RFC 9001 §8.2: the server's transport parameters are
-                    // carried in EncryptedExtensions.
                     let params = transport_params.ok_or_else(|| {
                         TlsError::Protocol(
                             "QUIC EncryptedExtensions lacks transport parameters".into(),
@@ -518,9 +516,6 @@ impl QuicClient {
                                 .into(),
                         ));
                     }
-                    // RFC 9000 §7.3: the server must echo the client's first
-                    // Initial DCID and (if a Retry was involved) the Retry
-                    // SCID.
                     if peer_transport.original_destination_connection_id.as_deref()
                         != Some(self.original_dcid.as_slice())
                     {
@@ -581,8 +576,7 @@ impl QuicClient {
                             ));
                         }
                     }
-                    let suite = self.key_schedule_ref()?.suite();
-                    verify_cert_verify(&cv, &leaf.spki, &hash, false, suite)?;
+                    verify_cert_verify(&cv, &leaf.spki, &hash, false)?;
                     self.cert_verify = Some(cv);
                     self.saw_cv = true;
                     self.transcript_mut()?.update(&message);
@@ -731,11 +725,6 @@ impl QuicServer {
         let mut random = [0u8; 32];
         super::handshake::fill_entropy(&mut random)?;
         let params = self.server_transport.encode(&self.server_source_cid)?;
-        // RFC 9001 §8.2: the server's transport parameters belong in the
-        // EncryptedExtensions message (protected by Handshake keys), never
-        // in the cleartext ServerHello. quinn/rustls enforce this and reject
-        // a ServerHello carrying the extension with
-        // UnexpectedCleartextExtension.
         let sh = super::handshake::build_server_hello(&random, &s_pub, ch.suite, &ch.session_id);
         let mut transcript = Transcript::new(ch.suite.hash());
         transcript.update(&message);
@@ -778,9 +767,6 @@ impl QuicServer {
             application_read: Some(packet_keys(ks.suite(), ks.client_application_secret())?),
             peer_transport: Some(client_transport),
         };
-        // The server's initial flight is intentionally explicit; this also
-        // prevents a caller from accidentally sending handshake bytes in the
-        // Initial packet-number space.
         if flight.initial.is_empty() || flight.handshake.is_empty() {
             return Err(TlsError::Internal("empty QUIC server TLS flight".into()));
         }
@@ -838,8 +824,6 @@ fn encrypted_extensions_h3(transport_params: Option<&[u8]>) -> Vec<u8> {
     let mut exts: Vec<(u16, Vec<u8>)> = Vec::new();
     exts.push((0x0010u16, alpn));
     if let Some(params) = transport_params {
-        // RFC 9001 §8.2: the server advertises its transport parameters in
-        // the EncryptedExtensions message.
         exts.push((EXT_QUIC_TRANSPORT_PARAMETERS, params.to_vec()));
     }
     let mut body = Vec::new();

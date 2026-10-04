@@ -712,16 +712,8 @@ pub fn session_config(ws: &WsConfig, params: Option<CompressionParams>) -> Sessi
 pub fn protocol_close(e: &Error) -> (u16, &'static str) {
     match e.kind {
         ErrorKind::Overflow => (1009, "message too big"),
-        ErrorKind::Protocol => {
-            if e.message
-                .as_deref()
-                .map(|m| m.contains("UTF-8"))
-                .unwrap_or(false)
-            {
-                (1007, "invalid payload data")
-            } else {
-                (1002, "protocol error")
-            }
+        ErrorKind::Protocol if e.message.as_deref().is_some_and(|m| m.contains("UTF-8")) => {
+            (1007, "invalid payload data")
         }
         _ => (1002, "protocol error"),
     }

@@ -46,13 +46,11 @@ fn join_decimal(v: &[u16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::courierust_fingerprint::profile::chrome_tls_profile;
+    use crate::courierust_fingerprint::profile::fixtures::ja_sample_profile;
 
     #[test]
     fn chrome_ja3_matches_public_record() {
-        // The widely-published Chrome JA3 (the MD5 below is from the
-        // public JA3 database and has matched real Chrome for years).
-        let p = chrome_tls_profile();
+        let p = ja_sample_profile();
         assert_eq!(
             ja3_string(&p),
             "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,0-23-65281-10-11-35-16-5-13-18-51-45-43-27-17513-21,29-23-24,0"

@@ -471,6 +471,10 @@ pub(crate) fn parse_chunk_size(line: &[u8]) -> Option<usize> {
 }
 
 /// Serialize a request head into `out`.
+///
+/// When the `COURIERUST_DUMP_REQUEST` environment variable is set, the
+/// exact serialized bytes are also written to that path — a debugging
+/// escape hatch for replaying identical requests through another stack.
 pub fn write_request_head(
     out: &mut Vec<u8>,
     method: &Method,
@@ -478,13 +482,27 @@ pub fn write_request_head(
     version: Version,
     headers: &HeaderMap,
 ) -> Result<()> {
+    let start = out.len();
     out.extend_from_slice(method.as_str().as_bytes());
     out.push(b' ');
     out.extend_from_slice(target.as_str().as_bytes());
     out.push(b' ');
     out.extend_from_slice(version.wire_str().as_bytes());
     out.extend_from_slice(b"\r\n");
-    write_headers(out, headers)
+    write_headers(out, headers)?;
+    if let Ok(path) = std::env::var("COURIERUST_DUMP_REQUEST") {
+        use std::io::Write as _;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = file.write_all(b"----- request -----\n");
+            let _ = file.write_all(&out[start..]);
+            let _ = file.write_all(b"\n");
+        }
+    }
+    Ok(())
 }
 
 /// Serialize a response head into `out`.
