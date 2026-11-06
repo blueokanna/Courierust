@@ -678,6 +678,7 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
                 TlsVersion::Tls13 => match self.read_one_tls13_record()? {
                     None => return Ok(Vec::new()), // clean EOF
                     Some((ct, payload)) => match ct {
+                        record::CONTENT_APPLICATION_DATA if payload.is_empty() => continue,
                         record::CONTENT_APPLICATION_DATA => return Ok(payload),
                         record::CONTENT_ALERT => {
                             if payload.first() == Some(&1) && payload.get(1) == Some(&0) {
@@ -739,6 +740,7 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
                     let (ct, payload) =
                         tls12::open_record(suite12, &self.read_keys, seq, &header, &encrypted)?;
                     match ct {
+                        record::CONTENT_APPLICATION_DATA if payload.is_empty() => continue,
                         record::CONTENT_APPLICATION_DATA => return Ok(payload),
                         record::CONTENT_ALERT => {
                             if payload.first() == Some(&1) && payload.get(1) == Some(&0) {
@@ -1537,6 +1539,14 @@ mod tests {
             assert_eq!(tls.alpn(), Some(&b"h2"[..]));
             let data = tls.read_record().unwrap();
             assert_eq!(data, b"ping");
+            tls.io
+                .write_encrypted_record(
+                    tls.suite,
+                    &tls.write_keys,
+                    record::CONTENT_APPLICATION_DATA,
+                    &[],
+                )
+                .unwrap();
             tls.write_all(b"pong").unwrap();
             tls.close_notify().unwrap();
         });
@@ -2126,6 +2136,14 @@ mod tests {
             assert_eq!(tls.alpn(), Some(&b"h2"[..]));
             let data = tls.read_record().unwrap();
             assert_eq!(data, b"ping");
+            tls.io
+                .write_tls12_record(
+                    tls.suite12.unwrap(),
+                    &tls.write_keys,
+                    record::CONTENT_APPLICATION_DATA,
+                    &[],
+                )
+                .unwrap();
             tls.write_all(b"pong").unwrap();
             tls.close_notify().unwrap();
         });

@@ -30,7 +30,9 @@ use super::crypto::ecdsa::Curve;
 use super::crypto::hash::{Digest, Sha256};
 use super::crypto::hmac::hmac;
 use super::key_schedule::{SuiteHash, TrafficKeys};
-use super::record::{CONTENT_ALERT, CONTENT_APPLICATION_DATA, CONTENT_CHANGE_CIPHER_SPEC};
+use super::record::{
+    CONTENT_ALERT, CONTENT_APPLICATION_DATA, CONTENT_CHANGE_CIPHER_SPEC, CONTENT_HANDSHAKE,
+};
 use super::{TlsError, TlsResult};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -43,6 +45,9 @@ use alloc::vec::Vec;
 pub(crate) const HS_SERVER_KEY_EXCHANGE: u8 = 12;
 pub(crate) const HS_SERVER_HELLO_DONE: u8 = 14;
 pub(crate) const HS_CLIENT_KEY_EXCHANGE: u8 = 16;
+// RFC 5077; a TLS 1.2 server may emit this before its ChangeCipherSpec, which
+// some production CDNs do. See the pre-ChangeCipherSpec read loop below.
+pub(crate) const HS_NEW_SESSION_TICKET: u8 = 4;
 
 /// TLS 1.2 record-layer version (also the ClientHello legacy_version).
 pub(crate) const VERSION_12: [u8; 2] = [0x03, 0x03];
@@ -62,6 +67,10 @@ const EXT_SUPPORTED_GROUPS: u16 = 0x000a;
 const EXT_SIGNATURE_ALGORITHMS: u16 = 0x000d;
 const EXT_ALPN: u16 = 0x0010;
 const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
+/// Extended master secret (RFC 7627 §5.1). Advertised by the fingerprint
+/// profiles, so a server that echoes it derives the master secret over the
+/// session hash and the client has to follow (see `derive_keys`).
+const EXT_EXTENDED_MASTER_SECRET: u16 = 0x0017;
 /// Secure renegotiation indicator (RFC 5746 §3.2): empty for a fresh
 /// handshake; TLS 1.2 peers require it.
 const EXT_RENEGOTIATION_INFO: u16 = 0xff01;
@@ -265,6 +274,18 @@ fn master_secret(
     seed.extend_from_slice(client_random);
     seed.extend_from_slice(server_random);
     let out = prf(h, premaster, b"master secret", &seed, 48);
+    let mut ms = [0u8; 48];
+    ms.copy_from_slice(&out);
+    ms
+}
+
+/// Derive the 48-byte master secret for a handshake that negotiated the
+/// extended master secret (RFC 7627 §4): the PRF seed is the session hash —
+/// every handshake message up to and including the ClientKeyExchange — rather
+/// than the client/server randoms. Derivations are not interchangeable, so
+/// the server's `extended_master_secret` echo has to be honoured exactly.
+fn extended_master_secret(h: SuiteHash, premaster: &[u8], session_hash: &[u8]) -> [u8; 48] {
+    let out = prf(h, premaster, b"extended master secret", session_hash, 48);
     let mut ms = [0u8; 48];
     ms.copy_from_slice(&out);
     ms
@@ -922,9 +943,13 @@ fn derive_keys(
     shared: &[u8; 32],
     client_random: &[u8; 32],
     server_random: &[u8; 32],
+    session_hash: Option<&[u8]>,
 ) -> ([u8; 48], Tls12Keys, Tls12Keys) {
     let h = suite.hash();
-    let master = master_secret(h, shared, client_random, server_random);
+    let master = match session_hash {
+        Some(hash) => extended_master_secret(h, shared, hash),
+        None => master_secret(h, shared, client_random, server_random),
+    };
     let (client_key, server_key, client_iv, server_iv) =
         key_block(h, &master, client_random, server_random, suite.key_len());
     let client_keys = Tls12Keys {
@@ -1204,7 +1229,6 @@ pub(crate) fn client_handshake<R: crate::courierust_io::Read, W: crate::courieru
             description: 40, // handshake_failure
         })?;
 
-    let (master, client_keys, server_keys) = derive_keys(suite, &shared, client_random, &sh.random);
     let mut transcript = Tls12Transcript::new(suite.hash());
     transcript.update(ch);
     for (msg_type, body) in reader.messages() {
@@ -1212,22 +1236,70 @@ pub(crate) fn client_handshake<R: crate::courierust_io::Read, W: crate::courieru
     }
     transcript.update(&cke);
     let fin_hash = transcript.current_hash();
+
+    let (master, client_keys, server_keys) = derive_keys(
+        suite,
+        &shared,
+        client_random,
+        &sh.random,
+        sh.extended_master_secret.then_some(fin_hash.as_slice()),
+    );
     let verify_data = finished_verify_data(suite.hash(), &master, b"client finished", &fin_hash);
     let fin_msg = encode_hs(20, &verify_data);
 
     io.write_plaintext_record_v(VERSION_12, 22, &cke)?;
     io.write_plaintext_record_v(VERSION_12, CONTENT_CHANGE_CIPHER_SPEC, &[1])?;
     io.write_tls12_record(suite, &client_keys, 22, &fin_msg)?;
-
-    let (ct, payload) = io.read_plaintext_record()?;
-    if ct != CONTENT_CHANGE_CIPHER_SPEC || payload.as_slice() != [1] {
-        return Err(TlsError::Protocol(
-            "expected server ChangeCipherSpec".into(),
-        ));
+    let mut pre_ccs_tickets: Vec<Vec<u8>> = Vec::new();
+    loop {
+        match io.read_plaintext_record()? {
+            (CONTENT_CHANGE_CIPHER_SPEC, payload) => {
+                if payload.as_slice() != [1] {
+                    return Err(TlsError::Protocol(
+                        "server ChangeCipherSpec carried an unexpected payload".into(),
+                    ));
+                }
+                break;
+            }
+            (CONTENT_HANDSHAKE, payload) => match parse_hs(&payload) {
+                Some((HS_NEW_SESSION_TICKET, body)) => {
+                    if pre_ccs_tickets.len() >= 4 || body.len() > 65536 {
+                        return Err(TlsError::Protocol(
+                            "too many or oversized TLS session tickets".into(),
+                        ));
+                    }
+                    pre_ccs_tickets.push(encode_hs(HS_NEW_SESSION_TICKET, &body))
+                }
+                Some((msg_type, _)) => {
+                    return Err(TlsError::Protocol(format!(
+                        "unexpected handshake message {msg_type} before server ChangeCipherSpec"
+                    )))
+                }
+                None => {
+                    return Err(TlsError::Protocol(
+                        "malformed handshake record before server ChangeCipherSpec".into(),
+                    ))
+                }
+            },
+            (CONTENT_ALERT, payload) => {
+                let level = payload.first().copied().unwrap_or(2);
+                let description = payload.get(1).copied().unwrap_or(0);
+                return Err(TlsError::Protocol(format!(
+                    "server sent alert {level}/{description} instead of ChangeCipherSpec"
+                )));
+            }
+            (record_type, _) => {
+                return Err(TlsError::Protocol(format!(
+                    "unexpected record type {record_type} before server ChangeCipherSpec"
+                )))
+            }
+        }
     }
     let (ct, plaintext) = io.read_tls12_record(suite, &server_keys)?;
-    if ct != 22 {
-        return Err(TlsError::Protocol("expected server Finished".into()));
+    if ct != CONTENT_HANDSHAKE {
+        return Err(TlsError::Protocol(format!(
+            "expected encrypted server Finished, got record type {ct}"
+        )));
     }
     let (m_type, fin_body) =
         parse_hs(&plaintext).ok_or_else(|| TlsError::Protocol("bad server Finished".into()))?;
@@ -1241,6 +1313,9 @@ pub(crate) fn client_handshake<R: crate::courierust_io::Read, W: crate::courieru
     }
     server_transcript.update(&cke);
     server_transcript.update(&fin_msg);
+    for ticket in &pre_ccs_tickets {
+        server_transcript.update(ticket);
+    }
     let server_fin_hash = server_transcript.current_hash();
     let expected =
         finished_verify_data(suite.hash(), &master, b"server finished", &server_fin_hash);
@@ -1270,6 +1345,8 @@ struct ServerHello12 {
     random: [u8; 32],
     suite_wire: u16,
     alpn: Option<Vec<u8>>,
+    /// Whether the server echoed `extended_master_secret` (RFC 7627 §5.2).
+    extended_master_secret: bool,
 }
 
 fn parse_server_hello12(body: &[u8]) -> TlsResult<ServerHello12> {
@@ -1296,6 +1373,7 @@ fn parse_server_hello12(body: &[u8]) -> TlsResult<ServerHello12> {
         return Err(TlsError::Protocol("bad SH compression".into()));
     }
     let mut alpn = None;
+    let mut extended_master_secret = false;
     if !c.done() {
         let ext_total =
             c.u16()
@@ -1319,6 +1397,16 @@ fn parse_server_hello12(body: &[u8]) -> TlsResult<ServerHello12> {
                 return Err(TlsError::Protocol(
                     "server negotiated TLS 1.3 on the TLS 1.2 path".into(),
                 ));
+            }
+            if ext_type == EXT_EXTENDED_MASTER_SECRET {
+                if !content.is_empty() || extended_master_secret {
+                    return Err(TlsError::Protocol(
+                        "invalid extended_master_secret extension".into(),
+                    ));
+                }
+                // RFC 7627 §5.2: the echo is what puts the handshake into
+                // extended mode; absence means the classic derivation.
+                extended_master_secret = true;
             }
             if ext_type == EXT_ALPN {
                 let mut g = Cur::new(content);
@@ -1348,6 +1436,7 @@ fn parse_server_hello12(body: &[u8]) -> TlsResult<ServerHello12> {
         random,
         suite_wire,
         alpn,
+        extended_master_secret,
     })
 }
 
@@ -1515,7 +1604,8 @@ pub(crate) fn server_handshake<R: crate::courierust_io::Read, W: crate::courieru
         level: 2,
         description: 40, // handshake_failure
     })?;
-    let (master, client_keys, server_keys) = derive_keys(suite, &shared, &ch.random, &s_random);
+    let (master, client_keys, server_keys) =
+        derive_keys(suite, &shared, &ch.random, &s_random, None);
     let (ct, payload) = io.read_plaintext_record()?;
     if ct != CONTENT_CHANGE_CIPHER_SPEC || payload.as_slice() != [1] {
         return Err(TlsError::Protocol(
@@ -1654,14 +1744,11 @@ mod tests {
 
     #[test]
     fn master_secret_matches_reference() {
-        // Cross-checked with an independent implementation (RFC 5246
-        // §8.1 semantics: PRF(pre_master, "master secret", CR || SR)).
         let h = SuiteHash::Sha256;
         let premaster = [0x11; 32];
         let cr = [0x22; 32];
         let sr = [0x33; 32];
         let ms = master_secret(h, &premaster, &cr, &sr);
-        // Recompute independently via the public PRF.
         let mut seed = Vec::new();
         seed.extend_from_slice(&cr);
         seed.extend_from_slice(&sr);
@@ -1672,14 +1759,12 @@ mod tests {
 
     #[test]
     fn ecdhe_symmetric() {
-        // Generate two key pairs; the shared secret must be symmetric.
         let (a, point_a) = super::super::crypto::ecdsa::ecdhe_generate(None).unwrap();
         let (b, point_b) = super::super::crypto::ecdsa::ecdhe_generate(None).unwrap();
         let s1 = super::super::crypto::ecdsa::ecdhe_shared(&a, &point_b).unwrap();
         let s2 = super::super::crypto::ecdsa::ecdhe_shared(&b, &point_a).unwrap();
         assert_eq!(s1, s2, "ECDH shared secrets must be symmetric");
         assert_ne!(s1, [0u8; 32]);
-        // Reusing a private key with the same public point reproduces it.
         let s3 = super::super::crypto::ecdsa::ecdhe_shared(&a, &point_b).unwrap();
         assert_eq!(s1, s3);
     }
@@ -1746,9 +1831,6 @@ mod tests {
 
     #[test]
     fn renegotiation_info_echoed_only_when_offered() {
-        // A ServerHello built with renegotiation=true must carry the
-        // RFC 5746 extension: `ff 01 00 01 00` (type, length 1, a single
-        // 0x00 length byte for the empty renegotiated_connection).
         let random = [0u8; 32];
         let sh = build_server_hello12(
             random,
@@ -1760,12 +1842,12 @@ mod tests {
         );
         let body = &sh[4..];
         let mut c = Cur::new(body);
-        c.take(2).unwrap(); // version
-        c.take(32).unwrap(); // random
+        c.take(2).unwrap();
+        c.take(32).unwrap();
         let sid_len = c.u8().unwrap() as usize;
         c.take(sid_len).unwrap();
-        c.take(2).unwrap(); // suite
-        c.take(1).unwrap(); // compression
+        c.take(2).unwrap();
+        c.take(1).unwrap();
         let ext_total = c.u16().unwrap() as usize;
         let ext_bytes = c.take(ext_total).unwrap();
         let mut e = Cur::new(ext_bytes);
@@ -1785,7 +1867,6 @@ mod tests {
         }
         assert!(found, "renegotiation_info must be echoed when offered");
 
-        // ...and omitted when the client did not offer it (RFC 5746 §3.2).
         let sh2 = build_server_hello12(
             random,
             &[],
@@ -1815,8 +1896,6 @@ mod tests {
 
     #[test]
     fn parse_client_hello_detects_renegotiation_offer() {
-        // Build a minimal ClientHello offering renegotiation_info and
-        // confirm parse_client_hello12 records it.
         let mut body = Vec::new();
         body.extend_from_slice(&[0x03, 0x03]); // legacy_version
         body.extend_from_slice(&[0u8; 32]); // random
