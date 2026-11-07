@@ -128,16 +128,8 @@ impl H2Conn {
     }
 
     pub(crate) fn release(&self, body_bytes: usize) {
-        let _ = self
-            .reservations
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                Some(value.saturating_sub(1))
-            });
-        let _ = self
-            .body_load
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                Some(value.saturating_sub(body_weight(body_bytes)))
-            });
+        crate::atomic::saturating_sub(&self.reservations, 1, Ordering::AcqRel);
+        crate::atomic::saturating_sub(&self.body_load, body_weight(body_bytes), Ordering::AcqRel);
     }
 
     pub(crate) fn is_idle(&self) -> bool {
@@ -259,6 +251,7 @@ fn start_inner(
     seed: Vec<u8>,
     upgrade_reply: Option<Sender<Result<H2Response>>>,
 ) -> Result<H2Conn> {
+    stream.configure(Some(DRIVER_READ_TIMEOUT))?;
     let peer = stream.peer_addr();
     let (tx, rx) = channel::<H2Cmd>();
     let cfg = cfg.clone();
@@ -271,10 +264,6 @@ fn start_inner(
         Some(s) => (s.h2_read_syscalls.clone(), s.h2_write_syscalls.clone()),
         None => (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
     };
-    if let Some(s) = cfg.stats.as_deref() {
-        s.h2_connections.fetch_add(1, Ordering::Relaxed);
-        s.h2_connections_active.fetch_add(1, Ordering::Relaxed);
-    }
     let stats = cfg.stats.clone();
     thread::Builder::new()
         .name("courierust-h2-driver".into())
@@ -329,8 +318,11 @@ fn driver(
     writes: Arc<AtomicUsize>,
     stats: Option<Arc<Stats>>,
 ) {
-    let _ = stream.configure(Some(DRIVER_READ_TIMEOUT));
     let stats = stats.as_deref();
+    if let Some(s) = stats {
+        s.h2_connections.fetch_add(1, Ordering::Relaxed);
+        s.h2_connections_active.fetch_add(1, Ordering::Relaxed);
+    }
     let _active_guard = stats.map(|s| ActiveGuard(s.h2_connections_active.clone()));
     let mut conn = if seed.is_empty() {
         Connection::new(
@@ -415,6 +407,9 @@ fn driver(
         let has_work =
             got_cmd || !deferred.is_empty() || !pending.is_empty() || !stream_bodies.is_empty();
         if has_work {
+            // Queue ready upload chunks before polling: poll_available flushes
+            // outbound data before its potentially blocking socket read.
+            drain_stream_bodies(&mut conn, &mut stream_bodies, &mut pending);
             match conn.poll_available(64) {
                 Ok(true) => last_rx = std::time::Instant::now(),
                 Ok(false) => {}
@@ -432,7 +427,7 @@ fn driver(
                 cfg.max_body,
                 cfg.read_timeout,
             );
-            drain_stream_bodies(&mut conn, &mut stream_bodies);
+            drain_stream_bodies(&mut conn, &mut stream_bodies, &mut pending);
             check_timeouts(&mut conn, &mut pending, stats);
             if !retry_deferred(
                 &mut conn,
@@ -497,7 +492,7 @@ fn driver(
                         cfg.max_body,
                         cfg.read_timeout,
                     );
-                    drain_stream_bodies(&mut conn, &mut stream_bodies);
+                    drain_stream_bodies(&mut conn, &mut stream_bodies, &mut pending);
                     check_timeouts(&mut conn, &mut pending, stats);
                     if !retry_deferred(
                         &mut conn,
@@ -836,7 +831,11 @@ fn retry_deferred(
 /// Feed streaming request-body chunks into the connection, respecting
 /// flow control. Chunks that cannot be queued yet are held for the next
 /// poll; a disconnected channel ends the stream.
-fn drain_stream_bodies(conn: &mut DriverConn<'_>, bodies: &mut HashMap<u32, StreamBody>) {
+fn drain_stream_bodies(
+    conn: &mut DriverConn<'_>,
+    bodies: &mut HashMap<u32, StreamBody>,
+    pending: &mut HashMap<u32, Pending>,
+) {
     let mut done = Vec::new();
     for (&sid, b) in bodies.iter_mut() {
         if let Some(chunk) = b.pending_chunk.take() {
@@ -846,14 +845,16 @@ fn drain_stream_bodies(conn: &mut DriverConn<'_>, bodies: &mut HashMap<u32, Stre
                     b.pending_chunk = Some(chunk);
                     continue;
                 }
-                Err(_) => {
-                    // Stream closed / connection error: drop the body.
+                Err(error) => {
+                    fail_request_body(conn, pending, sid, error);
                     done.push(sid);
                     continue;
                 }
             }
         }
-        loop {
+        // A continuously producing channel must not starve other streams,
+        // inbound WINDOW_UPDATE frames or deadline processing.
+        for _ in 0..64 {
             match b.rx.try_recv() {
                 Ok(Ok(chunk)) => {
                     if chunk.is_empty() {
@@ -865,19 +866,22 @@ fn drain_stream_bodies(conn: &mut DriverConn<'_>, bodies: &mut HashMap<u32, Stre
                             b.pending_chunk = Some(chunk);
                             break;
                         }
-                        Err(_) => {
+                        Err(error) => {
+                            fail_request_body(conn, pending, sid, error);
                             done.push(sid);
                             break;
                         }
                     }
                 }
-                Ok(Err(_)) => {
-                    let _ = conn.send_data(sid, Bytes::new(), true);
+                Ok(Err(error)) => {
+                    fail_request_body(conn, pending, sid, error);
                     done.push(sid);
                     break;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    let _ = conn.send_data(sid, Bytes::new(), true);
+                    if let Err(error) = conn.send_data(sid, Bytes::new(), true) {
+                        fail_request_body(conn, pending, sid, error);
+                    }
                     done.push(sid);
                     break;
                 }
@@ -887,6 +891,25 @@ fn drain_stream_bodies(conn: &mut DriverConn<'_>, bodies: &mut HashMap<u32, Stre
     }
     for sid in done {
         bodies.remove(&sid);
+    }
+}
+
+fn fail_request_body(
+    conn: &mut DriverConn<'_>,
+    pending: &mut HashMap<u32, Pending>,
+    stream_id: u32,
+    error: Error,
+) {
+    // END_STREAM would present a truncated prefix as a complete request.
+    // Reset only this stream and preserve the producer error for the caller.
+    conn.send_rst(stream_id, ErrorCode::Cancel);
+    if let Some(request) = pending.remove(&stream_id) {
+        if let Some(body) = request.body_tx {
+            let _ = body.send(Err(error.clone()));
+        }
+        if let Some(reply) = request.reply {
+            let _ = reply.send(Err(error));
+        }
     }
 }
 

@@ -371,8 +371,6 @@ impl RetryProtector {
     }
 
     fn validate(&self, peer: SocketAddr, token: &[u8]) -> Option<RetryToken> {
-        // The fixed fields and two bounded connection IDs make this a cheap
-        // reject path before any allocation or TLS work is performed.
         if token.len() < 1 + 8 + 1 + 2 + 1 + 1 + 1 + 32 {
             return None;
         }
@@ -544,8 +542,6 @@ fn build_client_connection(
         SocketAddr::V6(_) => SocketAddr::from(([0u16; 8], 0)),
     })
     .map_err(|e| io_error(e.to_string()))?;
-    // Left unconnected: `recv_from` reports the real source address so a
-    // migrated / NAT-rebound peer path can be validated (RFC 9000 §9).
     socket
         .set_nonblocking(true)
         .map_err(|e| io_error(e.to_string()))?;
@@ -613,14 +609,7 @@ impl H3Conn {
     }
 
     pub(crate) fn release(&self) {
-        // `fetch_update` (Rust 1.45) retries the CAS, so a release under
-        // contention is never dropped; `try_update` (Rust 1.95) is both
-        // above our MSRV and can return `Err`, leaking a reservation.
-        let _ = self
-            .reservations
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                Some(value.saturating_sub(1))
-            });
+        crate::atomic::saturating_sub(&self.reservations, 1, Ordering::AcqRel);
     }
 
     pub(crate) fn reservations(&self) -> usize {
@@ -787,10 +776,6 @@ fn run_client_driver(
             let remaining = deadline.saturating_duration_since(now);
             wait_ms = wait_ms.min(remaining.as_millis().min(i64::MAX as u128) as i64);
         }
-        // Fold QUIC protocol deadlines (pending ACK batch, loss/PTO
-        // timers, path validation) into the poll: a deferred ACK or a
-        // loss timer must fire at its absolute deadline, not on the next
-        // fixed 5 ms tick — that tick is the H3 loopback tail.
         if let Some(deadline) = conn.transport.earliest_deadline() {
             let remaining = deadline.saturating_duration_since(now);
             wait_ms = wait_ms.min(remaining.as_millis().min(i64::MAX as u128) as i64);
@@ -808,9 +793,6 @@ fn run_client_driver(
             Ok(ready) => ready,
             Err(error) => return finish(conn, &socket, io_error(error.to_string())),
         };
-        // Per-poll timeline (COURIERUST_H3_TRACE): a long wait here means
-        // a lost wake deferred command dispatch or response handling — the
-        // client side of the H3 tail.
         if h3_packet_trace() {
             let wait_us = wait_started.elapsed().as_micros() as u64;
             eprintln!(
@@ -820,8 +802,6 @@ fn run_client_driver(
             );
         }
         if ready.contains(&SOCKET_ID) {
-            // Bounded drain: mirror the server so a flood cannot starve
-            // `on_tick` / deadline handling between datagram batches.
             for _ in 0..MAX_DATAGRAMS_PER_POLL {
                 match socket.recv_from(&mut datagram) {
                     Ok((n, source)) => {
@@ -853,10 +833,6 @@ fn run_client_driver(
                     Err(error) => return finish(conn, &socket, io_error(error.to_string())),
                 }
             }
-            // Flush the whole receive batch's ACKs in one pass: the
-            // interactive fast path (ack_deadline None) coalesces a burst
-            // into one ACK, and doing it here — not per datagram — keeps
-            // that coalescing while still acknowledging promptly.
             if let Err(error) = conn.flush_acks(&socket) {
                 return finish(conn, &socket, error);
             }
@@ -894,9 +870,6 @@ struct ServerState {
     identity: crate::courierust_tls::Identity,
     alpn: Vec<Vec<u8>>,
     config: ServerConfig,
-    /// Process-lifetime secret used to derive stateless reset tokens
-    /// (RFC 9000 §10.3.2). Deterministic per CID, so a reset can be sent
-    /// for a connection whose state is gone.
     reset_key: [u8; 32],
 }
 
@@ -931,8 +904,6 @@ fn build_stateless_reset(dcid: &[u8], token: &[u8; 16], max_len: usize) -> Resul
         return Err(protocol("invalid connection ID for stateless reset"));
     }
     let head = 1 + dcid.len();
-    // A short-header packet needs at least 21 bytes to be valid at all
-    // (RFC 9000 §10.3), and the token has to sit at the tail.
     let min_len = (head + 1 + token.len()).max(MIN_SHORT_DATAGRAM);
     if max_len < min_len {
         return Ok(None);
@@ -1543,10 +1514,6 @@ impl ClientConnection {
         datagram: &mut [u8],
     ) -> Result<()> {
         self.last_activity = Instant::now();
-        // Handshake-stage messages (version negotiation / Retry) are only
-        // processed from the validated peer; a packet from a new source is
-        // authenticated in the packet loop below and only then may start
-        // path validation (RFC 9000 §9.3).
         if source == self.transport.peer.unwrap_or(source)
             || self.transport.pending_peer == Some(source)
         {
@@ -1584,11 +1551,6 @@ impl ClientConnection {
                     return Ok(());
                 }
                 if self.tls_server_hello || self.handshake_complete {
-                    // RFC 9000 §17.2.5.2: at most one Retry is processed per
-                    // connection attempt. A retransmitted Initial can draw a
-                    // second Retry out of a server, and the client discards
-                    // it — aborting here would kill a handshake that is
-                    // progressing normally.
                     return Ok(());
                 }
                 if !self.transport.apply_retry(retry.scid, retry.token) {
@@ -1831,12 +1793,6 @@ impl ClientConnection {
         if self.goaway_sent || !self.control_sent {
             return Ok(());
         }
-        // RFC 9114 §5.2 / §7.2.6: in the client-to-server direction the
-        // GOAWAY field is a *Push ID*, not a stream ID — the two number
-        // spaces are unrelated, and a server reading a stream ID here
-        // would refuse requests that were never in question. This
-        // endpoint never accepts a push (it never sends MAX_PUSH_ID), so
-        // "no push id is acceptable" is the honest value.
         let goaway = h3frame::Frame::GoAway(0).to_bytes();
         match self
             .transport
@@ -1978,9 +1934,6 @@ impl ClientConnection {
     /// Deliver timeout errors to requests whose deadline has passed and
     /// release their streams.
     fn check_timeouts(&mut self, now: Instant) {
-        // Partitioned in one pass instead of collecting indices and
-        // removing them in reverse: no index arithmetic to get wrong, and
-        // expiry order is irrelevant because every reply is an error.
         let mut live = VecDeque::with_capacity(self.waiting.len());
         for request in self.waiting.drain(..) {
             if request.deadline <= now {
@@ -2214,9 +2167,6 @@ impl ClientConnection {
         } else {
             let finished = {
                 let Some(request) = self.active.get_mut(&id) else {
-                    // A response stream we already completed may receive a
-                    // retransmitted final packet after delivery; ignore it
-                    // and drop the stub entry re-created above.
                     if id < 4 * self.next_stream_index {
                         self.streams.remove(&id);
                         return Ok(());
@@ -2245,9 +2195,6 @@ impl ClientConnection {
                 self.trace_request(&id, &request, Instant::now());
                 let _ = request.reply.send(Ok(response));
                 h3_close_stream(self.stats.as_ref(), &mut self.active_streams, id);
-                // Release the receive-side state now that the response is
-                // fully consumed; the guard above keeps late retransmits
-                // from re-creating it.
                 self.streams.remove(&id);
             }
         }
@@ -3269,15 +3216,6 @@ impl StreamReassembly {
             let data = &data[skip..];
             return self.insert(self.next, data, fin, max);
         }
-        // Out-of-order buffering with content-verified merging. RFC 9000
-        // §2.2: STREAM frame boundaries are not preserved across
-        // retransmission — a peer may legitimately re-send the same data
-        // split differently — so an incoming range that *overlaps* a
-        // buffered chunk is legal as long as every overlapped offset
-        // carries identical bytes. The previous code rejected any
-        // retransmission whose segmentation differed from the buffered
-        // chunk, tearing the connection down on perfectly correct peers
-        // (e.g. quinn) under loss + reordering.
         let affected: Vec<(u64, Vec<u8>)> = self
             .chunks
             .range(..end)
@@ -3395,12 +3333,6 @@ impl CryptoReassembly {
         let end = offset
             .checked_add(data.len() as u64)
             .ok_or_else(|| protocol("QUIC CRYPTO offset overflow"))?;
-        // Content-verified merging (mirrors `StreamReassembly::insert`):
-        // a peer may retransmit CRYPTO data with different segmentation,
-        // so an overlapping range is legal when the overlapped bytes are
-        // identical. The previous boundary check rejected every
-        // re-segmented retransmission and tore the connection down on
-        // correct peers under loss.
         let affected: Vec<(u64, Vec<u8>)> = self
             .chunks
             .range(..end)
@@ -4578,8 +4510,6 @@ struct QuicTransport {
     received_data: u64,
     received_stream_data: BTreeMap<u64, u64>,
     peer_max_streams_bidi: u64,
-    /// The peer's advertised cumulative limit on the uni streams we
-    /// initiate, raised by any MAX_STREAMS we received.
     peer_max_streams_uni: u64,
     local_max_streams_bidi: u64,
     local_max_streams_uni: u64,
@@ -6305,12 +6235,6 @@ fn open_packet_with_key(
     expected_phase: Option<bool>,
 ) -> Result<Option<(u64, Vec<u8>)>> {
     let header_room = meta.pn_offset.saturating_add(4).min(datagram.len());
-    // Header protection is removed in place. A failed attempt (phase
-    // mismatch OR an invalid recovered header) must restore the original
-    // bytes before returning, because the caller retries with the next
-    // key phase on the same buffer: unprotecting once with the wrong
-    // phase's HP key corrupts the first byte and packet number, and any
-    // subsequent attempt then computes a wrong AAD and can never succeed.
     let saved = expected_phase
         .is_some()
         .then(|| datagram[..header_room].to_vec());

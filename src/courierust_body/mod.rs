@@ -7,6 +7,7 @@
 
 use crate::courierust_bytes::Bytes;
 use crate::courierust_error::{Error, ErrorKind};
+use crate::courierust_http::header::HeaderMap;
 use crate::Result;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -176,13 +177,25 @@ pub struct ChannelStream {
     /// producer that could ever fire a wake, so claiming one would make a
     /// transport poll it at the slow cadence and delay every chunk.
     wake: Option<Arc<BodyWake>>,
+    trailers: Option<Arc<Mutex<Option<HeaderMap>>>>,
 }
 
 impl ChannelStream {
     /// Wrap a raw channel. No producer can wake through it, so a parked
     /// transport falls back to polling this stream.
     pub fn raw(rx: Receiver<Result<Bytes>>) -> Self {
-        Self { rx, wake: None }
+        Self {
+            rx,
+            wake: None,
+            trailers: None,
+        }
+    }
+
+    /// Final metadata is read only after all producers have disconnected.
+    pub(crate) fn terminal_trailers(&self) -> Option<HeaderMap> {
+        self.trailers
+            .as_ref()
+            .and_then(|slot| crate::lock(slot).clone())
     }
 
     /// Install the callback the producer fires after each chunk.
@@ -364,6 +377,7 @@ pub struct BodySender {
     /// Shared with the receiver side (`Body::Stream`), which is where a
     /// transport installs its wake callback.
     wake: Arc<BodyWake>,
+    trailers: Option<Arc<Mutex<Option<HeaderMap>>>>,
 }
 
 impl BodySender {
@@ -377,6 +391,15 @@ impl BodySender {
             tx,
             cancelled: Arc::new(AtomicBool::new(false)),
             wake: BodyWake::new(),
+            trailers: None,
+        }
+    }
+
+    /// Set the terminal metadata of an internal HTTP/2 response stream.
+    /// The channel must still be closed by dropping every sender.
+    pub(crate) fn set_trailers(&self, trailers: HeaderMap) {
+        if let Some(slot) = &self.trailers {
+            *crate::lock(slot) = Some(trailers);
         }
     }
 
@@ -446,15 +469,18 @@ impl BodySender {
 pub fn channel() -> (BodySender, Body) {
     let (tx, rx) = std::sync::mpsc::channel::<Result<Bytes>>();
     let wake = BodyWake::new();
+    let trailers = Arc::new(Mutex::new(None));
     (
         BodySender {
             tx,
             cancelled: Arc::new(AtomicBool::new(false)),
             wake: wake.clone(),
+            trailers: Some(trailers.clone()),
         },
         Body::Stream(ChannelStream {
             rx,
             wake: Some(wake),
+            trailers: Some(trailers),
         }),
     )
 }

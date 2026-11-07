@@ -15,10 +15,10 @@
 //! * X.509 chain validation with a pluggable root store (no bundled
 //!   root certificates — supply your own roots via [`RootStore`]).
 //!
-//! Honest scope note: 0-RTT / early data are not offered (replay
-//! protection is deliberately not taken on); the record-layer TLS 1.3
-//! KeyUpdate message is not sent (QUIC key updates are handled at the
-//! transport layer via the key-phase bit). TLS 1.3 session resumption is
+//! 0-RTT / early data are not offered. TLS 1.3 supports bidirectional
+//! KeyUpdate, including automatic updates at the per-key record limit;
+//! QUIC key updates use the transport's key-phase bit.
+//! TLS 1.3 session resumption is
 //! implemented — server-issued session tickets, 1-RTT PSK via
 //! psk_dhe_ke, client-side session store — and a full handshake is
 //! performed when no usable ticket is cached.
@@ -33,6 +33,9 @@ pub mod x509;
 
 #[cfg(test)]
 pub(crate) mod testdata;
+
+#[cfg(test)]
+mod record_tests;
 
 mod client_auth;
 mod handshake;
@@ -365,7 +368,7 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsIo<R, W> 
                 .read_exact_into(&mut header)
                 .map_err(TlsError::from)?;
             let len = ((header[3] as usize) << 8) | header[4] as usize;
-            if len > MAX_RECORD_PAYLOAD + 16 {
+            if len > MAX_RECORD_PAYLOAD {
                 return Err(TlsError::Protocol("record too large".into()));
             }
             let encrypted = self.reader.read_exact(len).map_err(TlsError::from)?;
@@ -384,9 +387,6 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsIo<R, W> 
                     ));
                 }
                 plain.extend_from_slice(&payload);
-                // A peer may fragment its flight across many records; only
-                // stop once the whole flight (ending in Finished) is
-                // buffered.
                 if handshake::has_complete_finished(&plain) {
                     return Ok(plain);
                 }
@@ -412,6 +412,8 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsIo<R, W> 
 /// stopped instead of treating a transient timeout as fatal (which would
 /// otherwise kill TLS connections under load).
 enum RecState {
+    /// A fatal record error permanently disables further I/O.
+    Failed,
     /// No partial record in flight.
     Idle,
     /// Reading the 5-byte record header.
@@ -552,7 +554,6 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
         let request = match body {
             [0] => false,
             [1] => true,
-            // RFC 8446 §4.6.3: any other value is illegal_parameter.
             _ => {
                 return Err(TlsError::Alert {
                     level: 2,
@@ -571,8 +572,6 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
         self.io.read_seq = Sequence::default();
         self.key_read_gen += 1;
         if request {
-            // "MUST send a KeyUpdate of its own ... prior to sending its
-            // next Application Data record."
             self.pending_key_update = true;
         }
         Ok(())
@@ -589,6 +588,13 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
     /// timeouts after the handshake).
     pub(crate) fn underlying(&self) -> &R {
         self.io.reader.get_ref()
+    }
+
+    pub(crate) fn has_pending_read(&self) -> bool {
+        self.closed
+            || self.pending_pos < self.pending.len()
+            || self.io.reader.buffered() != 0
+            || !matches!(self.rec, RecState::Idle)
     }
 
     /// The server name (SNI) used for this connection.
@@ -619,20 +625,33 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
         if self.closed {
             return Err(TlsError::Protocol("connection closed".into()));
         }
-        if self.version == TlsVersion::Tls13 {
-            // An answer owed to the peer goes out before the next
-            // application record (§4.6.3), and a key that has spent its
-            // record budget is replaced before it exceeds it (§5.5).
-            if self.pending_key_update {
-                self.pending_key_update = false;
-                self.send_key_update(false)?;
-            } else if self.write_records >= self.key_use_limit {
-                self.send_key_update(false)?;
-            }
+        let result = self.write_all_inner(data);
+        if result.is_err() {
+            // A partial encrypted write cannot safely be retried: records may
+            // already be on the wire and their sequence numbers are consumed.
+            self.closed = true;
+            self.rec = RecState::Failed;
         }
+        result
+    }
+
+    fn write_all_inner(&mut self, data: &[u8]) -> TlsResult<()> {
         let mut off = 0;
         while off < data.len() {
-            let take = core::cmp::min(data.len() - off, record::MAX_RECORD_PAYLOAD - 2);
+            if self.version == TlsVersion::Tls13 {
+                // An answer owed to the peer goes out before the next
+                // application record (§4.6.3), and a key that has spent its
+                // record budget is replaced before it exceeds it (§5.5).
+                if self.pending_key_update {
+                    self.pending_key_update = false;
+                    self.send_key_update(false)?;
+                } else if self.write_records >= self.key_use_limit {
+                    self.send_key_update(false)?;
+                }
+            }
+            // Both versions limit plaintext fragments to 2^14 bytes. The
+            // ciphertext expansion allowance is not application capacity.
+            let take = core::cmp::min(data.len() - off, record::MAX_PLAINTEXT);
             match self.version {
                 TlsVersion::Tls13 => self.io.write_encrypted_record_buffered(
                     self.suite,
@@ -660,14 +679,28 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
     }
 
     /// Read one application-data record (up to one TLS record of data).
-    /// Returns Ok(0) on clean shutdown. Any `NewSessionTicket` messages
-    /// carried in post-handshake records are captured first.
+    /// Returns an empty vector after an authenticated `close_notify`.
+    /// Transport EOF without that alert is truncation, even between records.
+    /// Fatal errors terminate the stream; timeouts preserve partial reads.
     pub fn read_record(&mut self) -> TlsResult<Vec<u8>> {
+        if matches!(self.rec, RecState::Failed) {
+            return Err(TlsError::Protocol("TLS stream failed previously".into()));
+        }
+        let result = self.read_record_inner();
+        if matches!(&result, Err(error) if !matches!(error, TlsError::Timeout | TlsError::WouldBlock))
+        {
+            self.closed = true;
+            self.rec = RecState::Failed;
+            self.pending.clear();
+            self.pending_pos = 0;
+        }
+        result
+    }
+
+    fn read_record_inner(&mut self) -> TlsResult<Vec<u8>> {
         if self.closed {
             return Ok(Vec::new());
         }
-        // A previously stashed record (set by callers that pre-read) is
-        // delivered before reading more from the transport.
         if self.pending_pos < self.pending.len() {
             let out = self.pending[self.pending_pos..].to_vec();
             self.pending_pos = self.pending.len();
@@ -675,21 +708,12 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
         }
         loop {
             match self.version {
-                TlsVersion::Tls13 => match self.read_one_tls13_record()? {
-                    None => return Ok(Vec::new()), // clean EOF
-                    Some((ct, payload)) => match ct {
+                TlsVersion::Tls13 => {
+                    let (ct, payload) = self.read_one_tls13_record()?;
+                    match ct {
                         record::CONTENT_APPLICATION_DATA if payload.is_empty() => continue,
                         record::CONTENT_APPLICATION_DATA => return Ok(payload),
-                        record::CONTENT_ALERT => {
-                            if payload.first() == Some(&1) && payload.get(1) == Some(&0) {
-                                self.closed = true;
-                                return Ok(Vec::new());
-                            }
-                            return Err(TlsError::Alert {
-                                level: payload.first().copied().unwrap_or(2),
-                                description: payload.get(1).copied().unwrap_or(0),
-                            });
-                        }
+                        record::CONTENT_ALERT => return self.read_alert(&payload),
                         record::CONTENT_HANDSHAKE => {
                             let mut rest = &payload[..];
                             while let Some(m) = handshake::peek_complete_hs(rest) {
@@ -713,15 +737,12 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
                         _ => {
                             return Err(TlsError::Protocol("unexpected record type".into()));
                         }
-                    },
-                },
+                    }
+                }
                 TlsVersion::Tls12 => {
                     let payload_len = match &self.rec {
                         RecState::Payload { payload, .. } => payload.len(),
-                        _ => match self.read_record_header()? {
-                            Some((_, len)) => len,
-                            None => return Ok(Vec::new()),
-                        },
+                        _ => self.read_record_header()?.1,
                     };
                     if payload_len > record::MAX_RECORD_PAYLOAD + 8 + 16 {
                         return Err(TlsError::Protocol("record too large".into()));
@@ -742,16 +763,7 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
                     match ct {
                         record::CONTENT_APPLICATION_DATA if payload.is_empty() => continue,
                         record::CONTENT_APPLICATION_DATA => return Ok(payload),
-                        record::CONTENT_ALERT => {
-                            if payload.first() == Some(&1) && payload.get(1) == Some(&0) {
-                                self.closed = true;
-                                return Ok(Vec::new());
-                            }
-                            return Err(TlsError::Alert {
-                                level: payload.first().copied().unwrap_or(2),
-                                description: payload.get(1).copied().unwrap_or(0),
-                            });
-                        }
+                        record::CONTENT_ALERT => return self.read_alert(&payload),
                         record::CONTENT_HANDSHAKE => {
                             return Err(TlsError::Protocol(
                                 "unexpected handshake after handshake".into(),
@@ -766,18 +778,25 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
         }
     }
 
+    fn read_alert(&mut self, payload: &[u8]) -> TlsResult<Vec<u8>> {
+        let [level, description] = *payload else {
+            return Err(TlsError::Protocol("invalid TLS alert length".into()));
+        };
+        if description == 0 {
+            self.closed = true;
+            return Ok(Vec::new());
+        }
+        Err(TlsError::Alert { level, description })
+    }
+
     /// Read and open one TLS 1.3 record (resuming a partial header/payload
-    /// across a timed-out read). `Ok(None)` is a clean EOF; a read
-    /// timeout surfaces as [`TlsError::Timeout`] with the read state
+    /// across a timed-out read). A timeout surfaces as [`TlsError::Timeout`] with the read state
     /// preserved so a later read resumes.
-    fn read_one_tls13_record(&mut self) -> TlsResult<Option<(u8, Vec<u8>)>> {
+    fn read_one_tls13_record(&mut self) -> TlsResult<(u8, Vec<u8>)> {
         loop {
             let payload_len = match &self.rec {
                 RecState::Payload { payload, .. } => payload.len(),
-                _ => match self.read_record_header()? {
-                    Some((_, len)) => len,
-                    None => return Ok(None),
-                },
+                _ => self.read_record_header()?.1,
             };
             if payload_len > record::MAX_RECORD_PAYLOAD + 8 + 16 {
                 return Err(TlsError::Protocol("record too large".into()));
@@ -795,7 +814,7 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
             let seq = self.io.read_seq.next()?;
             let (ct, payload) =
                 record::open_record(self.suite, &self.read_keys, seq, &header, &encrypted)?;
-            return Ok(Some((ct, payload)));
+            return Ok((ct, payload));
         }
     }
 
@@ -841,11 +860,11 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
     }
 
     /// Ensure a complete 5-byte record header is buffered, resuming from
-    /// a partial header left by a previous (timed-out) read. `Ok(None)`
-    /// means the peer closed cleanly. On success the internal state
+    /// a partial header left by a previous (timed-out) read. EOF is always
+    /// truncation here; only a decrypted alert can close TLS. On success the state
     /// transitions to [`RecState::Payload`] so the next phase knows the
     /// expected payload length.
-    fn read_record_header(&mut self) -> TlsResult<Option<([u8; 5], usize)>> {
+    fn read_record_header(&mut self) -> TlsResult<([u8; 5], usize)> {
         let (mut hdr, mut filled) = match &self.rec {
             RecState::Header { hdr, filled } => (*hdr, *filled),
             _ => ([0u8; 5], 0),
@@ -858,12 +877,12 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
                     payload: vec![0u8; payload_len],
                     filled: 0,
                 };
-                return Ok(Some((hdr, payload_len)));
+                return Ok((hdr, payload_len));
             }
             match self.io.reader.fill_buf() {
                 Ok([]) => {
                     self.closed = true;
-                    return Ok(None);
+                    return Err(TlsError::UnexpectedEof);
                 }
                 Ok(b) => {
                     let take = core::cmp::min(5 - filled, b.len());
@@ -880,7 +899,7 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> TlsStream<R,
                 }
                 Err(e) if e.kind == crate::courierust_error::ErrorKind::UnexpectedEof => {
                     self.closed = true;
-                    return Ok(None);
+                    return Err(TlsError::UnexpectedEof);
                 }
                 Err(e) => return Err(TlsError::from(e)),
             }
@@ -969,21 +988,13 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> crate::couri
     for TlsStream<R, W>
 {
     fn read(&mut self, buf: &mut [u8]) -> crate::courierust_error::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         if self.pending_pos >= self.pending.len() {
-            self.pending = match self.read_record() {
-                Ok(p) => p,
-                Err(TlsError::Timeout) => {
-                    return Err(crate::courierust_error::Error::new(
-                        crate::courierust_error::ErrorKind::Timeout,
-                    ))
-                }
-                Err(e) => {
-                    return Err(crate::courierust_error::Error::with_message(
-                        crate::courierust_error::ErrorKind::Other,
-                        e.to_string(),
-                    ))
-                }
-            };
+            self.pending = self
+                .read_record()
+                .map_err(crate::courierust_error::Error::from)?;
             self.pending_pos = 0;
             if self.pending.is_empty() {
                 return Ok(0);
@@ -1007,8 +1018,9 @@ impl<R: crate::courierust_io::Read, W: crate::courierust_io::Write> crate::couri
     }
 
     fn flush(&mut self) -> crate::courierust_error::Result<()> {
-        // The record layer's own writer already speaks this crate's error
-        // types, so a refusal arrives as `WouldBlock` without a mapping.
+        if matches!(self.rec, RecState::Failed) {
+            return Err(crate::Error::protocol("TLS stream failed previously"));
+        }
         self.io.writer.flush()
     }
 }
@@ -1244,9 +1256,6 @@ impl TlsConnector {
                 key_read_gen: 0,
                 key_write_gen: 0,
             };
-            // Tickets are captured lazily as records are read and cached
-            // in the shared store; connect() never blocks waiting for a
-            // post-handshake message.
             Ok(stream)
         } else {
             if !allow12 {

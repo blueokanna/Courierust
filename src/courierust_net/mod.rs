@@ -226,16 +226,28 @@ impl ConnStream {
         }
     }
 
+    /// A socket readiness probe cannot see bytes already held by TLS.
+    /// Treat a poisoned TLS state as unavailable rather than reusable.
+    pub(crate) fn has_pending_read(&self) -> bool {
+        match &self.inner {
+            ConnStreamKind::Plain(_) => false,
+            ConnStreamKind::Tls { tls, .. } => {
+                tls.lock().map_or(true, |tls| tls.has_pending_read())
+            }
+        }
+    }
+
     /// Configure nodelay + read timeout on the underlying socket, with
     /// *poll* semantics: an expiry reports `WouldBlock` so a driver that
     /// armed a short timeout to regain control can tell it apart from a
     /// real failure and go round its loop again.
     pub(crate) fn configure(&self, read_timeout: Option<Duration>) -> Result<()> {
-        self.deadline.store(false, Ordering::Relaxed);
         match &self.inner {
             ConnStreamKind::Plain(s) => configure(s, read_timeout),
             ConnStreamKind::Tls { socket, .. } => configure(socket, read_timeout),
-        }
+        }?;
+        self.deadline.store(false, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Configure nodelay + read timeout with *deadline* semantics: the
@@ -285,7 +297,9 @@ impl ConnStream {
     /// budget and the deadline keep this from becoming a slowloris
     /// vector: it is a bounded courtesy, not a promise to read a body.
     pub(crate) fn linger_close(&self, budget: usize, deadline: Duration) {
-        let _ = self.set_deadline(Some(deadline));
+        if self.set_deadline(Some(deadline)).is_err() {
+            return;
+        }
         let mut sink = [0u8; 8 * 1024];
         let mut left = budget;
         while left > 0 {

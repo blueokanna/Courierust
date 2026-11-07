@@ -1,0 +1,14 @@
+syntax = "proto3";
+package courierust.benchmark;
+
+message Payload {
+  bytes data = 1;
+  uint32 sequence = 2;
+}
+
+service Echo {
+  rpc Unary(Payload) returns (Payload);
+  rpc ServerStream(Payload) returns (stream Payload);
+  rpc ClientStream(stream Payload) returns (Payload);
+  rpc Bidi(stream Payload) returns (stream Payload);
+}

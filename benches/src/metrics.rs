@@ -32,8 +32,8 @@ impl Timing {
         if self.samples.is_empty() {
             return None;
         }
-        let position =
-            ((self.samples.len() - 1) as f64 * percentile.clamp(0.0, 1.0)).round() as usize;
+        let rank = (self.samples.len() as f64 * percentile.clamp(0.0, 1.0)).ceil() as usize;
+        let position = rank.saturating_sub(1).min(self.samples.len() - 1);
         Some(self.samples[position].as_secs_f64() * 1_000_000.0)
     }
 
@@ -177,7 +177,7 @@ pub fn stats_fields(timing: &Timing) -> String {
 
 /// Uniform-stride downsample plan so samples still represent the whole run.
 fn sample_plan(requests: usize, max_samples: usize) -> (usize, usize) {
-    let sample_count = requests.min(max_samples.max(1));
+    let sample_count = requests.min(max_samples);
     let stride = if sample_count == 0 {
         1
     } else {
@@ -196,7 +196,7 @@ where
 
     let started = Instant::now();
     for index in 0..requests {
-        let request_started = (index % stride == 0).then(Instant::now);
+        let request_started = (sample_count > 0 && index % stride == 0).then(Instant::now);
         work();
         if let Some(request_started) = request_started {
             samples.push(request_started.elapsed());
@@ -243,14 +243,16 @@ where
             let ready = ready.clone();
             let start_line = start_line.clone();
             // Keep the global sampling bound independent of worker count.
-            let per_worker_max = max_samples.div_ceil(active_workers);
+            let per_worker_max =
+                max_samples / active_workers + usize::from(index < max_samples % active_workers);
             let (sample_count, stride) = sample_plan(count, per_worker_max);
             handles.push(scope.spawn(move || {
                 let mut samples = Vec::with_capacity(sample_count);
                 ready.wait();
                 start_line.wait();
                 for request_index in 0..count {
-                    let request_started = (request_index % stride == 0).then(Instant::now);
+                    let request_started =
+                        (sample_count > 0 && request_index % stride == 0).then(Instant::now);
                     job();
                     if let Some(request_started) = request_started {
                         samples.push(request_started.elapsed());
@@ -261,10 +263,7 @@ where
         }
 
         ready.wait();
-        let total_samples: usize = counts
-            .iter()
-            .map(|count| sample_plan(*count, max_samples).0)
-            .sum();
+        let total_samples = requests.min(max_samples);
         let mut samples = Vec::with_capacity(total_samples);
 
         let started = Instant::now();
@@ -281,4 +280,72 @@ where
             samples,
         }
     })
+}
+
+/// A single independently timed repetition. Keep repetitions separate so
+/// downstream reports cannot select only the fastest observation.
+pub struct Comparison<'a> {
+    pub protocol: &'a str,
+    pub case: &'a str,
+    pub client: &'a str,
+    pub server: &'a str,
+    pub mode: &'a str,
+    pub bytes: usize,
+    pub workers: usize,
+    pub repetition: usize,
+    pub warmup: usize,
+}
+
+pub fn report_comparison(case: Comparison<'_>, mut timing: Timing) {
+    timing.sort_samples();
+    println!(
+        "COMPARISON|protocol={}|case={}|client={}|server={}|mode={}|bytes={}|workers={}|repetition={}|warmup={}|status=ok|requests={}|elapsed_ms={:.3}|rps={:.2}|p50_us={}|p95_us={}|p99_us={}|samples={}|{}",
+        case.protocol, case.case, case.client, case.server, case.mode,
+        case.bytes, case.workers, case.repetition, case.warmup,
+        timing.requests, timing.elapsed.as_secs_f64() * 1000.0,
+        timing.requests_per_second(), metric(timing.percentile_us(0.50)),
+        metric(timing.percentile_us(0.95)), metric(timing.percentile_us(0.99)),
+        timing.samples.len(), stats_fields(&timing),
+    );
+}
+
+/// Positive workload settings; malformed values are errors, not silently
+/// replaced with defaults that would change the claimed workload.
+pub fn setting(name: &str, default: usize) -> usize {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| panic!("{name} must be a positive integer")),
+        Err(std::env::VarError::NotPresent) => default,
+        Err(error) => panic!("{name}: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nearest_rank_percentiles_match_the_documented_estimator() {
+        let timing = Timing {
+            elapsed: Duration::from_secs(1),
+            requests: 4,
+            samples: [1, 2, 3, 4].map(Duration::from_micros).to_vec(),
+        };
+        assert_eq!(timing.percentile_us(0.50), Some(2.0));
+        assert_eq!(timing.percentile_us(0.99), Some(4.0));
+        assert_eq!(timing.percentile_us(0.0), Some(1.0));
+    }
+
+    #[test]
+    fn concurrent_samples_respect_the_global_budget() {
+        for budget in [0, 1, 3, 10, 32] {
+            let timing = run_concurrent(31, 8, budget, |_| Box::new(|| {}));
+            assert_eq!(timing.requests, 31);
+            assert!(timing.samples.len() <= budget);
+            assert_eq!(timing.samples.is_empty(), budget == 0);
+        }
+    }
 }

@@ -179,9 +179,6 @@ fn run_slow_sender_case(count: usize) {
         .serve_background(handler)
         .expect("start slow sender server");
 
-    // Phase 1: open all connections and trickle their headers in
-    // parallel. Each byte is preceded by a real delay, so the connection
-    // is provably in the middle of a request while the probe runs.
     let byte_delay = Duration::from_millis(env_usize("COURIERUST_SLOW_BYTE_DELAY_MS", 10) as u64);
     let started = Instant::now();
     let mut handles = Vec::with_capacity(count);
@@ -202,14 +199,7 @@ fn run_slow_sender_case(count: usize) {
         }));
     }
 
-    // Phase 2: while every connection is still trickling (they cannot
-    // have finished: `count * SLOW_HEADER.len()` bytes remain after the
-    // first byte), a fast probe must complete promptly. This is the
-    // actual Slowloris-resistance assertion.
     let probe_result = probe(addr);
-
-    // Phase 3: let the trickles finish and verify every slow sender gets
-    // its full response (the server did not stall or drop them).
     let mut completed = 0usize;
     for handle in handles {
         if handle.join().expect("slow sender thread panicked").is_ok() {

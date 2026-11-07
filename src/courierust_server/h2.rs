@@ -528,6 +528,9 @@ fn flush_deferred(
                 Ok(Ok(_)) => continue,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
+                    if let Some(trailers) = d.rx.terminal_trailers() {
+                        d.trailers = Some(trailer_fields(&trailers));
+                    }
                     d.ending = true;
                     continue;
                 }

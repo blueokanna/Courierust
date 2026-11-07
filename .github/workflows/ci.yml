@@ -3,12 +3,6 @@ name: CI
 on:
   push:
     branches: [main]
-    # `README.md` / `README_CN.md` are deliberately *not* ignored: the English
-    # README is compiled as doctests (src/lib.rs) and tests/readme_parity.rs
-    # compares both files block for block, so a docs-only push can redden
-    # main. `Github_Action_Benchmark.md` *is* ignored — it is machine-written
-    # evidence that the benchmark job commits back, and no build step reads
-    # it. Nothing under `docs/` is read by the crate either.
     paths-ignore:
       - 'Github_Action_Benchmark.md'
       - 'docs/**'
@@ -37,18 +31,23 @@ jobs:
         run: cargo fmt --all -- --check
 
   clippy:
-    name: clippy
+    name: clippy (${{ matrix.toolchain }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ['1.78.0', stable]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.78.0
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ matrix.toolchain }}
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy — std (all targets, warnings are errors)
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Clippy — no_std protocol core
-        run: cargo clippy --no-default-features --lib -- -D warnings
+        run: cargo clippy --locked --no-default-features --lib -- -D warnings
 
   test:
     name: test (${{ matrix.os }})
@@ -61,14 +60,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.78.0
       - uses: Swatinem/rust-cache@v2
+      - name: Root lockfile is compatible with the MSRV
+        run: cargo metadata --locked --format-version 1
       - name: Build — std (all targets)
-        run: cargo build --all-targets
+        run: cargo build --locked --all-targets
       - name: Build — no_std protocol core
-        run: cargo build --no-default-features --lib
+        run: cargo build --locked --no-default-features --lib
       - name: Run tests (unit + integration)
-        run: cargo test --all-targets
+        run: cargo test --locked --all-targets
       - name: Run doc tests
-        run: cargo test --doc
+        run: cargo test --locked --doc
 
   docs:
     name: docs
@@ -80,7 +81,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.78.0
       - uses: Swatinem/rust-cache@v2
       - name: Build rustdoc (missing-docs is on)
-        run: cargo doc --no-deps
+        run: cargo doc --locked --no-deps
 
   workflows:
     name: actionlint
@@ -115,6 +116,8 @@ jobs:
       - name: Bench workspace is rustfmt-clean
         run: cargo fmt --manifest-path benches/Cargo.toml -- --check
       - name: Bench workspace is clippy-clean (warnings are errors)
-        run: cargo clippy --manifest-path benches/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --manifest-path benches/Cargo.toml --locked --all-targets -- -D warnings
+      - name: Benchmark measurement regressions
+        run: cargo test --manifest-path benches/Cargo.toml --locked --lib
       - name: Fuzz workspace compiles
-        run: cargo check --manifest-path fuzz/Cargo.toml --all-targets
+        run: cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets

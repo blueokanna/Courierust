@@ -375,7 +375,13 @@ fn build_profiled_client_hello(
         };
         exts.push((ext, payload));
     }
-    exts.push((next_grease(), Vec::new()));
+    // GREASE values may repeat in different vectors, but extension types
+    // must be unique within a ClientHello (RFC 8446 section 4.2).
+    let mut trailing_grease = next_grease();
+    while exts.iter().any(|(id, _)| *id == trailing_grease) {
+        trailing_grease = grease(((trailing_grease >> 12) + 1) as u8);
+    }
+    exts.push((trailing_grease, Vec::new()));
 
     let mut ext_block = Vec::new();
     let total: usize = exts.iter().map(|(_, v)| v.len() + 4).sum();
@@ -2119,6 +2125,33 @@ mod tests {
             client_hello_offers_tls13(&hello(&[0x02, 0x03, 0x03])),
             Ok(false)
         ));
+    }
+
+    #[test]
+    fn profiled_grease_extensions_are_distinct_for_colliding_random_bytes() {
+        for byte in 0..=u8::MAX {
+            let hello = build_profiled_client_hello(
+                &[byte; 32],
+                &chrome_tls_profile(),
+                Some(&[0x77; 32]),
+                &[b"h2".to_vec()],
+                Some("localhost"),
+            );
+            let message = parse_hs(&hello).unwrap();
+            let mut ids = extensions(message.body)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>();
+            assert_eq!(ids.iter().filter(|&&id| is_grease(id)).count(), 2);
+            let count = ids.len();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(
+                ids.len(),
+                count,
+                "duplicate extension for random byte {byte}"
+            );
+        }
     }
 
     /// Once GREASE is filtered the profiled hello must reproduce the

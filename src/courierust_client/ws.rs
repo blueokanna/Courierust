@@ -228,10 +228,7 @@ impl WebSocket {
             net::configure(&stream, cfg.read_timeout)?;
             ConnStream::plain(stream)
         };
-        // The handshake read is a deadline: a peer that stops answering
-        // must surface as `Timeout`, not as the `WouldBlock` a POSIX poll
-        // timeout produces.
-        let _ = conn.set_deadline(cfg.read_timeout);
+        conn.set_deadline(cfg.read_timeout)?;
         let stream = Arc::new(conn);
 
         // ---- handshake ------------------------------------------------
@@ -242,9 +239,6 @@ impl WebSocket {
 
         let mut headers = HeaderMap::with_capacity(8 + opts.protocols.len());
         let host_header = {
-            // An IPv6 literal must keep its brackets in `Host` (RFC 3986
-            // §3.2.2, RFC 9112 §3.2): `Host: ::1:9001` is not a valid
-            // authority, and the peer cannot tell where the port starts.
             let authority = if host.contains(':') {
                 alloc::format!("[{host}]")
             } else {
@@ -282,10 +276,6 @@ impl WebSocket {
                 push(&mut headers, "user-agent", ua)?;
             }
         }
-        // A WebSocket handshake is a request from the same client, so the
-        // configured defaults travel with it — but never at the expense of
-        // a field the handshake itself defines (host, upgrade, connection,
-        // sec-websocket-*).
         for (name, value) in cfg.default_headers.iter() {
             if !headers.contains_key(name.as_str()) {
                 headers.insert(name.clone(), value.clone());
@@ -324,9 +314,6 @@ impl WebSocket {
 
         let mut compression = None;
         if response_headers.get("sec-websocket-extensions").is_some() {
-            // Validate against the offer this client actually sent: with
-            // compression disabled nothing was offered, so any extension
-            // in the response fails the connection (RFC 6455 §4.1).
             let mut offered = if opts.compression {
                 crate::courierust_ws::handshake::parse_extension_value(PM_DEFLATE_OFFER)?
             } else {
@@ -611,8 +598,6 @@ fn read_response_head(
     HeaderMap,
 )> {
     for _ in 0..=MAX_INFORMATIONAL {
-        // The status line borrows the scratch line buffer; it is parsed
-        // and released before the header block reuses that buffer.
         let (status, version) = {
             let line = scratch.line();
             reader.read_until_into(b'\n', 16 * 1024, line)?;
@@ -649,8 +634,6 @@ fn validate_response(
             alloc::format!("ws: server answered {} instead of 101", status.as_u16()),
         ));
     }
-    // A switched protocol has no body framing: tolerating either header
-    // here is how a client ends up desynchronised with a proxy.
     for name in ["content-length", "transfer-encoding"] {
         if headers.contains_key(name) {
             return Err(Error::protocol(alloc::format!(

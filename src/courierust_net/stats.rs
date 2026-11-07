@@ -156,9 +156,7 @@ impl Stats {
         if amount == 0 {
             return;
         }
-        let _ = target.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            Some(current.saturating_sub(amount))
-        });
+        crate::atomic::saturating_sub(target, amount, Ordering::Relaxed);
     }
 }
 

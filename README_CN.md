@@ -88,6 +88,8 @@ RFC 9218 用 8 个 urgency 级别替代了旧版依赖树。我们把它实现�
 
 这个仓库把解析器当作攻击面来对待。除了到处都有的大小上限（头/行/正文），几个值得特别指出的防御：
 
+- **HTTP/1 响应边界。** 客户端执行 `max_header_list` 限制，最终响应前最多接受 32 个信息响应，并拒绝非预期的协议升级。存在未读 HTTP 或 TLS 数据的连接不会进入连接池。一旦收到任何响应字节，后续失败就不能触发失效连接重试。
+- **TLS 截断与失败状态。** TLS 1.2 和 1.3 只有收到经过认证的 `close_notify` 才会报告正常 EOF。缺少该告警的传输层关闭返回 `UnexpectedEof`，因此依靠连接关闭定界的 HTTPS 正文不会把截断数据作为成功结果返回。致命记录错误会禁止后续读写；读超时则保留部分记录，允许下次读取继续。
 - **请求走私（CWE-444）。** 值不一致的重复 `Content-Length` 直接拒绝；`Transfer-Encoding` 按码字列表解析，`chunked` 必须是最后一个且只出现一次（`Transfer-Encoding: notchunked`、`chunked, gzip`、空码字全部拒绝）；请求行必须恰好三个 token。关键在于**阻塞式解析器与事件驱动增量解析器共享同一套 chunk-size 解析与分帧规则**——两条路径对同一个请求的含义产生分歧，正是代理后面发生走私的根源，所以这里只有一个权威。
 - **TLS 记录层。** 密文长度边界、padding 校验、内层 content-type 检查、按方向独立序号（被篡改的记录以 `bad_record_mac` 失败）。TLS 1.2 沿用同一套 AEAD 纪律：只实现 AEAD 套件（RFC 5246 §6.2.3.3 的 AAD 构造；CBC/HMAC、RC4、静态 RSA 从不提供），Finished 的 `verify_data` 在两个版本上都用常量时间比较。解密后的握手缓冲区按协议上限封顶在 16 MiB，对端连发握手记录也无法无限增长内存。握手在两个方向都跑在专用的 `handshake_timeout`（默认 10 s）下，因此连接后卡在握手中的对端会释放 worker/调用方，而不是占满整个读超时。
 - **TLS 信任。** 证书链校验（有效期、名称链、签名、CA/key-usage、信任锚）、RFC 6125 主机名匹配（含 IP SAN 与单通配符）、EKU 强制（叶子证书带 EKU 扩展时必须允许 `serverAuth`）。`verify: false` 仅为测试与确无锚点的对端存在，且仍会校验 `CertificateVerify` + `Finished`——握手在密码学上依然成立。
@@ -354,7 +356,7 @@ fn main() {
 
 ```toml
 [dependencies]
-courierust = { version = "1.0.8", default-features = false }
+courierust = { version = "1.1.0", default-features = false }
 ```
 
 `--no-default-features` 构建只编译协议核心，可用于嵌入式 / 内核态。网络层需要 `std` feature（默认开启）。
@@ -367,7 +369,7 @@ courierust = { version = "1.0.8", default-features = false }
 - **TLS 无 0-RTT；双向 mTLS 仅限 TLS 1.3 over TCP**。TLS 1.3 会话恢复已在 TLS 层实现（服务端签发 session ticket、1-RTT PSK `psk_dhe_ke`、按主机名分键的客户端会话缓存），池化客户端按 authority 缓存 connector，一条连接上拿到的 ticket 会在下一条连接上提供（基准行仍报告 `session_resumption=n/a`，那是基准的问题，不是实现的问题）。0-RTT / early data 从不提供。TLS 1.2 session id 会携带但从不用于恢复。客户端认证**已实现**，限 TLS 1.3 over TCP：服务端 `ClientAuth::required`/`optional`，客户端 `TlsSettings::identity`，证书链按 client-auth 信任根 + 有效期 + `clientAuth` EKU 校验，由 `CertificateVerify` 证明持有私钥；要求认证而客户端拒绝时发送 `certificate_required`——拒绝是线上的告警，而不是默默关闭套接字。与 TLS 1.2 的组合（握手建立时）和与 HTTP/3 的组合（启动时）都会被拒绝而非半服务；握手后认证超出范围。两个方向都有单元测试，并有经公共 `TlsSettings`/`client_auth` 接口的集成测试。
 - **事件驱动服务器全平台默认开启，只处理 HTTP/1.1**。`ServerConfig::event_driven`（默认 `true`）把空闲明文 HTTP 连接挂在轮询器上（Winsock `select` / POSIX `poll`），少量 worker 即可服务大量 idle keep-alive / SSE / 长轮询连接；TLS 与 HTTP/2 连接仍走阻塞池模型（由 `handshake_timeout`、`h2_idle_timeout` 与 worker 数共同约束）。设为 `false` 恢复旧的**每连接一池任务**模型；该路径已不建议用于生产——空闲/慢连接群会耗尽池——仅作对比与调试，默认事件路径用 `max_connections`（连接上限）与 `idle_timeout` 约束资源。
 - **请求体流式上传目前只在 HTTP/2 下可靠**（h2 天然分帧）。HTTP/1.1 的请求体要么一次性给全（`Body::Bytes`），要么你自己拼 chunked。
-- **gRPC 不含 protobuf、`.proto` 代码生成与 `grpc.reflection`**。消息编解码需要你实现 codec trait 或接你自己的 protobuf 生成代码；reflection 需要 protobuf 模式清单，属外部职责。
+- **gRPC 包含 protobuf codec 和代码生成，但不提供 reflection 服务**。自定义消息可以实现公开 codec trait。服务端目前缓冲完整请求体，内部消息通道无界；有限的客户端流/双向流不等于具备有界背压的交互式端到端流。
 - **长时间阻塞的同步 handler 会占住一个 worker**（事件驱动与否都一样）——任何同步服务器的通病；流式场景用 channel 响应体。worker 占用**按连接而非按流**：一条连接上的任意空闲流只占同一个 worker，慢流不阻塞同连接其他流——两者均有集成测试覆盖。
 - **WebSocket 只实现 RFC 6455 与 RFC 7692。** 未实现 RFC 8441（WebSocket over HTTP/2）：`ws://`/`wss://` 客户端在 ALPN 中**只**提供 `http/1.1`（即使 `ClientConfig::http2 = true`），并在读到任何一帧之前拒绝落在 h2 上的连接；而在已建立的 h2 连接上尝试 WebSocket 会被服务端按畸形消息处理——**流级错误 `PROTOCOL_ERROR`**（RFC 9113 §8.1.1），RFC 8441 扩展 CONNECT（`:protocol = websocket`，即 RFC 8441 §3 定义的拒绝）与 HTTP/1.1 式的 `Upgrade`/`Connection` 字段（§8.2.2）两种形式都如此——因此连接与其它流保持可用。绝不会发生的是：对一个不可能成为 WebSocket 的请求回 `200`，或建立一条看似成功却不承载任何帧的连接。事件驱动驱动中服务回调运行在 reactor 工作线程上，因此在 `on_message` 里做批量推送会阻塞 reactor，最终触发有界发送队列；扇出的正确路径是其他线程使用 `WsConn::sender()`。本 crate 两端之间传输 256 KiB 消息比 tungstenite 的组合慢（原因定位与 Windows socket deadline 的发现见 [`benches/WS_BENCHMARK.md`](https://github.com/blueokanna/Courierust/blob/main/benches/WS_BENCHMARK.md)）——小消息与中等消息为持平或领先。
 - **HTTPS 是一等公民**：客户端与服务端内置从零实现的 TLS 1.2 + TLS 1.3；`https://` 需要自备根证书库（无内置 CA）。**ALPN 强制一致**：配置 h2 的客户端连到协商出 `http/1.1` 的服务器，或对方**完全未协商 ALPN**（RFC 9113 §3.3 要求 TLS 上必须用 ALPN `h2`），都会得到明确错误而非静默协议错乱。
@@ -490,22 +492,24 @@ cargo fuzz run --fuzz-dir fuzz h2_frame -- -max_total_time=20
 - Courierust h1/h2c **客户端** → hyper h1/h2 **服务端**：路径回显、POST 回显、keep-alive 复用、h2 多路复用（并发不同路径不得串线）；
 - hyper-util h1/h2c **客户端** → Courierust **服务端**，以及 reqwest（blocking，h1 与 h2c prior knowledge）→ Courierust **服务端**；
 - 对真实 hyper 服务端的 1 MiB 请求/响应往返（双向流控窗口补充）与慢读 sanity 检查；
-- **HTTP/3 自互操作**（H3 客户端与服务器均为本 crate 实现；工作区没有主流 H3 对端）：GET/POST 往返、池化连接复用、双向 256 KiB 请求/响应流控、单条 QUIC 连接上的并发流多路复用——作为 H3 路径的环回回归门（同样接入 `benchmark.yml`）。
+- **HTTP/3 自互操作**（H3 客户端与服务器均为本 crate 实现；独立 Quinn/h3 对照另行运行）：GET/POST 往返、池化连接复用、双向 256 KiB 请求/响应流控、单条 QUIC 连接上的并发流多路复用——作为 H3 路径的环回回归门（同样接入 `benchmark.yml`）。
 
 该套件在每个 PR 的 CI（`benchmark.yml`）中运行，真实互操作回归会让流水线失败。主流 crate 仅是 bench 工作区的 dev 依赖；`courierust` 库本身保持零依赖。
 
-`compare` bench 还跑一个 **HTTP/3 对比**，对端是业界标准的 **quinn + h3 crate**：两个客户端都复用同一条池化 QUIC 连接、面向同一个 Courierust H3 服务端，测量热路径每请求延迟（1 KiB / 64 KiB）。quinn 行只在独立的 quinn/rustls QUIC/TLS 握手真正与 Courierust 服务端完成时才报告——完成时两行都带实测 p50/p99；不能完成时（真实的跨实现互操作缺口）quinn 行如实报告 `not_available` 并附失败原因，绝不造假。在握手能完成的 runner 上，quinn 的 1 KiB p99 约 0.3 ms、64 KiB p99 约 1.2 ms，这就是 Courierust 行对照的基准。
+`compare` bench 还跑一个 **HTTP/3 对比**，对端是业界标准的 **quinn + h3 crate**：两个客户端都复用同一条池化 QUIC 连接、面向同一个 Courierust H3 服务端，测量热路径每请求延迟（1 KiB / 64 KiB）。quinn 行只在独立的 quinn/rustls QUIC/TLS 握手真正与 Courierust 服务端完成时才报告——完成时两行都带实测 p50/p99；不能完成时（真实的跨实现互操作缺口）quinn 行如实报告 `not_available` 并附失败原因，绝不造假。应比较同一次运行的实测值，不将某台机器的时延当成固定基准。
 
 自互操作只能证明 Courierust 的 TLS 与*自己*一致。为了对照独立实现验证 TLS 层，另一个工作流（`tls-interop.yml`，脚本 `scripts/tls_interop.sh`）用一次性 CA 签发的证书驱动 **OpenSSL `s_server`**（Courierust 客户端 → OpenSSL）、**`curl` / `openssl s_client`**（独立栈 → Courierust 服务端，h1 + h2 ALPN）、**带 HTTP/2 的 nginx**（Courierust h2 客户端 → nginx）以及 **rustls + hyper 对端**（`benches/src/tls_peer.rs`，h1 双向）。rustls 行里的 TLS 版本与 ALPN 取自对端自己打印的协商结果——绝不会出现「握手没选的版本被写进行里」。
 
 环回数字永远说明不了线缆代价。`cross-machine.yml` 在两台**不同物理机上的自托管 runner**（标签 `courierust-server` / `courierust-client`）上运行同一个 `network` bench 二进制，并把得到的 `NETWORK|...` 行与同一二进制的环回基线对比——两次运行之间的 rps/p99 差距就是网络路径，而不是协议栈。
 
+完整的 [协议对照说明](https://github.com/blueokanna/Courierust/blob/main/benches/README.md) 记录 H1/H2/H3、rustls TLS、tonic gRPC 和 tungstenite WebSocket 的矩阵、配置、复现命令及覆盖边界。
+
 ## 测试
 
 下面的数量按测试二进制区分，可与一次实际运行一一对应：
 
-- **单元测试 489 个**（`cargo test --lib`）：覆盖 HPACK 全部 RFC 向量（C.2/C.3/C.4/C.5/C.6）、Huffman 编解码（含解码输出上限）、帧编解码、状态机、流控、WUCS 调度、JA3/JA4 公开记录比对、指纹解析、TLS 1.3 握手与 RFC 8448 密钥调度、TLS 1.2 握手（ECDHE-RSA/ECDSA AEAD 套件、PRF、RFC 5746 重协商回显、Ed25519 ServerKeyExchange 签名/验证）、X25519/Ed25519/ECDSA/RSA 原语、DEFLATE/gzip 编解码（往返、CRC-32 向量、损坏拒绝、输出上限、与 Python zlib 输出交叉验证，以及覆盖距离码 22-29 的远距离向量）、**WebSocket 引擎**（掩码相位表、最短长度编码、控制帧规则、增量 UTF-8 校验、握手解析、共享关闭标志、RFC 7692 协商）、轮询器 self-pipe（唤醒描述符）语义与「已关闭描述符」契约、h2 池的加权负载记账、`application/x-www-form-urlencoded` 编解码（WHATWG 透传集、`+`/`%XX` 往返、拒绝畸形转义与非 UTF-8）、h1/h2/h3 共用的字段值字符类，以及按 RFC 8446 §4.6.1 逐字段走线的 `NewSessionTicket` 线格式（空的扩展向量仍然是向量）与「武装的读截止时间在每个平台都表现为 `Timeout`」这条契约，PEM 读取器（护甲规则、三种私钥容器）、`Identity` 加载（PEM/DER 校验、私钥与证书不匹配、`Debug` 只打印私钥长度而非字节）、同时带两种分帧时的拒绝判定（RFC 9112 §6.1 / CWE-444），以及按 RFC 3986 §5.4 参考向量核对的重定向解析。
-- **集成测试 89 个**（`tests/integration.rs`）：真实 TCP 环回上的 h1/h2/HTTPS 请求往返、keep-alive 复用、chunked、重定向、h2 并发多路复用、流式响应、大体积流控往返、gRPC unary/服务端流/客户端流/双向流与错误状态/trailers/deadline 执行、gzip 往返、`grpc.health.v1.Health` `Check` + `Watch`、RFC 7540 §3.2 `h2c` Upgrade、并发证明（慢流不阻塞同连接其他流；大量空闲流按连接而非按流占 worker；空闲连接羊群不阻塞新请求；事件调度器回收 slow-loris 并执行 `max_connections`；服务端流式响应按短节奏冲刷；单条 h2 连接并发突发不饥饿）、**请求构建**（`Client::request` 与快捷方法发全部动词、`query`/`form` 编码、basic/bearer 认证、客户端默认头与请求自身字段的优先级、跨源重定向不被带回默认凭据、h1 与 h2 上的每请求截止时间且连接仍可复用、含 CR/LF 的头值在 h1/h2 均被拒绝）、**h1 分帧回归**（`Content-Length: 0` 必须被应答而不是挂起；HEAD 响应到头部块就结束），以及 **TLS 策略/加固**（信任拒绝、过期证书、不可信签发链、自签名但显式信任、主机名不匹配、ALPN 一致、TLS 1.2 与 TLS 1.3 分别用 RSA / P-384 / Ed25519 身份的完整往返、纯 TLS 1.3 客户端拒绝 TLS 1.2 服务器——绝不静默降级——与 RFC 8446 降级哨兵、握手中断失败、畸形 TLS 输入存活、`verify:false`），以及 **PEM 身份加载**（用 `tests/certs/*.pem` 的 OpenSSL 夹具启动的服务端能真的服务请求；带中间证书的链加载为两张证书；取自另一张证书的私钥在加载时被拒绝），以及 **请求走私防护**（同时带两种分帧的请求被**两个驱动**同样以 `400` 回答，其后面流水线发送的字节绝不会被当作第二个请求解析）和相对 `Location` 按请求路径解析（RFC 3986 §5.2）。
+- **单元测试 545 个**（`cargo test --lib`）：覆盖 HPACK 全部 RFC 向量（C.2/C.3/C.4/C.5/C.6）、Huffman 编解码（含解码输出上限）、帧编解码、状态机、流控、WUCS 调度、JA3/JA4 公开记录比对、指纹解析、TLS 1.3 握手与 RFC 8448 密钥调度、TLS 1.2 握手（ECDHE-RSA/ECDSA AEAD 套件、PRF、RFC 5746 重协商回显、Ed25519 ServerKeyExchange 签名/验证）、X25519/Ed25519/ECDSA/RSA 原语、DEFLATE/gzip 编解码（往返、CRC-32 向量、损坏拒绝、输出上限、与 Python zlib 输出交叉验证，以及覆盖距离码 22-29 的远距离向量）、**WebSocket 引擎**（掩码相位表、最短长度编码、控制帧规则、增量 UTF-8 校验、握手解析、共享关闭标志、RFC 7692 协商）、轮询器 self-pipe（唤醒描述符）语义与「已关闭描述符」契约、h2 池的加权负载记账、`application/x-www-form-urlencoded` 编解码（WHATWG 透传集、`+`/`%XX` 往返、拒绝畸形转义与非 UTF-8）、h1/h2/h3 共用的字段值字符类，以及按 RFC 8446 §4.6.1 逐字段走线的 `NewSessionTicket` 线格式（空的扩展向量仍然是向量）与「武装的读截止时间在每个平台都表现为 `Timeout`」这条契约，PEM 读取器（护甲规则、三种私钥容器）、`Identity` 加载（PEM/DER 校验、私钥与证书不匹配、`Debug` 只打印私钥长度而非字节）、同时带两种分帧时的拒绝判定（RFC 9112 §6.1 / CWE-444），以及按 RFC 3986 §5.4 参考向量核对的重定向解析。
+- **集成测试 88 个**（`tests/integration.rs`）：真实 TCP 环回上的 h1/h2/HTTPS 请求往返、keep-alive 复用、chunked、重定向、h2 并发多路复用、流式响应、大体积流控往返、gRPC unary/服务端流/客户端流/双向流与错误状态/trailers/deadline 执行、gzip 往返、`grpc.health.v1.Health` `Check` + `Watch`、RFC 7540 §3.2 `h2c` Upgrade、并发证明（慢流不阻塞同连接其他流；大量空闲流按连接而非按流占 worker；空闲连接羊群不阻塞新请求；事件调度器回收 slow-loris 并执行 `max_connections`；服务端流式响应按短节奏冲刷；单条 h2 连接并发突发不饥饿）、**请求构建**（`Client::request` 与快捷方法发全部动词、`query`/`form` 编码、basic/bearer 认证、客户端默认头与请求自身字段的优先级、跨源重定向不被带回默认凭据、h1 与 h2 上的每请求截止时间且连接仍可复用、含 CR/LF 的头值在 h1/h2 均被拒绝）、**h1 分帧回归**（`Content-Length: 0` 必须被应答而不是挂起；HEAD 响应到头部块就结束），以及 **TLS 策略/加固**（信任拒绝、过期证书、不可信签发链、自签名但显式信任、主机名不匹配、ALPN 一致、TLS 1.2 与 TLS 1.3 分别用 RSA / P-384 / Ed25519 身份的完整往返、纯 TLS 1.3 客户端拒绝 TLS 1.2 服务器——绝不静默降级——与 RFC 8446 降级哨兵、握手中断失败、畸形 TLS 输入存活、`verify:false`），以及 **PEM 身份加载**（用 `tests/certs/*.pem` 的 OpenSSL 夹具启动的服务端能真的服务请求；带中间证书的链加载为两张证书；取自另一张证书的私钥在加载时被拒绝），以及 **请求走私防护**（同时带两种分帧的请求被**两个驱动**同样以 `400` 回答，其后面流水线发送的字节绝不会被当作第二个请求解析）和相对 `Location` 按请求路径解析（RFC 3986 §5.2）。
 - **HTTP/3 测试 14 个**（`tests/h3.rs` + `tests/h3_key_update.rs`）：QUIC v1 + TLS 1.3 真实 UDP 套接字、走公共 `Client`/`Server`：GET/POST 往返、池化连接复用、双向 256 KiB 请求/响应流控、并发多路复用、每请求 deadline 执行、HEAD 响应不等 handler 的流式 body、双向 key update，以及 H3 TLS 安全（不信任 / 过期 / 错误证书链 / 主机名不匹配证书均在握手阶段拒绝）。
 - **HTTP/2 加固测试 39 个**（`tests/h2_hardening.rs`）：恶意帧输入（超长帧、畸形 SETTINGS/PING/WINDOW_UPDATE、填充越界的 PADDED HEADERS、流级零增量 `WINDOW_UPDATE` 必须停留在流级错误、空闲流上的 `WINDOW_UPDATE`、流控窗口溢出、HPACK 头表与 Huffman 炸弹、截断/EOS Huffman、伪头顺序、`content-length` 不一致、非法 `transfer-encoding`/`connection` 系头、含 NUL/CR/LF 的字段值报流错误而非连接错误、两端 `SETTINGS_MAX_CONCURRENT_STREAMS` 强制、`h2c` 存活检测：SETTINGS_TIMEOUT 与 keepalive 死对端检测）。
 - **WebSocket 端到端测试 37 个**（`tests/ws.rs`）：真实服务端 + 真实客户端 + 真实 socket，覆盖升级握手（含 RFC 6455 accept-key 官方向量）、双向掩码、带交错控制帧的分片重组、`permessage-deflate` 协商与 RFC 7692 互操作、UTF-8 失败码、关闭握手的干净性、本 crate TLS 上的 `wss://`、其他线程推送、握手上携带客户端默认头、Origin / 子协议策略、帧/消息/队列上限，以及 reactor 回归（一条连接关闭后仍打开的连接必须继续被服务；健康 reactor 的等待自愈次数为 0）。
@@ -514,11 +518,25 @@ cargo fuzz run --fuzz-dir fuzz h2_frame -- -max_total_time=20
 - **文档一致性测试 5 个**（`tests/readme_parity.rs`）：`README.md` 与 `README_CN.md` 必须包含完全相同的可复制代码块（逐字节）、同一张结构图，且只能使用绝对链接（crates.io/docs.rs 不提供相对目标的文件）；每个 `src/<模块>/README.md` / `README_CN.md` 对、以及每个 `wiki/en/*.md` / `wiki/zh/*.md` 对都必须包含相同的代码（注释可翻译）。
 - **README / wiki doctest**：`README.md`、每个 `src/<模块>/README.md` 以及每个 `wiki/en/*.md` 页面里的所有 `rust` 代码块都由 `cargo test --doc` 编译，因此示例一旦失效会在 CI 失败，而不是让用户照抄到坏代码。
 
-`benches/` 与 `fuzz/` 是各自独立的 workspace（自己的 lockfile 与 target 目录）——根目录的 `cargo test` / `cargo check --all-targets` **不会**覆盖它们，而 CI 两个都会构建（`cargo bench --manifest-path benches/Cargo.toml --locked --no-run`、`cargo check --manifest-path fuzz/Cargo.toml --all-targets`）。它们依赖对标的第三方 crate，因此用固定版本的新工具链（1.98.0）而非 1.78 MSRV 构建。给公开结构体加字段时，必须把这两个工作区也编译一遍；编辑器任务 `ci: benches all targets (locked)` 与 `ci: fuzz all targets` 就是干这个的，两者都带 `--locked`，所以 lockfile 过期在本地就会失败，而不是拖到 CI。根 crate 同时是两个工作区的路径依赖，所以根 `Cargo.toml` 一升版本号，它们的 lockfile 立即失效：在同一次提交里用 `cargo update --manifest-path benches/Cargo.toml -p courierust`（`fuzz/Cargo.toml` 同理）重新生成。
+`benches/` 与 `fuzz/` 是各自独立的 workspace（自己的 lockfile 与 target 目录）——根目录的 `cargo test` / `cargo check --all-targets` **不会**覆盖它们，而 CI 两个都会构建（`cargo bench --manifest-path benches/Cargo.toml --locked --no-run`、`cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets`）。它们依赖对标的第三方 crate，因此用固定版本的新工具链（1.98.0）而非 1.78 MSRV 构建。给公开结构体加字段时，必须把这两个工作区也编译一遍；编辑器任务 `ci: benches all targets (locked)` 与 `ci: fuzz all targets` 就是干这个的，两者都带 `--locked`，所以 lockfile 过期在本地就会失败，而不是拖到 CI。根 crate 同时是两个工作区的路径依赖，所以根 `Cargo.toml` 一升版本号，它们的 lockfile 立即失效：在同一次提交里用 `cargo update --manifest-path benches/Cargo.toml -p courierust`（`fuzz/Cargo.toml` 同理）重新生成。
 
 ```bash
-cargo test                 # everything
-cargo build --no-default-features   # confirm the core compiles warning-free
+cargo +1.78.0 test --locked --all-targets
+cargo +1.78.0 test --locked --doc
+cargo +1.78.0 clippy --locked --no-default-features --lib -- -D warnings
+cargo +1.98.0 clippy --manifest-path benches/Cargo.toml --locked --all-targets -- -D warnings
+cargo +1.98.0 check --manifest-path fuzz/Cargo.toml --locked --all-targets
+```
+
+发版时，三个锁文件必须与包版本号在同一次提交中更新。根锁文件保留 Cargo v3 格式，保证 Rust 1.78 可以读取；bench 和 fuzz 的独立锁文件可以使用 v4。CI 同时检查最低支持版本与 stable Clippy，构建统一使用 `--locked`，避免构建过程悄悄修复过期的锁文件。
+
+```bash
+cargo +1.78.0 generate-lockfile
+cargo +1.98.0 update --manifest-path benches/Cargo.toml -p courierust
+cargo +1.98.0 update --manifest-path fuzz/Cargo.toml -p courierust
+cargo +1.78.0 metadata --locked --format-version 1
+cargo +1.98.0 metadata --manifest-path benches/Cargo.toml --locked --format-version 1
+cargo +1.98.0 metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1
 ```
 
 ## 许可

@@ -273,11 +273,8 @@ fn parse_forwarded_ip(token: &str) -> Option<IpAddr> {
         return None;
     }
     let host = match token.strip_prefix('[') {
-        // `[v6]:port` — the bracketed literal is the address.
         Some(rest) => rest.split_once(']')?.0,
         None => match token.split_once(':') {
-            // A single colon with a numeric tail is unambiguously a port:
-            // a bare IPv6 literal always has at least two colons.
             Some((host, port))
                 if !host.contains(':')
                     && !port.is_empty()

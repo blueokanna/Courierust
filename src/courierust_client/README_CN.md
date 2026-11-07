@@ -4,7 +4,7 @@
 
 ## 模型
 
-- **HTTP/1.1**——按 authority 的 keep-alive 池，有界复用。取用池连接前先做一次活性探测（服务器在空转期间已关掉的连接不付出任何代价：还没写入任何字节，即便是 `POST` 也不会发到死连接上）；请求途中连接死亡则**一次**新连接重试，且仅限于可重放的幂等方法（RFC 9110 §9.2.2），绝不重放 `POST`。每条连接拥有自己的读写缓冲区和 `Scratch`，稳态 keep-alive 请求会复用它能复用的每一块缓冲区——头块、body 暂存、请求行都写在连接已有的内存里——并且不做任何 socket 重配。（`Url`、authority 与池键仍然是每次调用构造的：这里说的是缓冲区复用，不是“一次请求零分配”。）
+- **HTTP/1.1**——按 authority 分组的 keep-alive 连接池，每条连接持有读写缓冲区和 `Scratch`。复用前先拒绝存在缓冲输入的连接，再探测套接字就绪状态；探测失败则丢弃连接。复用连接在尚未收到任何响应字节时发生传输错误，才可能换用新连接重试一次，且仅适用于幂等方法（RFC 9110 §9.2.2）。`POST` 不会自动重放。探测能减少失效连接带来的错误，但无法阻止对端在探测后立即关闭。
 - **HTTP/2**——每条连接由专用 driver 线程驱动，串行化线上访问的同时多路复用流。请求经 channel 到达；响应经每流 channel 流回。`max_connections_per_host` 按 authority 封顶存活连接；h2 池按 authority 共享。
 - **HTTP/3**——`http3://`（以及 ALPN `h3`）路由进 H3 runtime 的 UDP reactor，支持池化连接复用。
 - **WebSocket**——`courierust_client::ws::WebSocket` 通过 `ws://` 或 TLS（`wss://`）升级，提供 `send_text` / `send_binary` / `send_ping` / `read_message` / `close`，并支持子协议、Origin 头、压缩偏好与读超时，全部沿用同一个 `ClientConfig`。它与服务端共用组帧/UTF-8/关闭握手引擎（`courierust_ws`），两端强制的是同一套规则。
@@ -18,7 +18,9 @@
 - **正向代理**——`ClientConfig.proxy = Some("http://user:pass@host:3128")`。`http://` 目标用 **absolute-form** 发给代理（RFC 9110 §3.2.2），由代理去解析 origin 域名——这正是客户端站在代理后面的意义。`https://` 目标先建 `CONNECT` 隧道，TLS 与 origin **端到端**协商：代理只转发密文，既读不到也换不了证书。URL 里的凭据变成 `Proxy-Authorization: Basic …`，只发给代理（隧道场景下它根本到不了 origin；absolute-form 场景下由代理消费）。下面两件事**故意不支持**，且一律报错而不是静默兜底：`https://` 代理（需要 TLS 套 TLS，传输层没有嵌套 TLS），以及代理搭配明文 h2c / HTTP/3（两者都没有不改变语义的正向代理形式）。本 crate **不读任何环境变量**（`HTTP_PROXY` / `NO_PROXY`）：看不见的配置就是无法如实报告的配置。
 - **优先级**——`execute_priority(url, req, Priority { urgency, incremental })` 驱动 WUCS 调度器（见 `blogs/01`）。
 - **worker 占用按连接而非按流**——一条带很多流的 h2 连接只占一个 worker，流永远不会把 worker 用量翻倍，也互不阻塞。
-- **超时**——连接、握手（TLS）、读超时都在 `ClientConfig` 上配置；单个请求可用 `RequestBuilder::timeout` 覆盖读超时。这个覆盖与配置项同义，是**传输层截止时间**，按每次尝试生效（重定向每一跳都有完整超时），用后恢复，因此池化连接不会把上一个调用者的截止时间带给下一个请求。它的到期在每个平台上都表现为 `ErrorKind::Timeout`。
+- **超时**——`ClientConfig` 配置连接、TLS 握手和读超时；`RequestBuilder::timeout` 为单个请求覆盖读超时。HTTP/1 使用套接字 I/O 超时，并非整个请求的墙钟时间上限：连续成功的读取可能延长请求总时长。每次重试或重定向分别应用超时。套接字配置失败会返回错误；响应成功后，只有恢复配置超时成功的连接才会入池。已设置的超时在各平台均以 `ErrorKind::Timeout` 返回。
+- **响应限制**——HTTP/1 对每个响应头块执行 `max_header_list` 限制，最终响应前最多接受 32 个信息响应。非预期的 `101` 升级会报错。以连接关闭定界的 HTTPS 正文必须收到 TLS `close_notify`，缺少该告警的传输层关闭返回 `UnexpectedEof`。
+- **h2c 升级被拒绝**——对端保持 HTTP/1.1 时，后续请求复用常规 HTTP/1 连接池。`max_connections_per_host` 为零会禁用该空闲连接池，包括升级尝试后保留下来的 HTTP/1 连接。
 - **请求构建**——`Client::request(url, method)` 返回 `RequestBuilder`：头、body、`query` / `form`（WHATWG `application/x-www-form-urlencoded`，实现在 `courierust_http::form`）、`basic_auth` / `bearer_auth`、RFC 9218 `priority`，以及每请求 `timeout`。`Client::{put, delete, head, patch, options}` 是快捷方法。它构造的就是手写调用所发的同一个 `Request`，交给同一条 `execute` 路径，重定向、连接池与三种协议都完全一致。
 - **默认头**——`ClientConfig::default_headers` 会合入客户端自己发起的那个请求，请求本身设置的同名字段永远优先。只在首跳合入：跨源重定向会剥掉 `authorization` / `proxy-authorization` / `cookie`（不论它们来自请求还是配置），再合一次就等于把默认凭据又放回这条规则要保护的那一跳。
 - **WebSocket 的读超时就是 socket 超时。** `ClientConfig::read_timeout`（默认 60 s）对交互式流量是正确的存活机制，但 Windows 会在每次阻塞操作上收费：armed 状态下 256 KiB 的 WebSocket 批量推送大约**慢 2 倍**。批量传输的客户端应设 `read_timeout: None`，改用应用层存活判断——服务端就是这么做的（实测见 [`courierust_ws` README](../courierust_ws/README_CN.md)）。

@@ -1,8 +1,8 @@
 [package]
 name = "courierust_benchmark"
-version = "0.1.0"
+build = "codegen/build.rs"
+version = "0.1.1"
 edition = "2021"
-# Never published: this workspace exists to measure and compare, not to ship.
 publish = false
 license-file = "../LICENSE"
 authors = ["blueokanna", "HyphenTeam"]
@@ -24,20 +24,53 @@ http-body-util = "0.1"
 h3 = "0.0"
 h3-quinn = "0.0"
 http = "1"
-hyper = { version = "1", features = ["http1", "http2", "client", "server", "full"] }
+hyper = { version = "1", features = [
+    "http1",
+    "http2",
+    "client",
+    "server",
+    "full",
+] }
 hyper-util = { version = "0.1", features = [
     "tokio",
     "server-auto",
     "client-legacy",
 ] }
 quinn = "0.11"
-reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "http2"] }
+reqwest = { version = "0.13.4", default-features = false, features = [
+    "blocking",
+    "http2",
+] }
 rustls = "0.23"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "macros"] }
+tokio = { version = "1", features = [
+    "rt",
+    "rt-multi-thread",
+    "net",
+    "sync",
+    "macros",
+] }
 tokio-rustls = "0.26"
 tungstenite = "0.30.0"
 tokio-tungstenite = "0.30.0"
 futures-util = "0.3.34"
+prost = "0.14"
+tonic = "0.14"
+tonic-prost = "0.14"
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+protoc-bin-vendored = "3"
+
+[[bench]]
+name = "grpc"
+harness = false
+path = "src/grpc.rs"
+
+[[bench]]
+name = "tls"
+harness = false
+path = "src/tls.rs"
 
 [[bench]]
 name = "throughput"

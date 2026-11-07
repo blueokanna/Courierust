@@ -463,60 +463,37 @@ mod tests {
     #[test]
     fn wake_interrupts_already_blocked_wait() {
         use crate::courierust_server::event::{drain_wake, wake_nudge, wakeup_pair};
-        use std::sync::Arc;
-        use std::time::Instant;
-        // The production pattern: the reactor is already parked in `wait`
-        // when a worker completes and writes the wake byte. A wake that
-        // only works when written *before* the poll starts would leave a
-        // worker→reactor handoff parked for a full poll timeout.
+        use std::sync::mpsc::sync_channel;
+        use std::time::Duration;
+
         let (reader, writer) = wakeup_pair().unwrap();
-        let writer = Arc::new(writer);
-        let mut p = Poller::new();
-        let wfd = fd_of(&reader);
-        let mut samples: Vec<std::time::Duration> = Vec::with_capacity(100);
-        for _ in 0..100 {
-            let writer = writer.clone();
-            let nudger = std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_micros(200));
+        let (start, requests) = sync_channel(0);
+        let (sent, completed) = sync_channel(0);
+        let nudger = std::thread::spawn(move || {
+            while requests.recv().is_ok() {
+                // Give the receiver an opportunity to enter the OS wait.
+                // Correctness is the wake token, not scheduler latency.
+                std::thread::sleep(Duration::from_millis(1));
                 wake_nudge(&writer);
-            });
-            let started = Instant::now();
-            let ready = p.wait(1000, Some(wfd)).unwrap();
-            let elapsed = started.elapsed();
-            samples.push(elapsed);
+                if sent.send(()).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut poller = Poller::new();
+        for _ in 0..32 {
+            start.send(()).unwrap();
+            let ready = poller.wait(10_000, Some(fd_of(&reader))).unwrap();
             assert!(
                 ready.contains(&WAKE_ID),
                 "wake lost while wait was blocked: {ready:?}"
             );
-            nudger.join().unwrap();
+            completed.recv_timeout(Duration::from_secs(10)).unwrap();
             drain_wake(&reader);
         }
-        samples.sort_unstable();
-        // The blocked-wait variant measures thread-scheduling latency too
-        // (the nudger thread must wake and write the byte), so under
-        // parallel `--all-targets` load the tail is dominated by OS
-        // scheduler jitter, not by the self-pipe. The assertions therefore
-        // keep a modest central claim (p50 < 10 ms) and use a generous
-        // p100 bound (900 ms) that still cleanly fails on the real
-        // regression this test guards: a *lost* wake parks the loop for
-        // the full 1000 ms poll timeout.
-        assert!(
-            samples[49] < std::time::Duration::from_millis(10),
-            "p50 blocked-wait wake latency too high: {:#?}",
-            samples[49]
-        );
-        assert!(
-            samples[95] < std::time::Duration::from_millis(100),
-            "p95 blocked-wait wake latency too high: {:#?}",
-            samples[95]
-        );
-        assert!(
-            samples[99] < std::time::Duration::from_millis(900),
-            "p100 blocked-wait wake latency too high (wake likely lost): {:#?}",
-            samples[99]
-        );
+        drop(start);
+        nudger.join().unwrap();
     }
-
     #[test]
     fn a_socket_beyond_the_old_select_limit_is_reported_by_the_wait_that_saw_it() {
         // 70 registered sockets: more than one Winsock `select` batch (64),

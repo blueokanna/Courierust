@@ -71,7 +71,11 @@ fn main() {
         }
     };
     let code = resp.status.as_u16();
-    let body_len = resp.body.collect().map(|b| b.len()).unwrap_or(0);
+    let body_len = resp
+        .body
+        .collect()
+        .expect("TLS response body was incomplete")
+        .len();
     if code != 200 {
         println!("TLSINTEROP|role=client|peer=external|protocol={proto}|status=failed|http={code}");
         std::process::exit(1);

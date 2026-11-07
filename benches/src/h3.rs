@@ -75,28 +75,34 @@ fn run_scenarios(client: &Client, url: String, requests: usize) {
         for &workers in &SCENARIO_WORKERS {
             let mut t = if workers == 1 {
                 run_sequential(requests, MAX_SAMPLES, || {
-                    let _ = client.get(&resp_url);
+                    check_response(client.get(&resp_url), size, None);
                 })
             } else {
                 run_concurrent(requests, workers, MAX_SAMPLES, |_| {
                     let client = client.clone();
                     let resp_url = resp_url.clone();
                     Box::new(move || {
-                        let _ = client.get(&resp_url);
+                        check_response(client.get(&resp_url), size, None);
                     })
                 })
             };
             t.sort_samples();
-            report(&format!("h3_resp_{size}_w{workers}"), workers, &t);
+            report(
+                &format!("h3_resp_{size}_w{workers}"),
+                workers,
+                size,
+                "download",
+                &t,
+            );
         }
         let upload_payload = Bytes::from(vec![b'x'; size]);
-        let upload_url = url.clone();
+        let upload_url = format!("{url}/upload");
         for &workers in &SCENARIO_WORKERS {
             let mut t = if workers == 1 {
                 run_sequential(requests, MAX_SAMPLES, || {
                     let req =
                         Request::post("/upload").with_body(Body::Bytes(upload_payload.clone()));
-                    let _ = client.execute(&upload_url, req);
+                    check_response(client.execute(&upload_url, req), 0, Some(size));
                 })
             } else {
                 run_concurrent(requests, workers, MAX_SAMPLES, |_| {
@@ -106,12 +112,18 @@ fn run_scenarios(client: &Client, url: String, requests: usize) {
                     Box::new(move || {
                         let req =
                             Request::post("/upload").with_body(Body::Bytes(upload_payload.clone()));
-                        let _ = client.execute(&upload_url, req);
+                        check_response(client.execute(&upload_url, req), 0, Some(size));
                     })
                 })
             };
             t.sort_samples();
-            report(&format!("h3_upload_{size}_w{workers}"), workers, &t);
+            report(
+                &format!("h3_upload_{size}_w{workers}"),
+                workers,
+                size,
+                "upload",
+                &t,
+            );
         }
     }
 }
@@ -119,9 +131,36 @@ fn run_scenarios(client: &Client, url: String, requests: usize) {
 const CERT_DER: &[u8] = include_bytes!("../../tests/certs/server_cert.der");
 const KEY_DER: &[u8] = include_bytes!("../../tests/certs/server_key.der");
 
-fn report(label: &str, workers: usize, timing: &Timing) {
+fn check_response(
+    response: courierust::Result<Response<Body>>,
+    expected_bytes: usize,
+    uploaded_bytes: Option<usize>,
+) {
+    let response = response.expect("H3 request failed; no valid performance result");
+    assert_eq!(response.status.as_u16(), 200);
+    assert_eq!(
+        response.version,
+        courierust::courierust_http::Version::HTTP_3
+    );
+    if let Some(expected) = uploaded_bytes {
+        let actual = response
+            .headers
+            .get("x-upload-bytes")
+            .expect("upload acknowledgement")
+            .to_str()
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        assert_eq!(actual, expected, "peer did not receive the complete upload");
+    }
+    let body = response.body.collect().expect("complete H3 response body");
+    assert_eq!(body.len(), expected_bytes, "incorrect H3 response length");
+    assert!(body.iter().all(|byte| *byte == b'r'), "corrupt H3 response");
+}
+
+fn report(label: &str, workers: usize, bytes: usize, direction: &str, timing: &Timing) {
     println!(
-        "RESULT|suite=h3|case={label}|protocol=h3|mode=reuse|payload=empty|bytes=0|workers={workers}|requests={}|elapsed_ms={:.3}|rps={:.1}|p50_us={:.1}|p75_us={:.1}|p90_us={:.1}|p99_us={:.1}|{}|samples={}",
+        "RESULT|suite=h3|case={label}|protocol=h3|mode=reuse|payload={direction}|bytes={bytes}|workers={workers}|status=ok|requests={}|elapsed_ms={:.3}|rps={:.1}|p50_us={:.1}|p75_us={:.1}|p90_us={:.1}|p99_us={:.1}|{}|samples={}",
         timing.requests,
         timing.elapsed.as_secs_f64() * 1000.0,
         timing.requests_per_second(),
@@ -214,6 +253,17 @@ fn run_suite() {
     let _handle = server
         .serve_background(move |req: Request<Body>| {
             let path = req.uri.as_str();
+            if path == "/upload" {
+                let body = req.body.collect().expect("complete H3 upload");
+                assert!(body.iter().all(|byte| *byte == b'x'), "corrupt H3 upload");
+                return Response::<Body>::with_status(200.into()).header(
+                    courierust::courierust_http::header::HeaderName::from_static("x-upload-bytes"),
+                    courierust::courierust_http::header::HeaderValue::from_bytes(
+                        body.len().to_string().as_bytes(),
+                    )
+                    .unwrap(),
+                );
+            }
             if let Some(rest) = path.strip_prefix("/resp/") {
                 if let Ok(n) = rest.parse::<usize>() {
                     let n = n.min(MAX_RESPONSE_BYTES);
@@ -236,6 +286,7 @@ fn run_suite() {
     let client_cfg = ClientConfig {
         http3: true,
         max_connections_per_host: 1,
+        read_timeout: Some(std::time::Duration::from_secs(10)),
         tls: Some(ClientTls {
             roots,
             verify: true,
@@ -246,7 +297,7 @@ fn run_suite() {
         ..Default::default()
     };
     let client = Client::with_config(client_cfg.clone());
-    let url = format!("https://{addr}/bench");
+    let url = format!("https://{addr}");
 
     if std::env::var_os("H3_SCENARIOS").is_some() {
         run_scenarios(&client, url.clone(), requests.min(100));
@@ -255,7 +306,7 @@ fn run_suite() {
 
     let cold = Client::with_config(client_cfg);
     let started = Instant::now();
-    let _ = cold.get(&url).unwrap();
+    check_response(cold.get(&url), 0, None);
     println!(
         "RESULT|suite=h3|case=h3_connect|protocol=h3|mode=connect|payload=empty|bytes=0|workers=1|requests=1|connect_ms={:.3}",
         started.elapsed().as_secs_f64() * 1000.0,
@@ -263,53 +314,53 @@ fn run_suite() {
     drop(cold);
 
     for _ in 0..3 {
-        let _ = client.get(&url).unwrap();
+        check_response(client.get(&url), 0, None);
     }
 
     let mut seq = run_sequential(requests, MAX_SAMPLES, || {
-        let _ = client.get(&url);
+        check_response(client.get(&url), 0, None);
     });
     seq.sort_samples();
-    report("h3_sequential", 1, &seq);
+    report("h3_sequential", 1, 0, "empty", &seq);
     if body_bytes > 0 {
         let upload_payload = Bytes::from(vec![b'x'; body_bytes]);
         let upload_client = client.clone();
-        let upload_url = url.clone();
+        let upload_url = format!("{url}/upload");
         let upload_requests = requests.min(200);
         let mut up = run_sequential(upload_requests, MAX_SAMPLES, || {
             let req = Request::post("/upload").with_body(Body::Bytes(upload_payload.clone()));
-            let _ = upload_client.execute(&upload_url, req);
+            check_response(upload_client.execute(&upload_url, req), 0, Some(body_bytes));
         });
         up.sort_samples();
-        report("h3_upload", 1, &up);
+        report("h3_upload", 1, body_bytes, "upload", &up);
     }
 
     let response_bytes = env_usize("BENCH_RESPONSE_BYTES", 0);
     if response_bytes > 0 {
         let resp_url = format!("{url}/resp/{response_bytes}");
         let mut down = run_sequential(requests.min(200), MAX_SAMPLES, || {
-            let _ = client.get(&resp_url);
+            check_response(client.get(&resp_url), response_bytes, None);
         });
         down.sort_samples();
-        report("h3_response", 1, &down);
+        report("h3_response", 1, response_bytes, "download", &down);
     }
 
     let mut conc = run_concurrent(requests, workers, MAX_SAMPLES, |_| {
         let client = client.clone();
         let url = url.clone();
         Box::new(move || {
-            let _ = client.get(&url);
+            check_response(client.get(&url), 0, None);
         })
     });
     conc.sort_samples();
-    report("h3_parallel", workers, &conc);
+    report("h3_parallel", workers, 0, "empty", &conc);
 
     if runs > 1 {
         let mut seq_metrics = Vec::with_capacity(runs);
         let mut conc_metrics = Vec::with_capacity(runs);
         for _ in 0..runs {
             let mut s = run_sequential(requests, MAX_SAMPLES, || {
-                let _ = client.get(&url);
+                check_response(client.get(&url), 0, None);
             });
             s.sort_samples();
             seq_metrics.push(RunMetrics::from_timing(&s));
@@ -318,7 +369,7 @@ fn run_suite() {
                 let client = client.clone();
                 let url = url.clone();
                 Box::new(move || {
-                    let _ = client.get(&url);
+                    check_response(client.get(&url), 0, None);
                 })
             });
             c.sort_samples();

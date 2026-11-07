@@ -197,12 +197,22 @@ fn hyper_server(protocol: Protocol, payload: Payload) -> SocketAddr {
                 let Ok((stream, _)) = listener.accept().await else {
                     break;
                 };
-                let _ = stream.set_nodelay(true);
+                stream.set_nodelay(true).unwrap();
                 let body = body.clone();
                 let service = service_fn(move |request: hyper::Request<Incoming>| {
                     let body = body.clone();
                     async move {
-                        let _ = BodyExt::collect(request.into_body()).await;
+                        let upload = request.uri().path() == "/large-body";
+                        let received = BodyExt::collect(request.into_body())
+                            .await
+                            .expect("complete HTTP request")
+                            .to_bytes();
+                        if upload {
+                            assert!(received
+                                .iter()
+                                .enumerate()
+                                .all(|(index, byte)| *byte == (index % 251) as u8));
+                        }
                         Ok::<_, Infallible>(hyper::Response::new(Full::new(body)))
                     }
                 });
@@ -222,9 +232,19 @@ fn hyper_server(protocol: Protocol, payload: Payload) -> SocketAddr {
     address
 }
 
-fn assert_courierust_response(response: Response<Body>, expected_bytes: usize) {
+fn assert_courierust_response(response: Response<Body>, expected_bytes: usize, protocol: Protocol) {
     assert_eq!(response.status.as_u16(), 200);
-    assert_eq!(response.body.collect().unwrap().len(), expected_bytes);
+    assert_eq!(
+        response.version,
+        match protocol {
+            Protocol::H1 => courierust::courierust_http::Version::HTTP_11,
+            Protocol::H2c => courierust::courierust_http::Version::HTTP_2,
+            Protocol::H3 => courierust::courierust_http::Version::HTTP_3,
+        }
+    );
+    let body = response.body.collect().unwrap();
+    assert_eq!(body.len(), expected_bytes);
+    assert!(body.iter().all(|byte| *byte == b'x'));
 }
 
 fn run_courierust_client(
@@ -241,18 +261,18 @@ fn run_courierust_client(
         ..Default::default()
     });
     let url = format!("http://{address}/benchmark");
-    assert_courierust_response(client.get(&url).unwrap(), payload.bytes);
+    assert_courierust_response(client.get(&url).unwrap(), payload.bytes, protocol);
 
     if workers == 1 {
         run_sequential(requests, MAX_SAMPLES, || {
-            assert_courierust_response(client.get(&url).unwrap(), payload.bytes);
+            assert_courierust_response(client.get(&url).unwrap(), payload.bytes, protocol);
         })
     } else {
         run_concurrent(requests, workers, MAX_SAMPLES, |_| {
             let client = client.clone();
             let url = url.clone();
             Box::new(move || {
-                assert_courierust_response(client.get(&url).unwrap(), payload.bytes);
+                assert_courierust_response(client.get(&url).unwrap(), payload.bytes, protocol);
             })
         })
     }
@@ -288,13 +308,18 @@ fn assert_reqwest_response(
     handle: &tokio::runtime::Handle,
 ) {
     assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(response.version(), reqwest::Version::HTTP_2);
     let body = handle.block_on(response.bytes()).unwrap();
     assert_eq!(body.len(), expected_bytes);
+    assert!(body.iter().all(|byte| *byte == b'x'));
 }
 
 fn assert_reqwest_blocking_response(response: reqwest::blocking::Response, expected_bytes: usize) {
     assert_eq!(response.status().as_u16(), 200);
-    assert_eq!(response.bytes().unwrap().len(), expected_bytes);
+    assert_eq!(response.version(), reqwest::Version::HTTP_11);
+    let body = response.bytes().unwrap();
+    assert_eq!(body.len(), expected_bytes);
+    assert!(body.iter().all(|byte| *byte == b'x'));
 }
 
 fn run_reqwest_client(
@@ -382,7 +407,11 @@ fn run_courierust_h2_large_body(
     let request = || {
         let req =
             Request::post("/large-body").with_body(Body::Bytes(Bytes::from(request_body.to_vec())));
-        assert_courierust_response(client.execute(&url, req).unwrap(), response_payload.bytes);
+        assert_courierust_response(
+            client.execute(&url, req).unwrap(),
+            response_payload.bytes,
+            Protocol::H2c,
+        );
     };
     request();
     run_sequential(requests, MAX_SAMPLES, request)
@@ -477,8 +506,13 @@ fn print_result(metadata: ResultMetadata, mut timing: Timing) {
         pool_value,
     } = metadata;
     timing.sort_samples();
+    let (status, reason) = if case.contains("h2c_large_body") {
+        ("diagnostic", "flow_control_workload_not_a_speed_ratio")
+    } else {
+        ("valid", "-")
+    };
     println!(
-        "RESULT|suite=compare|case={case}|layer={layer}|protocol={}|client={client}|server={server}|payload={}|bytes={}|workers={workers}|server_threads={server_threads}|pool_policy={pool_policy}|pool_value={pool_value}|repetitions={repetitions}|status=valid|reason=-|requests={}|elapsed_ms={:.3}|rps={:.1}|response_mbps={:.3}|p50_us={}|p75_us={}|p90_us={}|p95_us={}|p99_us={}|{}|samples={}",
+        "RESULT|suite=compare|case={case}|layer={layer}|protocol={}|client={client}|server={server}|payload={}|bytes={}|workers={workers}|server_threads={server_threads}|pool_policy={pool_policy}|pool_value={pool_value}|repetitions={repetitions}|status={status}|reason={reason}|requests={}|elapsed_ms={:.3}|rps={:.1}|response_mbps={:.3}|p50_us={}|p75_us={}|p90_us={}|p95_us={}|p99_us={}|{}|samples={}",
         protocol.name(),
         payload.name,
         payload.bytes,
@@ -734,7 +768,7 @@ fn run_courierust_h3_client(address: SocketAddr, payload: Payload, requests: usi
     let url = format!("https://{address}/benchmark");
     let request = || {
         let response = client.get(&url).unwrap();
-        assert_eq!(response.body.collect().unwrap().len(), payload.bytes);
+        assert_courierust_response(response, payload.bytes, Protocol::H3);
     };
     request();
     run_sequential(requests, MAX_SAMPLES, request)
@@ -812,11 +846,19 @@ fn run_quinn_h3_client(
             return Err(format!("status {}", response.status()));
         }
         let mut total = 0usize;
-        while let Some(chunk) = handle
+        while let Some(mut chunk) = handle
             .block_on(stream.recv_data())
             .map_err(|e| format!("recv data: {e}"))?
         {
             total += chunk.remaining();
+            while chunk.has_remaining() {
+                let part = chunk.chunk();
+                if !part.iter().all(|byte| *byte == b'x') {
+                    return Err("corrupt H3 payload".into());
+                }
+                let consumed = part.len();
+                chunk.advance(consumed);
+            }
         }
         if total != payload.bytes {
             return Err(format!(

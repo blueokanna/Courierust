@@ -1,7 +1,7 @@
 //! TLS 1.3 record layer (RFC 8446 §5).
 //!
 //! Handles the protected records: the inner plaintext is
-//! `content || padding || padding_len || real_content_type`, the outer
+//! `content || real_content_type || zero_padding`, the outer
 //! type is always `application_data`, and each AEAD invocation uses
 //! `nonce = iv XOR sequence_number`. Sequence numbers are 64-bit and
 //! must never overflow; record sizes are bounded to the TLS 1.3 limit.
@@ -19,7 +19,10 @@ pub(crate) const CONTENT_HANDSHAKE: u8 = 22;
 /// Content type: application_data.
 pub(crate) const CONTENT_APPLICATION_DATA: u8 = 23;
 
-/// The maximum size of a TLS record payload (2^14 + 256 for TLS 1.3).
+/// Maximum content length before adding an inner type or encryption.
+pub(crate) const MAX_PLAINTEXT: usize = 16_384;
+
+/// Maximum TLS 1.3 ciphertext length, including the authentication tag.
 pub(crate) const MAX_RECORD_PAYLOAD: usize = 16_384 + 256;
 
 /// Tracks the 64-bit sequence number for one read or write direction.
@@ -62,7 +65,7 @@ pub(crate) fn seal_record(
     content_type: u8,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, TlsError> {
-    if plaintext.len() + 1 > MAX_RECORD_PAYLOAD {
+    if plaintext.len() > MAX_PLAINTEXT {
         return Err(TlsError::Protocol("record too large".into()));
     }
     // RFC 8446 §5.2: TLSInnerPlaintext = content || type || zeros.
@@ -109,7 +112,13 @@ pub(crate) fn open_record(
     if header[0] != CONTENT_APPLICATION_DATA {
         return Err(TlsError::Protocol("unexpected record type".into()));
     }
-    if encrypted.len() < 16 || encrypted.len() > MAX_RECORD_PAYLOAD + 16 {
+    if encrypted.len() > MAX_RECORD_PAYLOAD {
+        return Err(TlsError::Alert {
+            level: 2,
+            description: 22,
+        });
+    }
+    if encrypted.len() < 16 {
         return Err(TlsError::Protocol("bad record length".into()));
     }
     let nonce = build_nonce(&keys.iv, seq);
@@ -119,6 +128,12 @@ pub(crate) fn open_record(
             level: 2,        // fatal
             description: 20, // bad_record_mac
         })?;
+    if inner.len() > MAX_PLAINTEXT + 1 {
+        return Err(TlsError::Alert {
+            level: 2,
+            description: 22,
+        });
+    }
     if inner.is_empty() {
         return Err(TlsError::Protocol("record too short".into()));
     }
@@ -134,7 +149,7 @@ pub(crate) fn open_record(
             // The record contained only zero bytes: no content type.
             return Err(TlsError::Alert {
                 level: 2,
-                description: 20, // bad_record_mac
+                description: 10, // unexpected_message
             });
         }
         n -= 1;
@@ -145,7 +160,7 @@ pub(crate) fn open_record(
     }
     if !matches!(
         content_type,
-        CONTENT_CHANGE_CIPHER_SPEC | CONTENT_ALERT | CONTENT_HANDSHAKE | CONTENT_APPLICATION_DATA
+        CONTENT_ALERT | CONTENT_HANDSHAKE | CONTENT_APPLICATION_DATA
     ) {
         return Err(TlsError::Alert {
             level: 2,
@@ -163,6 +178,69 @@ pub(crate) fn open_record(
 mod tests {
     use super::*;
     use crate::courierust_tls::key_schedule::CipherSuite;
+
+    #[test]
+    fn authenticated_plaintext_and_padding_obey_the_record_limit() {
+        let suite = CipherSuite::TlsAes128GcmSha256;
+        let keys = TrafficKeys {
+            key: [0x42; 32],
+            iv: [0x24; 12],
+        };
+        assert!(seal_record(
+            suite,
+            &keys,
+            0,
+            CONTENT_APPLICATION_DATA,
+            &vec![1; MAX_PLAINTEXT]
+        )
+        .is_ok());
+        assert!(seal_record(
+            suite,
+            &keys,
+            0,
+            CONTENT_APPLICATION_DATA,
+            &vec![1; MAX_PLAINTEXT + 1]
+        )
+        .is_err());
+        for (content, padding, accepted) in [
+            (16_384, 0, true),
+            (16_383, 1, true),
+            (16_384, 1, false),
+            (16_385, 0, false),
+        ] {
+            let mut inner = vec![1; content];
+            inner.push(CONTENT_APPLICATION_DATA);
+            inner.resize(inner.len() + padding, 0);
+            let length = inner.len() + 16;
+            let header = [
+                CONTENT_APPLICATION_DATA,
+                3,
+                3,
+                (length >> 8) as u8,
+                length as u8,
+            ];
+            let ciphertext = suite
+                .seal(
+                    &keys.key[..suite.key_len()],
+                    &build_nonce(&keys.iv, 0),
+                    &header,
+                    &inner,
+                )
+                .unwrap();
+            let result = open_record(suite, &keys, 0, &header, &ciphertext);
+            if accepted {
+                assert_eq!(result.unwrap().1, vec![1; content]);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(TlsError::Alert {
+                        description: 22,
+                        ..
+                    })
+                ));
+            }
+        }
+    }
 
     #[test]
     fn record_roundtrip_all_suites() {

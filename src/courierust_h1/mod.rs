@@ -91,40 +91,18 @@ pub fn parse_version(v: &[u8]) -> Result<Version> {
     Ok(match v {
         b"HTTP/1.0" => Version::HTTP_10,
         b"HTTP/1.1" => Version::HTTP_11,
-        b"HTTP/2" => Version::HTTP_2,
         _ => return Err(Error::protocol("unsupported HTTP version")),
     })
 }
 
 /// Read a header block (lines until an empty line).
 pub fn read_headers<R: Read>(reader: &mut BufReader<R>) -> Result<HeaderMap> {
-    let mut headers = HeaderMap::new();
-    let mut total = 0usize;
-    loop {
-        let line = reader.read_until(b'\n', MAX_LINE)?;
-        total += line.len();
-        if total > MAX_HEADER_BLOCK {
-            return Err(Error::overflow("header block too large"));
-        }
-        if line.len() >= MAX_LINE {
-            return Err(Error::overflow("header line too long"));
-        }
-        let trimmed = trim_crlf(&line);
-        if trimmed.is_empty() {
-            break; // end of headers
-        }
-        if headers.len() >= MAX_HEADERS {
-            return Err(Error::overflow("too many header fields"));
-        }
-        let (name, value) = split_header(trimmed)?;
-        headers.append(name, value);
-    }
-    Ok(headers)
+    read_headers_scratch(reader, &mut crate::courierust_io::Scratch::new())
 }
 
 /// Like [`read_headers`] but reads each line into the connection's
 /// [`crate::courierust_io::Scratch`] line buffer, so steady-state header parsing
-/// performs no allocation. The per-connection scratch is the hot path
+/// reuses its line allocation. The per-connection scratch is the hot path
 /// for keep-alive servers and clients.
 pub fn read_headers_scratch<R: Read>(
     reader: &mut BufReader<R>,
@@ -670,6 +648,15 @@ pub fn is_hop_by_hop(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_textual_start_line_cannot_claim_http2_or_http3() {
+        for version in [b"HTTP/2".as_slice(), b"HTTP/2.0", b"HTTP/3", b"HTTP/3.0"] {
+            assert!(parse_version(version).is_err());
+        }
+        assert_eq!(parse_version(b"HTTP/1.0").unwrap(), Version::HTTP_10);
+        assert_eq!(parse_version(b"HTTP/1.1").unwrap(), Version::HTTP_11);
+    }
     use crate::courierust_error::ErrorKind;
     use crate::courierust_http::header::{HeaderMap, HeaderName, HeaderValue};
     use crate::courierust_http::method::Method;

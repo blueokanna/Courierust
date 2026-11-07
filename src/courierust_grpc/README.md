@@ -20,6 +20,10 @@ If you already have a protobuf ecosystem, you're not locked in — `EncodeMessag
 
 ## Honest scope
 
+Responses are incremental, but the server currently buffers the request body before invoking the service. Client-streaming and bidi support finite message sequences; they do not yet provide interactive request streaming or bounded end-to-end backpressure. Internal message channels are unbounded. Account for these limits when admitting concurrent calls.
+
+Unary calls consume the final status and reject extra response messages. Streaming calls must be read through their final status: receiving a message does not imply success. Errors and deadlines after the first message are transmitted in final trailers. Timeout serialization preserves fractional units and rounds upward only when the eight-digit wire limit requires it.
+
 No reflection service (needs a protobuf schema registry — external responsibility). No interceptors on the server side. The 4 MiB default per-message ceiling is a hard cap — set `max_message_size` explicitly for larger payloads.
 
 ## Usage

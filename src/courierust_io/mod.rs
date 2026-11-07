@@ -67,11 +67,11 @@ pub struct BufReader<R> {
 }
 
 impl<R> BufReader<R> {
-    /// Wrap `inner` with a `cap`-byte buffer.
+    /// Wrap `inner` with a buffer of at least one byte.
     pub fn new(inner: R, cap: usize) -> Self {
         Self {
             inner,
-            buf: vec![0u8; cap],
+            buf: vec![0u8; cap.max(1)],
             pos: 0,
             cap: 0,
         }
@@ -91,13 +91,16 @@ impl<R> BufReader<R> {
     /// Seed the buffer with bytes that were already read from the
     /// transport before this reader was created (used by the RFC 7540
     /// §3.2 `h2c` Upgrade path: the server's SETTINGS frame may already
-    /// be buffered behind the `101` response). Must be called on a fresh
-    /// reader; the seed must fit in the buffer.
+    /// be buffered behind the `101` response). Existing unread bytes
+    /// precede the seed; the buffer grows rather than discarding input.
     pub fn seed(&mut self, data: &[u8]) {
-        debug_assert!(self.pos == 0 && self.cap == 0);
-        let n = core::cmp::min(data.len(), self.buf.len());
-        self.buf[..n].copy_from_slice(&data[..n]);
-        self.cap = n;
+        let held = self.buffered();
+        let total = held.checked_add(data.len()).expect("buffer size overflow");
+        self.buf.copy_within(self.pos..self.cap, 0);
+        self.buf.resize(self.buf.len().max(total), 0);
+        self.buf[held..total].copy_from_slice(data);
+        self.pos = 0;
+        self.cap = total;
     }
 
     /// Grow the buffer to at least `cap` bytes, preserving whatever is
@@ -563,6 +566,21 @@ impl Scratch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_capacity_reader_does_not_report_false_eof() {
+        let mut reader = BufReader::new(SliceReader::new(b"data"), 0);
+        assert_eq!(reader.read_exact(4).unwrap(), b"data");
+    }
+
+    #[test]
+    fn protocol_handoff_preserves_every_seeded_byte() {
+        let mut reader = BufReader::new(SliceReader::new(b"tail"), 2);
+        reader.seed(b"abcdef");
+        assert_eq!(reader.read_exact(2).unwrap(), b"ab");
+        reader.seed(b"gh");
+        assert_eq!(reader.read_exact(10).unwrap(), b"cdefghtail");
+    }
 
     #[test]
     fn bufreader_exact_and_until() {

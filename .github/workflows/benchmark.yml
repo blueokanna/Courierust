@@ -36,6 +36,7 @@ jobs:
   bench:
     name: All benchmarks (release)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
@@ -47,9 +48,20 @@ jobs:
         shell: bash
         env:
           COURIERUST_NETWORK_URL: ${{ secrets.COURIERUST_REMOTE_URL }}
-          COURIERUST_H3_DEBUG: 1
         run: |
           suite_failed=0
+
+          {
+            date -u
+            git rev-parse HEAD
+            rustc --version --verbose
+            cargo --version
+            uname -a
+            lscpu
+            sha256sum Cargo.lock benches/Cargo.lock
+            cargo tree --manifest-path benches/Cargo.toml --locked --depth 1
+          } > benchmark-environment.log
+          cargo metadata --manifest-path benches/Cargo.toml --locked --format-version 1 > benchmark-dependencies.json
 
           run_suite() {
             local suite=$1
@@ -90,7 +102,11 @@ jobs:
           run_suite h3 h3.log \
             cargo bench --manifest-path benches/Cargo.toml --locked --bench h3
           run_suite ws ws.log \
-            cargo bench --manifest-path benches/Cargo.toml --locked --bench ws
+            env WS_BENCH_SECTION=compare cargo bench --manifest-path benches/Cargo.toml --locked --bench ws
+          run_suite grpc grpc.log \
+            cargo bench --manifest-path benches/Cargo.toml --locked --bench grpc
+          run_suite tls_compare tls.log \
+            cargo bench --manifest-path benches/Cargo.toml --locked --bench tls
           run_suite complexity complexity.log \
             cargo bench --manifest-path benches/Cargo.toml --locked --bench complexity
 
@@ -148,6 +164,8 @@ jobs:
           BENCHMARK_INTEROP_EXIT: ${{ steps.benchmarks.outputs.interop_exit }}
           BENCHMARK_H3_EXIT: ${{ steps.benchmarks.outputs.h3_exit }}
           BENCHMARK_WS_EXIT: ${{ steps.benchmarks.outputs.ws_exit }}
+          BENCHMARK_GRPC_EXIT: ${{ steps.benchmarks.outputs.grpc_exit }}
+          BENCHMARK_TLS_COMPARE_EXIT: ${{ steps.benchmarks.outputs.tls_compare_exit }}
           BENCHMARK_COMPLEXITY_EXIT: ${{ steps.benchmarks.outputs.complexity_exit }}
           BENCHMARK_NETWORK_EXIT: ${{ steps.benchmarks.outputs.network_exit }}
           BENCHMARK_FUZZ_EXIT: ${{ steps.fuzz.outputs.fuzz_exit }}
@@ -188,6 +206,10 @@ jobs:
             fuzz.log
             h3.log
             ws.log
+            grpc.log
+            tls.log
+            benchmark-environment.log
+            benchmark-dependencies.json
             complexity.log
           if-no-files-found: error
 

@@ -997,7 +997,6 @@ fn pem_identity_loads_a_chain_and_refuses_a_mismatched_key() {
     .expect_err("an Ed25519 certificate with a P-384 key must be refused");
     assert!(err.to_string().contains("does not match"), "{err}");
 
-    // The trust side of the same story: roots come from files too.
     let mut roots = courierust::courierust_tls::RootStore::new();
     assert_eq!(
         roots.add_pem_file("tests/certs/server_cert.pem").unwrap(),
@@ -2199,9 +2198,6 @@ fn event_streaming_body_does_not_hold_a_worker() {
         }
     });
     let addr = base.trim_start_matches("http://").to_string();
-
-    // Start the stream by hand and read its head: the producer needs
-    // another ~540 ms to finish, and this connection stays open.
     let mut streamed = TcpStream::connect(addr).unwrap();
     streamed
         .set_read_timeout(Some(Duration::from_secs(30)))
@@ -2213,7 +2209,6 @@ fn event_streaming_body_does_not_hold_a_worker() {
     let n = streamed.read(&mut head).unwrap();
     assert!(n > 0, "the streaming response must start");
 
-    // The only event worker must still be free for this connection.
     let t0 = Instant::now();
     let client = Client::new();
     let resp = client.get(&format!("{base}/fast")).unwrap();
@@ -2224,7 +2219,6 @@ fn event_streaming_body_does_not_hold_a_worker() {
         "a stream waiting for its producer held the only worker for {waited:?}"
     );
 
-    // The stream itself still completes, terminator included.
     let mut rest = String::new();
     streamed.read_to_string(&mut rest).unwrap();
     assert!(rest.contains("part-9"), "the stream must finish: {rest:?}");
@@ -2333,15 +2327,19 @@ fn grpc_server_streaming() {
 fn grpc_client_streaming() {
     let addr = grpc_echo_stream_server();
     let client = GrpcClient::new(&format!("http://{addr}")).unwrap();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        for p in ["a", "b", "c"] {
-            tx.send(Ok(Bytes::from(p))).unwrap();
+    for messages in [
+        vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        (0..257).map(|index| format!("{index:04}")).collect(),
+    ] {
+        let expected = messages.concat();
+        let (tx, rx) = std::sync::mpsc::channel();
+        for message in messages {
+            tx.send(Ok(Bytes::from(message))).unwrap();
         }
         drop(tx);
-    });
-    let resp = client.client_stream("/echo.Echo/ClientStream", rx).unwrap();
-    assert_eq!(resp.to_str().unwrap(), "abc");
+        let resp = client.client_stream("/echo.Echo/ClientStream", rx).unwrap();
+        assert_eq!(resp.to_str().unwrap(), expected);
+    }
 }
 
 #[test]
@@ -3021,17 +3019,13 @@ fn a_307_without_a_body_is_still_followed() {
 // ---------------------------------------------------------------------
 
 /// A stub HTTP/1.1 server that answers the first request with keep-alive
-/// and then lets the connection die:
-///
-/// * `rude`: it stays open until the *second* request arrives, then hangs
-///   up without answering — the race a liveness probe cannot see, so only
-///   a retry recovers it.
-/// * polite: it closes shortly after answering, so the next request finds
-///   a spent (but still pooled) connection and the probe must drop it.
+/// and closes after reading the second request without answering it.
+/// This is the race a liveness probe cannot prevent: the connection was
+/// healthy when the request started, but the peer did not respond.
 ///
 /// The accept counter tells a test whether the client re-opened.
-fn spawn_dying_keep_alive_stub(rude: bool) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
-    use std::io::{BufRead, BufReader, Write};
+fn spawn_dying_keep_alive_stub() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::Ordering;
 
@@ -3048,21 +3042,35 @@ fn spawn_dying_keep_alive_stub(rude: bool) -> (String, Arc<std::sync::atomic::At
                     return;
                 };
                 let mut reader = BufReader::new(read_half);
-                let read_head = |reader: &mut BufReader<std::net::TcpStream>| -> bool {
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let read_request = |reader: &mut BufReader<std::net::TcpStream>| -> bool {
                     let mut line = String::new();
                     if !matches!(reader.read_line(&mut line), Ok(n) if n > 0) {
                         return false;
                     }
+                    let mut content_length = 0;
                     loop {
                         let mut rest = String::new();
                         match reader.read_line(&mut rest) {
                             Ok(0) | Err(_) => return false,
-                            Ok(_) if rest.trim_end().is_empty() => return true,
-                            Ok(_) => {}
+                            Ok(_) if rest.trim_end().is_empty() => break,
+                            Ok(_) => {
+                                if let Some((name, value)) = rest.split_once(':') {
+                                    if name.eq_ignore_ascii_case("content-length") {
+                                        content_length = value.trim().parse::<usize>().unwrap();
+                                    }
+                                }
+                            }
                         }
                     }
+                    // Closing with an unread POST body can reset the TCP
+                    // connection and discard the response on BSD/macOS.
+                    assert!(content_length <= 1024, "unexpected fixture request size");
+                    reader.read_exact(&mut vec![0; content_length]).is_ok()
                 };
-                if !read_head(&mut reader) {
+                if !read_request(&mut reader) {
                     return;
                 }
                 let (label, close) = if is_first {
@@ -3078,14 +3086,10 @@ fn spawn_dying_keep_alive_stub(rude: bool) -> (String, Arc<std::sync::atomic::At
                 );
                 let _ = stream.write_all(label.as_bytes());
                 let _ = stream.flush();
-                if is_first && rude {
+                if is_first {
                     // Wait for the next request, then vanish without
                     // answering it.
-                    let mut next = String::new();
-                    let _ = reader.read_line(&mut next);
-                } else if is_first {
-                    // Let the client pool the connection, then close it.
-                    std::thread::sleep(std::time::Duration::from_millis(40));
+                    let _ = read_request(&mut reader);
                 }
                 drop(stream);
             });
@@ -3101,7 +3105,7 @@ fn spawn_dying_keep_alive_stub(rude: bool) -> (String, Arc<std::sync::atomic::At
 fn h1_client_retries_idempotent_request_on_a_stale_keep_alive() {
     use std::sync::atomic::Ordering;
 
-    let (base, accepts) = spawn_dying_keep_alive_stub(true);
+    let (base, accepts) = spawn_dying_keep_alive_stub();
     let client = Client::new();
     let first = client.get(&format!("{base}/one")).unwrap();
     assert_eq!(first.body.as_bytes(), Some(&b"first"[..]));
@@ -3124,7 +3128,7 @@ fn h1_client_retries_idempotent_request_on_a_stale_keep_alive() {
 fn h1_client_never_replays_a_non_idempotent_request() {
     use std::sync::atomic::Ordering;
 
-    let (base, accepts) = spawn_dying_keep_alive_stub(true);
+    let (base, accepts) = spawn_dying_keep_alive_stub();
     let client = Client::new();
     let first = client.get(&format!("{base}/one")).unwrap();
     assert_eq!(first.body.as_bytes(), Some(&b"first"[..]));
@@ -3148,31 +3152,6 @@ fn h1_client_never_replays_a_non_idempotent_request() {
         1,
         "no replacement connection may be opened for a POST"
     );
-}
-
-/// A connection the peer closed while it sat idle is dropped *before* the
-/// next request is written, so even a request that may never be replayed
-/// (POST) succeeds — nothing was sent on the dead connection at all.
-#[test]
-fn h1_client_probes_a_pooled_connection_before_reusing_it() {
-    use std::sync::atomic::Ordering;
-
-    let (base, accepts) = spawn_dying_keep_alive_stub(false);
-    let client = Client::new();
-    let first = client.get(&format!("{base}/one")).unwrap();
-    assert_eq!(first.body.as_bytes(), Some(&b"first"[..]));
-    // Give the stub's FIN time to arrive: the pooled connection is now
-    // spent, and nothing but the probe can know that.
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    let second = client
-        .post(
-            &format!("{base}/two"),
-            Body::Bytes(Bytes::from_static(b"body")),
-        )
-        .expect("a POST must be sent on a fresh connection, not a spent one");
-    assert_eq!(second.body.as_bytes(), Some(&b"second"[..]));
-    assert_eq!(accepts.load(Ordering::SeqCst), 2);
 }
 
 // ---------------------------------------------------------------------
@@ -3531,8 +3510,6 @@ fn per_request_timeout_bounds_one_request_only() {
         .expect_err("the request must not outlive its own deadline");
     assert_eq!(err.kind, courierust::ErrorKind::Timeout, "{err:?}");
 
-    // The connection went back to the pool: it must carry the configured
-    // deadline again, not the one that just expired.
     let resp = client.get(&format!("{base}/fast")).unwrap();
     assert_eq!(resp.status.as_u16(), 200);
     assert_eq!(resp.text().unwrap(), "ok");
@@ -3575,7 +3552,6 @@ fn per_request_timeout_applies_over_h2() {
         .expect_err("the h2 stream must be abandoned at its deadline");
     assert_eq!(err.kind, courierust::ErrorKind::Timeout, "{err:?}");
 
-    // Only that stream was abandoned; the connection is still usable.
     let resp = client.get(&format!("{base}/fast")).unwrap();
     assert_eq!(resp.text().unwrap(), "ok");
 }

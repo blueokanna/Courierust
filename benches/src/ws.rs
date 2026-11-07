@@ -40,6 +40,21 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tungstenite::Message as TungMessage;
 
+trait MedianTime: Iterator<Item = f64> + Sized {
+    fn median_seconds(self) -> f64 {
+        let mut values: Vec<_> = self.collect();
+        assert!(!values.is_empty());
+        values.sort_by(f64::total_cmp);
+        let middle = values.len() / 2;
+        if values.len().is_multiple_of(2) {
+            (values[middle - 1] + values[middle]) / 2.0
+        } else {
+            values[middle]
+        }
+    }
+}
+impl<I: Iterator<Item = f64>> MedianTime for I {}
+
 // ---------------------------------------------------------------------
 // Timing helpers
 // ---------------------------------------------------------------------
@@ -354,7 +369,10 @@ fn echo_courierust_tuned(
         ws.send_binary(&payload).unwrap();
         let event = ws.read_message().unwrap();
         match event {
-            courierust::courierust_ws::Event::Binary(b) => assert_eq!(b.len(), size),
+            courierust::courierust_ws::Event::Binary(b) => assert!(
+                b.len() == size && b.iter().all(|byte| *byte == 0x5a),
+                "corrupt WebSocket echo"
+            ),
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -380,7 +398,10 @@ fn echo_courierust_client_on_tungstenite_server(
     for _ in 0..count {
         ws.send_binary(&payload).unwrap();
         match ws.read_message().unwrap() {
-            courierust::courierust_ws::Event::Binary(b) => assert_eq!(b.len(), size),
+            courierust::courierust_ws::Event::Binary(b) => assert!(
+                b.len() == size && b.iter().all(|byte| *byte == 0x5a),
+                "corrupt WebSocket echo"
+            ),
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -403,7 +424,10 @@ fn echo_tungstenite_client_on_courierust_server(
         ws.send(TungMessage::Binary(payload.clone().into()))
             .unwrap();
         let msg = ws.read().unwrap();
-        assert_eq!(msg.len(), size);
+        assert!(
+            matches!(msg, TungMessage::Binary(ref bytes) if bytes.len() == size && bytes.iter().all(|byte| *byte == 0x5a)),
+            "incorrect WebSocket message"
+        );
     }
     start.elapsed().as_secs_f64()
 }
@@ -444,7 +468,19 @@ fn echo_courierust_pipelined(
             sent += 1;
         }
         match ws.read_message().unwrap() {
-            courierust::courierust_ws::Event::Binary(b) => assert_eq!(b.len(), size),
+            courierust::courierust_ws::Event::Binary(b) => assert!(
+                b.len() == size && b.iter().all(|byte| *byte == 0x5a),
+                "corrupt WebSocket echo"
+            ),
+            other => panic!("unexpected {other:?}"),
+        }
+        inflight -= 1;
+    }
+    while inflight > 0 {
+        match ws.read_message().unwrap() {
+            courierust::courierust_ws::Event::Binary(bytes) => {
+                assert_eq!(bytes.as_ref(), payload.as_slice());
+            }
             other => panic!("unexpected {other:?}"),
         }
         inflight -= 1;
@@ -473,7 +509,10 @@ fn echo_courierust_phases(addr: std::net::SocketAddr, size: usize, count: usize)
         send += t.elapsed();
         let t = Instant::now();
         match ws.read_message().unwrap() {
-            courierust::courierust_ws::Event::Binary(b) => assert_eq!(b.len(), size),
+            courierust::courierust_ws::Event::Binary(b) => assert!(
+                b.len() == size && b.iter().all(|byte| *byte == 0x5a),
+                "corrupt WebSocket echo"
+            ),
             other => panic!("unexpected {other:?}"),
         }
         recv += t.elapsed();
@@ -575,7 +614,10 @@ fn echo_tungstenite(addr: std::net::SocketAddr, size: usize, count: usize) -> f6
         ws.send(TungMessage::Binary(payload.clone().into()))
             .unwrap();
         let msg = ws.read().unwrap();
-        assert_eq!(msg.len(), size);
+        assert!(
+            matches!(msg, TungMessage::Binary(ref bytes) if bytes.len() == size && bytes.iter().all(|byte| *byte == 0x5a)),
+            "incorrect WebSocket message"
+        );
     }
     start.elapsed().as_secs_f64()
 }
@@ -619,7 +661,7 @@ fn echo_tokio_tungstenite(size: usize, count: usize) -> f64 {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         stream.set_nodelay(true).unwrap();
         let url = format!("ws://{addr}/echo");
-        let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str())
+        let (mut ws, _) = tokio_tungstenite::client_async(url.as_str(), stream)
             .await
             .expect("handshake");
         let payload = vec![0x5au8; size];
@@ -629,7 +671,7 @@ fn echo_tokio_tungstenite(size: usize, count: usize) -> f64 {
                 .await
                 .unwrap();
             let msg = ws.next().await.unwrap().unwrap();
-            assert_eq!(msg.len(), size);
+            assert!(matches!(msg, TungMessage::Binary(ref bytes) if bytes.len() == size && bytes.iter().all(|byte| *byte == 0x5a)), "incorrect WebSocket message");
         }
         let elapsed = start.elapsed().as_secs_f64();
         server.abort();
@@ -684,16 +726,14 @@ fn echo_benchmarks() {
             .map(|_| echo_tungstenite_client_on_courierust_server(courierust_addr, size, count))
             .collect();
 
-        let best = |v: &Vec<f64>| v.iter().cloned().fold(f64::MAX, f64::min);
-        let ours = best(&ours);
-        let ours_deflate = best(&ours_deflate);
-        let sync_t = best(&sync_t);
-        let async_t = best(&async_t);
-        let cross_client = best(&cross_client);
-        let cross_server = best(&cross_server);
-        let raw = (0..3)
-            .map(|_| echo_tcp_raw(size, count))
-            .fold(f64::MAX, f64::min);
+        let median = |v: &Vec<f64>| v.iter().cloned().median_seconds();
+        let ours = median(&ours);
+        let ours_deflate = median(&ours_deflate);
+        let sync_t = median(&sync_t);
+        let async_t = median(&async_t);
+        let cross_client = median(&cross_client);
+        let cross_server = median(&cross_server);
+        let raw = (0..3).map(|_| echo_tcp_raw(size, count)).median_seconds();
 
         let report = |label: &str, secs: f64| {
             println!(
@@ -874,7 +914,10 @@ fn push_read_courierust_opts(
     for i in 0..count {
         let t = Instant::now();
         match ws.read_message().unwrap() {
-            courierust::courierust_ws::Event::Binary(b) => assert_eq!(b.len(), size),
+            courierust::courierust_ws::Event::Binary(b) => assert!(
+                b.len() == size && b.iter().all(|byte| *byte == 0x5a),
+                "corrupt WebSocket echo"
+            ),
             other => panic!("unexpected {other:?}"),
         }
         if trace && i < 12 {
@@ -909,7 +952,10 @@ fn push_read_tungstenite(target: &str, count: usize, size: usize) -> f64 {
     let start = Instant::now();
     for _ in 0..count {
         let msg = ws.read().unwrap();
-        assert_eq!(msg.len(), size);
+        assert!(
+            matches!(msg, TungMessage::Binary(ref bytes) if bytes.len() == size && bytes.iter().all(|byte| *byte == 0x5a)),
+            "incorrect WebSocket message"
+        );
     }
     start.elapsed().as_secs_f64()
 }
@@ -986,42 +1032,42 @@ fn push_benchmarks() {
         let _ = push_read_courierust(&ours_url, 20, size);
         let _ = push_read_tungstenite(&theirs_url, 20, size);
 
-        let best = |v: Vec<f64>| v.iter().cloned().fold(f64::MAX, f64::min);
-        let ours_reads = best(
+        let median = |v: Vec<f64>| v.iter().cloned().median_seconds();
+        let ours_reads = median(
             (0..3)
                 .map(|_| push_read_courierust(&ours_url, count, size))
                 .collect(),
         );
-        let ours_reads_no_deadline = best(
+        let ours_reads_no_deadline = median(
             (0..3)
                 .map(|_| push_read_courierust_opts(&ours_url, count, size, 64 * 1024, false))
                 .collect(),
         );
-        let ours_both_no_deadline = best(
+        let ours_both_no_deadline = median(
             (0..3)
                 .map(|_| {
                     push_read_courierust_opts(&ours_nodeadline_url, count, size, 64 * 1024, false)
                 })
                 .collect(),
         );
-        let ours_client_deadline_only = best(
+        let ours_client_deadline_only = median(
             (0..3)
                 .map(|_| {
                     push_read_courierust_opts(&ours_nodeadline_url, count, size, 64 * 1024, true)
                 })
                 .collect(),
         );
-        let ours_client_theirs_server = best(
+        let ours_client_theirs_server = median(
             (0..3)
                 .map(|_| push_read_courierust(&theirs_url, count, size))
                 .collect(),
         );
-        let theirs_client_ours_server = best(
+        let theirs_client_ours_server = median(
             (0..3)
                 .map(|_| push_read_tungstenite(&ours_url, count, size))
                 .collect(),
         );
-        let theirs_reads = best(
+        let theirs_reads = median(
             (0..3)
                 .map(|_| push_read_tungstenite(&theirs_url, count, size))
                 .collect(),
@@ -1042,7 +1088,7 @@ fn push_benchmarks() {
         report("tungstenite srv -> tungstenite client", theirs_reads);
         report(
             "raw TCP, same write pattern",
-            best((0..3).map(|_| push_raw_control(size, count)).collect()),
+            median((0..3).map(|_| push_raw_control(size, count)).collect()),
         );
         println!(
             "  ratios: own/blocking = {:.2}x\n",
@@ -1574,6 +1620,114 @@ fn scale_benchmarks() {
     scale_writer_contention();
 }
 
+fn paired_echo_comparison() {
+    use courierust_benchmark::metrics::{
+        report_comparison, run_sequential, setting, Comparison, MAX_SAMPLES,
+    };
+    let requests = setting("BENCH_REQUESTS", 1000);
+    let repetitions = setting("BENCH_REPETITIONS", 4);
+    let warmup = setting("BENCH_WARMUP", 16);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let own = start_courierust_server_with(false, false);
+    let foreign = start_tungstenite_server();
+    println!("META|suite=ws|protocol=ws|tls=off|compression=off|connections=1|nodelay=true|timeout=none|load=closed_loop|validation=opcode_and_full_payload|order=alternating");
+    for (server, address) in [("tungstenite", foreign), ("courierust", own)] {
+        for size in [64, 1024, 16 * 1024, 256 * 1024] {
+            let url = format!("ws://{address}/echo");
+            let payload = vec![0x5a; size];
+            for repetition in 0..repetitions {
+                for offset in 0..3 {
+                    let implementation = if repetition % 2 == 0 {
+                        offset
+                    } else {
+                        2 - offset
+                    };
+                    let mut operation: Box<dyn FnMut()> = match implementation {
+                        0 => {
+                            let mut ws = CourierustWs::connect(
+                                &url,
+                                &ClientConfig {
+                                    read_timeout: None,
+                                    ..Default::default()
+                                },
+                            )
+                            .unwrap();
+                            let payload = payload.clone();
+                            Box::new(move || {
+                                ws.send_binary(&payload).unwrap();
+                                match ws.read_message().unwrap() {
+                                    courierust::courierust_ws::Event::Binary(bytes) => {
+                                        assert_eq!(bytes.as_ref(), payload.as_slice())
+                                    }
+                                    event => panic!("unexpected {event:?}"),
+                                }
+                            })
+                        }
+                        1 => {
+                            let socket = TcpStream::connect(address).unwrap();
+                            socket.set_nodelay(true).unwrap();
+                            let (mut ws, _) = tungstenite::client(url.as_str(), socket).unwrap();
+                            let payload = payload.clone();
+                            Box::new(move || {
+                                ws.send(TungMessage::Binary(payload.clone().into()))
+                                    .unwrap();
+                                let reply = ws.read().unwrap();
+                                assert!(reply.is_binary());
+                                assert_eq!(reply.into_data().as_ref(), payload.as_slice());
+                            })
+                        }
+                        _ => {
+                            let mut ws = runtime.block_on(async {
+                                let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+                                socket.set_nodelay(true).unwrap();
+                                tokio_tungstenite::client_async(url.as_str(), socket)
+                                    .await
+                                    .unwrap()
+                                    .0
+                            });
+                            let runtime = &runtime;
+                            let payload = payload.clone();
+                            Box::new(move || {
+                                runtime.block_on(async {
+                                    ws.send(TungMessage::Binary(payload.clone().into()))
+                                        .await
+                                        .unwrap();
+                                    let reply = ws.next().await.unwrap().unwrap();
+                                    assert!(reply.is_binary());
+                                    assert_eq!(reply.into_data().as_ref(), payload.as_slice());
+                                })
+                            })
+                        }
+                    };
+                    for _ in 0..warmup {
+                        operation();
+                    }
+                    let timing = run_sequential(requests, MAX_SAMPLES, operation);
+                    report_comparison(
+                        Comparison {
+                            protocol: "ws",
+                            case: "binary_echo",
+                            client: ["courierust", "tungstenite", "tokio-tungstenite"]
+                                [implementation],
+                            server,
+                            mode: "reuse",
+                            bytes: size,
+                            workers: 1,
+                            repetition: repetition + 1,
+                            warmup,
+                        },
+                        timing,
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn main() {
     println!("courierust WebSocket benchmark");
     println!(
@@ -1584,6 +1738,10 @@ fn main() {
     );
     flush_out();
     match std::env::var("WS_BENCH_SECTION").as_deref() {
+        Ok("compare") => {
+            paired_echo_comparison();
+            return;
+        }
         Ok("push") => {
             push_benchmarks();
             return;
@@ -1625,7 +1783,7 @@ fn read_buffer_sensitivity() {
         let _ = echo_courierust_tuned(addr, SIZE, 20, true, false, buffer);
         let secs = (0..3)
             .map(|_| echo_courierust_tuned(addr, SIZE, COUNT, true, false, buffer))
-            .fold(f64::MAX, f64::min);
+            .median_seconds();
         println!(
             "  buffer {:>7} bytes             {:>9.0} msg/s  ({:>7.2} us/msg)",
             buffer,
@@ -1649,18 +1807,18 @@ fn phase_split() {
     let _ = echo_courierust(ours, SIZE, 20);
     let _ = echo_courierust_client_on_tungstenite_server(theirs, SIZE, 20);
     let run = |label: &str, addr| {
-        let mut best = (f64::MAX, f64::MAX);
+        let mut median = (f64::MAX, f64::MAX);
         for _ in 0..3 {
             let (send, recv) = echo_courierust_phases(addr, SIZE, COUNT);
-            if send + recv < best.0 + best.1 {
-                best = (send, recv);
+            if send + recv < median.0 + median.1 {
+                median = (send, recv);
             }
         }
         println!(
             "  {label:<34} send {:>7.2} us   wait {:>7.2} us   total {:>7.2} us",
-            best.0 * 1e6 / COUNT as f64,
-            best.1 * 1e6 / COUNT as f64,
-            (best.0 + best.1) * 1e6 / COUNT as f64
+            median.0 * 1e6 / COUNT as f64,
+            median.1 * 1e6 / COUNT as f64,
+            (median.0 + median.1) * 1e6 / COUNT as f64
         );
     };
     run("courierust client -> courierust srv", ours);
@@ -1690,7 +1848,7 @@ fn timeout_sensitivity() {
     let run = |label: &str, addr, client_timeout: bool| {
         let secs = (0..3)
             .map(|_| echo_courierust_with(addr, 64, COUNT, client_timeout, false))
-            .fold(f64::MAX, f64::min);
+            .median_seconds();
         println!(
             "  {label:<44} {:>9.0} msg/s  ({:>6.2} µs/msg)",
             COUNT as f64 / secs,
@@ -1703,14 +1861,14 @@ fn timeout_sensitivity() {
 
     // Latency vs throughput, on the same socket and payload.
     println!("\n== alternating vs windowed pipeline (64-byte messages) ==\n");
-    let best = |v: Vec<f64>| v.iter().cloned().fold(f64::MAX, f64::min);
-    let alternating = best(
+    let median = |v: Vec<f64>| v.iter().cloned().median_seconds();
+    let alternating = median(
         (0..3)
             .map(|_| echo_courierust(with_timeouts, 64, COUNT))
             .collect(),
     );
     for window in [8usize, 64, 512] {
-        let pipelined = best(
+        let pipelined = median(
             (0..3)
                 .map(|_| echo_courierust_pipelined(with_timeouts, 64, COUNT, window))
                 .collect(),

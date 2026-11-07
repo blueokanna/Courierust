@@ -115,6 +115,42 @@ fn spawn_counting_upstream(hits: Arc<AtomicUsize>, delay: Duration) -> String {
     format!("http://{addr}")
 }
 
+/// Hold the first request until the test explicitly releases it. The
+/// notification proves the proxy has reserved the upstream's in-flight slot.
+struct BlockedUpstream {
+    base: String,
+    entered: std::sync::mpsc::Receiver<()>,
+    release: std::sync::mpsc::Sender<()>,
+    _handle: courierust::courierust_server::ServerHandle,
+}
+
+fn spawn_blocked_upstream(hits: Arc<AtomicUsize>) -> BlockedUpstream {
+    let (entered_tx, entered) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    let server = Server::bind_with_config("127.0.0.1:0", ServerConfig::default()).unwrap();
+    let addr = server.local_addr().unwrap();
+    let handle = server
+        .serve_background(move |_req: Request<Body>| {
+            if hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("test must release the occupied upstream");
+            }
+            Response::<Body>::with_status(200.into()).with_body(Body::from("ok"))
+        })
+        .unwrap();
+    BlockedUpstream {
+        base: format!("http://{addr}"),
+        entered,
+        release,
+        _handle: handle,
+    }
+}
+
 /// A port nothing is listening on: bound, read and released, so a connection
 /// to it is refused rather than left hanging.
 fn closed_port() -> u16 {
@@ -646,7 +682,8 @@ fn an_upstream_redirect_is_relayed_not_followed() {
 fn least_connections_sends_nothing_to_the_upstream_that_is_still_busy() {
     let slow = Arc::new(AtomicUsize::new(0));
     let quick = Arc::new(AtomicUsize::new(0));
-    let a = spawn_counting_upstream(slow.clone(), Duration::from_millis(2000));
+    let blocked = spawn_blocked_upstream(slow.clone());
+    let a = blocked.base.clone();
     let b = spawn_counting_upstream(quick.clone(), Duration::ZERO);
     let proxy = spawn_concurrent_proxy(8, move |_| {
         ReverseProxy::new(Client::new()).balanced(
@@ -656,10 +693,13 @@ fn least_connections_sends_nothing_to_the_upstream_that_is_still_busy() {
         )
     });
 
-    // The first request takes the slow upstream and holds it for two seconds.
+    // Keep the first upstream occupied throughout all three other requests.
     let url = format!("{proxy}/x");
     let occupied = std::thread::spawn(move || Client::new().get(&url));
-    std::thread::sleep(Duration::from_millis(300));
+    blocked
+        .entered
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
 
     let client = Client::new();
     for _ in 0..3 {
@@ -674,13 +714,15 @@ fn least_connections_sends_nothing_to_the_upstream_that_is_still_busy() {
         "round robin would have sent the third request back to the busy upstream"
     );
     assert_eq!(slow.load(Ordering::SeqCst), 1);
+    blocked.release.send(()).unwrap();
     assert_eq!(occupied.join().unwrap().unwrap().status.as_u16(), 200);
 }
 
 #[test]
 fn an_upstream_at_its_in_flight_limit_is_refused_not_queued() {
     let hits = Arc::new(AtomicUsize::new(0));
-    let upstream = spawn_counting_upstream(hits.clone(), Duration::from_millis(2000));
+    let blocked = spawn_blocked_upstream(hits.clone());
+    let upstream = blocked.base.clone();
     let proxy = spawn_concurrent_proxy(8, move |_| {
         let limited = Upstream::limited(Url::parse(&upstream).unwrap(), 1);
         ReverseProxy::new(Client::new()).route_all(prefix_route("/"), [limited])
@@ -688,7 +730,10 @@ fn an_upstream_at_its_in_flight_limit_is_refused_not_queued() {
 
     let url = format!("{proxy}/x");
     let occupied = std::thread::spawn(move || Client::new().get(&url));
-    std::thread::sleep(Duration::from_millis(300));
+    blocked
+        .entered
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
 
     let resp = Client::new().get(&format!("{proxy}/x")).unwrap();
     assert_eq!(resp.status.as_u16(), 503);
@@ -705,6 +750,7 @@ fn an_upstream_at_its_in_flight_limit_is_refused_not_queued() {
         "the refusal says which limit was hit: {:?}",
         body.to_str()
     );
+    blocked.release.send(()).unwrap();
     assert_eq!(occupied.join().unwrap().unwrap().status.as_u16(), 200);
 
     // And once the slot is free, traffic flows again.
@@ -724,9 +770,6 @@ fn a_chain_from_an_untrusted_peer_is_replaced_not_relayed() {
     let hits = Arc::new(AtomicUsize::new(0));
     let seen = Arc::new(Mutex::new(None));
     let upstream = spawn_upstream(hits.clone(), seen.clone());
-    // No `trust`: the default, and the only safe one. A proxy that has not
-    // been told who is in front of it cannot tell a load balancer's chain
-    // from a client's forgery.
     let proxy = spawn_proxy(move |_| {
         ReverseProxy::new(Client::new()).route(prefix_route("/"), Url::parse(&upstream).unwrap())
     });

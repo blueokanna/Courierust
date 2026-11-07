@@ -77,6 +77,9 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+#[cfg(feature = "std")]
+mod atomic;
+
 /// Lock a [`std::sync::Mutex`], recovering from poisoning.
 ///
 /// A poisoned lock means some thread panicked while holding it. For a

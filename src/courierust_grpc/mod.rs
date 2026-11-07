@@ -90,33 +90,34 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 
 /// Format a duration as a `grpc-timeout` value (gRPC A6: `1H`, `1M`,
 /// `1S`, `100m`, `100u`, `100n`). The coarsest unit with an integer
-/// count is used.
+/// count is used when exact. Otherwise, round up at the finest unit that
+/// fits the eight-digit wire limit. Durations beyond that limit saturate
+/// at `99999999H`.
 pub fn grpc_timeout(d: Duration) -> String {
     if d.is_zero() {
         return "1n".to_string();
     }
     let nanos = d.as_nanos();
-    let hours = d.as_secs() / 3600;
-    if hours > 0 {
-        return format!("{hours}H");
+    const UNITS: [(u128, char); 6] = [
+        (3_600_000_000_000, 'H'),
+        (60_000_000_000, 'M'),
+        (1_000_000_000, 'S'),
+        (1_000_000, 'm'),
+        (1_000, 'u'),
+        (1, 'n'),
+    ];
+    for (scale, unit) in UNITS {
+        if nanos % scale == 0 && nanos / scale <= 99_999_999 {
+            return format!("{}{unit}", nanos / scale);
+        }
     }
-    let mins = d.as_secs() / 60;
-    if mins > 0 {
-        return format!("{mins}M");
+    for (scale, unit) in UNITS.into_iter().rev() {
+        let count = nanos.div_ceil(scale);
+        if count <= 99_999_999 {
+            return format!("{count}{unit}");
+        }
     }
-    let secs = d.as_secs();
-    if secs > 0 {
-        return format!("{secs}S");
-    }
-    let millis = nanos / 1_000_000;
-    if millis > 0 {
-        return format!("{millis}m");
-    }
-    let micros = nanos / 1_000;
-    if micros > 0 {
-        return format!("{micros}u");
-    }
-    format!("{nanos}n")
+    "99999999H".to_string()
 }
 
 /// A request interceptor: a hook that can inspect / mutate outgoing
@@ -251,13 +252,7 @@ impl GrpcClient {
     /// `package.Service/Method`.
     pub fn call(&self, method: &str, req: Bytes) -> Result<Bytes> {
         let mut stream = self.call_with_metadata(method, req, &HeaderMap::new())?;
-        match stream.next_message()? {
-            Some(msg) => Ok(msg),
-            None => Err(Error::grpc(
-                status::INTERNAL,
-                "empty response from unary call",
-            )),
-        }
+        stream.single_message()
     }
 
     /// Perform a unary call with a typed codec.
@@ -305,13 +300,7 @@ impl GrpcClient {
         reqs: std::sync::mpsc::Receiver<Result<Bytes>>,
     ) -> Result<Bytes> {
         let mut stream = self.bidi_stream(method, reqs)?;
-        match stream.next_message()? {
-            Some(msg) => Ok(msg),
-            None => Err(Error::grpc(
-                status::INTERNAL,
-                "empty response from client-streaming call",
-            )),
-        }
+        stream.single_message()
     }
 
     /// Bidi streaming call: send many request messages, receive a stream
@@ -445,6 +434,20 @@ pub struct MessageStream {
 }
 
 impl MessageStream {
+    /// Unary results are successful only after the final status arrives.
+    fn single_message(&mut self) -> Result<Bytes> {
+        let message = self
+            .next_message()?
+            .ok_or_else(|| Error::grpc(status::INTERNAL, "missing unary response message"))?;
+        if self.next_message()?.is_some() {
+            return Err(Error::grpc(
+                status::INTERNAL,
+                "multiple unary response messages",
+            ));
+        }
+        Ok(message)
+    }
+
     fn new(
         resp: crate::courierust_client::h2::H2Response,
         max_message_size: usize,
@@ -636,7 +639,8 @@ fn frame_stream(
                     Ok(m) => frame_outbound(m, compress, max_message_size),
                     Err(e) => Err(e),
                 };
-                if tx.send(frame.map(Bytes::from)).is_err() {
+                let failed = frame.is_err();
+                if tx.send(frame.map(Bytes::from)).is_err() || failed {
                     break;
                 }
             }
@@ -865,13 +869,19 @@ impl Deadline {
         let s = v
             .to_str()
             .map_err(|_| Error::grpc(status::INVALID_ARGUMENT, "malformed grpc-timeout value"))?;
-        if s.len() < 2 {
+        if s.len() < 2 || !s.is_ascii() {
             return Err(Error::grpc(
                 status::INVALID_ARGUMENT,
                 "grpc-timeout must be a value plus a unit",
             ));
         }
         let (num, unit) = s.split_at(s.len() - 1);
+        if num.len() > 8 || !num.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(Error::grpc(
+                status::INVALID_ARGUMENT,
+                "grpc-timeout requires 1-8 digits",
+            ));
+        }
         let n: u64 = num
             .parse()
             .map_err(|_| Error::grpc(status::INVALID_ARGUMENT, "bad grpc-timeout value"))?;
@@ -882,7 +892,7 @@ impl Deadline {
             ));
         }
         let dur = match unit {
-            "H" => Duration::from_secs(n),
+            "H" => Duration::from_secs(n * 3600),
             "M" => Duration::from_secs(n.saturating_mul(60)),
             "S" => Duration::from_secs(n),
             "m" => Duration::from_millis(n),
@@ -895,7 +905,13 @@ impl Deadline {
                 ));
             }
         };
-        Ok(Self(Some(std::time::Instant::now() + dur)))
+        let deadline = std::time::Instant::now().checked_add(dur).ok_or_else(|| {
+            Error::grpc(
+                status::INVALID_ARGUMENT,
+                "grpc-timeout exceeds the clock range",
+            )
+        })?;
+        Ok(Self(Some(deadline)))
     }
 
     /// Whether the deadline has already passed.
@@ -1019,18 +1035,33 @@ impl Handler for GrpcHandler {
         // drop their clones on exit, so `recv()` disconnecting means the
         // call completed without streaming.
         let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
-        // Carries the service's final outcome for finite calls.
-        let (result_tx, result_rx) =
-            std::sync::mpsc::channel::<std::result::Result<(), (u32, String)>>();
+        // The framing thread publishes this outcome only after the last
+        // message, while the handler also needs it for trailers-only calls.
+        let result = Arc::new(Mutex::new(None));
+        let framing_result = result.clone();
+        let service_result = result.clone();
+        let deadline_instant = deadline.0;
 
         let started_tx2 = started_tx.clone();
         let cancel_framing = cancel.clone();
-        let _ = std::thread::Builder::new()
+        let framing_thread = std::thread::Builder::new()
             .name("courierust-grpc-frame".into())
             .spawn(move || {
                 let mut first = true;
+                let mut terminal_error = None;
                 loop {
-                    let m = match msg_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                    if deadline_instant.is_some_and(|end| std::time::Instant::now() >= end) {
+                        terminal_error =
+                            Some((status::DEADLINE_EXCEEDED, "deadline exceeded".to_string()));
+                        cancel_framing.store(true, std::sync::atomic::Ordering::Release);
+                        break;
+                    }
+                    let poll_interval = std::time::Duration::from_millis(50);
+                    let wait = deadline_instant.map_or(poll_interval, |end| {
+                        end.saturating_duration_since(std::time::Instant::now())
+                            .min(poll_interval)
+                    });
+                    let m = match msg_rx.recv_timeout(wait) {
                         Ok(m) => m,
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                             if cancel_framing.load(std::sync::atomic::Ordering::Acquire) {
@@ -1048,7 +1079,18 @@ impl Handler for GrpcHandler {
                         Ok(raw) => frame_outbound(raw, accept_gzip, max),
                         Err(e) => Err(e),
                     };
-                    if body_tx.send_result(frame.map(Bytes::from)).is_err() {
+                    let frame = match frame {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            terminal_error = Some((
+                                error.grpc_code().unwrap_or(status::INTERNAL),
+                                error.to_string(),
+                            ));
+                            cancel_framing.store(true, std::sync::atomic::Ordering::Release);
+                            break;
+                        }
+                    };
+                    if body_tx.send(Bytes::from(frame)).is_err() {
                         // The response body was dropped: stop consuming and
                         // tell the handler, which is what lets a service
                         // blocked on its own logic return.
@@ -1056,7 +1098,21 @@ impl Handler for GrpcHandler {
                         break;
                     }
                 }
+                let outcome = terminal_error.map(Err).unwrap_or_else(|| {
+                    crate::lock(&framing_result).clone().unwrap_or_else(|| {
+                        Err((
+                            status::UNKNOWN,
+                            "service ended without a final status".to_string(),
+                        ))
+                    })
+                });
+                let (code, message) = outcome.err().unwrap_or((status::OK, String::new()));
+                body_tx.set_trailers(status_metadata(code, &message));
             });
+        if let Err(error) = framing_thread {
+            cancel.store(true, Ordering::Release);
+            return grpc_error_response(status::RESOURCE_EXHAUSTED, &error.to_string());
+        }
 
         let service = self.service.clone();
         let method2 = method.clone();
@@ -1067,8 +1123,7 @@ impl Handler for GrpcHandler {
         let started_tx3 = started_tx;
         // `deadline` is moved into the serve closure; snapshot the
         // instant first so `handle()` can still wait with a timeout.
-        let deadline_instant = deadline.0;
-        let _ = std::thread::Builder::new()
+        let service_thread = std::thread::Builder::new()
             .name("courierust-grpc-serve".into())
             .spawn(move || {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1083,12 +1138,16 @@ impl Handler for GrpcHandler {
                     Ok(r) => r,
                     Err(_) => Err((status::INTERNAL, "service handler panicked".to_string())),
                 };
-                let _ = result_tx.send(mapped);
+                *crate::lock(&service_result) = Some(mapped);
                 // Dropping `started_tx3` (and, on the way out, the
                 // framing thread's clone once the message channel closes)
                 // lets `handle()` see the call finished.
                 drop(started_tx3);
             });
+        if let Err(error) = service_thread {
+            cancel.store(true, Ordering::Release);
+            return grpc_error_response(status::RESOURCE_EXHAUSTED, &error.to_string());
+        }
 
         let wait = match deadline_instant {
             Some(d) => {
@@ -1113,7 +1172,7 @@ impl Handler for GrpcHandler {
             }
         };
 
-        // A response carrying `grpc-status: 0` in the trailing block.
+        // The final metadata comes from the producer after its last message.
         let streaming_response = |body: Body| {
             let mut resp = Response::<Body>::with_status(200.into());
             resp.headers.insert(
@@ -1128,12 +1187,6 @@ impl Handler for GrpcHandler {
                     HeaderValue::from_static("identity")
                 },
             );
-            let mut tr = HeaderMap::new();
-            tr.insert(
-                HeaderName::from_lowercase("grpc-status"),
-                HeaderValue::from_static("0"),
-            );
-            resp.trailers = Some(tr);
             resp.body = body;
             resp
         };
@@ -1143,10 +1196,10 @@ impl Handler for GrpcHandler {
             WaitOutcome::Started => streaming_response(body),
             // All senders gone: the call finished without streaming, so
             // its exact outcome is known.
-            WaitOutcome::Finished => match result_rx.recv() {
-                Ok(Ok(())) => streaming_response(body),
-                Ok(Err((code, msg))) => grpc_error_response(code, &msg),
-                Err(_) => grpc_error_response(status::INTERNAL, "service thread exited"),
+            WaitOutcome::Finished => match crate::lock(&result).clone() {
+                Some(Ok(())) => streaming_response(body),
+                Some(Err((code, msg))) => grpc_error_response(code, &msg),
+                None => grpc_error_response(status::INTERNAL, "service thread exited"),
             },
             WaitOutcome::DeadlineExceeded => {
                 // Tell the handler the response is no longer wanted before
@@ -1175,27 +1228,210 @@ enum WaitOutcome {
 /// Build a gRPC error response.
 pub fn grpc_error_response(code: u32, message: &str) -> Response<Body> {
     let mut resp = Response::<Body>::with_status(200.into());
+    resp.headers = status_metadata(code, message);
     resp.headers.insert(
-        HeaderName::from_lowercase("content-type"),
+        HeaderName::from_static("content-type"),
         HeaderValue::from_static(CONTENT_TYPE),
-    );
-    resp.headers.insert(
-        HeaderName::from_lowercase("grpc-status"),
-        HeaderValue::from_bytes(code.to_string().as_bytes())
-            .unwrap_or_else(|_| HeaderValue::from_static("13")),
-    );
-    resp.headers.insert(
-        HeaderName::from_lowercase("grpc-message"),
-        HeaderValue::from_bytes(message.as_bytes())
-            .unwrap_or_else(|_| HeaderValue::from_static("")),
     );
     resp.body = Body::Empty;
     resp
 }
 
+fn status_metadata(code: u32, message: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    let mut encoded = String::new();
+    for byte in message.bytes() {
+        if (0x20..=0x7e).contains(&byte) && byte != b'%' {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write;
+            write!(&mut encoded, "%{byte:02X}").expect("writing to a String");
+        }
+    }
+    headers.insert(
+        HeaderName::from_lowercase("grpc-status"),
+        HeaderValue::from_bytes(code.to_string().as_bytes())
+            .unwrap_or_else(|_| HeaderValue::from_static("13")),
+    );
+    headers.insert(
+        HeaderName::from_lowercase("grpc-message"),
+        HeaderValue::from_bytes(encoded.as_bytes())
+            .unwrap_or_else(|_| HeaderValue::from_static("")),
+    );
+    headers
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_request_producer_cannot_complete_a_unary_call() {
+        let server =
+            GrpcServer::bind("127.0.0.1:0", |_method: &str, bytes: Bytes| Ok(bytes)).unwrap();
+        let address = server.local_addr().unwrap();
+        let _server = server.serve_background().unwrap();
+        let client = GrpcClient::new(&format!("http://{address}")).unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        send.send(Ok(Bytes::from_static(b"valid prefix"))).unwrap();
+        send.send(Err(Error::grpc(
+            status::DATA_LOSS,
+            "request producer failed",
+        )))
+        .unwrap();
+        drop(send);
+        let error = client
+            .client_stream("/test.Echo/Unary", receive)
+            .unwrap_err();
+        assert_eq!(error.grpc_code(), Some(status::DATA_LOSS));
+        assert_eq!(
+            &*client
+                .call("/test.Echo/Unary", Bytes::from_static(b"next call"))
+                .unwrap(),
+            b"next call"
+        );
+    }
+
+    #[test]
+    fn a_streaming_service_error_reaches_the_final_trailers() {
+        let server = GrpcServer::bind_streaming(
+            "127.0.0.1:0",
+            |_: &str,
+             _: &mut dyn Iterator<Item = Result<Bytes>>,
+             sender: &crate::courierust_body::BodySender| {
+                sender.send_bytes(b"first")?;
+                Err(Error::grpc(
+                    status::DATA_LOSS,
+                    "failure after first message",
+                ))
+            },
+        )
+        .unwrap();
+        let address = server.local_addr().unwrap();
+        let _handle = server.serve_background().unwrap();
+        let client = GrpcClient::new(&format!("http://{address}")).unwrap();
+        let mut stream = client.call_stream("/test/stream", Bytes::new()).unwrap();
+        assert_eq!(&*stream.next_message().unwrap().unwrap(), b"first");
+        assert_eq!(
+            stream.next_message().unwrap_err().grpc_code(),
+            Some(status::DATA_LOSS)
+        );
+    }
+
+    #[test]
+    fn deadlines_remain_active_after_the_first_stream_message() {
+        let server = GrpcServer::bind_streaming(
+            "127.0.0.1:0",
+            |_: &str,
+             _: &mut dyn Iterator<Item = Result<Bytes>>,
+             sender: &crate::courierust_body::BodySender| {
+                sender.send_bytes(b"first")?;
+                let limit = std::time::Instant::now() + Duration::from_secs(3);
+                while !sender.is_cancelled() && std::time::Instant::now() < limit {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        let address = server.local_addr().unwrap();
+        let _handle = server.serve_background().unwrap();
+        let client = GrpcClient::new(&format!("http://{address}")).unwrap();
+        let metadata = deadline_header("200m");
+        let mut stream = client
+            .call_with_metadata("/test/stream", Bytes::new(), &metadata)
+            .unwrap();
+        assert_eq!(&*stream.next_message().unwrap().unwrap(), b"first");
+        assert_eq!(
+            stream.next_message().unwrap_err().grpc_code(),
+            Some(status::DEADLINE_EXCEEDED)
+        );
+    }
+
+    #[test]
+    fn grpc_error_messages_use_percent_encoded_utf8() {
+        let message = "失败\n100%";
+        let response = grpc_error_response(status::INTERNAL, message);
+        let encoded = response
+            .headers
+            .get("grpc-message")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(encoded.is_ascii());
+        assert!(!encoded.contains('\n'));
+        assert_eq!(percent_decode(encoded), message);
+    }
+
+    fn deadline_header(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("grpc-timeout"),
+            HeaderValue::from_bytes(value.as_bytes()).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn grpc_hour_deadlines_are_hours_not_seconds() {
+        let before = std::time::Instant::now();
+        let deadline = Deadline::parse(&deadline_header("1H")).unwrap().0.unwrap();
+        assert!(deadline.duration_since(before) >= Duration::from_secs(3600));
+        assert!(deadline.duration_since(std::time::Instant::now()) <= Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn grpc_timeout_preserves_fractional_units_and_bounds_wire_digits() {
+        assert_eq!(grpc_timeout(Duration::from_millis(1500)), "1500m");
+        assert_eq!(grpc_timeout(Duration::from_secs(3661)), "3661S");
+        assert_eq!(grpc_timeout(Duration::from_nanos(100_000_001)), "100001u");
+        assert_eq!(grpc_timeout(Duration::MAX), "99999999H");
+    }
+
+    #[test]
+    fn grpc_deadlines_reject_noncanonical_numeric_syntax() {
+        for value in ["+1S", "000000001S", "-1S", "1.5S", "S", "1µ"] {
+            assert!(Deadline::parse(&deadline_header(value)).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn unary_waits_for_status_and_rejects_extra_messages() {
+        let server = Server::bind_with_config("127.0.0.1:0", ServerConfig::default()).unwrap();
+        let address = server.local_addr().unwrap();
+        let _handle = server
+            .serve_background(|request: Request<Body>| {
+                let mut bytes = frame_message(b"payload", false);
+                if request.uri.as_str() == "/extra" {
+                    bytes.extend_from_slice(&frame_message(b"unexpected", false));
+                }
+                let mut response =
+                    Response::<Body>::with_status(200.into()).with_body(Body::from(bytes));
+                response.headers.insert(
+                    HeaderName::from_static("content-type"),
+                    HeaderValue::from_static(CONTENT_TYPE),
+                );
+                let mut trailers = HeaderMap::new();
+                trailers.insert(
+                    HeaderName::from_static("grpc-status"),
+                    HeaderValue::from_static(if request.uri.as_str() == "/fail" {
+                        "13"
+                    } else {
+                        "0"
+                    }),
+                );
+                response.trailers = Some(trailers);
+                response
+            })
+            .unwrap();
+        let client = GrpcClient::new(&format!("http://{address}")).unwrap();
+        assert_eq!(
+            client.call("/fail", Bytes::new()).unwrap_err().grpc_code(),
+            Some(status::INTERNAL)
+        );
+        assert!(client.call("/extra", Bytes::new()).is_err());
+        assert_eq!(&*client.call("/ok", Bytes::new()).unwrap(), b"payload");
+    }
 
     /// `Compressed-Flag` is 0 or 1; a peer that sends anything else is
     /// malformed rather than "compressed", and the length cap must hold

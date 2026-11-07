@@ -24,13 +24,18 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
+mod tests;
+
+/// Bound the work a peer can demand before sending a final response.
+const MAX_INFORMATIONAL_RESPONSES: usize = 32;
+
 /// One HTTP/1 connection with persistent buffers.
 pub struct H1Connection {
     stream: Arc<ConnStream>,
     reader: BufReader<Arc<ConnStream>>,
     writer: BufWriter<Arc<ConnStream>>,
     scratch: Scratch,
-    version: Version,
     reusable: bool,
     read_started: bool,
 }
@@ -61,61 +66,28 @@ impl H1Connection {
         hostname: &str,
         cfg: &ClientConfig,
     ) -> Result<Self> {
-        Self::wrap(stream, tls, hostname, cfg)
+        let conn = match tls {
+            Some(connector) => {
+                courierust_net::configure(&stream, cfg.handshake_timeout.or(cfg.read_timeout))?;
+                ConnStream::tls_client(stream, connector, hostname)?
+            }
+            None => ConnStream::plain(stream),
+        };
+        Self::from_stream_seeded(conn, cfg, &[])
     }
 
     /// Wrap a socket whose peer is an HTTP proxy, so the request — written
     /// in the absolute form by the caller — is addressed *to the proxy*.
     ///
-    /// The difference from [`Self::from_socket`] is one field: a
-    /// `Proxy-Authorization` is this hop's business, while every other
-    /// hop-by-hop field is still filtered out.
+    /// This is an alias of [`Self::from_socket`]. Forward-proxy request
+    /// serialization is selected by the `to_proxy` argument to [`Self::send`].
     pub fn from_proxy_socket(
         stream: std::net::TcpStream,
         tls: Option<&crate::courierust_tls::TlsConnector>,
         hostname: &str,
         cfg: &ClientConfig,
     ) -> Result<Self> {
-        Self::wrap(stream, tls, hostname, cfg)
-    }
-
-    /// The one wrapping path both constructors share: the peer's identity
-    /// is a flag, everything else about the phase is `cfg`.
-    fn wrap(
-        stream: std::net::TcpStream,
-        tls: Option<&crate::courierust_tls::TlsConnector>,
-        hostname: &str,
-        cfg: &ClientConfig,
-    ) -> Result<Self> {
-        let conn = match tls {
-            Some(c) => {
-                courierust_net::configure(&stream, cfg.handshake_timeout)?;
-                let conn = ConnStream::tls_client(stream, c, hostname)?;
-                if let Some(alpn) = conn.alpn() {
-                    if alpn.as_slice() == b"h2" {
-                        return Err(Error::protocol(
-                            "server negotiated h2 via ALPN, but the client is configured for HTTP/1.1",
-                        ));
-                    }
-                }
-                conn
-            }
-            None => {
-                courierust_net::configure(&stream, cfg.read_timeout)?;
-                ConnStream::plain(stream)
-            }
-        };
-        let _ = conn.set_deadline(cfg.read_timeout);
-        let conn = Arc::new(conn);
-        Ok(Self {
-            reader: BufReader::new(conn.clone(), 16 * 1024),
-            writer: BufWriter::new(conn.clone(), 16 * 1024),
-            stream: conn,
-            scratch: Scratch::new(),
-            version: Version::HTTP_11,
-            reusable: true,
-            read_started: false,
-        })
+        Self::from_socket(stream, tls, hostname, cfg)
     }
 
     /// Wrap an already-open transport (e.g. a socket left over from an
@@ -127,7 +99,15 @@ impl H1Connection {
         cfg: &ClientConfig,
         seed: &[u8],
     ) -> Result<Self> {
-        let _ = stream.set_deadline(cfg.read_timeout);
+        if let Some(alpn) = stream.alpn() {
+            if alpn != b"http/1.1" {
+                return Err(Error::protocol(format!(
+                    "server negotiated {:?} via ALPN, expected HTTP/1.1",
+                    String::from_utf8_lossy(&alpn)
+                )));
+            }
+        }
+        stream.set_deadline(cfg.read_timeout)?;
         let conn = Arc::new(stream);
         let mut reader = BufReader::new(conn.clone(), 16 * 1024);
         if !seed.is_empty() {
@@ -138,7 +118,6 @@ impl H1Connection {
             writer: BufWriter::new(conn.clone(), 16 * 1024),
             stream: conn,
             scratch: Scratch::new(),
-            version: Version::HTTP_11,
             reusable: true,
             read_started: false,
         })
@@ -146,7 +125,7 @@ impl H1Connection {
 
     /// Whether the connection can be returned to the pool.
     pub fn is_reusable(&self) -> bool {
-        self.reusable
+        self.reusable && self.reader.buffered() == 0 && !self.stream.has_pending_read()
     }
 
     /// Re-arm the socket deadline for the request in flight.
@@ -179,6 +158,9 @@ impl H1Connection {
     /// costing anything: nothing has been written yet, so there is no
     /// replay question at all — not even for a `POST`.
     pub fn is_alive(&self) -> bool {
+        if !self.is_reusable() {
+            return false;
+        }
         thread_local! {
             static PROBE: std::cell::RefCell<Poller> =
                 std::cell::RefCell::new(Poller::new());
@@ -187,7 +169,7 @@ impl H1Connection {
             let mut probe = probe.borrow_mut();
             probe.clear();
             probe.register(1, self.stream.raw_fd(), false);
-            probe.wait(0, None).unwrap_or_default().is_empty()
+            matches!(probe.wait(0, None), Ok(ready) if ready.is_empty())
         })
     }
 
@@ -221,6 +203,12 @@ impl H1Connection {
         host_header: &str,
         to_proxy: bool,
     ) -> Result<Response<Body>> {
+        if !self.reusable
+            || self.reader.buffered() != 0
+            || (self.read_started && self.stream.has_pending_read())
+        {
+            return Err(Error::protocol("HTTP/1 connection is not reusable"));
+        }
         let mut headers = HeaderMap::with_capacity(req.headers.len() + 4);
         headers.insert(
             HeaderName::from_lowercase("host"),
@@ -254,6 +242,16 @@ impl H1Connection {
                 return Err(Error::protocol("streaming request bodies require h2"));
             }
         };
+        if headers.contains_key("content-length") {
+            let actual = body.map_or(0, |bytes| bytes.len());
+            if courierust_h1::body_length(&headers, None, None)?
+                != courierust_h1::BodyLen::Length(actual)
+            {
+                return Err(Error::protocol(
+                    "content-length does not match request body",
+                ));
+            }
+        }
         if let Some(b) = body {
             let cl = courierust_h1::IToA::new(b.len());
             headers.insert(
@@ -264,6 +262,7 @@ impl H1Connection {
 
         let head = self.scratch.body();
         courierust_h1::write_request_head(head, &req.method, &req.uri, Version::HTTP_11, &headers)?;
+        self.reusable = false;
         self.read_started = false;
         self.writer.write_all(head)?;
         if let Some(b) = body {
@@ -275,28 +274,38 @@ impl H1Connection {
     }
 
     fn read_response(&mut self, cfg: &ClientConfig, method: Method) -> Result<Response<Body>> {
-        let (reader, scratch) = (&mut self.reader, &mut self.scratch);
-        let status_line = scratch.line();
-        reader.read_until_into(b'\n', 16 * 1024, status_line)?;
-        let (status, version) = courierust_h1::parse_status_line(status_line)?;
-
-        self.read_started = true;
-        self.version = version;
-        let mut status = status;
-        let mut headers = courierust_h1::read_headers_scratch(reader, scratch)?;
-        while status.is_informational() {
-            let line = scratch.line();
-            reader.read_until_into(b'\n', 16 * 1024, line)?;
-            let (s, _) = courierust_h1::parse_status_line(line)?;
-            status = s;
-            headers = courierust_h1::read_headers_scratch(reader, scratch)?;
+        self.reusable = false;
+        for _ in 0..=MAX_INFORMATIONAL_RESPONSES {
+            let line = self.scratch.line();
+            let read = self.reader.read_until_into(b'\n', 16 * 1024, line);
+            self.read_started |= !line.is_empty();
+            read?;
+            let (status, version) = courierust_h1::parse_status_line(line)?;
+            if !matches!(version, Version::HTTP_10 | Version::HTTP_11) {
+                return Err(Error::protocol("invalid HTTP/1 response version"));
+            }
+            if status == StatusCode::SWITCHING_PROTOCOLS {
+                return Err(Error::protocol("unsolicited protocol upgrade"));
+            }
+            let headers = courierust_h1::read_headers_scratch_with_limit(
+                &mut self.reader,
+                &mut self.scratch,
+                cfg.max_header_list,
+                || Ok(()),
+            )?;
+            if !status.is_informational() {
+                return self.finish_response(
+                    cfg,
+                    &method,
+                    ResponseHead {
+                        status,
+                        version,
+                        headers,
+                    },
+                );
+            }
         }
-        let head = ResponseHead {
-            status,
-            version,
-            headers,
-        };
-        self.finish_response(cfg, &method, head)
+        Err(Error::overflow("too many informational responses"))
     }
 
     /// Read a response body given an already-parsed response head (used
@@ -311,6 +320,7 @@ impl H1Connection {
     ) -> Result<Response<Body>> {
         // The caller already consumed the head, so the peer has answered.
         self.read_started = true;
+        self.reusable = false;
         let status = head.status;
         let version = head.version;
         let (reader, scratch) = (&mut self.reader, &mut self.scratch);
@@ -346,8 +356,7 @@ impl H1Connection {
 /// Read a body delimited by connection close into the scratch body
 /// buffer.
 ///
-/// Only a clean EOF (or a `WouldBlock` on a non-blocking transport) ends
-/// the body. Timeouts and transport resets mid-body are propagated as
+/// Only a clean EOF ends the body. Timeouts and transport resets are propagated as
 /// errors — previously every read error was treated as EOF, silently
 /// returning a truncated body as a successful response when a server
 /// reset/aborted mid-stream. A request deadline that expires mid-body is
@@ -359,17 +368,12 @@ fn read_until_eof_scratch(
 ) -> Result<Bytes> {
     let out = scratch.body();
     loop {
-        let b = match reader.fill_buf() {
-            Ok([]) => break,
-            Ok(b) => b,
-            Err(e) => match e.kind {
-                ErrorKind::UnexpectedEof => break, // clean close ends the body
-                ErrorKind::WouldBlock => break,    // non-blocking transports only
-                _ => return Err(e),
-            },
+        let b = match reader.fill_buf()? {
+            [] => break,
+            b => b,
         };
         let n = b.len();
-        if out.len() + n > max {
+        if n > max.saturating_sub(out.len()) {
             return Err(Error::overflow("body exceeds limit"));
         }
         out.extend_from_slice(b);

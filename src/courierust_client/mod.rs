@@ -331,7 +331,6 @@ impl Default for RetryPolicy {
 }
 
 impl RetryPolicy {
-    /// Whether a failure should be retried.
     fn should_retry(&self, attempt: u32, method: &Method, error: &Error) -> bool {
         if attempt >= self.attempts {
             return false;
@@ -339,10 +338,6 @@ impl RetryPolicy {
         if !self.retry_non_idempotent && !method.is_idempotent() {
             return false;
         }
-        // Only failures where the exchange did not complete: the connection
-        // failed, went away, or timed out. A protocol violation, an
-        // oversized message or a malformed header is a property of the peer
-        // or of this request, and repeating it just burns the budget.
         matches!(
             error.kind,
             ErrorKind::Io | ErrorKind::UnexpectedEof | ErrorKind::Timeout | ErrorKind::Canceled
@@ -412,10 +407,6 @@ struct ClientInner {
 
 impl Drop for ClientInner {
     fn drop(&mut self) {
-        // Stop every pooled h3 driver so its thread exits promptly once
-        // the client is gone (they would otherwise linger until the idle
-        // timeout). The driver replies with an error to anything it was
-        // mid-flight on, which is unreachable anyway.
         let drivers: Vec<H3Conn> = {
             let pools = crate::lock(&self.h3_pool);
             pools.values().flatten().cloned().collect()
@@ -660,28 +651,12 @@ impl Client {
         timeout: Option<Duration>,
         depth: usize,
     ) -> Result<Response<Body>> {
-        // The caller's own head, captured before this client adds anything
-        // to it: a follow-up has to be rebuilt from what the caller wrote,
-        // not from whatever the previous hop happened to be carrying.
-        // Whether there *was* a body matters as much as what the head said —
-        // `content-length` is written by the driver at send time, so a
-        // caller that set the body directly has a head that describes
-        // nothing.
         let orig_method = req.method.clone();
-        // The client's default fields are merged into the request this call
-        // initiates — and only that one. A redirect hop is a new request
-        // *derived from* the original: its fields were merged already, and
-        // the credential stripping below removed the ones a cross-origin
-        // hop must not carry. Merging again would put a default credential
-        // back on that hop.
         if depth == 0 {
             req = self.with_default_headers(req);
         }
         let orig_headers = req.headers.clone();
         let orig_had_body = !req.body.is_empty() || head_declares_body(&orig_headers);
-        // What this client can read is decided in one place: the offer here
-        // and the decode below are the two halves of `accept_encoding`, so a
-        // server can never pick a coding the caller is not prepared for.
         self.offer_content_encodings(&mut req);
         self.attach_cookies(url, &mut req);
         let mut resp = self.execute_with_retry(url, req, priority, timeout)?;
@@ -700,32 +675,16 @@ impl Client {
                     301 | 302 if orig_method == Method::POST => Method::GET,
                     _ => orig_method.clone(),
                 };
-                // 307/308 carry the method *and* the body forward. The body
-                // is gone (the exchange that produced this response consumed
-                // it, and a streaming body cannot be replayed), so following
-                // one would send a different request than the caller wrote.
-                // Handing the redirect back lets the caller decide.
                 if method == orig_method && orig_had_body {
                     return Ok(resp);
                 }
                 let mut new_req = Request::new(method, next.path_and_query.clone());
                 let mut headers = orig_headers;
-                // Strip credentials on any cross-origin hop — either an
-                // authority change OR a scheme downgrade (https→http even
-                // on the same port, e.g. https://host:8443 →
-                // http://host:8443). Reusing the same port keeps the
-                // authority equal, so authority alone is not sufficient.
                 if next.authority() != url.authority() || next.scheme != url.scheme {
                     for name in ["authorization", "proxy-authorization", "cookie"] {
                         headers.remove(name);
                     }
                 }
-                // The follow-up has no body, so any field that still
-                // describes one is a lie the peer will act on:
-                // `Content-Length: N` with no body is how a request
-                // desynchronises the connection it is written on — the peer
-                // waits for N bytes that never come, and the next request on
-                // that connection is read as this one's body.
                 headers.remove("content-length");
                 headers.remove("content-type");
                 headers.remove("transfer-encoding");
@@ -748,16 +707,9 @@ impl Client {
         let Some(policy) = &self.inner.config.retry else {
             return self.execute_inner(url, req, priority, timeout);
         };
-        // A streaming body is consumed by the attempt that used it, so it
-        // forfeits retrying rather than being silently turned into a
-        // different second request.
         if policy.attempts <= 1 || !(req.body.is_bytes() || req.body.is_empty()) {
             return self.execute_inner(url, req, priority, timeout);
         }
-        // Everything the attempt needs, captured once: `Request<Body>` is
-        // not `Clone` (a channel body has no second reader), so each
-        // attempt is rebuilt from these four pieces. `Request` has exactly
-        // these fields, so nothing is dropped in the rebuild.
         let method = req.method.clone();
         let uri = req.uri.clone();
         let version = req.version;
@@ -1106,11 +1058,14 @@ impl Client {
         };
         match tls {
             Some(c) => {
-                let _ = crate::courierust_net::configure(&stream, cfg.handshake_timeout);
+                crate::courierust_net::configure(
+                    &stream,
+                    cfg.handshake_timeout.or(cfg.read_timeout),
+                )?;
                 crate::courierust_net::ConnStream::tls_client(stream, c, hostname)
             }
             None => {
-                let _ = crate::courierust_net::configure(&stream, cfg.read_timeout);
+                crate::courierust_net::configure(&stream, cfg.read_timeout)?;
                 Ok(crate::courierust_net::ConnStream::plain(stream))
             }
         }
@@ -1130,60 +1085,41 @@ impl Client {
         req: Request<Body>,
         timeout: Option<Duration>,
     ) -> Result<Response<Body>> {
-        // Pool key includes the scheme: `http://host:8443` (plain) and
-        // `https://host:8443` (TLS) share an authority but must never
-        // reuse each other's connections — reusing the plaintext one for
-        // an https URL would silently downgrade the request.
         let key = format!("{}://{authority}", url.scheme);
         let hostname = url.host.clone();
-        // A pooled keep-alive connection can die while it sits idle (the
-        // server's own idle timeout, a proxy, a restart). Probing before
-        // writing anything is what makes that free: a spent connection is
-        // dropped here, so no request — not even a non-idempotent one — is
-        // put on the wire to discover it.
         let mut reused = false;
         let mut owned = loop {
             let pooled = {
                 let mut pool = crate::lock(&self.inner.h1_pool);
-                let entry = pool.entry(key.clone()).or_default();
-                entry
-                    .iter()
-                    .position(|(a, _)| *a == addr)
-                    .map(|i| entry.remove(i).1)
+                let connection = pool.get_mut(&key).and_then(|entry| {
+                    entry
+                        .iter()
+                        .position(|(a, _)| *a == addr)
+                        .map(|i| entry.swap_remove(i).1)
+                });
+                if pool.get(&key).is_some_and(Vec::is_empty) {
+                    pool.remove(&key);
+                }
+                connection
             };
             match pooled {
                 Some(conn) if conn.is_alive() => {
                     reused = true;
                     break conn;
                 }
-                // Spent: dropped, and the next pooled connection (if any)
-                // is tried before opening a new one.
                 Some(_) => continue,
                 None => {
                     let stream =
                         self.open_transport(addr, proxy, authority, tls.as_ref(), &hostname)?;
-                    if let Some(alpn) = stream.alpn() {
-                        if alpn.as_slice() == b"h2" {
-                            return Err(Error::protocol(
-                                "server negotiated h2 via ALPN, but the client is configured for HTTP/1.1",
-                            ));
-                        }
-                    }
                     break H1Connection::from_stream_seeded(stream, &self.inner.config, &[])?;
                 }
             }
         };
-        // A forward proxy is addressed by the **target**, not by the
-        // origin's path: without absolute-form it answers as if it were
-        // the origin itself. A tunnelled request belongs to the origin and
-        // is addressed like any other.
         let to_proxy = proxy.is_some_and(|p| p.kind == ProxyKind::Http) && url.scheme == "http";
         let mut req = req;
         if to_proxy {
             req.uri = absolute_form(url, &req.uri)?;
             if let Some(auth) = proxy.and_then(|p| p.authorization.as_ref()) {
-                // Sent to the proxy only; it is hop-by-hop and the proxy
-                // consumes it, so the origin never sees it.
                 req.headers.insert(
                     HeaderName::from_lowercase("proxy-authorization"),
                     HeaderValue::from_bytes(auth.as_bytes())?,
@@ -1191,54 +1127,39 @@ impl Client {
             }
         }
         let deadline = timeout.filter(|d| Some(*d) != self.inner.config.read_timeout);
-        if let Some(d) = deadline {
-            let _ = owned.set_read_deadline(Some(d));
-        }
-        // The `Host` field omits the scheme's default port: RFC 9110
-        // permits `host:443`, but browsers never send it, and carrying
-        // it marks the request as non-browser traffic.
         let host_header = host_header_value(&url.scheme, authority);
-        let result = owned.send(&req, &self.inner.config, host_header, to_proxy);
-        if deadline.is_some() {
-            let _ = owned.set_read_deadline(self.inner.config.read_timeout);
-        }
-        match result {
-            Ok(resp) => {
-                self.pool_h1(key, addr, owned);
-                Ok(resp)
+        loop {
+            if let Some(d) = deadline {
+                owned.set_read_deadline(Some(d))?;
             }
-            Err(error) => {
-                // A reused connection that failed before the peer answered
-                // a single byte was almost certainly already gone when the
-                // request was written: retry it once on a fresh
-                // connection. Only methods that are safe to replay
-                // (RFC 9110 §9.2.2) qualify — a POST may well have been
-                // executed, so its error is returned instead of risking a
-                // second execution.
-                if reused && req.method.is_idempotent() && owned.is_stale_failure(&error) {
-                    let stream =
-                        self.open_transport(addr, proxy, authority, tls.as_ref(), &hostname)?;
-                    let mut retry =
-                        H1Connection::from_stream_seeded(stream, &self.inner.config, &[])?;
-                    if let Some(d) = deadline {
-                        let _ = retry.set_read_deadline(Some(d));
+            match owned.send(&req, &self.inner.config, host_header, to_proxy) {
+                Ok(response) => {
+                    if deadline.is_none()
+                        || owned
+                            .set_read_deadline(self.inner.config.read_timeout)
+                            .is_ok()
+                    {
+                        self.pool_h1(key, addr, owned);
                     }
-                    let resp = retry.send(&req, &self.inner.config, host_header, to_proxy);
-                    if deadline.is_some() {
-                        let _ = retry.set_read_deadline(self.inner.config.read_timeout);
-                    }
-                    let resp = resp?;
-                    self.pool_h1(key, addr, retry);
-                    return Ok(resp);
+                    return Ok(response);
                 }
                 Err(error)
+                    if reused && req.method.is_idempotent() && owned.is_stale_failure(&error) =>
+                {
+                    // Retry at most once, only before any response bytes.
+                    reused = false;
+                    let stream =
+                        self.open_transport(addr, proxy, authority, tls.as_ref(), &hostname)?;
+                    owned = H1Connection::from_stream_seeded(stream, &self.inner.config, &[])?;
+                }
+                Err(error) => return Err(error),
             }
         }
     }
 
     /// Return a reusable connection to the pool (bounded per authority).
     fn pool_h1(&self, key: String, addr: SocketAddr, conn: H1Connection) {
-        if !conn.is_reusable() {
+        if !conn.is_reusable() || self.inner.config.max_connections_per_host == 0 {
             return;
         }
         let mut pool = crate::lock(&self.inner.h1_pool);
@@ -1436,8 +1357,6 @@ impl Client {
             }
         }
 
-        // Rare fallback after a long open race: block on the
-        // least-loaded live connection (its dispatch queue drains).
         let mut pools = crate::lock(&self.inner.h3_pool);
         let list = pools.entry(authority.to_string()).or_default();
         let conn = list
@@ -1508,7 +1427,7 @@ impl Client {
     /// 7540 §3.2 `h2c` Upgrade handshake (only for `http://` hosts). A
     /// pooled, already-upgraded connection is reused when available;
     /// otherwise a fresh socket is upgraded. If the server declines the
-    /// upgrade, the HTTP/1.1 response is returned directly.
+    /// upgrade, its HTTP/1.1 connection uses the regular keep-alive pool.
     fn execute_h2c_upgrade(
         &self,
         url: &Url,
@@ -1560,6 +1479,16 @@ impl Client {
                 });
         }
 
+        let fallback_key = format!("{}://{authority}", url.scheme);
+        let has_fallback = {
+            let pool = crate::lock(&self.inner.h1_pool);
+            pool.get(&fallback_key)
+                .is_some_and(|entry| entry.iter().any(|(peer, _)| *peer == addr))
+        };
+        if has_fallback {
+            return self.execute_h1(url, authority, addr, None, None, req, timeout);
+        }
+
         let stream = crate::courierust_net::connect(&addr, self.inner.config.connect_timeout)?;
         crate::courierust_net::configure(&stream, self.inner.config.read_timeout)?;
         let settings_b64 = h2::upgrade_settings_b64(&self.inner.config);
@@ -1602,13 +1531,7 @@ impl Client {
                 let mut owned =
                     H1Connection::from_stream_seeded(cs, &self.inner.config, &leftover)?;
                 let resp = owned.finish_response(&self.inner.config, &req_method, head)?;
-                if owned.is_reusable() {
-                    let mut pool = crate::lock(&self.inner.h1_pool);
-                    let entry = pool.entry(authority.to_string()).or_default();
-                    if entry.len() < self.inner.config.max_connections_per_host {
-                        entry.push((addr, owned));
-                    }
-                }
+                self.pool_h1(fallback_key, addr, owned);
                 Ok(resp)
             }
         }
@@ -1649,8 +1572,6 @@ impl Client {
             Err(std::sync::mpsc::SendError(cmd)) => {
                 conn.accepting.store(false, Ordering::Release);
                 conn.release(body_bytes);
-                // `get_h2_conn` already reserves for the retried request;
-                // a second `reserve` here would leak one unit per retry.
                 let fresh = self.get_h2_conn(authority, addr, tls, proxy, hostname, body_bytes)?;
                 let (tx2, rx2) = std::sync::mpsc::channel();
                 let cmd2 = retarget_reply(cmd, tx2);
@@ -1679,15 +1600,6 @@ impl Client {
         body_bytes: usize,
     ) -> Result<H2Conn> {
         let max_connections = self.inner.config.max_connections_per_host.max(1);
-        // Opening a connection (TCP connect + optional TLS handshake +
-        // driver thread spawn) can take milliseconds. It must NOT run
-        // while holding the shared pool lock, or one slow open serializes
-        // every concurrent requester (the 32-worker h2 regression). A
-        // `pending_h2_opens` counter (guarded by the same lock) keeps the
-        // per-authority cap exact while the connect runs unlocked, and a
-        // condition variable lets concurrent callers sleep until the
-        // opener lands instead of spinning or failing on a transiently
-        // empty pool.
         loop {
             let mut open = false;
             let mut should_wait = false;
@@ -1696,11 +1608,6 @@ impl Client {
                 let mut pending = crate::lock(&self.inner.pending_h2_opens);
                 let list = pools.entry(authority.to_string()).or_default();
                 list.retain(|c| c.accepting.load(Ordering::Acquire));
-                // An idle connection is free regardless of its latency
-                // history: prefer it outright, so a stale EWMA sample can
-                // never block keep-alive reuse (an idle connection's EWMA
-                // only decays on new samples, so a weighted-min pick that
-                // considered it would skip it forever).
                 if let Some(conn) = list
                     .iter()
                     .filter(|c| c.accepting.load(Ordering::Acquire))
@@ -1710,9 +1617,6 @@ impl Client {
                     conn.reserve(body_bytes);
                     return Ok(conn);
                 }
-                // All busy. At the per-authority cap pick the least
-                // weighted load (streams + body bytes + EWMA); under the
-                // cap open a fresh connection for wire parallelism.
                 let least_loaded = list
                     .iter()
                     .filter(|c| c.accepting.load(Ordering::Acquire))
@@ -1747,7 +1651,6 @@ impl Client {
                 break;
             }
 
-            // Open outside the pool lock.
             let opened = (|| -> Result<H2Conn> {
                 let stream = self.open_h2_stream(addr, proxy, authority, tls, hostname)?;
                 let conn = h2::start(stream, &self.inner.config)?;
@@ -2002,9 +1905,6 @@ impl Proxy {
                  (TLS to the proxy needs nested TLS, which the transport does not have)"
             )));
         };
-        // A trailing path is meaningless for a forward proxy; reject it
-        // rather than ignore something that suggests a misconfiguration
-        // (a PAC file, a reverse-proxy path, …).
         let (authority, path) = match rest.find('/') {
             Some(i) => (&rest[..i], &rest[i..]),
             None => (rest, ""),
@@ -2199,7 +2099,7 @@ fn connect_socks5(
     local_dns: bool,
 ) -> Result<std::net::TcpStream> {
     let mut stream = crate::courierust_net::connect(&addr, timeout)?;
-    let _ = crate::courierust_net::configure(&stream, timeout);
+    crate::courierust_net::configure(&stream, timeout)?;
 
     // Greeting. Offering both methods lets the proxy pick, which is what
     // the RFC intends; offering only `no authentication` would make a proxy
@@ -2377,7 +2277,7 @@ fn connect_tunnel(
     // The same deadline covers the read of the reply: a proxy that accepts
     // and then says nothing must not hold the caller for the full
     // `read_timeout`.
-    let _ = crate::courierust_net::configure(&stream, timeout);
+    crate::courierust_net::configure(&stream, timeout)?;
 
     let mut head = String::with_capacity(128);
     head.push_str("CONNECT ");
@@ -2581,6 +2481,150 @@ mod tests {
     use crate::courierust_server::{Server, ServerConfig, TlsSettings as ServerTls};
     use crate::courierust_tls::testdata;
 
+    #[test]
+    fn failed_h1_connects_do_not_leave_empty_authority_entries() {
+        let client = Client::with_config(ClientConfig {
+            connect_timeout: Some(Duration::ZERO),
+            ..Default::default()
+        });
+        for port in 1..=16 {
+            assert!(client.get(&format!("http://127.0.0.1:{port}/")).is_err());
+        }
+        assert!(crate::lock(&client.inner.h1_pool).is_empty());
+    }
+
+    #[test]
+    fn a_declined_h2c_upgrade_uses_the_regular_h1_pool() {
+        use crate::courierust_http::Version;
+        use crate::courierust_net::stats::Stats;
+
+        for capacity in [1, 0] {
+            let stats = Stats::new();
+            let server = Server::bind_with_config(
+                "127.0.0.1:0",
+                ServerConfig {
+                    http2: false,
+                    event_driven: false,
+                    threads: 2,
+                    stats: Some(stats.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let addr = server.local_addr().unwrap();
+            let _handle = server
+                .serve_background(|_: Request<Body>| Response::ok().with_body(Body::from("ok")))
+                .unwrap();
+            let client = Client::with_config(ClientConfig {
+                http2: true,
+                h2c_upgrade: true,
+                max_connections_per_host: capacity,
+                read_timeout: Some(Duration::from_secs(2)),
+                ..Default::default()
+            });
+            let url = format!("http://{addr}/");
+            for _ in 0..3 {
+                let response = client.get(&url).unwrap();
+                assert_eq!(response.version, Version::HTTP_11);
+                assert_eq!(response.body.as_bytes(), Some(&b"ok"[..]));
+            }
+            assert_eq!(
+                stats.snapshot().connections_accepted,
+                if capacity == 0 { 3 } else { 1 }
+            );
+            let pool = crate::lock(&client.inner.h1_pool);
+            if capacity == 0 {
+                assert!(pool.is_empty());
+            } else {
+                assert_eq!(pool.len(), 1);
+                assert_eq!(pool[&format!("http://{addr}")].len(), 1);
+            }
+        }
+    }
+
+    /// Observe FIN on the actual pooled socket before issuing a POST.
+    /// Sleeping after the server closes does not establish that ordering.
+    #[test]
+    fn h1_client_probes_a_pooled_connection_before_reusing_it() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::{Shutdown, TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let socket = TcpStream::connect(addr).unwrap();
+        let observer = socket.try_clone().unwrap();
+        let (mut stale_peer, _) = listener.accept().unwrap();
+        stale_peer
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let client = Client::new();
+        let conn =
+            H1Connection::from_socket(socket, None, "127.0.0.1", &client.inner.config).unwrap();
+        assert!(conn.is_alive(), "an idle open socket is reusable");
+        client.pool_h1(format!("http://{addr}"), addr, conn);
+
+        stale_peer.shutdown(Shutdown::Write).unwrap();
+        observer
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(observer.peek(&mut [0]).unwrap(), 0, "FIN must have arrived");
+        drop(observer);
+
+        let peer = std::thread::spawn(move || {
+            // The client must drop the stale socket without writing the POST.
+            assert_eq!(stale_peer.read(&mut [0]).unwrap(), 0);
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "no replacement connection"
+                        );
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("accept replacement: {error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(&socket);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "POST /two HTTP/1.1\r\n");
+            let mut length = None;
+            loop {
+                line.clear();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                }
+            }
+            assert_eq!(length, Some(4));
+            let mut body = [0; 4];
+            reader.read_exact(&mut body).unwrap();
+            assert_eq!(&body, b"body");
+            drop(reader);
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 6\r\nconnection: close\r\n\r\nsecond",
+                )
+                .unwrap();
+        });
+
+        let response = client.post(&format!("http://{addr}/two"), "body").unwrap();
+        assert_eq!(response.body.as_bytes(), Some(&b"second"[..]));
+        peer.join().unwrap();
+    }
+
     /// TLS session resumption, wired through the public client: the first
     /// request to an authority pays a full handshake and captures a
     /// session ticket; the second request (a fresh connection — the
@@ -2643,8 +2687,6 @@ mod tests {
             );
         }
 
-        // Second request: fresh TLS connection (never pooled), same
-        // cached connector → the PSK is offered and the handshake resumes.
         let resp = client.get(&format!("https://{addr}/two")).unwrap();
         assert_eq!(resp.status.as_u16(), 200);
         {
