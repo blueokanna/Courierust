@@ -31,17 +31,13 @@ pub fn is_preface(buf: &[u8]) -> bool {
 /// Whether an error says "the transport cannot take more right now"
 /// rather than "the connection is gone".
 ///
-/// A non-blocking socket reports `WouldBlock`; a blocking one reports
-/// whatever its armed timeout produced, which the net adapter normalises
-/// to the same thing and a TLS record layer may carry as a timeout. Both
-/// are backpressure — a parked frame can be resumed, a discarded one
-/// corrupts the stream — so neither is allowed to end the session. A
-/// peer that never drains its window is still caught: the drivers fail
-/// the request on its deadline and close the connection when the socket
-/// stops making progress altogether.
+/// Only `WouldBlock` guarantees a resumable refusal. A blocking send
+/// timeout can leave Winsock's accepted byte count indeterminate; retrying
+/// the retained slice can duplicate bytes. Request deadlines are enforced
+/// by the driver, independently of non-blocking socket readiness.
 #[inline]
 fn is_backpressure(e: &Error) -> bool {
-    matches!(e.kind, ErrorKind::WouldBlock | ErrorKind::Timeout)
+    e.kind == ErrorKind::WouldBlock
 }
 
 /// Connection configuration.
@@ -240,6 +236,7 @@ pub struct Connection<R, W> {
     local: Settings,
     peer: Settings,
     settings_sent: bool,
+    peer_settings_received: bool,
 
     // Outbound
     preface_pending: bool,
@@ -323,6 +320,7 @@ impl<R: Read, W: Write> Connection<R, W> {
             local,
             peer,
             settings_sent: false,
+            peer_settings_received: false,
             out: BytesMut::new(),
             flush_pending: false,
             pending_frames: VecDeque::new(),
@@ -444,6 +442,12 @@ impl<R: Read, W: Write> Connection<R, W> {
     #[inline]
     pub fn peer_settings(&self) -> &Settings {
         &self.peer
+    }
+
+    /// Whether the peer's initial non-ACK SETTINGS have been validated.
+    /// Before this, [`Self::peer_settings`] contains protocol defaults.
+    pub fn peer_settings_received(&self) -> bool {
+        self.peer_settings_received
     }
 
     /// Current local settings.
@@ -860,29 +864,30 @@ impl<R: Read, W: Write> Connection<R, W> {
         Ok(())
     }
 
-    /// Release received-data credit back to the peer (BCR). Batches
-    /// WINDOW_UPDATE frames.
+    /// Release up to `n` received bytes after consumption, batching
+    /// WINDOW_UPDATE frames. Excess releases and closed streams are ignored.
     pub fn release_data(&mut self, stream_id: u32, n: usize) {
-        let n = n as i64;
-        let stream_release_threshold = (self.local.initial_window_size as i64 / 2).max(16 * 1024);
-        let mut emit_stream = 0i64;
-        if let Some(s) = self.streams.get_mut(&stream_id) {
-            if s.recv_unreleased >= stream_release_threshold {
-                emit_stream = s.recv_unreleased;
-                s.recv_unreleased = 0;
-                s.recv_window = s
-                    .recv_window
-                    .saturating_add(emit_stream)
-                    .min(MAX_FLOW_WINDOW);
-            }
-        }
-        if emit_stream > 0 {
+        let stream_release_threshold = (self.local.initial_window_size as i64 / 2).max(1);
+        let Some(s) = self.streams.get_mut(&stream_id) else {
+            return;
+        };
+        let released = n.min(s.recv_unreleased as usize) as i64;
+        s.recv_unreleased -= released;
+        // Window deficit includes both outstanding application bytes and
+        // consumed bytes waiting for a batched WINDOW_UPDATE.
+        let increment =
+            i64::from(self.local.initial_window_size) - s.recv_window - s.recv_unreleased;
+        if increment >= stream_release_threshold {
+            s.recv_window += increment;
             self.pending_frames.push_back(Frame::WindowUpdate {
                 stream_id,
-                increment: emit_stream.min(i64::from(u32::MAX)) as u32,
+                increment: increment as u32,
             });
         }
+        self.release_connection_credit(released);
+    }
 
+    fn release_connection_credit(&mut self, n: i64) {
         self.conn_pending_release += n;
         let conn_threshold = 32 * 1024i64;
         if self.conn_pending_release >= conn_threshold {
@@ -973,7 +978,12 @@ impl<R: Read, W: Write> Connection<R, W> {
                 self.flush_pending = true;
                 Ok(progress)
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                self.closed = true;
+                self.flush_pending = false;
+                self.pending_frames.clear();
+                Err(e)
+            }
         }
     }
 
@@ -2038,6 +2048,9 @@ impl<R: Read, W: Write> Connection<R, W> {
         });
         if self.config.auto_release_credit {
             self.release_data(stream_id, len as usize);
+        } else if padding != 0 {
+            // Padding never reaches the application and cannot be held by it.
+            self.release_data(stream_id, padding);
         }
         if end_stream {
             let closed = self
@@ -2112,6 +2125,7 @@ impl<R: Read, W: Write> Connection<R, W> {
             }
         }
         self.peer = new_settings;
+        self.peer_settings_received = true;
         self.pending_frames.push_back(Frame::Settings {
             ack: true,
             entries: Vec::new(),
@@ -2315,27 +2329,18 @@ impl<R: Read, W: Write> Connection<R, W> {
     }
 
     fn close_stream(&mut self, stream_id: u32) {
+        let mut discarded = 0;
         if let Some(s) = self.streams.get_mut(&stream_id) {
             // Release any un-released receive credit on close.
             if s.recv_unreleased > 0 {
-                let n = s.recv_unreleased;
+                discarded = s.recv_unreleased;
                 s.recv_unreleased = 0;
-                self.conn_recv_window.release(n);
-                self.conn_pending_release += n;
             }
             s.state = StreamState::Closed;
             s.recv_ended = true;
             s.send_done = true;
         }
-        let conn_threshold = 32 * 1024i64;
-        if self.conn_pending_release >= conn_threshold {
-            let inc = self.conn_pending_release.min(i64::from(u32::MAX)) as u32;
-            self.conn_pending_release = 0;
-            self.pending_frames.push_back(Frame::WindowUpdate {
-                stream_id: 0,
-                increment: inc,
-            });
-        }
+        self.release_connection_credit(discarded);
         self.scheduler.remove(stream_id);
         self.scheduled.remove(&stream_id);
         self.send_queue.remove(&stream_id);
@@ -2416,6 +2421,122 @@ mod tests {
 
     /// A reader that behaves like a socket with nothing to say yet.
     struct Silent;
+
+    #[test]
+    fn a_small_receive_window_keeps_making_progress() {
+        let mut config = Config::default();
+        config.local_settings.initial_window_size = 7;
+        let mut conn = Connection::new(Silent, Refusing::unblocked(), config);
+        let sid = conn.open_request(Priority::default()).unwrap();
+        conn.streams.get_mut(&sid).unwrap().state = StreamState::Open;
+        for _ in 0..100 {
+            conn.on_data(sid, Bytes::from_static(b"1234567"), false, 0)
+                .unwrap();
+            assert_eq!(conn.streams.get(&sid).unwrap().recv_window, 7);
+        }
+    }
+
+    #[test]
+    fn an_ambiguous_write_timeout_cannot_replay_a_frame() {
+        struct AcceptedThenTimedOut(Vec<u8>);
+        impl Write for AcceptedThenTimedOut {
+            fn write(&mut self, data: &[u8]) -> Result<usize> {
+                self.0.extend_from_slice(data);
+                Err(Error::timeout("accepted byte count is unknown"))
+            }
+            fn flush(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let mut conn = Connection::new(Silent, AcceptedThenTimedOut(Vec::new()), Config::default());
+        assert_eq!(conn.flush().unwrap_err().kind, ErrorKind::Timeout);
+        assert!(conn.is_closed());
+        let wire = conn.writer.get_ref().0.clone();
+        assert!(!wire.is_empty());
+        conn.flush().unwrap();
+        conn.flush_final();
+        assert_eq!(conn.writer.get_ref().0, wire);
+    }
+
+    #[test]
+    fn manual_receive_credit_releases_only_consumed_bytes() {
+        let mut conn = Connection::new(
+            Silent,
+            Refusing::unblocked(),
+            Config {
+                auto_release_credit: false,
+                ..Config::default()
+            },
+        );
+        let sid = conn.open_request(Priority::default()).unwrap();
+        conn.streams.get_mut(&sid).unwrap().state = StreamState::Open;
+        conn.on_data(sid, Bytes::from(vec![7; 40_000]), false, 7)
+            .unwrap();
+        assert_eq!(conn.streams.get(&sid).unwrap().recv_unreleased, 40_000);
+        conn.release_data(sid, 1_000);
+        assert_eq!(conn.streams.get(&sid).unwrap().recv_unreleased, 39_000);
+        assert!(conn
+            .pending_frames
+            .iter()
+            .all(|f| !matches!(f, Frame::WindowUpdate { .. })));
+        conn.release_data(sid, 32_000);
+        assert_eq!(conn.streams.get(&sid).unwrap().recv_unreleased, 7_000);
+        let updates: Vec<_> = conn
+            .pending_frames
+            .iter()
+            .filter_map(|frame| {
+                if let Frame::WindowUpdate {
+                    stream_id,
+                    increment,
+                } = frame
+                {
+                    Some((*stream_id, *increment))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(updates, [(sid, 33_007), (0, 33_007)]);
+        conn.close_stream(sid);
+        assert_eq!(
+            conn.conn_recv_window.available() + conn.conn_pending_release,
+            65_535
+        );
+    }
+
+    #[test]
+    fn receive_credit_is_conserved_when_a_stream_closes() {
+        for auto_release_credit in [false, true] {
+            for consumed in [0, 40, 100, 200, usize::MAX] {
+                let mut conn = Connection::new(
+                    Silent,
+                    Refusing::unblocked(),
+                    Config {
+                        auto_release_credit,
+                        ..Config::default()
+                    },
+                );
+                let sid = conn.open_request(Priority::default()).unwrap();
+                conn.streams.get_mut(&sid).unwrap().state = StreamState::Open;
+                let initial = conn.conn_recv_window.available();
+                conn.on_data(sid, Bytes::from(vec![7; 100]), false, 0)
+                    .unwrap();
+                conn.release_data(sid, consumed);
+                conn.close_stream(sid);
+                assert_eq!(
+                    conn.conn_recv_window.available() + conn.conn_pending_release,
+                    initial,
+                    "auto={auto_release_credit}, consumed={consumed}"
+                );
+                conn.release_data(sid, 100);
+                assert_eq!(
+                    conn.conn_recv_window.available() + conn.conn_pending_release,
+                    initial,
+                    "release after closure must not mint credit"
+                );
+            }
+        }
+    }
 
     impl Read for Silent {
         fn read(&mut self, _out: &mut [u8]) -> Result<usize> {

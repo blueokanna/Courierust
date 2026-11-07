@@ -4,18 +4,11 @@
 //! so the same buffered codec drives both loopback tests and real
 //! sockets. Non-blocking `WouldBlock` maps to [`crate::ErrorKind::WouldBlock`].
 //!
-//! A socket timeout is *not* spelled the same way by every kernel:
-//! Windows fails the read (or the write) with `WSAETIMEDOUT`, POSIX with
-//! `EAGAIN` — the very code that otherwise means "no data right now".
-//! The raw adapters fold both into [`crate::ErrorKind::WouldBlock`], so a
-//! caller sees the condition rather than this kernel's spelling of it,
-//! and the connection adapter then decides what the expiry *means*: a
-//! *deadline* (`ConnStream::set_deadline`, a request or a shutdown
-//! budget, where expiry is an answer of its own) becomes
-//! [`crate::ErrorKind::Timeout`], while a *poll* (`ConnStream::configure`,
-//! where the h2/h3 drivers use a short timeout to regain control) keeps
-//! `WouldBlock` so the driver can tell "nothing yet" from "gone" and go
-//! round its loop again.
+//! Read polling normalizes platform timeout codes to `WouldBlock`; an
+//! armed request deadline converts this to `Timeout`. Writes preserve
+//! blocking timeouts: Winsock may already have accepted bytes, so retrying
+//! such a send can corrupt the stream. Plain H2 sockets use non-blocking
+//! I/O and readiness notifications instead of short socket timeouts.
 
 use crate::courierust_error::{Error, ErrorKind, Result};
 use crate::courierust_io::{Read, Write};
@@ -39,7 +32,6 @@ impl Read for &TcpStream {
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                 Err(Error::new(ErrorKind::WouldBlock))
             }
-            Err(e) if e.raw_os_error() == Some(997) => Err(Error::new(ErrorKind::WouldBlock)),
             Err(e) => Err(e.into()),
         }
     }
@@ -52,10 +44,16 @@ impl Write for &TcpStream {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 Err(Error::new(ErrorKind::WouldBlock))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                Err(Error::new(ErrorKind::WouldBlock))
+            Err(e)
+                if cfg!(windows)
+                    && (e.kind() == std::io::ErrorKind::TimedOut
+                        || e.raw_os_error() == Some(997)) =>
+            {
+                // Winsock cannot report how many bytes a timed-out blocking
+                // send accepted. IO_PENDING is not WSAEWOULDBLOCK either.
+                let _ = self.shutdown(std::net::Shutdown::Both);
+                Err(e.into())
             }
-            Err(e) if e.raw_os_error() == Some(997) => Err(Error::new(ErrorKind::WouldBlock)),
             Err(e) => Err(e.into()),
         }
     }
@@ -247,6 +245,22 @@ impl ConnStream {
             ConnStreamKind::Plain(s) => configure(s, read_timeout),
             ConnStreamKind::Tls { socket, .. } => configure(socket, read_timeout),
         }?;
+        self.deadline.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Prepare a connection owned by the H2 readiness driver. Plain sockets
+    /// use resumable non-blocking I/O; TLS retains blocking record writes
+    /// and the existing write deadline instead of adopting the poll interval.
+    pub(crate) fn configure_h2(&self, read_poll: Duration) -> Result<()> {
+        match &self.inner {
+            ConnStreamKind::Plain(socket) => {
+                socket.set_read_timeout(None)?;
+                socket.set_write_timeout(None)?;
+                socket.set_nonblocking(true)?;
+            }
+            ConnStreamKind::Tls { socket, .. } => socket.set_read_timeout(Some(read_poll))?,
+        }
         self.deadline.store(false, Ordering::Relaxed);
         Ok(())
     }
@@ -505,13 +519,10 @@ mod tests {
         panic!("no backpressure after {total} bytes");
     }
 
-    /// Both spellings of an armed timeout — `WSAETIMEDOUT` on Windows,
-    /// `EAGAIN` on POSIX — mean "not ready" while the socket is armed for
-    /// polling, so a driver can park and come back. Read and write halves
-    /// are checked together: a driver that only sees this on one of them
-    /// fails a large upload on Windows and passes on Linux.
+    /// Reads can report a polling lapse, but a blocking Winsock send
+    /// timeout is terminal because its accepted byte count is unknown.
     #[test]
-    fn poll_timeout_is_reported_as_would_block() {
+    fn read_polling_and_blocking_write_timeouts_are_distinct() {
         let mut sink = [0u8; 16];
 
         let (stream, _peer) = silent_pair();
@@ -519,7 +530,14 @@ mod tests {
         let mut reader: &ConnStream = &stream;
         let err = reader.read(&mut sink).expect_err("the peer is silent");
         assert_eq!(err.kind, ErrorKind::WouldBlock, "{err:?}");
-        assert_eq!(write_until_refused(&stream), ErrorKind::WouldBlock);
+        assert_eq!(
+            write_until_refused(&stream),
+            if cfg!(windows) {
+                ErrorKind::Timeout
+            } else {
+                ErrorKind::WouldBlock
+            }
+        );
 
         let (stream, _peer) = silent_pair();
         stream
@@ -527,5 +545,24 @@ mod tests {
             .unwrap();
         assert_eq!(write_until_refused(&stream), ErrorKind::Timeout);
         assert!(stream.deadline_is_armed());
+    }
+
+    #[test]
+    fn plain_h2_uses_resumable_nonblocking_backpressure() {
+        let (stream, _peer) = silent_pair();
+        stream.configure(Some(Duration::from_millis(30))).unwrap();
+        stream.configure_h2(Duration::from_millis(5)).unwrap();
+        let ConnStreamKind::Plain(socket) = &stream.inner else {
+            unreachable!()
+        };
+        assert_eq!(socket.read_timeout().unwrap(), None);
+        assert_eq!(socket.write_timeout().unwrap(), None);
+        let mut reader = &stream;
+        assert_eq!(
+            reader.read(&mut [0; 1]).unwrap_err().kind,
+            ErrorKind::WouldBlock
+        );
+        assert_eq!(write_until_refused(&stream), ErrorKind::WouldBlock);
+        assert!(!stream.deadline_is_armed());
     }
 }

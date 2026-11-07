@@ -3,6 +3,7 @@
 //! Compiled once into the bench package's library target so every bench
 //! binary reuses the same timing/sampling code instead of owning a copy.
 
+pub mod listener;
 pub mod metrics;
 
 /// A `reqwest` client builder that never routes through an HTTP proxy.

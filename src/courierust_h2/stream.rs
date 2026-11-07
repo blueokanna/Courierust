@@ -42,7 +42,7 @@ pub struct Stream {
     pub send_done: bool,
     /// Whether we have delivered END_STREAM to the application.
     pub recv_ended: bool,
-    /// Bytes of received data not yet released back to the peer.
+    /// Received bytes whose consumption has not yet been acknowledged.
     pub recv_unreleased: i64,
     /// Whether a header block has already been delivered for this
     /// stream (subsequent blocks are trailers).

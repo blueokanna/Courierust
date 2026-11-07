@@ -7,6 +7,9 @@ if ($runs.Count -lt 2) { throw 'At least two independent runs are required.' }
 $firstManifest = $null
 $selectedSuites = $null
 foreach ($run in $runs) {
+    if (Test-Path -LiteralPath (Join-Path $run.FullName 'intervention.json')) {
+        throw "Run $($run.Name) required external intervention; it cannot be aggregated as an ordinary repeat."
+    }
     $manifest = [IO.File]::ReadAllText((Join-Path $run.FullName 'source-sha256.txt'))
     if ([string]::IsNullOrWhiteSpace($manifest)) { throw "Empty source inventory in $($run.Name)." }
     if ($null -eq $firstManifest) {
@@ -60,7 +63,8 @@ foreach ($suite in @($selectedSuites | Where-Object { $_ -in @('tls', 'grpc', 'c
             if ($row.measurement -notin @('requests', 'duration')) { throw 'Unknown measurement mode.' }
             if ($row.measurement -eq 'duration') {
                 $elapsed = [double]::Parse($row.elapsed_ms, [Globalization.CultureInfo]::InvariantCulture)
-                if ([long]$row.target_ms -le 0 -or $elapsed -lt [long]$row.target_ms -or [long]$row.requests -le 0) {
+                if ([double]::IsNaN($elapsed) -or [double]::IsInfinity($elapsed) -or
+                    [long]$row.target_ms -le 0 -or $elapsed -lt [long]$row.target_ms -or [long]$row.requests -le 0) {
                     throw 'Duration result did not meet its declared budget.'
                 }
             } elseif ([long]$row.requests -ne [long]$row.target_requests -or [long]$row.requests -le 0) {

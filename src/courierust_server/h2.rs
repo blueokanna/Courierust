@@ -49,9 +49,9 @@ fn read_preface(stream: &ConnStream) -> Result<()> {
     Ok(())
 }
 
-/// Bound partial-frame reads after a readiness notification.
-fn configure_read_timeout(stream: &ConnStream) -> Result<()> {
-    stream.configure(Some(STREAMING_READ_TIMEOUT))
+/// Select non-blocking plain I/O or bounded TLS record reads.
+fn configure_transport(stream: &ConnStream) -> Result<()> {
+    stream.configure_h2(STREAMING_READ_TIMEOUT)
 }
 
 const STREAMING_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5);
@@ -65,7 +65,7 @@ pub(crate) fn serve(
     config: &ServerConfig,
 ) -> Result<()> {
     read_preface(stream)?;
-    configure_read_timeout(stream)?;
+    configure_transport(stream)?;
     let stats = config.stats.clone();
     let stats = stats.as_deref();
     if let Some(s) = stats {
@@ -90,7 +90,7 @@ pub(crate) fn serve_upgraded(
     is_head: bool,
 ) -> Result<()> {
     read_preface(stream)?;
-    configure_read_timeout(stream)?;
+    configure_transport(stream)?;
     let stats = config.stats.clone();
     let stats = stats.as_deref();
     if let Some(s) = stats {

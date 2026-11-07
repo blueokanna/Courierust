@@ -274,7 +274,7 @@ const MAX_DEFERRED: usize = 1024;
 /// arrived, which is exactly the client's concurrent-stream count.
 fn stream_limit_reached(conn: &DriverConn<'_>, pending: &HashMap<u32, Pending>) -> bool {
     let limit = conn.peer_settings().max_concurrent_streams as usize;
-    pending.len() >= limit
+    !conn.peer_settings_received() || pending.len() >= limit
 }
 
 /// Start an h2 connection driver over `stream` (plain TCP or TLS).
@@ -301,7 +301,7 @@ fn start_inner(
     seed: Vec<u8>,
     upgrade_reply: Option<Sender<Result<H2Response>>>,
 ) -> Result<H2Conn> {
-    stream.configure(Some(DRIVER_READ_TIMEOUT))?;
+    stream.configure_h2(DRIVER_READ_TIMEOUT)?;
     let peer = stream.peer_addr();
     let (tx, rx) = channel::<H2Cmd>();
     let readiness = Readiness::new(&stream)?;
@@ -479,7 +479,7 @@ fn driver(
                 (
                     started,
                     cfg.h2_settings_timeout
-                        .filter(|_| conn.settings_ack_pending()),
+                        .filter(|_| conn.settings_ack_pending() || !conn.peer_settings_received()),
                 ),
                 (
                     last_rx,
@@ -643,7 +643,9 @@ fn apply_liveness(
     let now = std::time::Instant::now();
 
     if let Some(t) = cfg.h2_settings_timeout {
-        if conn.settings_ack_pending() && now.duration_since(started) >= t {
+        if (conn.settings_ack_pending() || !conn.peer_settings_received())
+            && now.duration_since(started) >= t
+        {
             conn.send_goaway(ErrorCode::SettingsTimeout, b"peer did not ACK SETTINGS");
             accepting.store(false, Ordering::Release);
             fail_all(
@@ -1435,7 +1437,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_stream_limit_defers_until_peer_raises_it() {
+    fn requests_wait_for_initial_settings_and_a_nonzero_stream_limit() {
         use crate::courierust_h2::{
             frame::Frame,
             settings::{Setting, SETTINGS_MAX_CONCURRENT_STREAMS},
@@ -1456,7 +1458,7 @@ mod tests {
             h2_config(&ClientConfig::default()),
         );
         let pending = HashMap::new();
-        assert!(!stream_limit_reached(&conn, &pending));
+        assert!(stream_limit_reached(&conn, &pending));
         for limit in [0, 2] {
             let mut bytes = crate::courierust_bytes::BytesMut::new();
             Frame::Settings {

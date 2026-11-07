@@ -172,15 +172,8 @@ impl grpc::StreamingService for CourierustEcho {
                 })?)?;
             }
             "Bidi" => {
-                for (sequence, bytes) in requests.enumerate() {
-                    let message = decode(bytes?)?;
-                    if message.sequence as usize != sequence {
-                        return Err(courierust::Error::grpc(
-                            grpc::status::DATA_LOSS,
-                            format!("request sequence {}, expected {sequence}", message.sequence),
-                        ));
-                    }
-                    send(message)?;
+                for bytes in requests {
+                    send(decode(bytes?)?)?;
                 }
             }
             _ => {

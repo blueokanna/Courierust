@@ -73,12 +73,16 @@ gRPC 流式用例默认每次 RPC 有四条消息，`bytes` 是单条业务 payl
 
 每行最多保留 2,048 个延迟样本，使用固定种子的 reservoir sampling 覆盖整个计时区间；分位数是样本估计，不是所有请求的精确分位数。`WINDOW` 保留约一秒一段的完成数、耗时、吞吐和最后一个不足一秒的窗口；窗口在计时结束后输出。`started_unix_ms` 加 `offset_ms` 可与资源日志对齐。`*.resources.json` 约每秒记录整个基准进程的累计 CPU 时间、工作集、私有字节、线程数和句柄数，包含两个客户端及服务端，不能用于单独归因某个服务端的 CPU。
 
-独立运行交替服务端顺序，进程内仍交替客户端顺序。脚本拒绝覆盖非空证据目录，并保留失败、超时和所有重复。下面的聚焦运行只选择 gRPC；省略 `Cases`、`Bytes`、`Servers` 则运行该 suite 的完整矩阵。过滤值拼写错误会失败。
+gRPC/TLS 的独立运行交替服务端顺序，进程内交替客户端顺序。HTTP 仅在配对比较中交替双方，服务端组顺序固定。脚本拒绝覆盖非空证据目录，并保留失败、超时和所有重复。下面的聚焦运行只选择 gRPC；省略 `Cases`、`Bytes`、`Servers` 则运行该 suite 的完整矩阵。过滤值拼写错误会失败。
 
 ```powershell
 ./scripts/run_protocol_study.ps1 -Runs 5 -Suites grpc -Cases 'ClientStream,Bidi' -Bytes 1024 -DurationMs 5000 -Repetitions 2 -OutputDirectory target/grpc-duration
 ./scripts/summarize_protocol_study.ps1 -Directory target/grpc-duration
 ```
+
+TLS 完整握手的 `bytes` 为 `0`。同时测握手和 64 KiB 回显时，应使用 `-Cases 'full_handshake,record_echo' -Bytes '0,65536'`；只选 `65536` 会排除握手。完整握手不断建立新 TCP 连接，独立进程也共享主机的临时端口和 TIME_WAIT 状态。Windows 复测曾因 `10048 / AddrInUse` 失败，这不是 TLS 记录层错误。可显式使用 `-CooldownSeconds 60` 在独立运行间冷却，并在 `study-settings.json` 中保留间隔；具体间隔需结合主机状态，不能保证所有负载都不耗尽端口。脚本不自动重试失败或修改系统网络配置。
+
+TLS 测试对端通过取消信号停止等待连接，不再新建 TCP 连接唤醒监听线程，避免端口不足时清理过程再次失败并卡住。失败批次保留原始退出码；有人工干预的运行应记录 `intervention.json`，汇总器会拒绝将它作为正常重复。
 
 可用 `-StreamMessages 64 -ReadDelayMs 1` 增加每次 RPC 的消息数，并在双方客户端的每次流式接收前施加消费延迟。该延迟属于负载本身，不应与零延迟结果混合排名；同步和异步定时器也可能有不同粒度。每条返回消息校验顺序和正文，最后必须读到成功状态。请求仍是预先准备后上传，当前 Courierust 服务端仍会收集请求体；这不是交互式全双工能力或有界内存证明。
 
@@ -126,3 +130,7 @@ H1 每次最多初始化并读取 64 KiB，不在第一次接收前初始化整�
 HTTP/2 调度器现在对增量流和非增量流都记账，连接每次消费一个调度项，仅在仍有可发送数据时重新入队；优先级更新不会创建未就绪项。回归覆盖 10,000 次入队/出队、增量流防饥饿，以及 1,000 轮持续上传。帧大小超过配置 quantum 时仍能前进。这修复调度状态错误，不代表已经解释所有 gRPC 吞吐波动。
 
 gRPC 服务端对未压缩消息使用收集正文的共享切片，去掉整段正文和逐消息的重复复制；压缩消息仍单独分配解压结果。服务若长期保留其中一条切片，也会保留该请求的整个正文存储。请求缓冲与每 RPC 线程创建的架构没有因此消失。
+
+64 条消息的 Bidi 检查曾抓到末条消息重复，原始 HTTP/2 字节也包含重复 DATA。明文 H2 现在使用非阻塞 socket 和就绪通知；阻塞发送超时会结束连接，不能把无法确认的发送结果重试成重复字节。[Winsock 对 SO_SNDTIMEO 的说明](https://learn.microsoft.com/en-us/windows/win32/winsock/sol-socket-socket-options)明确指出，超时后的连接状态不确定。TLS 保留原有写入期限，不再将 5 ms 的读取轮询间隔同时设为写入期限。
+
+客户端在收到初始 SETTINGS 后才分配新请求流，避免依靠阻塞读取的偶然等待来获得并发限制。H2 接收额度按实际消费量返还，关闭流不会再次返还已经记账的字节；小窗口也能及时发送 WINDOW_UPDATE。回归分别检查发送超时不可重放、额度守恒、部分消费、padding 和小窗口进展。

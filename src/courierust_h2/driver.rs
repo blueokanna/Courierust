@@ -42,8 +42,8 @@ impl Readiness {
     }
 
     /// Flush before parking. Internal codec/TLS input must be consumed even
-    /// when the kernel has no further bytes. Socket reads retain their bounded
-    /// timeout for incomplete frames; TLS writes remain blocking.
+    /// when the kernel has no further bytes. Plain sockets are non-blocking;
+    /// TLS reads retain a bounded poll timeout and record writes remain blocking.
     pub(crate) fn poll<R: Read, W: Write>(
         &mut self,
         conn: &mut Connection<R, W>,

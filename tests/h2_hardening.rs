@@ -1198,6 +1198,8 @@ fn h2_client_handles_interim_1xx_then_final_response() {
         let mut peer = RawH2Peer { stream: sock };
         assert!(peer.read_preface());
         let _ = peer.read_frame(); // client SETTINGS
+        peer.send_frame(0x4, 0, 0, &[]); // server connection preface
+        peer.send_frame(0x4, 0x1, 0, &[]); // acknowledge client SETTINGS
         loop {
             match peer.read_frame() {
                 Some((0x1, _, 1, _)) => break,

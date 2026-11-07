@@ -11,6 +11,7 @@
     [ValidateRange(0, 100)][int]$ReadDelayMs = 0,
     [ValidateRange(2, 20)][int]$Repetitions = 4,
     [ValidateRange(1, 10000)][int]$Warmup = 8,
+    [ValidateRange(0, 3600)][int]$CooldownSeconds = 0,
     [switch]$ResponseSweep,
     [string]$OutputDirectory = 'target/protocol-study'
 )
@@ -24,6 +25,16 @@ try {
     $env:BENCH_RESPONSE_SWEEP = if ($ResponseSweep) { '1' } else { '0' }
     $env:GRPC_SERVER_NODELAY = '1'
     for ($run = 1; $run -le $Runs; $run++) {
+        if ($run -gt 1 -and $CooldownSeconds -gt 0) {
+            Write-Output "Cooling down for $CooldownSeconds seconds before the next independent process."
+            # Slice long waits so cancellation and status reporting stay responsive.
+            $remaining = $CooldownSeconds
+            while ($remaining -gt 0) {
+                $seconds = [math]::Min($remaining, 30)
+                Start-Sleep -Seconds $seconds
+                $remaining -= $seconds
+            }
+        }
         $directory = Join-Path $OutputDirectory ('run-{0:d3}' -f $run)
         Write-Output "Independent run $run / $Runs"
         & (Join-Path $PSScriptRoot 'run_protocol_comparisons.ps1') `
@@ -33,6 +44,10 @@ try {
             -OutputDirectory $directory
         $manifest = Join-Path (Join-Path $PSScriptRoot '..') (Join-Path $directory 'source-sha256.txt')
         $sourceHashes = [IO.File]::ReadAllText([IO.Path]::GetFullPath($manifest))
+        $settingsPath = Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($manifest))) 'study-settings.json'
+        [IO.File]::WriteAllText($settingsPath, (@{
+            independent_run = $run; runs = $Runs; cooldown_seconds = $CooldownSeconds
+        } | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
         if ($null -eq $firstSourceHashes) {
             $firstSourceHashes = $sourceHashes
         } elseif ($firstSourceHashes -cne $sourceHashes) {

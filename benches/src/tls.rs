@@ -2,13 +2,14 @@
 //! Cipher, key exchange, certificate, ALPN and resumption policy are fixed.
 
 use courierust::courierust_tls as tls;
+use courierust_benchmark::listener::CancellableListener;
 use courierust_benchmark::metrics::{
     measure_comparison, setting, CaseFilter, Comparison, Measurement, MAX_SAMPLES,
 };
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicU64, Ordering},
     Arc,
 };
 use std::time::{Duration, Instant};
@@ -244,13 +245,14 @@ fn connect(
 
 struct Peer {
     address: SocketAddr,
-    stop: Arc<AtomicBool>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 impl Drop for Peer {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        let _ = TcpStream::connect(self.address);
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
         let result = self.thread.take().unwrap().join();
         if !std::thread::panicking() {
             result.expect("TLS peer failed");
@@ -280,15 +282,10 @@ fn peer(version: Version, ours: bool) -> Peer {
     let foreign = Arc::new(config);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
-    let stop = Arc::new(AtomicBool::new(false));
-    let stopped = stop.clone();
+    let (mut listener, stop) = CancellableListener::new(listener).unwrap();
     let thread = std::thread::spawn(move || {
         let mut sessions: Vec<std::thread::JoinHandle<()>> = Vec::new();
-        for socket in listener.incoming() {
-            if stopped.load(Ordering::Acquire) {
-                break;
-            }
-            let mut socket = socket.unwrap();
+        while let Some(mut socket) = listener.accept().unwrap() {
             configure(&socket);
             let own = own.clone();
             let foreign = foreign.clone();
@@ -332,7 +329,7 @@ fn peer(version: Version, ours: bool) -> Peer {
     });
     Peer {
         address,
-        stop,
+        stop: Some(stop),
         thread: Some(thread),
     }
 }
