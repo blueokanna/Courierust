@@ -68,6 +68,30 @@ jobs:
         run: cargo build --locked --no-default-features --lib
       - name: Run tests (unit + integration)
         run: cargo test --locked --all-targets
+      - name: Repeat Windows pooled-connection regression
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $artifacts = cargo test --locked --lib --no-run --message-format=json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $binaries = @($artifacts | ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object {
+              $_.reason -eq 'compiler-artifact' -and
+              $_.target.name -eq 'courierust' -and
+              $_.profile.test -and $_.executable
+            })
+          if ($binaries.Count -ne 1) { throw 'Expected one library test executable.' }
+          $case = 'courierust_client::tests::h1_client_probes_a_pooled_connection_before_reusing_it'
+          for ($iteration = 1; $iteration -le 100; $iteration++) {
+            $result = & $binaries[0].executable --exact $case 2>&1
+            # --exact also exits successfully when the test name matches nothing.
+            if ($LASTEXITCODE -ne 0 -or
+                -not ($result -match '^test result: ok\. 1 passed; 0 failed; 0 ignored;')) {
+              $result | Write-Output
+              throw "Pooled-connection regression failed on iteration $iteration."
+            }
+          }
+          Write-Output 'Pooled-connection regression passed 100 consecutive runs.'
       - name: Run doc tests
         run: cargo test --locked --doc
 

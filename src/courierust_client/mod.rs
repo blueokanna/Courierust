@@ -1936,7 +1936,6 @@ impl Proxy {
         } else {
             match hostport.rsplit_once(':') {
                 Some((h, p)) if !h.contains(':') => (h.to_string(), parse_proxy_port(p)?),
-                // No port: the scheme's default.
                 _ if !hostport.contains(':') => (hostport.to_string(), default_port),
                 _ => return Err(Error::protocol("proxy IPv6 host must be bracketed")),
             }
@@ -2101,9 +2100,6 @@ fn connect_socks5(
     let mut stream = crate::courierust_net::connect(&addr, timeout)?;
     crate::courierust_net::configure(&stream, timeout)?;
 
-    // Greeting. Offering both methods lets the proxy pick, which is what
-    // the RFC intends; offering only `no authentication` would make a proxy
-    // that requires credentials answer `no acceptable methods`.
     let greeting: &[u8] = match &proxy.credentials {
         Some(_) => &[5, 2, 0, 2],
         None => &[5, 1, 0],
@@ -2274,9 +2270,6 @@ fn connect_tunnel(
     timeout: Option<Duration>,
 ) -> Result<std::net::TcpStream> {
     let mut stream = crate::courierust_net::connect(&addr, timeout)?;
-    // The same deadline covers the read of the reply: a proxy that accepts
-    // and then says nothing must not hold the caller for the full
-    // `read_timeout`.
     crate::courierust_net::configure(&stream, timeout)?;
 
     let mut head = String::with_capacity(128);
@@ -2337,7 +2330,6 @@ fn resolve_redirect(base: &Url, location: &str) -> Result<Url> {
     // Fragments are not transmitted in HTTP request targets.
     let location = location.split_once('#').map_or(location, |(head, _)| head);
     if let Some(rest) = location.strip_prefix("//") {
-        // Network-path reference: same scheme, different authority.
         return Url::parse(&format!("{}://{rest}", base.scheme));
     }
     if location.contains("://") {
@@ -2346,9 +2338,6 @@ fn resolve_redirect(base: &Url, location: &str) -> Result<Url> {
     let base_target = base.path_and_query.as_str();
     let (base_path, base_query) = split_query(base_target);
     let (ref_path, ref_query) = split_query(location);
-    // RFC 3986 §5.2.2: an empty reference path keeps the base path *and*
-    // the base query; otherwise the reference's query (possibly none)
-    // wins.
     let query = match (ref_query, ref_path.is_empty()) {
         (Some(query), _) => Some(query.to_string()),
         (None, true) => base_query.map(str::to_string),
@@ -2571,7 +2560,6 @@ mod tests {
         drop(observer);
 
         let peer = std::thread::spawn(move || {
-            // The client must drop the stale socket without writing the POST.
             assert_eq!(stale_peer.read(&mut [0]).unwrap(), 0);
             listener.set_nonblocking(true).unwrap();
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -2588,6 +2576,7 @@ mod tests {
                     Err(error) => panic!("accept replacement: {error}"),
                 }
             };
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
