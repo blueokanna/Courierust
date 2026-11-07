@@ -993,15 +993,12 @@ impl<R: Read, W: Write> Connection<R, W> {
         let max_frame = self.peer.max_frame_size as i64;
         for _ in 0..64 {
             let want = max_frame as usize;
-            let sid = match self.scheduler.next(want) {
+            let sid = match self.scheduler.pop(want) {
                 Some(s) => s,
                 None => break,
             };
 
             self.scheduled.remove(&sid);
-            // An empty DATA frame or trailing HEADERS consumes no flow
-            // credit. In particular END_STREAM must not wait for a peer
-            // that is itself waiting for the request to end.
             let empty_front = self
                 .send_queue
                 .get(&sid)
@@ -1235,7 +1232,7 @@ impl<R: Read, W: Write> Connection<R, W> {
             };
             self.frame.payload_filled += n;
             if self.frame.payload_filled < self.frame.payload_len {
-                return Ok(false); // payload still incomplete
+                return Ok(false);
             }
         }
 
@@ -1383,18 +1380,6 @@ impl<R: Read, W: Write> Connection<R, W> {
                 error_code,
             } => {
                 if !self.streams.contains(&stream_id) {
-                    // RFC 9113 §5.1: RST_STREAM on an idle stream (one
-                    // that was never opened) is a PROTOCOL_ERROR;
-                    // RST_STREAM for a stream that has already closed is
-                    // a normal race and MUST be ignored.
-                    //
-                    // The `last_peer_id` test only sees *peer-initiated*
-                    // streams, which on a client connection is none of
-                    // them — so a server that resets a stream we already
-                    // finished (§8.1: it may send RST_STREAM(NO_ERROR)
-                    // to tell us to stop sending) used to look like an
-                    // idle-stream error and killed the whole connection.
-                    // `recently_closed` is the record that knows better.
                     if self.recently_closed.iter().any(|&c| c == stream_id) {
                         return Ok(());
                     }
@@ -2488,6 +2473,41 @@ mod tests {
         conn.send_headers(sid, &fields, false).unwrap();
         conn.send_data(sid, Bytes::from(vec![0x77_u8; 4096]), true)
             .unwrap();
+    }
+
+    #[test]
+    fn incremental_uploads_do_not_accumulate_scheduler_entries() {
+        let mut conn = Connection::new(
+            Silent,
+            Refusing::unblocked(),
+            Config {
+                scheduler_quantum: 1,
+                ..Config::default()
+            },
+        );
+        let sid = conn
+            .open_request(Priority {
+                urgency: 0,
+                incremental: true,
+            })
+            .unwrap();
+        conn.send_headers(sid, &request_prefix(), false).unwrap();
+        conn.flush().unwrap();
+        // A single long-lived stream repeatedly consumes and replenishes
+        // credit, as a long upload or slow consumer does on the wire.
+        for _ in 0..1000 {
+            conn.conn_send_window = FlowWindow::new(65_535, MAX_FLOW_WINDOW);
+            conn.streams.get_mut(&sid).unwrap().send_window = 65_535;
+            conn.send_data(sid, Bytes::from(vec![0x71; 32_768]), false)
+                .unwrap();
+            conn.flush().unwrap();
+            assert!(conn.scheduler.is_empty());
+            assert!(conn.scheduled.is_empty());
+            assert!(conn.send_queue.get(&sid).map_or(true, |q| q.is_empty()));
+        }
+        conn.send_data(sid, Bytes::new(), true).unwrap();
+        conn.flush().unwrap();
+        assert!(conn.scheduler.is_empty());
     }
 
     #[test]

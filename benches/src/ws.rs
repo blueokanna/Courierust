@@ -1719,6 +1719,8 @@ fn paired_echo_comparison() {
                             workers: 1,
                             repetition: repetition + 1,
                             warmup,
+                            stream_messages: 0,
+                            read_delay_ms: 0,
                         },
                         timing,
                     );

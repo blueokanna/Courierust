@@ -3,7 +3,7 @@
 
 use courierust::courierust_tls as tls;
 use courierust_benchmark::metrics::{
-    report_comparison, run_sequential, setting, Comparison, MAX_SAMPLES,
+    measure_comparison, setting, CaseFilter, Comparison, Measurement, MAX_SAMPLES,
 };
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -418,8 +418,23 @@ fn crypto_cost(requests: usize) {
 
 fn main() {
     let requests = setting("BENCH_REQUESTS", 100);
+    let measurement = Measurement::from_env(requests);
     let repetitions = setting("BENCH_REPETITIONS", 4);
     let warmup = setting("BENCH_WARMUP", 4);
+    let filter = CaseFilter::from_env(
+        &["full_handshake", "record_echo"],
+        &[0, 1024, 64 * 1024],
+        &["rustls-aws-lc", "courierust"],
+    );
+    assert!(
+        ["courierust", "rustls-aws-lc"].iter().any(|server| {
+            filter.includes("full_handshake", 0, server)
+                || [1024, 65536]
+                    .iter()
+                    .any(|size| filter.includes("record_echo", *size, server))
+        }),
+        "TLS filters select no valid case/payload combination"
+    );
     let diagnostics = match std::env::var("BENCH_TLS_DIAGNOSTICS").as_deref() {
         Err(std::env::VarError::NotPresent) | Ok("0") => false,
         Ok("1") => true,
@@ -449,7 +464,11 @@ fn main() {
         }
         let own_client = version.own_client();
         let foreign_client = version.foreign_client();
-        for server in [false, true] {
+        let mut peers = [false, true];
+        if filter.reverse_order {
+            peers.reverse();
+        }
+        for server in peers {
             let server_name = if server {
                 "courierust"
             } else {
@@ -457,6 +476,14 @@ fn main() {
             };
             let peer = peer(version, server);
             for size in [0usize, 1024, 64 * 1024] {
+                let case = if size == 0 {
+                    "full_handshake"
+                } else {
+                    "record_echo"
+                };
+                if !filter.includes(case, size, server_name) {
+                    continue;
+                }
                 for repetition in 0..repetitions {
                     for ours in if repetition % 2 == 0 {
                         [true, false]
@@ -473,7 +500,7 @@ fn main() {
                                 None,
                             )
                         };
-                        let mut operation: Box<dyn FnMut()> = if size == 0 {
+                        let operation: Box<dyn FnMut()> = if size == 0 {
                             Box::new(|| {
                                 drop(make());
                             })
@@ -492,11 +519,7 @@ fn main() {
                                 assert_eq!(reply, payload);
                             })
                         };
-                        for _ in 0..warmup {
-                            operation();
-                        }
-                        let timing = run_sequential(requests, MAX_SAMPLES, operation);
-                        report_comparison(
+                        measure_comparison(
                             Comparison {
                                 protocol: version.label,
                                 case: if size == 0 {
@@ -511,8 +534,12 @@ fn main() {
                                 workers: 1,
                                 repetition: repetition + 1,
                                 warmup,
+                                stream_messages: 0,
+                                read_delay_ms: 0,
                             },
-                            timing,
+                            measurement,
+                            MAX_SAMPLES,
+                            operation,
                         );
                     }
                 }

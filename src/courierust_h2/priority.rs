@@ -7,9 +7,9 @@
 //! high-urgency bucket can never starve lower-urgency traffic (RFC 9218
 //! §10 explicitly warns against starvation). Incremental streams inside a
 //! bucket are served in round-robin so bandwidth is shared as their data
-//! arrives; non-incremental streams are served FIFO by stream id, which
-//! matches the RFC 9218 recommendation ("ascending order of the stream
-//! ID"). The selection cost is O(1) — a fixed 8-bucket scan — which is
+//! arrives; non-incremental streams are served in enqueue order. Both
+//! classes consume the bucket budget and alternate when both are ready.
+//! The selection cost is O(1) — a fixed 8-bucket scan — which is
 //! what makes per-frame scheduling affordable on a hot connection.
 
 use alloc::collections::VecDeque;
@@ -91,7 +91,9 @@ struct Bucket {
     non_incremental: VecDeque<u32>,
     /// Incremental streams, round-robin.
     incremental: VecDeque<u32>,
-    /// DRR deficit in bytes.
+    /// Alternate classes when both have pending streams.
+    incremental_turn: bool,
+    /// Bytes charged in this round.
     deficit: u32,
     /// DRR quantum in bytes.
     quantum: u32,
@@ -102,6 +104,7 @@ impl Bucket {
         Self {
             non_incremental: VecDeque::new(),
             incremental: VecDeque::new(),
+            incremental_turn: false,
             deficit: 0,
             quantum,
         }
@@ -149,9 +152,9 @@ impl Scheduler {
         self.count == 0
     }
 
-    /// Register a stream.
+    /// Register a previously unregistered stream. Urgency is clamped to 0..=7.
     pub fn add(&mut self, stream_id: u32, p: Priority) {
-        let b = &mut self.buckets[p.urgency as usize];
+        let b = &mut self.buckets[p.urgency.min(7) as usize];
         if p.incremental {
             b.incremental.push_back(stream_id);
         } else {
@@ -160,13 +163,17 @@ impl Scheduler {
         self.count += 1;
     }
 
-    /// Move a stream to a new priority (RFC 9218 reprioritization).
+    /// Move a registered stream to a new priority (RFC 9218 reprioritization).
+    /// Updating an absent stream does not make it runnable.
     pub fn update(&mut self, stream_id: u32, old: Priority, new: Priority) {
         if old == new {
             return;
         }
+        let before = self.count;
         self.remove(stream_id);
-        self.add(stream_id, new);
+        if self.count != before {
+            self.add(stream_id, new);
+        }
     }
 
     /// Remove a stream.
@@ -185,45 +192,53 @@ impl Scheduler {
         }
     }
 
-    /// Pick the next stream to serve, accounting for `want` bytes about
-    /// to be transmitted. Returns `None` if nothing is servable.
-    ///
-    /// Scan order is urgency 0 → 7. Incremental streams are always
-    /// servable (one round-robin turn each). Non-incremental streams are
-    /// servable while the bucket's deficit plus `want` stays within its
-    /// quantum; a saturated bucket yields to lower urgencies, and when a
-    /// full scan finds nothing, deficits reset and the round advances —
-    /// this is the DRR anti-starvation guarantee.
+    /// Pick the next stream, charging its bucket for `want` bytes.
+    /// Non-incremental entries are consumed; incremental entries rotate and
+    /// remain registered until removed. Both classes respect the same budget.
+    /// A frame larger than the quantum uses one whole quantum, ensuring
+    /// progress even when the peer's frame limit exceeds our configuration.
     pub fn next(&mut self, want: usize) -> Option<u32> {
-        for u in 0..8 {
-            let b = &mut self.buckets[u];
-            if let Some(sid) = b.incremental.pop_front() {
-                b.incremental.push_back(sid);
-                return Some(sid);
-            }
-            if !b.non_incremental.is_empty() && b.deficit.saturating_add(want as u32) <= b.quantum {
-                b.deficit = b.deficit.saturating_add(want as u32);
-                return b.non_incremental.pop_front();
-            }
+        self.select(want, false)
+    }
+
+    /// Consume one ready entry. The connection explicitly requeues streams
+    /// that still have data and flow credit, including incremental streams.
+    pub(crate) fn pop(&mut self, want: usize) -> Option<u32> {
+        self.select(want, true)
+    }
+
+    fn select(&mut self, want: usize, consume: bool) -> Option<u32> {
+        if self.is_empty() {
+            return None;
         }
-        // Nothing servable: some non-incremental bucket is saturated.
-        let any = self.buckets.iter().any(|b| !b.non_incremental.is_empty());
-        if any {
-            self.rounds += 1;
-            for b in self.buckets.iter_mut() {
-                b.deficit = 0;
-            }
-            for u in 0..8 {
-                let b = &mut self.buckets[u];
-                if let Some(sid) = b.incremental.pop_front() {
-                    b.incremental.push_back(sid);
-                    return Some(sid);
+        for pass in 0..2 {
+            if pass == 1 {
+                self.rounds = self.rounds.wrapping_add(1);
+                for b in &mut self.buckets {
+                    b.deficit = 0;
                 }
-                if !b.non_incremental.is_empty()
-                    && b.deficit.saturating_add(want as u32) <= b.quantum
-                {
-                    b.deficit = b.deficit.saturating_add(want as u32);
-                    return b.non_incremental.pop_front();
+            }
+            for b in &mut self.buckets {
+                let charge = want.max(1).min(b.quantum as usize) as u32;
+                if charge > b.quantum - b.deficit {
+                    continue;
+                }
+                let non_incremental = !b.non_incremental.is_empty()
+                    && (!b.incremental_turn || b.incremental.is_empty());
+                let sid = if non_incremental {
+                    b.non_incremental.pop_front()
+                } else {
+                    b.incremental.pop_front()
+                };
+                if let Some(sid) = sid {
+                    b.deficit += charge;
+                    b.incremental_turn = non_incremental;
+                    if consume || non_incremental {
+                        self.count -= 1;
+                    } else {
+                        b.incremental.push_back(sid);
+                    }
+                    return Some(sid);
                 }
             }
         }
@@ -234,6 +249,71 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consumed_entries_leave_no_stale_count_or_duplicate() {
+        for incremental in [false, true] {
+            let mut scheduler = Scheduler::new(1);
+            let priority = Priority {
+                urgency: 255,
+                incremental,
+            };
+            for _ in 0..10_000 {
+                scheduler.add(1, priority);
+                assert_eq!(scheduler.len(), 1);
+                assert_eq!(scheduler.pop(usize::MAX), Some(1));
+                assert!(scheduler.is_empty());
+                assert_eq!(scheduler.pop(1), None);
+            }
+        }
+        let mut scheduler = Scheduler::new(100);
+        scheduler.add(1, Priority::default());
+        assert_eq!(scheduler.next(1), Some(1));
+        assert!(scheduler.is_empty());
+        scheduler.update(
+            1,
+            Priority::default(),
+            Priority {
+                urgency: 0,
+                incremental: true,
+            },
+        );
+        assert!(scheduler.is_empty());
+    }
+
+    #[test]
+    fn incremental_streams_cannot_starve_lower_urgencies_or_the_other_class() {
+        let mut scheduler = Scheduler::new(2);
+        scheduler.add(
+            1,
+            Priority {
+                urgency: 0,
+                incremental: true,
+            },
+        );
+        scheduler.add(
+            2,
+            Priority {
+                urgency: 7,
+                incremental: false,
+            },
+        );
+        assert_eq!(scheduler.next(1), Some(1));
+        assert_eq!(scheduler.next(1), Some(1));
+        assert_eq!(scheduler.next(1), Some(2));
+        scheduler.add(
+            3,
+            Priority {
+                urgency: 0,
+                incremental: false,
+            },
+        );
+        assert_eq!(scheduler.next(1), Some(3));
+        assert_eq!(scheduler.next(1), Some(1));
+        assert_eq!(scheduler.len(), 1);
+        scheduler.remove(1);
+        assert!(scheduler.is_empty());
+    }
 
     #[test]
     fn parse_priority_values() {

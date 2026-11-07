@@ -1,20 +1,14 @@
 name: Fuzz (long-running)
 
-# Deep fuzz runs: instead of a fixed run count, each target gets a time
-# budget of wall-clock fuzzing so the h1 parser, the h2 state machine and
-# the HPACK/Huffman codecs are explored far beyond what a PR-time smoke
-# run covers. Failures abort the job (a crash anywhere is a release
-# blocker). Runs on demand and nightly.
-
 on:
   workflow_dispatch:
     inputs:
       minutes_per_target:
-        description: 'Wall-clock minutes per fuzz target (deep runs: 30-120; CI smoke stays at 20 s in benchmark.yml)'
+        description: "Wall-clock minutes per fuzz target (deep runs: 30-120; CI smoke stays at 20 s in benchmark.yml)"
         required: false
-        default: '30'
+        default: "30"
   schedule:
-    - cron: '0 4 * * *'
+    - cron: "0 4 * * *"
 
 permissions:
   contents: read
@@ -26,21 +20,21 @@ jobs:
   fuzz:
     name: Long fuzz (${{ matrix.target }}, ${{ inputs.minutes_per_target || 30 }}m)
     runs-on: ubuntu-latest
-    # One job per target. `minutes_per_target` may be as high as 120 and
-    # GitHub kills a job at 360 minutes, so all targets in a single job could
-    # not honour the documented range — a run at the top of it would be killed
-    # mid-corpus, and a killed job runs no `always()` step, so the log would
-    # be lost with it. Per-target jobs also cost the largest budget rather
     # than the sum.
     timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
-        # Must stay in step with fuzz/fuzz_targets/: a target that no workflow
-        # runs is a parser nobody is checking. The three WebSocket targets
-        # were missing here even though the codec, the handshake and the
-        # session state machine are all reachable from the network.
-        target: [h2_frame, hpack_block, h1_request, h2_connection, ws_frame, ws_handshake, ws_session]
+        target:
+          [
+            h2_frame,
+            hpack_block,
+            h1_request,
+            h2_connection,
+            ws_frame,
+            ws_handshake,
+            ws_session,
+          ]
     steps:
       - uses: actions/checkout@v4
       - name: Install nightly + cargo-fuzz
@@ -58,14 +52,16 @@ jobs:
             echo "minutes_per_target must be between 30 and 120" >&2
             exit 2
           fi
+          # Keep compilation outside the reported execution interval.
+          cargo +nightly fuzz build --fuzz-dir fuzz "$TARGET" 2>&1 | tee fuzz-build.log
           started=$(date +%s)
           # `-max_total_time` is the libFuzzer time budget; the run aborts
           # non-zero on any crash/leak/hang in the target.
           set +e
           cargo +nightly fuzz run --fuzz-dir fuzz "$TARGET" -- \
             -max_total_time="$((MINUTES * 60))" -max_len=16384 \
-            -timeout=10 -rss_limit_mb=2048
-          status=$?
+            -timeout=10 -rss_limit_mb=2048 2>&1 | tee fuzz-execution.log
+          status=${PIPESTATUS[0]}
           set -e
           duration=$(( $(date +%s) - started ))
           if [[ "$status" -eq 0 ]]; then
@@ -85,9 +81,9 @@ jobs:
           name: fuzz-long-${{ matrix.target }}
           path: |
             fuzz.log
+            fuzz-build.log
+            fuzz-execution.log
             fuzz/corpus/${{ matrix.target }}/**
-          # libFuzzer writes the corpus into the (not checked-in) working
-          # directory, so the artifact *is* the corpus diff: the new inputs a
-          # maintainer commits after reviewing them. This job cannot commit
-          # them itself — it holds `contents: read`.
+            fuzz/artifacts/${{ matrix.target }}/**
+
           if-no-files-found: warn

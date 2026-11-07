@@ -39,7 +39,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_protocol_compari
 | `build-artifacts.jsonl` | 本次构建产生的可执行文件及编译信息 |
 | `suite-timing.json` | 各 suite 的实际开始时间与耗时 |
 
-独立运行完成后，用 `powershell -File scripts/summarize_protocol_study.ps1 -Directory target/protocol-study` 生成 `statistics.json`。汇总要求至少两次运行、源码清单一致、六个 suite 全部成功且每个有效配置的重复数一致；失败日志不能截取成功行后混入排名。输出保留每次运行的中位数及范围，不将范围当作置信区间。
+独立运行完成后，用 `powershell -File scripts/summarize_protocol_study.ps1 -Directory target/protocol-study` 生成 `statistics.json`。汇总要求至少两次运行、源码清单一致、所选 suite 一致且全部成功、每个有效配置的重复数一致；失败日志不能截取成功行后混入排名。输出保留每次运行的中位数及范围，不将范围当作置信区间。
 
 单独运行协议：
 
@@ -51,21 +51,38 @@ cargo +1.98.0 bench --manifest-path benches/Cargo.toml --locked --bench compare
 cargo +1.98.0 bench --manifest-path benches/Cargo.toml --locked --bench interop
 ```
 
-`BENCH_REQUESTS` 设置每轮调用数，`BENCH_REPETITIONS` 设置重复次数。gRPC/TLS/WS 用 `BENCH_WARMUP`，预热不计时；HTTP 对照保留各用例自己的预热逻辑。HTTP 大请求诊断默认每轮至多 32 次。`h3` 诊断使用 `BENCH_RUNS`，与矩阵的重复参数不同。运行环境和日志 `META` 是实际配置依据。
+`BENCH_REPETITIONS` 设置进程内重复次数。gRPC/TLS 默认每行测量至少 1 秒，使用 `BENCH_DURATION_MS` 调整；只有显式设为 `0` 才以 `BENCH_REQUESTS` 限定调用数。其他 suite 仍使用请求数预算，不能把它们写成定时负载。gRPC/TLS/WS 用 `BENCH_WARMUP`，预热不计时；HTTP 对照保留各用例自己的预热逻辑。HTTP 大请求诊断默认每轮至多 32 次。`h3` 诊断使用 `BENCH_RUNS`，与矩阵的重复参数不同。运行环境和日志 `META` 是实际配置依据。
 
 独立进程重复和大响应扫描：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_protocol_study.ps1 -Runs 3 -Requests 128 -Repetitions 4 -ResponseSweep
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_protocol_study.ps1 -Runs 5 -DurationMs 1000 -Requests 128 -Repetitions 4 -ResponseSweep
 ```
 
-每次运行分别保存六个 suite 的报告，不把进程内重复冒充独立实验。`suite-timing.json` 保留开始时间及包含预热、连接建立和退出的进程总时长；行内 `elapsed_ms` 才是该负载的计时区间。`BENCH_RESPONSE_SWEEP=1` 增加 256 KiB、512 KiB、1 MiB、2 MiB、4 MiB 的 H1/H2 响应，保持同对端和完整字节校验。每组 HTTP 对照结束时关闭对应服务端。
+每次运行分别保存六个 suite 的报告，不把进程内重复冒充独立实验。`suite-timing.json` 保留开始时间及包含预热、连接建立和退出的进程总时长；行内 `elapsed_ms` 才是该负载的计时区间。`BENCH_RESPONSE_SWEEP=1` 增加 256 KiB、384 KiB、512 KiB、768 KiB、1 MiB、2 MiB、4 MiB 的 H1/H2 响应，保持同对端和完整字节校验。每组 HTTP 对照结束时关闭对应服务端。
 
 TLS 成本诊断与吞吐矩阵分开执行：设置 `BENCH_TLS_DIAGNOSTICS=1` 后运行 `tls`。它报告 64 KiB 分配复制、四条 16 KiB AES-GCM 加解密，以及客户端 socket 读写调用数和墙钟耗时。`outside_socket_us` 包含密码运算、复制、验证、调度及插桩开销，不是 CPU 时间；socket 读取时间还包含等待对端。微基准不能与网络耗时直接相加，插桩结果也不能替代未插桩的吞吐结果。
 
 gRPC 的自定义 tonic incoming 流逐连接设置并读取验证 `TCP_NODELAY`。正常比较强制开启；单独运行 `grpc` 时可用 `GRPC_SERVER_NODELAY=0` 做控制实验，不能将这种配置的不对称结果列入公平排名。没有同环境抓包及时间线，不能仅凭约 40 ms 的延迟认定是 delayed ACK。
 
-gRPC 流式用例每次 RPC 有四条消息，`bytes` 是单条业务 payload 长度，`requests` 是完成的 RPC 数，不是消息数。TLS 完整握手包含 TCP 连接、socket 设置及握手验证；记录回显在已建立连接上计时，`bytes` 是单方向应用长度。WS 一次请求是一次完整回显。
+gRPC 流式用例默认每次 RPC 有四条消息，`bytes` 是单条业务 payload 长度，`requests` 是完成的 RPC 数，不是消息数。TLS 完整握手包含 TCP 连接、socket 设置及握手验证；记录回显在已建立连接上计时，`bytes` 是单方向应用长度。WS 一次请求是一次完整回显。
+
+## 定时复测与持续传输
+
+定时模式在完成当前操作、校验正文和最终状态后检查预算，不会在半个 RPC 中截断结果；阻塞操作仍由协议超时终止。因此实际 `elapsed_ms` 可以略超过 `target_ms`，`requests` 是实际完成数。汇总按预算分组，不按实际完成数分组。计数模式用于快速检查，不适合据此解释几个百分点的差距。
+
+每行最多保留 2,048 个延迟样本，使用固定种子的 reservoir sampling 覆盖整个计时区间；分位数是样本估计，不是所有请求的精确分位数。`WINDOW` 保留约一秒一段的完成数、耗时、吞吐和最后一个不足一秒的窗口；窗口在计时结束后输出。`started_unix_ms` 加 `offset_ms` 可与资源日志对齐。`*.resources.json` 约每秒记录整个基准进程的累计 CPU 时间、工作集、私有字节、线程数和句柄数，包含两个客户端及服务端，不能用于单独归因某个服务端的 CPU。
+
+独立运行交替服务端顺序，进程内仍交替客户端顺序。脚本拒绝覆盖非空证据目录，并保留失败、超时和所有重复。下面的聚焦运行只选择 gRPC；省略 `Cases`、`Bytes`、`Servers` 则运行该 suite 的完整矩阵。过滤值拼写错误会失败。
+
+```powershell
+./scripts/run_protocol_study.ps1 -Runs 5 -Suites grpc -Cases 'ClientStream,Bidi' -Bytes 1024 -DurationMs 5000 -Repetitions 2 -OutputDirectory target/grpc-duration
+./scripts/summarize_protocol_study.ps1 -Directory target/grpc-duration
+```
+
+可用 `-StreamMessages 64 -ReadDelayMs 1` 增加每次 RPC 的消息数，并在双方客户端的每次流式接收前施加消费延迟。该延迟属于负载本身，不应与零延迟结果混合排名；同步和异步定时器也可能有不同粒度。每条返回消息校验顺序和正文，最后必须读到成功状态。请求仍是预先准备后上传，当前 Courierust 服务端仍会收集请求体；这不是交互式全双工能力或有界内存证明。
+
+这些脚本依然产生闭环本机流量。增加运行时间不能替代跨机网络、外部恒定到达率、长时间 fuzz、故障注入或独立安全审计。吞吐曲线与 CPU/内存同步变化只是线索；若没有调用栈或受控实验，不把相关性写成根因。
 
 ## 结果判读
 
@@ -105,3 +122,7 @@ H2 在 socket 拒绝写入后先刷新旧批次，再编码新帧。此前缓冲
 H1 每次最多初始化并读取 64 KiB，不在第一次接收前初始化整个大正文。正文构建仍有分配，转成当前 `Bytes` 的共享存储仍有复制；这条路径不能称为端到端零拷贝。整块预初始化的候选实现曾在 4 MiB 复测中退化，未作为最终实现保留。
 
 发布证据应包含 MSRV/stable 检查、Linux/macOS/Windows 测试、独立互通、持续 fuzz、长时间资源稳定性、慢读写与取消测试，以及部署环境负载结果。每项保留日志、版本和退出状态；未执行的项目不能补造结论。
+
+HTTP/2 调度器现在对增量流和非增量流都记账，连接每次消费一个调度项，仅在仍有可发送数据时重新入队；优先级更新不会创建未就绪项。回归覆盖 10,000 次入队/出队、增量流防饥饿，以及 1,000 轮持续上传。帧大小超过配置 quantum 时仍能前进。这修复调度状态错误，不代表已经解释所有 gRPC 吞吐波动。
+
+gRPC 服务端对未压缩消息使用收集正文的共享切片，去掉整段正文和逐消息的重复复制；压缩消息仍单独分配解压结果。服务若长期保留其中一条切片，也会保留该请求的整个正文存储。请求缓冲与每 RPC 线程创建的架构没有因此消失。

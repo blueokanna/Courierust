@@ -96,16 +96,36 @@ jobs:
         run: cargo test --locked --doc
 
   docs:
-    name: docs
+    name: docs (${{ matrix.toolchain }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ['1.78.0', nightly]
     env:
-      RUSTDOCFLAGS: "-D warnings"
+      RUSTDOCFLAGS: "--cfg docsrs -D warnings"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.78.0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
       - uses: Swatinem/rust-cache@v2
       - name: Build rustdoc (missing-docs is on)
-        run: cargo doc --locked --no-deps
+        if: matrix.toolchain != 'nightly'
+        run: cargo doc --locked --no-deps --all-features
+      - name: Build packaged docs with docs.rs example scraping
+        if: matrix.toolchain == 'nightly'
+        shell: bash
+        run: |
+          cargo package --locked --no-verify
+          mkdir -p target/docs-package
+          archives=(target/package/*.crate)
+          test "${#archives[@]}" -eq 1
+          tar -xzf "${archives[0]}" -C target/docs-package
+          manifests=(target/docs-package/*/Cargo.toml)
+          test "${#manifests[@]}" -eq 1
+          cargo doc --manifest-path "${manifests[0]}" --locked --no-deps --all-features \
+            -Zunstable-options -Zrustdoc-scrape-examples
 
   workflows:
     name: actionlint
@@ -143,5 +163,8 @@ jobs:
         run: cargo clippy --manifest-path benches/Cargo.toml --locked --all-targets -- -D warnings
       - name: Benchmark measurement regressions
         run: cargo test --manifest-path benches/Cargo.toml --locked --lib
+      - name: Benchmark aggregation regressions
+        shell: pwsh
+        run: ./scripts/test_protocol_summary.ps1
       - name: Fuzz workspace compiles
         run: cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets

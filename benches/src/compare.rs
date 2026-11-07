@@ -1017,8 +1017,16 @@ fn main() {
                 bytes: 256 * 1024,
             },
             Payload {
+                name: "384k",
+                bytes: 384 * 1024,
+            },
+            Payload {
                 name: "512k",
                 bytes: 512 * 1024,
+            },
+            Payload {
+                name: "768k",
+                bytes: 768 * 1024,
             },
             Payload {
                 name: "1m",

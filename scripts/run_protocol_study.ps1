@@ -1,6 +1,14 @@
-param(
-    [ValidateRange(2, 20)][int]$Runs = 3,
+﻿param(
+    [ValidateRange(2, 20)][int]$Runs = 5,
     [ValidateRange(1, 1000000)][int]$Requests = 128,
+    [ValidateRange(0, 3600000)][int]$DurationMs = 1000,
+    [ValidateRange(10, 3600)][int]$SuiteTimeoutSeconds = 900,
+    [ValidateSet('compare', 'grpc', 'tls', 'ws', 'h3', 'interop')][string[]]$Suites = @('compare', 'grpc', 'tls', 'ws', 'h3', 'interop'),
+    [string]$Cases = '',
+    [string]$Bytes = '',
+    [string]$Servers = '',
+    [ValidateRange(2, 1024)][int]$StreamMessages = 4,
+    [ValidateRange(0, 100)][int]$ReadDelayMs = 0,
     [ValidateRange(2, 20)][int]$Repetitions = 4,
     [ValidateRange(1, 10000)][int]$Warmup = 8,
     [switch]$ResponseSweep,
@@ -20,6 +28,8 @@ try {
         Write-Output "Independent run $run / $Runs"
         & (Join-Path $PSScriptRoot 'run_protocol_comparisons.ps1') `
             -Requests $Requests -Repetitions $Repetitions -Warmup $Warmup `
+            -DurationMs $DurationMs -SuiteTimeoutSeconds $SuiteTimeoutSeconds -Suites $Suites `
+            -Cases $Cases -Bytes $Bytes -Servers $Servers -StreamMessages $StreamMessages -ReadDelayMs $ReadDelayMs -ReverseOrder:($run % 2 -eq 0) `
             -OutputDirectory $directory
         $manifest = Join-Path (Join-Path $PSScriptRoot '..') (Join-Path $directory 'source-sha256.txt')
         $sourceHashes = [IO.File]::ReadAllText([IO.Path]::GetFullPath($manifest))

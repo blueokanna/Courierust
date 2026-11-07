@@ -6,7 +6,7 @@ use courierust::courierust_client::{Client, ClientConfig};
 use courierust::courierust_grpc::{self as grpc, GrpcClient, GrpcClientConfig, GrpcServer};
 use courierust::courierust_server::ServerConfig;
 use courierust_benchmark::metrics::{
-    report_comparison, run_sequential, setting, Comparison, MAX_SAMPLES,
+    measure_comparison, setting, CaseFilter, Comparison, Measurement, MAX_SAMPLES,
 };
 use prost::Message;
 use std::pin::Pin;
@@ -23,7 +23,33 @@ use wire::{
     Payload,
 };
 
-const MESSAGES: u32 = 4;
+struct StreamWorkload {
+    messages: u32,
+    read_delay: Duration,
+}
+
+fn stream_workload() -> &'static StreamWorkload {
+    static CONFIG: std::sync::OnceLock<StreamWorkload> = std::sync::OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let messages = setting("GRPC_STREAM_MESSAGES", 4);
+        assert!(
+            (2..=1024).contains(&messages),
+            "GRPC_STREAM_MESSAGES must be 2..=1024"
+        );
+        let delay = match std::env::var("GRPC_READ_DELAY_MS") {
+            Err(std::env::VarError::NotPresent) => 0,
+            Ok(value) => value
+                .parse::<u64>()
+                .expect("GRPC_READ_DELAY_MS must be an integer"),
+            Err(error) => panic!("GRPC_READ_DELAY_MS: {error}"),
+        };
+        assert!(delay <= 100, "GRPC_READ_DELAY_MS must be 0..=100");
+        StreamWorkload {
+            messages: messages as u32,
+            read_delay: Duration::from_millis(delay),
+        }
+    })
+}
 const PREFIX: &str = "/courierust.benchmark.Echo/";
 
 impl grpc::codec::EncodeMessage for Payload {
@@ -55,7 +81,7 @@ impl Echo for TonicEcho {
     async fn server_stream(&self, request: Request<Payload>) -> Result<Response<Replies>, Status> {
         let message = request.into_inner();
         let fail = message.sequence == u32::MAX;
-        let replies = (0..MESSAGES).map(move |sequence| {
+        let replies = (0..stream_workload().messages).map(move |sequence| {
             if fail && sequence == 1 {
                 Err(Status::data_loss("after first message"))
             } else {
@@ -122,7 +148,7 @@ impl grpc::StreamingService for CourierustEcho {
                     }
                     send(message)?;
                 } else {
-                    for sequence in 0..MESSAGES {
+                    for sequence in 0..stream_workload().messages {
                         if message.sequence == u32::MAX && sequence == 1 {
                             return Err(courierust::Error::grpc(
                                 grpc::status::DATA_LOSS,
@@ -188,7 +214,7 @@ fn courierust_rpc(client: &GrpcClient, shape: &str, message: &Payload) {
             .unwrap()
     } else {
         let (sender, receiver) = std::sync::mpsc::channel();
-        for sequence in 0..MESSAGES {
+        for sequence in 0..stream_workload().messages {
             sender
                 .send(Ok(Bytes::from(
                     Payload {
@@ -204,12 +230,19 @@ fn courierust_rpc(client: &GrpcClient, shape: &str, message: &Payload) {
             let response = client
                 .client_stream(&method, receiver)
                 .expect("client-streaming final status");
-            verify(Payload::decode(&*response).unwrap(), message, MESSAGES - 1);
+            verify(
+                Payload::decode(&*response).unwrap(),
+                message,
+                stream_workload().messages - 1,
+            );
             return;
         }
         client.bidi_stream(&method, receiver).unwrap()
     };
-    for sequence in 0..MESSAGES {
+    for sequence in 0..stream_workload().messages {
+        if !stream_workload().read_delay.is_zero() {
+            std::thread::sleep(stream_workload().read_delay);
+        }
         let bytes = stream
             .next_message()
             .unwrap()
@@ -232,7 +265,7 @@ async fn tonic_rpc(
         );
         return;
     }
-    let requests = (0..MESSAGES)
+    let requests = (0..stream_workload().messages)
         .map(|sequence| Payload {
             data: message.data.clone(),
             sequence,
@@ -250,7 +283,7 @@ async fn tonic_rpc(
                 .await
                 .unwrap()
                 .into_inner();
-            verify(response, message, MESSAGES - 1);
+            verify(response, message, stream_workload().messages - 1);
             return;
         }
         "Bidi" => client
@@ -260,7 +293,10 @@ async fn tonic_rpc(
             .into_inner(),
         _ => unreachable!(),
     };
-    for sequence in 0..MESSAGES {
+    for sequence in 0..stream_workload().messages {
+        if !stream_workload().read_delay.is_zero() {
+            tokio::time::sleep(stream_workload().read_delay).await;
+        }
         verify(
             stream.message().await.unwrap().expect("missing message"),
             message,
@@ -297,9 +333,17 @@ fn courierust_client(address: std::net::SocketAddr) -> GrpcClient {
 }
 
 fn main() {
+    let workload = stream_workload();
+    let messages = workload.messages;
     let requests = setting("BENCH_REQUESTS", 100);
+    let measurement = Measurement::from_env(requests);
     let repetitions = setting("BENCH_REPETITIONS", 4);
     let warmup = setting("BENCH_WARMUP", 4);
+    let filter = CaseFilter::from_env(
+        &["Unary", "ServerStream", "ClientStream", "Bidi"],
+        &[1024, 64 * 1024],
+        &["tonic", "courierust"],
+    );
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -342,10 +386,14 @@ fn main() {
     .unwrap();
     let courierust_address = server.local_addr().unwrap();
     let _courierust_server = server.serve_background().unwrap();
-    println!("META|suite=grpc|transport=h2c|tls=off|codec=prost_shared|compression=identity|connections=1|server_threads=2|stream_messages={MESSAGES}|order=alternating|validation=bytes_sequence_final_status|load=closed_loop");
+    println!("META|suite=grpc|transport=h2c|tls=off|codec=prost_shared|compression=identity|connections=1|server_threads=2|stream_messages={messages}|order=alternating|validation=bytes_sequence_final_status|load=closed_loop");
     println!("META|tonic_server_tcp_nodelay={server_nodelay}|client_tcp_nodelay=true|courierust_server_tcp_nodelay=true");
 
-    for (server_name, address) in [("tonic", tonic_address), ("courierust", courierust_address)] {
+    let mut peers = [("tonic", tonic_address), ("courierust", courierust_address)];
+    if filter.reverse_order {
+        peers.reverse();
+    }
+    for (server_name, address) in peers {
         let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
             .unwrap()
             .tcp_nodelay(true)
@@ -393,24 +441,23 @@ fn main() {
         for size in [1024, 64 * 1024] {
             let message = payload(size, 0);
             for shape in ["Unary", "ServerStream", "ClientStream", "Bidi"] {
+                if !filter.includes(shape, size, server_name) {
+                    continue;
+                }
                 for repetition in 0..repetitions {
                     for ours in if repetition % 2 == 0 {
                         [true, false]
                     } else {
                         [false, true]
                     } {
-                        let mut operation = || {
+                        let operation = || {
                             if ours {
                                 courierust_rpc(&courierust, shape, &message);
                             } else {
                                 runtime.block_on(tonic_rpc(&mut tonic_client, shape, &message));
                             }
                         };
-                        for _ in 0..warmup {
-                            operation();
-                        }
-                        let timing = run_sequential(requests, MAX_SAMPLES, operation);
-                        report_comparison(
+                        measure_comparison(
                             Comparison {
                                 protocol: "grpc-h2",
                                 case: shape,
@@ -421,8 +468,12 @@ fn main() {
                                 workers: 1,
                                 repetition: repetition + 1,
                                 warmup,
+                                stream_messages: messages as usize,
+                                read_delay_ms: workload.read_delay.as_millis() as u64,
                             },
-                            timing,
+                            measurement,
+                            MAX_SAMPLES,
+                            operation,
                         );
                     }
                 }

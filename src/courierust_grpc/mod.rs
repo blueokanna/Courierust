@@ -500,15 +500,12 @@ impl MessageStream {
                 }
             }
             if self.done {
-                // Body fully consumed: leftover bytes are a truncated
-                // final frame.
                 if !self.buf.is_empty() {
                     return Err(Error::protocol("truncated gRPC message"));
                 }
                 self.finish()?;
                 return Ok(None);
             }
-            // Refill from the body (blocking).
             match &self.body {
                 Body::Channel(rx) => match rx.recv() {
                     Ok(Ok(chunk)) => self.buf.extend_from_slice(&chunk),
@@ -554,13 +551,6 @@ impl MessageStream {
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<u32>().ok())
             });
-        // A gRPC exchange always terminates with a `grpc-status` (in
-        // trailers, or in the head for trailer-only responses). A stream
-        // ending without one means the transport died mid-stream, the
-        // peer reset the stream, or the peer is not actually gRPC — in
-        // every case reporting OK would silently turn a truncated
-        // response into a valid one (RFC 9110 / gRPC spec: missing
-        // status is UNKNOWN).
         let Some(code) = code else {
             return Err(Error::grpc(
                 status::UNKNOWN,
@@ -827,14 +817,16 @@ impl StreamingService for UnaryAdapter {
     }
 }
 
-/// Decode a buffer of gRPC frames into request messages.
-fn decode_messages(raw: &[u8], max: usize) -> Result<Vec<Result<Bytes>>> {
+/// Decode buffered requests. Identity messages share the collected body;
+/// compressed messages own their decompressed storage. Retaining an identity
+/// message also retains the body allocation until its last slice is dropped.
+fn decode_messages(raw: &Bytes, max: usize) -> Result<Vec<Result<Bytes>>> {
     let mut out = Vec::new();
     let mut pos = 0usize;
     while pos < raw.len() {
         let (compressed, len) = read_frame_header(&raw[pos..], max)?;
         let start = pos + 5;
-        if raw.len() < start + len {
+        if len > raw.len() - start {
             return Err(Error::protocol("truncated gRPC request message"));
         }
         let payload = &raw[start..start + len];
@@ -842,7 +834,7 @@ fn decode_messages(raw: &[u8], max: usize) -> Result<Vec<Result<Bytes>>> {
             let plain = compress::gunzip(payload, max)?;
             out.push(Ok(Bytes::from(plain)));
         } else {
-            out.push(Ok(Bytes::from(payload)));
+            out.push(Ok(raw.slice(start..start + len)));
         }
         pos = start + len;
     }
@@ -987,7 +979,7 @@ impl Handler for GrpcHandler {
             .unwrap_or(false);
 
         let raw = match req.body.collect() {
-            Ok(b) => b.to_vec(),
+            Ok(b) => b,
             Err(e) => return grpc_error_response(status::INTERNAL, &e.to_string()),
         };
         let messages = match decode_messages(&raw, self.max_message_size) {
@@ -1214,6 +1206,34 @@ fn status_metadata(code: u32, message: &str) -> HeaderMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buffered_identity_requests_share_storage_and_outlive_the_body() {
+        let raw = Bytes::from_static(b"\0\0\0\0\x03abc\0\0\0\0\x02de\0\0\0\0\0");
+        let messages = decode_messages(&raw, 3)
+            .unwrap()
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(messages[0].as_ptr(), raw[5..].as_ptr());
+        assert_eq!(messages[1].as_ptr(), raw[13..].as_ptr());
+        drop(raw);
+        assert_eq!(&*messages[0], b"abc");
+        assert_eq!(&*messages[1], b"de");
+        assert!(messages[2].is_empty());
+    }
+
+    #[test]
+    fn buffered_requests_reject_truncation_oversize_and_invalid_flags() {
+        for raw in [
+            &b"\0\0\0\0"[..],
+            &b"\0\0\0\0\x03ab"[..],
+            &b"\0\xff\xff\xff\xff"[..],
+            &b"\x02\0\0\0\0"[..],
+        ] {
+            assert!(decode_messages(&Bytes::from(raw), 3).is_err());
+        }
+    }
 
     #[test]
     fn a_failed_request_producer_cannot_complete_a_unary_call() {

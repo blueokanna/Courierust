@@ -3,8 +3,238 @@
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-/// Per-case sample cap; overshoot is downsampled with a uniform stride.
+/// Per-case sample cap.
 pub const MAX_SAMPLES: usize = 2048;
+
+/// Explicit filters for focused studies; reject typos instead of reporting
+/// success after accidentally selecting no workloads.
+pub struct CaseFilter {
+    cases: Vec<String>,
+    sizes: Vec<String>,
+    servers: Vec<String>,
+    pub reverse_order: bool,
+}
+
+impl CaseFilter {
+    pub fn from_env(cases: &[&str], sizes: &[usize], servers: &[&str]) -> Self {
+        fn read(name: &str, allowed: &[&str]) -> Vec<String> {
+            match std::env::var(name) {
+                Err(std::env::VarError::NotPresent) => {
+                    allowed.iter().map(|s| (*s).to_owned()).collect()
+                }
+                Err(error) => panic!("{name}: {error}"),
+                Ok(value) => {
+                    let selected: Vec<_> = value.split(',').map(str::to_owned).collect();
+                    assert!(
+                        selected.iter().all(|s| allowed.contains(&s.as_str())),
+                        "{name}: unsupported selection {value:?}; allowed: {allowed:?}"
+                    );
+                    selected
+                }
+            }
+        }
+        let sizes: Vec<_> = sizes.iter().map(usize::to_string).collect();
+        let filter = Self {
+            cases: read("BENCH_CASES", cases),
+            sizes: read(
+                "BENCH_BYTES",
+                &sizes.iter().map(String::as_str).collect::<Vec<_>>(),
+            ),
+            servers: read("BENCH_SERVERS", servers),
+            reverse_order: match std::env::var("BENCH_REVERSE_ORDER").as_deref() {
+                Err(std::env::VarError::NotPresent) | Ok("0") => false,
+                Ok("1") => true,
+                _ => panic!("BENCH_REVERSE_ORDER must be 0 or 1"),
+            },
+        };
+        println!(
+            "META|cases={}|bytes={}|servers={}|reverse_order={}",
+            filter.cases.join(","),
+            filter.sizes.join(","),
+            filter.servers.join(","),
+            filter.reverse_order
+        );
+        filter
+    }
+
+    pub fn includes(&self, case: &str, size: usize, server: &str) -> bool {
+        self.cases.iter().any(|s| s == case)
+            && self.sizes.iter().any(|s| s == &size.to_string())
+            && self.servers.iter().any(|s| s == server)
+    }
+}
+
+/// Stop after a request count (smoke checks) or an elapsed-time budget.
+/// Time limits are checked after a complete, validated operation; transport
+/// timeouts remain responsible for interrupting a stuck operation.
+#[derive(Clone, Copy, Debug)]
+pub enum Measurement {
+    Requests(usize),
+    Duration(Duration),
+}
+
+impl Measurement {
+    pub fn from_env(requests: usize) -> Self {
+        let milliseconds = match std::env::var("BENCH_DURATION_MS") {
+            Ok(value) => value
+                .parse::<u64>()
+                .expect("BENCH_DURATION_MS must be an integer"),
+            Err(std::env::VarError::NotPresent) => 1000,
+            Err(error) => panic!("BENCH_DURATION_MS: {error}"),
+        };
+        assert!(
+            milliseconds <= 3_600_000,
+            "BENCH_DURATION_MS must not exceed one hour"
+        );
+        if milliseconds == 0 {
+            assert!(
+                requests > 0,
+                "a benchmark must execute at least one request"
+            );
+            Self::Requests(requests)
+        } else {
+            Self::Duration(Duration::from_millis(milliseconds))
+        }
+    }
+
+    fn fields(self) -> String {
+        match self {
+            Self::Requests(requests) => {
+                format!("measurement=requests|target_requests={requests}|target_ms=0")
+            }
+            Self::Duration(duration) => format!(
+                "measurement=duration|target_requests=0|target_ms={}",
+                duration.as_millis()
+            ),
+        }
+    }
+}
+
+// Algorithm R with deterministic SplitMix64 randomness. The seed is fixed for
+// reproducibility, not secrecy. Rejection avoids modulo bias. Unlike sampling
+// only the first N calls, this retains observations from the entire run.
+struct Reservoir {
+    values: Vec<Duration>,
+    capacity: usize,
+    seen: u64,
+    random: u64,
+}
+
+impl Reservoir {
+    fn new(capacity: usize) -> Self {
+        Self {
+            values: Vec::with_capacity(capacity),
+            capacity,
+            seen: 0,
+            random: 0x7265736572766f69,
+        }
+    }
+
+    fn observe(&mut self, value: Duration) {
+        self.seen += 1;
+        if self.values.len() < self.capacity {
+            self.values.push(value);
+        } else if self.capacity != 0 {
+            let threshold = self.seen.wrapping_neg() % self.seen;
+            let position = loop {
+                self.random = self.random.wrapping_add(0x9e3779b97f4a7c15);
+                let mut z = self.random;
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+                z ^= z >> 31;
+                if z >= threshold {
+                    break z % self.seen;
+                }
+            };
+            if position < self.capacity as u64 {
+                self.values[position as usize] = value;
+            }
+        }
+    }
+}
+
+struct Window {
+    offset: Duration,
+    elapsed: Duration,
+    requests: usize,
+}
+
+fn measure(
+    mut work: impl FnMut(),
+    limit: Measurement,
+    max_samples: usize,
+) -> (Timing, Vec<Window>) {
+    match limit {
+        Measurement::Requests(count) => assert!(count > 0),
+        Measurement::Duration(duration) => assert!(!duration.is_zero()),
+    }
+    let mut reservoir = Reservoir::new(max_samples);
+    let mut windows = Vec::new();
+    let mut requests = 0;
+    let mut window_requests = 0;
+    let mut window_offset = Duration::ZERO;
+    let started = Instant::now();
+    let elapsed = loop {
+        let request_started = Instant::now();
+        work();
+        let completed = Instant::now();
+        reservoir.observe(completed.duration_since(request_started));
+        requests += 1;
+        window_requests += 1;
+        let elapsed = completed.duration_since(started);
+        let finished = match limit {
+            Measurement::Requests(count) => requests >= count,
+            Measurement::Duration(duration) => elapsed >= duration,
+        };
+        let window_elapsed = elapsed - window_offset;
+        if window_elapsed >= Duration::from_secs(1) || finished {
+            windows.push(Window {
+                offset: window_offset,
+                elapsed: window_elapsed,
+                requests: window_requests,
+            });
+            window_offset = elapsed;
+            window_requests = 0;
+        }
+        if finished {
+            break elapsed;
+        }
+    };
+    (
+        Timing {
+            elapsed,
+            requests,
+            samples: reservoir.values,
+        },
+        windows,
+    )
+}
+
+/// Warm up, measure and emit every time window after timing has stopped.
+/// Each window shares the complete case identity with its aggregate result.
+pub fn measure_comparison(
+    case: Comparison<'_>,
+    limit: Measurement,
+    max_samples: usize,
+    mut work: impl FnMut(),
+) {
+    for _ in 0..case.warmup {
+        work();
+    }
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before Unix epoch")
+        .as_millis();
+    let (timing, windows) = measure(work, limit, max_samples);
+    for window in windows {
+        println!("WINDOW|protocol={}|case={}|client={}|server={}|mode={}|bytes={}|workers={}|repetition={}|started_unix_ms={unix_ms}|offset_ms={:.3}|elapsed_ms={:.3}|requests={}|rps={:.2}",
+            case.protocol, case.case, case.client, case.server, case.mode, case.bytes,
+            case.workers, case.repetition, window.offset.as_secs_f64() * 1000.0,
+            window.elapsed.as_secs_f64() * 1000.0, window.requests,
+            window.requests as f64 / window.elapsed.as_secs_f64());
+    }
+    report_measured_comparison(case, timing, &limit.fields());
+}
 
 /// Timing for one benchmark case.
 pub struct Timing {
@@ -294,12 +524,21 @@ pub struct Comparison<'a> {
     pub workers: usize,
     pub repetition: usize,
     pub warmup: usize,
+    pub stream_messages: usize,
+    pub read_delay_ms: u64,
 }
 
-pub fn report_comparison(case: Comparison<'_>, mut timing: Timing) {
+pub fn report_comparison(case: Comparison<'_>, timing: Timing) {
+    let fields = Measurement::Requests(timing.requests).fields();
+    report_measured_comparison(case, timing, &fields);
+}
+
+fn report_measured_comparison(case: Comparison<'_>, mut timing: Timing, fields: &str) {
     timing.sort_samples();
+    let stream_messages = case.stream_messages;
+    let read_delay_ms = case.read_delay_ms;
     println!(
-        "COMPARISON|protocol={}|case={}|client={}|server={}|mode={}|bytes={}|workers={}|repetition={}|warmup={}|status=ok|requests={}|elapsed_ms={:.3}|rps={:.2}|p50_us={}|p95_us={}|p99_us={}|samples={}|{}",
+        "COMPARISON|protocol={}|case={}|client={}|server={}|mode={}|bytes={}|workers={}|repetition={}|warmup={}|status=ok|requests={}|elapsed_ms={:.3}|rps={:.2}|p50_us={}|p95_us={}|p99_us={}|samples={}|{}|{fields}|stream_messages={stream_messages}|read_delay_ms={read_delay_ms}",
         case.protocol, case.case, case.client, case.server, case.mode,
         case.bytes, case.workers, case.repetition, case.warmup,
         timing.requests, timing.elapsed.as_secs_f64() * 1000.0,
@@ -326,6 +565,49 @@ pub fn setting(name: &str, default: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duration_finishes_a_validated_operation_and_accounts_for_every_window() {
+        let mut calls = 0;
+        let (timing, windows) = measure(
+            || {
+                calls += 1;
+                std::thread::sleep(Duration::from_millis(2));
+            },
+            Measurement::Duration(Duration::from_millis(1)),
+            8,
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(timing.requests, calls);
+        assert!(timing.elapsed >= Duration::from_millis(1));
+        assert_eq!(windows.iter().map(|w| w.requests).sum::<usize>(), calls);
+        assert_eq!(
+            windows.iter().map(|w| w.elapsed).sum::<Duration>(),
+            timing.elapsed
+        );
+    }
+
+    #[test]
+    fn reservoir_is_bounded_and_includes_late_observations() {
+        for capacity in [0, 1, 128, 2048] {
+            let mut reservoir = Reservoir::new(capacity);
+            for value in 0..100_000 {
+                reservoir.observe(Duration::from_nanos(value));
+            }
+            assert_eq!(reservoir.values.len(), capacity);
+            if capacity >= 128 {
+                assert!(reservoir.values.iter().any(|v| v.as_nanos() > 50_000));
+            }
+        }
+    }
+
+    #[test]
+    fn request_mode_keeps_the_exact_budget() {
+        let (timing, windows) = measure(|| {}, Measurement::Requests(123), 10);
+        assert_eq!(timing.requests, 123);
+        assert_eq!(timing.samples.len(), 10);
+        assert_eq!(windows.iter().map(|w| w.requests).sum::<usize>(), 123);
+    }
 
     #[test]
     fn nearest_rank_percentiles_match_the_documented_estimator() {
