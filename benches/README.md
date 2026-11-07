@@ -61,7 +61,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_protocol_study.p
 
 每次运行分别保存六个 suite 的报告，不把进程内重复冒充独立实验。`suite-timing.json` 保留开始时间及包含预热、连接建立和退出的进程总时长；行内 `elapsed_ms` 才是该负载的计时区间。`BENCH_RESPONSE_SWEEP=1` 增加 256 KiB、384 KiB、512 KiB、768 KiB、1 MiB、2 MiB、4 MiB 的 H1/H2 响应，保持同对端和完整字节校验。每组 HTTP 对照结束时关闭对应服务端。
 
-TLS 成本诊断与吞吐矩阵分开执行：设置 `BENCH_TLS_DIAGNOSTICS=1` 后运行 `tls`。它报告 64 KiB 分配复制、四条 16 KiB AES-GCM 加解密，以及客户端 socket 读写调用数和墙钟耗时。`outside_socket_us` 包含密码运算、复制、验证、调度及插桩开销，不是 CPU 时间；socket 读取时间还包含等待对端。微基准不能与网络耗时直接相加，插桩结果也不能替代未插桩的吞吐结果。
+TLS 成本诊断与吞吐矩阵分开执行：设置 `BENCH_TLS_DIAGNOSTICS=1` 后运行 `tls`。它报告 64 KiB 分配复制、四条 16 KiB AES-GCM 加解密，并分别拆分完整握手与记录回显的 socket 读写调用数和墙钟耗时。`outside_socket_us` 包含密码运算、复制、验证、调度及插桩开销，不是 CPU 时间；完整握手的剩余时间还包含 TCP 建连、socket 配置和连接销毁。socket 读取时间也包含等待对端。微基准不能与网络耗时直接相加，插桩结果不能替代未插桩的吞吐结果。
 
 gRPC 的自定义 tonic incoming 流逐连接设置并读取验证 `TCP_NODELAY`。正常比较强制开启；单独运行 `grpc` 时可用 `GRPC_SERVER_NODELAY=0` 做控制实验，不能将这种配置的不对称结果列入公平排名。没有同环境抓包及时间线，不能仅凭约 40 ms 的延迟认定是 delayed ACK。
 

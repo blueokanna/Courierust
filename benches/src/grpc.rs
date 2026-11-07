@@ -172,8 +172,15 @@ impl grpc::StreamingService for CourierustEcho {
                 })?)?;
             }
             "Bidi" => {
-                for bytes in requests {
-                    send(decode(bytes?)?)?;
+                for (sequence, bytes) in requests.enumerate() {
+                    let message = decode(bytes?)?;
+                    if message.sequence as usize != sequence {
+                        return Err(courierust::Error::grpc(
+                            grpc::status::DATA_LOSS,
+                            format!("request sequence {}, expected {sequence}", message.sequence),
+                        ));
+                    }
+                    send(message)?;
                 }
             }
             _ => {
@@ -249,7 +256,14 @@ fn courierust_rpc(client: &GrpcClient, shape: &str, message: &Payload) {
             .expect("missing gRPC message");
         verify(Payload::decode(&*bytes).unwrap(), message, sequence);
     }
-    assert!(stream.next_message().expect("final gRPC status").is_none());
+    let extra = stream.next_message().expect("final gRPC status");
+    assert!(
+        extra.is_none(),
+        "extra gRPC response: {:?}",
+        extra
+            .as_ref()
+            .map(|b| Payload::decode(&**b).map(|p| (p.sequence, p.data.len())))
+    );
 }
 
 async fn tonic_rpc(
@@ -303,7 +317,12 @@ async fn tonic_rpc(
             sequence,
         );
     }
-    assert!(stream.message().await.expect("final gRPC status").is_none());
+    let extra = stream.message().await.expect("final gRPC status");
+    assert!(
+        extra.is_none(),
+        "extra gRPC response: {:?}",
+        extra.as_ref().map(|p| (p.sequence, p.data.len()))
+    );
 }
 
 fn courierust_client(address: std::net::SocketAddr) -> GrpcClient {

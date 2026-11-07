@@ -345,6 +345,31 @@ fn diagnose(version: Version, requests: usize) {
     let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
     frame.extend_from_slice(&payload);
     for ours in [true, false] {
+        for _ in 0..8 {
+            drop(connect(peer.address, version, ours, &own, &foreign, None));
+        }
+        let handshake_cost = Arc::new(IoCost::default());
+        let started = Instant::now();
+        for _ in 0..requests {
+            drop(connect(
+                peer.address,
+                version,
+                ours,
+                &own,
+                &foreign,
+                Some(handshake_cost.clone()),
+            ));
+        }
+        report_io_cost(
+            version,
+            ours,
+            requests,
+            "full_handshake",
+            0,
+            &handshake_cost,
+            started.elapsed(),
+        );
+
         let cost = Arc::new(IoCost::default());
         let mut stream = connect(
             peer.address,
@@ -371,16 +396,37 @@ fn diagnose(version: Version, requests: usize) {
         for _ in 0..requests {
             operation();
         }
-        let total_ns = started.elapsed().as_nanos();
-        let read_ns = cost.read_ns.load(Ordering::Relaxed);
-        let write_ns = cost.write_ns.load(Ordering::Relaxed);
-        let per_call = |ns: u128| ns as f64 / requests as f64 / 1000.0;
-        println!("TLS_COST|protocol={}|client={}|server=rustls-aws-lc|bytes=65536|requests={requests}|wall_us={:.3}|socket_read_us={:.3}|socket_write_us={:.3}|outside_socket_us={:.3}|read_calls={}|write_calls={}|scope=client_after_warmup|instrumented=true",
-            version.label, if ours { "courierust" } else { "rustls-aws-lc" },
-            per_call(total_ns), per_call(read_ns.into()), per_call(write_ns.into()),
-            per_call(total_ns.saturating_sub(u128::from(read_ns) + u128::from(write_ns))),
-            cost.reads.load(Ordering::Relaxed), cost.writes.load(Ordering::Relaxed));
+        report_io_cost(
+            version,
+            ours,
+            requests,
+            "record_echo",
+            65_536,
+            &cost,
+            started.elapsed(),
+        );
     }
+}
+
+fn report_io_cost(
+    version: Version,
+    ours: bool,
+    requests: usize,
+    case: &str,
+    bytes: usize,
+    cost: &IoCost,
+    elapsed: Duration,
+) {
+    let total_ns = elapsed.as_nanos();
+    let read_ns = cost.read_ns.load(Ordering::Relaxed);
+    let write_ns = cost.write_ns.load(Ordering::Relaxed);
+    let per_call = |ns: u128| ns as f64 / requests as f64 / 1000.0;
+
+    println!("TLS_COST|protocol={}|case={case}|client={}|server=rustls-aws-lc|bytes={bytes}|requests={requests}|wall_us={:.3}|socket_read_us={:.3}|socket_write_us={:.3}|outside_socket_us={:.3}|read_calls={}|write_calls={}|scope=client_after_warmup|instrumented=true",
+        version.label, if ours { "courierust" } else { "rustls-aws-lc" },
+        per_call(total_ns), per_call(read_ns.into()), per_call(write_ns.into()),
+        per_call(total_ns.saturating_sub(u128::from(read_ns) + u128::from(write_ns))),
+        cost.reads.load(Ordering::Relaxed), cost.writes.load(Ordering::Relaxed));
 }
 
 fn crypto_cost(requests: usize) {
