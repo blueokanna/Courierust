@@ -37,6 +37,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_protocol_compari
 | `source-sha256.txt` | 工作树文件哈希，包含未提交修改 |
 | `benchmark-dependencies.json` | Cargo 解析的依赖版本及来源 |
 | `build-artifacts.jsonl` | 本次构建产生的可执行文件及编译信息 |
+| `suite-timing.json` | 各 suite 的实际开始时间与耗时 |
+
+独立运行完成后，用 `powershell -File scripts/summarize_protocol_study.ps1 -Directory target/protocol-study` 生成 `statistics.json`。汇总要求至少两次运行、源码清单一致、六个 suite 全部成功且每个有效配置的重复数一致；失败日志不能截取成功行后混入排名。输出保留每次运行的中位数及范围，不将范围当作置信区间。
 
 单独运行协议：
 
@@ -49,6 +52,18 @@ cargo +1.98.0 bench --manifest-path benches/Cargo.toml --locked --bench interop
 ```
 
 `BENCH_REQUESTS` 设置每轮调用数，`BENCH_REPETITIONS` 设置重复次数。gRPC/TLS/WS 用 `BENCH_WARMUP`，预热不计时；HTTP 对照保留各用例自己的预热逻辑。HTTP 大请求诊断默认每轮至多 32 次。`h3` 诊断使用 `BENCH_RUNS`，与矩阵的重复参数不同。运行环境和日志 `META` 是实际配置依据。
+
+独立进程重复和大响应扫描：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_protocol_study.ps1 -Runs 3 -Requests 128 -Repetitions 4 -ResponseSweep
+```
+
+每次运行分别保存六个 suite 的报告，不把进程内重复冒充独立实验。`suite-timing.json` 保留开始时间及包含预热、连接建立和退出的进程总时长；行内 `elapsed_ms` 才是该负载的计时区间。`BENCH_RESPONSE_SWEEP=1` 增加 256 KiB、512 KiB、1 MiB、2 MiB、4 MiB 的 H1/H2 响应，保持同对端和完整字节校验。每组 HTTP 对照结束时关闭对应服务端。
+
+TLS 成本诊断与吞吐矩阵分开执行：设置 `BENCH_TLS_DIAGNOSTICS=1` 后运行 `tls`。它报告 64 KiB 分配复制、四条 16 KiB AES-GCM 加解密，以及客户端 socket 读写调用数和墙钟耗时。`outside_socket_us` 包含密码运算、复制、验证、调度及插桩开销，不是 CPU 时间；socket 读取时间还包含等待对端。微基准不能与网络耗时直接相加，插桩结果也不能替代未插桩的吞吐结果。
+
+gRPC 的自定义 tonic incoming 流逐连接设置并读取验证 `TCP_NODELAY`。正常比较强制开启；单独运行 `grpc` 时可用 `GRPC_SERVER_NODELAY=0` 做控制实验，不能将这种配置的不对称结果列入公平排名。没有同环境抓包及时间线，不能仅凭约 40 ms 的延迟认定是 delayed ACK。
 
 gRPC 流式用例每次 RPC 有四条消息，`bytes` 是单条业务 payload 长度，`requests` 是完成的 RPC 数，不是消息数。TLS 完整握手包含 TCP 连接、socket 设置及握手验证；记录回显在已建立连接上计时，`bytes` 是单方向应用长度。WS 一次请求是一次完整回显。
 
@@ -73,6 +88,20 @@ gRPC 流式用例每次 RPC 有四条消息，`bytes` 是单条业务 payload �
 
 通过测试只说明已覆盖用例满足断言。自研 TLS 密码实现、H3 复杂网络行为、gRPC 请求缓冲和无界消息通道，不能凭本地吞吐量宣称达到成熟实现的全部能力。这里没有独立安全审计证明或“零漏洞”认证。
 
-HTTP/2 客户端仍以 5 ms socket 读取超时轮询流式请求通道，生产者就绪和通道结束没有直接唤醒驱动的机制。先发送已就绪数据消除了部分等待，但没有解决整个唤醒设计；gRPC client-streaming 的实测差距必须保留。将该路径改为事件驱动，需要同时验证 TLS 分段读取、取消、流控和连接复用，不能靠缩短轮询间隔或省略消息来制造性能提升。
+HTTP/2 客户端和服务端共用 socket 就绪等待，`Body::Stream` 的数据和结束通知直接唤醒驱动；原始 `Body::Channel` 保留 5 ms 轮询回退，部分帧读取也保留有界超时。每条 HTTP/2 连接仍有驱动线程，并新增一对本地通知 socket，不能将此路径描述成单 reactor 管理所有连接。请求缓冲、无界通道和慢消费者的内存上界仍需单独评估。
+
+AES-GCM 在支持 PCLMULQDQ 的 x86_64 上使用无查表的字段乘法，其他 CPU 保留逐位实现。标准向量、全部基向量组合和部分块差分测试验证算法一致性；这不是密码实现整体的独立审计。加速结果必须注明 CPU 特性，不能外推为 ARM 性能。
+
+这次 GHASH 改动也没有消除 AES 其他路径的侧信道风险：当前 AES 软件轮函数和密钥扩展仍有依赖秘密数据的 S-box 查表。不能把硬件 GHASH 或 AES-NI 的局部属性写成整个 TLS 实现的恒定时间保证；这些路径仍需整改及独立密码审计。
+
+HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS=0` 现在阻止新流；此前将其作为“无限制”不符合 [RFC 9113 §6.5.2](https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5.2)。默认无实际约束使用 `u32::MAX`，显式配置零的调用方应检查这一行为修正。
+
+发送窗口耗尽时，空 DATA 的 `END_STREAM` 和 trailing HEADERS 仍须能够发送；它们不消耗流控额度。回归测试覆盖连接窗口为零、流窗口为零或负数，以及最后一段 DATA 恰好耗尽额度的情况。客户端和服务端的 channel 适配器共用按剩余缓冲容量分段入队的实现，保留未接收的后缀；服务端不再因入队失败而丢弃已取出的数据。此处限制的是传输发送队列，并没有把无界生产者通道变成端到端有界通道。
+
+H2 在 socket 拒绝写入后先刷新旧批次，再编码新帧。此前缓冲写入器刷新旧尾部失败时尚未接收新数据，而连接层误以为新数据已被保留并清空了暂存，造成丢帧。回归测试以连续拒绝写入、期间追加多个流、随后恢复的顺序验证完整线缆字节；不依赖操作系统偶发超时来触发。
+
+等待对端流名额的请求也执行超时预算，队列后方的短期限请求不会被前方请求遮挡。H1 已知长度正文直接读入最终分配，保留预读字节和下一条消息的边界；截断或读取失败不会把预先初始化的尾部作为正文返回。
+
+H1 每次最多初始化并读取 64 KiB，不在第一次接收前初始化整个大正文。正文构建仍有分配，转成当前 `Bytes` 的共享存储仍有复制；这条路径不能称为端到端零拷贝。整块预初始化的候选实现曾在 4 MiB 复测中退化，未作为最终实现保留。
 
 发布证据应包含 MSRV/stable 检查、Linux/macOS/Windows 测试、独立互通、持续 fuzz、长时间资源稳定性、慢读写与取消测试，以及部署环境负载结果。每项保留日志、版本和退出状态；未执行的项目不能补造结论。

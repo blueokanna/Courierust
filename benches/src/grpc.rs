@@ -11,7 +11,7 @@ use courierust_benchmark::metrics::{
 use prost::Message;
 use std::pin::Pin;
 use std::time::Duration;
-use tokio_stream::{wrappers::TcpListenerStream, Stream};
+use tokio_stream::{wrappers::TcpListenerStream, Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
 mod wire {
@@ -309,11 +309,23 @@ fn main() {
         .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
         .unwrap();
     let tonic_address = listener.local_addr().unwrap();
+    let server_nodelay = match std::env::var("GRPC_SERVER_NODELAY").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("1") => true,
+        Ok("0") => false,
+        _ => panic!("GRPC_SERVER_NODELAY must be 0 or 1"),
+    };
+    let incoming = TcpListenerStream::new(listener).map(move |accepted| {
+        accepted.and_then(|socket| {
+            socket.set_nodelay(server_nodelay)?;
+            assert_eq!(socket.nodelay()?, server_nodelay);
+            Ok(socket)
+        })
+    });
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let tonic_server = runtime.spawn(async move {
         tonic::transport::Server::builder()
             .add_service(EchoServer::new(TonicEcho))
-            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+            .serve_with_incoming_shutdown(incoming, async {
                 let _ = stopped.await;
             })
             .await
@@ -331,10 +343,12 @@ fn main() {
     let courierust_address = server.local_addr().unwrap();
     let _courierust_server = server.serve_background().unwrap();
     println!("META|suite=grpc|transport=h2c|tls=off|codec=prost_shared|compression=identity|connections=1|server_threads=2|stream_messages={MESSAGES}|order=alternating|validation=bytes_sequence_final_status|load=closed_loop");
+    println!("META|tonic_server_tcp_nodelay={server_nodelay}|client_tcp_nodelay=true|courierust_server_tcp_nodelay=true");
 
     for (server_name, address) in [("tonic", tonic_address), ("courierust", courierust_address)] {
         let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
             .unwrap()
+            .tcp_nodelay(true)
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(5));
         let mut tonic_client = EchoClient::new(runtime.block_on(endpoint.connect()).unwrap());
@@ -354,7 +368,6 @@ fn main() {
                 .grpc_code(),
             Some(grpc::status::INVALID_ARGUMENT)
         );
-        // A message followed by an error must remain an error in both stacks.
         let mut foreign = runtime
             .block_on(tonic_client.server_stream(invalid.clone()))
             .unwrap()

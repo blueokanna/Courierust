@@ -507,6 +507,12 @@ impl<R: Read, W: Write> Connection<R, W> {
     /// Best-effort flush of queued control frames (e.g. GOAWAY) even after
     /// the session is marked closed.
     fn flush_final(&mut self) {
+        if self.flush_pending {
+            let outcome = self.drain_out();
+            if outcome.is_err() || self.flush_pending {
+                return;
+            }
+        }
         while let Some(f) = self.pending_frames.pop_front() {
             let mut buf = BytesMut::with_capacity(64);
             f.encode(&mut buf);
@@ -518,6 +524,22 @@ impl<R: Read, W: Write> Connection<R, W> {
     /// Flush pending outbound frames to the transport.
     pub fn flush(&mut self) -> Result<()> {
         self.flush_outbound().map(|_| ())
+    }
+
+    /// Transport-driver hooks: buffered input and actual write progress.
+    #[cfg(feature = "std")]
+    pub(crate) fn buffered_input(&self) -> bool {
+        self.reader.buffered() != 0
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn flush_progress(&mut self) -> Result<bool> {
+        self.flush_outbound()
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn transport_write_pending(&self) -> bool {
+        self.flush_pending
     }
 
     /// Send a header block on a stream (request on the client, response
@@ -688,12 +710,12 @@ impl<R: Read, W: Write> Connection<R, W> {
         if !stream.can_send() {
             return Err(Error::canceled("stream not writable"));
         }
-        let buffered: usize = self
-            .send_queue
-            .get(&stream_id)
-            .map(|q| q.iter().map(|c| c.data.len()).sum())
-            .unwrap_or(0);
-        if buffered + data_len > self.config.max_send_buffer {
+        if data_len
+            > self
+                .config
+                .max_send_buffer
+                .saturating_sub(stream.send_buffered)
+        {
             return Err(Error::overflow("per-stream send buffer full"));
         }
         stream.send_buffered += data_len;
@@ -710,6 +732,33 @@ impl<R: Read, W: Write> Connection<R, W> {
             });
         self.maybe_schedule(stream_id);
         Ok(data_len)
+    }
+
+    /// Queue the prefix that fits without losing the unaccepted suffix.
+    /// Channel adapters use this instead of requiring producer chunks to fit
+    /// the transport's per-stream buffer in their entirety.
+    #[cfg(feature = "std")]
+    pub(crate) fn send_body_chunk(&mut self, stream_id: u32, chunk: &mut Bytes) -> Result<()> {
+        let stream = self
+            .streams
+            .get(&stream_id)
+            .ok_or_else(|| Error::protocol("send_data: unknown stream"))?;
+        if self.goaway_sent || self.closed || !stream.can_send() {
+            return Err(Error::canceled("stream not writable"));
+        }
+        let capacity = self
+            .config
+            .max_send_buffer
+            .saturating_sub(stream.send_buffered);
+        let take = capacity.min(chunk.len());
+        if self.config.max_send_buffer == 0 && !chunk.is_empty() {
+            return Err(Error::overflow("per-stream send buffer is disabled"));
+        }
+        if take != 0 {
+            self.send_data(stream_id, chunk.slice_to(take), false)?;
+            *chunk = chunk.slice_from(take);
+        }
+        Ok(())
     }
 
     /// Queue a trailing header block for a stream (RFC 9113 §8.1). The
@@ -862,6 +911,16 @@ impl<R: Read, W: Write> Connection<R, W> {
         if self.closed {
             return Ok(false);
         }
+        // BufWriter retains the refused tail, but a write whose preliminary
+        // flush fails has not accepted the new slice. Finish the old batch
+        // before encoding another one, keeping both ordering and queue bounds.
+        let mut progress = false;
+        if self.flush_pending {
+            progress = self.drain_out()?;
+            if self.flush_pending {
+                return Ok(progress);
+            }
+        }
         if self.preface_pending {
             self.out.extend_from_slice(frame::CLIENT_PREFACE);
             self.preface_pending = false;
@@ -877,7 +936,7 @@ impl<R: Read, W: Write> Connection<R, W> {
             f.encode(&mut buf);
             self.out.extend_from_slice(&buf);
         }
-        self.drain_out()
+        Ok(self.drain_out()? || progress)
     }
 
     /// Hand the staged bytes to the transport, keeping whatever it does
@@ -920,9 +979,6 @@ impl<R: Read, W: Write> Connection<R, W> {
 
     fn queue_settings(&mut self) {
         let mut entries = self.local.to_vec();
-        // RFC 9113 §6.5.2: a server MUST NOT send ENABLE_PUSH (only
-        // clients use it to disable server push). nghttp2/curl reject a
-        // server SETTINGS carrying it.
         if !self.config.client {
             entries.retain(|s| s.id != SETTINGS_ENABLE_PUSH);
         }
@@ -934,9 +990,6 @@ impl<R: Read, W: Write> Connection<R, W> {
 
     /// Emit DATA frames for scheduled streams, bounded per flush for fairness
     fn emit_data_frames(&mut self) -> Result<()> {
-        if self.conn_send_window.available() <= 0 {
-            return Ok(());
-        }
         let max_frame = self.peer.max_frame_size as i64;
         for _ in 0..64 {
             let want = max_frame as usize;
@@ -946,6 +999,14 @@ impl<R: Read, W: Write> Connection<R, W> {
             };
 
             self.scheduled.remove(&sid);
+            // An empty DATA frame or trailing HEADERS consumes no flow
+            // credit. In particular END_STREAM must not wait for a peer
+            // that is itself waiting for the request to end.
+            let empty_front = self
+                .send_queue
+                .get(&sid)
+                .and_then(|queue| queue.front())
+                .is_some_and(|chunk| chunk.data.is_empty());
             let can_send = {
                 let s = match self.streams.get(&sid) {
                     Some(s) => s,
@@ -954,7 +1015,7 @@ impl<R: Read, W: Write> Connection<R, W> {
                         continue;
                     }
                 };
-                s.send_window > 0
+                s.send_window > 0 || empty_front
             };
             if !can_send {
                 self.scheduler.remove(sid);
@@ -966,7 +1027,7 @@ impl<R: Read, W: Write> Connection<R, W> {
                 .min(self.conn_send_window.available())
                 .min(max_frame)
                 .max(0) as usize;
-            if amount == 0 {
+            if amount == 0 && !empty_front {
                 self.scheduler.remove(sid);
                 self.scheduled.remove(&sid);
                 continue;
@@ -1049,19 +1110,19 @@ impl<R: Read, W: Write> Connection<R, W> {
                 }
             }
 
-            let Some(stream) = self.streams.get(&sid) else {
+            if self.streams.get(&sid).is_none() {
                 self.scheduler.remove(sid);
                 self.scheduled.remove(&sid);
                 continue;
-            };
+            }
             let exhausted = self
                 .send_queue
                 .get(&sid)
                 .map(|q| q.is_empty())
                 .unwrap_or(true);
-            if !exhausted && stream.send_window > 0 {
+            if !exhausted {
                 self.maybe_schedule(sid);
-            } else if exhausted {
+            } else {
                 self.scheduler.remove(sid);
                 self.scheduled.remove(&sid);
             }
@@ -1107,16 +1168,15 @@ impl<R: Read, W: Write> Connection<R, W> {
         if self.scheduled.contains(&stream_id) {
             return;
         }
-        let has_data = self
+        let front = self
             .send_queue
             .get(&stream_id)
-            .map(|q| !q.is_empty())
-            .unwrap_or(false);
-        if !has_data {
+            .and_then(|queue| queue.front());
+        let Some(front) = front else {
             return;
-        }
+        };
         let ok = match self.streams.get(&stream_id) {
-            Some(s) => s.send_window > 0,
+            Some(s) => s.send_window > 0 || front.data.is_empty(),
             None => false,
         };
         if !ok {
@@ -1185,14 +1245,6 @@ impl<R: Read, W: Write> Connection<R, W> {
                 "frame header missing after a complete read",
             ));
         };
-        // RFC 9113 §6.3 and §6.9 scope two malformed frames to the stream
-        // rather than the connection: a PRIORITY whose length is not 5
-        // (stream error of type FRAME_SIZE_ERROR) and a stream-level
-        // WINDOW_UPDATE with a zero increment (stream error of type
-        // PROTOCOL_ERROR). `Frame::parse` reports every malformed frame
-        // the same way, and the connection-error path below would GOAWAY
-        // the whole multiplex — failing every unrelated in-flight request
-        // over one bad frame.
         let stream_scoped: Option<(u32, ErrorCode, &'static str)> =
             if header.kind == frame::kind::PRIORITY {
                 if header.stream_id == 0 {
@@ -1500,11 +1552,7 @@ impl<R: Read, W: Write> Connection<R, W> {
             if !self.streams.accept_peer_id(sid) {
                 return self.conn_error(ErrorCode::ProtocolError, "non-monotonic stream id");
             }
-            let max_conc = if self.local.max_concurrent_streams == 0 {
-                usize::MAX
-            } else {
-                self.local.max_concurrent_streams as usize
-            };
+            let max_conc = self.local.max_concurrent_streams as usize;
             if self.streams.open_count() >= max_conc {
                 self.pending_frames.push_back(Frame::RstStream {
                     stream_id: sid,
@@ -2442,6 +2490,90 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn terminal_frames_do_not_need_connection_or_stream_credit() {
+        for trailers in [false, true] {
+            for (connection_credit, stream_credit) in [(0, 65_535), (65_535, 0), (0, 0), (0, -1)] {
+                let mut conn = Connection::new(Silent, Refusing::unblocked(), Config::default());
+                let sid = conn.open_request(Priority::default()).unwrap();
+                conn.send_headers(
+                    sid,
+                    &vec![
+                        hf(":method", "POST"),
+                        hf(":scheme", "http"),
+                        hf(":path", "/"),
+                        hf(":authority", "localhost"),
+                    ],
+                    false,
+                )
+                .unwrap();
+                conn.flush().unwrap();
+                let before = conn.writer.get_ref().out.len();
+                conn.conn_send_window = FlowWindow::new(connection_credit, MAX_FLOW_WINDOW);
+                conn.streams.get_mut(&sid).unwrap().send_window = stream_credit;
+                if trailers {
+                    conn.send_trailers(sid, &vec![hf("grpc-status", "0")])
+                        .unwrap();
+                } else {
+                    conn.send_data(sid, Bytes::new(), true).unwrap();
+                }
+                conn.flush().unwrap();
+                let wire = &conn.writer.get_ref().out[before..];
+                assert!(
+                    wire.len() >= 9,
+                    "terminal frame stalled without flow credit"
+                );
+                assert_eq!(
+                    wire[3],
+                    if trailers {
+                        frame::kind::HEADERS
+                    } else {
+                        frame::kind::DATA
+                    }
+                );
+                assert_ne!(wire[4] & 1, 0, "END_STREAM must reach the wire");
+                assert!(conn.send_queue.get(&sid).unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn trailers_follow_data_when_its_last_byte_exhausts_both_windows() {
+        let mut conn = Connection::new(Silent, Refusing::unblocked(), Config::default());
+        let sid = conn.open_request(Priority::default()).unwrap();
+        conn.send_headers(
+            sid,
+            &vec![
+                hf(":method", "POST"),
+                hf(":scheme", "http"),
+                hf(":path", "/"),
+                hf(":authority", "localhost"),
+            ],
+            false,
+        )
+        .unwrap();
+        conn.flush().unwrap();
+        conn.conn_send_window = FlowWindow::new(2, MAX_FLOW_WINDOW);
+        conn.streams.get_mut(&sid).unwrap().send_window = 2;
+        conn.send_data(sid, Bytes::from_static(b"abcd"), false)
+            .unwrap();
+        conn.send_trailers(sid, &vec![hf("grpc-status", "0")])
+            .unwrap();
+        conn.flush().unwrap();
+        assert_eq!(conn.send_queue.get(&sid).unwrap().len(), 2);
+        let before = conn.writer.get_ref().out.len();
+        conn.on_window_update(0, 2).unwrap();
+        conn.on_window_update(sid, 2).unwrap();
+        conn.flush().unwrap();
+        let wire = &conn.writer.get_ref().out[before..];
+        assert_eq!(&wire[9..11], b"cd");
+        assert_eq!(wire[3], frame::kind::DATA);
+        assert_eq!(wire[4] & 1, 0);
+        assert_eq!(wire[11 + 3], frame::kind::HEADERS);
+        assert_ne!(wire[11 + 4] & 1, 0);
+        assert!(conn.send_queue.get(&sid).unwrap().is_empty());
+    }
+
     /// A full send buffer is backpressure, not a dead connection. With
     /// the window closed the driver keeps polling and the bytes stay put;
     /// once the peer drains, the upload resumes where it stopped, so the
@@ -2493,6 +2625,77 @@ mod tests {
             want,
             "the stream is byte-exact after the pause"
         );
+    }
+
+    #[test]
+    fn new_frames_wait_behind_a_refused_transport_tail() {
+        let mut reference = Connection::new(Silent, Refusing::unblocked(), Config::default());
+        small_upload(&mut reference);
+        reference.flush().unwrap();
+        for _ in 0..4 {
+            small_upload(&mut reference);
+        }
+        reference.flush().unwrap();
+        let expected = reference.writer.get_ref().out.clone();
+        let blocked = Rc::new(Cell::new(usize::MAX));
+        let mut stalled = Connection::new(
+            Silent,
+            Refusing {
+                out: Vec::new(),
+                calls: Rc::new(Cell::new(0)),
+                refuse_calls: blocked.clone(),
+                max_chunk: 512,
+            },
+            Config::default(),
+        );
+        small_upload(&mut stalled);
+        stalled.flush().unwrap();
+        for _ in 0..4 {
+            small_upload(&mut stalled);
+        }
+        for _ in 0..3 {
+            stalled.flush().unwrap();
+        }
+        assert!(stalled.writer.get_ref().out.is_empty());
+        blocked.set(0);
+        for _ in 0..4 {
+            stalled.flush().unwrap();
+        }
+        assert_eq!(
+            stalled.writer.get_ref().out,
+            expected,
+            "new frames must not disappear when flushing the older tail fails"
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn disabled_send_buffer_rejects_a_body_chunk_without_consuming_it() {
+        let mut conn = Connection::new(
+            Silent,
+            Refusing::unblocked(),
+            Config {
+                max_send_buffer: 0,
+                ..Config::default()
+            },
+        );
+        let sid = conn.open_request(Priority::default()).unwrap();
+        conn.send_headers(
+            sid,
+            &vec![
+                hf(":method", "POST"),
+                hf(":scheme", "http"),
+                hf(":path", "/"),
+            ],
+            false,
+        )
+        .unwrap();
+        let mut chunk = Bytes::from_static(b"not accepted");
+        assert_eq!(
+            conn.send_body_chunk(sid, &mut chunk).unwrap_err().kind,
+            ErrorKind::Overflow
+        );
+        assert_eq!(chunk.as_slice(), b"not accepted");
     }
 
     #[test]

@@ -97,7 +97,8 @@ impl Stats {
         Arc::new(Self::default())
     }
 
-    /// Read every counter at one instant.
+    /// Read counters independently with relaxed loads. Fields can describe
+    /// slightly different instants; this is not a coherent transaction.
     pub fn snapshot(&self) -> StatsSnapshot {
         StatsSnapshot {
             connections_accepted: self.connections_accepted.load(Ordering::Relaxed),

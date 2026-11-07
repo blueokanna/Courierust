@@ -200,7 +200,7 @@ pub struct ServerConfig {
     /// idle time, releasing the worker thread it occupied.
     pub h2_idle_timeout: Option<Duration>,
     /// h2: `SETTINGS_MAX_CONCURRENT_STREAMS` this server advertises
-    /// (RFC 9113 §6.5.2; 0 = unlimited). Streams beyond this limit are
+    /// (RFC 9113 §6.5.2; zero prevents new streams). Streams beyond this limit are
     /// rejected with `REFUSED_STREAM`.
     pub h2_max_concurrent_streams: u32,
     /// h2: return receive flow-control credit to the peer as request-body

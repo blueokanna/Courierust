@@ -8,10 +8,10 @@ use courierust_benchmark::metrics::{
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const CERT: &[u8] = include_bytes!("../certs/h3_server.der");
 const KEY: &[u8] = include_bytes!("../certs/h3_server_key.der");
@@ -20,18 +20,78 @@ const ALPN: &[u8] = b"courierust-benchmark";
 
 trait Transport: Read + Write + Send {}
 impl<T: Read + Write + Send> Transport for T {}
-struct Socket(TcpStream);
+#[derive(Default)]
+struct IoCost {
+    reads: AtomicU64,
+    writes: AtomicU64,
+    read_ns: AtomicU64,
+    write_ns: AtomicU64,
+}
+
+// Instrument only the separate diagnostic run, not comparison rows.
+struct Socket(TcpStream, Option<Arc<IoCost>>);
+impl Read for Socket {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let started = self.1.as_ref().map(|_| Instant::now());
+        let result = self.0.read(bytes);
+        if let (Some(cost), Some(started)) = (&self.1, started) {
+            cost.read_ns
+                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            cost.reads.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn read_vectored(&mut self, buffers: &mut [std::io::IoSliceMut<'_>]) -> std::io::Result<usize> {
+        let started = self.1.as_ref().map(|_| Instant::now());
+        let result = self.0.read_vectored(buffers);
+        if let (Some(cost), Some(started)) = (&self.1, started) {
+            cost.read_ns
+                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            cost.reads.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+}
+impl Write for Socket {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let started = self.1.as_ref().map(|_| Instant::now());
+        let result = self.0.write(bytes);
+        if let (Some(cost), Some(started)) = (&self.1, started) {
+            cost.write_ns
+                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            cost.writes.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    // Preserve rustls's ability to send several TLS records in one syscall.
+    // Write's default implementation would silently measure only one slice.
+    fn write_vectored(&mut self, buffers: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
+        let started = self.1.as_ref().map(|_| Instant::now());
+        let result = self.0.write_vectored(buffers);
+        if let (Some(cost), Some(started)) = (&self.1, started) {
+            cost.write_ns
+                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            cost.writes.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
 impl courierust::courierust_io::Read for Socket {
     fn read(&mut self, bytes: &mut [u8]) -> courierust::Result<usize> {
-        courierust::courierust_io::Read::read(&mut &self.0, bytes)
+        Read::read(self, bytes).map_err(Into::into)
     }
 }
 impl courierust::courierust_io::Write for Socket {
     fn write(&mut self, bytes: &[u8]) -> courierust::Result<usize> {
-        courierust::courierust_io::Write::write(&mut &self.0, bytes)
+        Write::write(self, bytes).map_err(Into::into)
     }
     fn flush(&mut self) -> courierust::Result<()> {
-        courierust::courierust_io::Write::flush(&mut &self.0)
+        Write::flush(self).map_err(Into::into)
     }
 }
 struct Own(tls::TlsStream<Socket, Socket>);
@@ -140,15 +200,17 @@ fn connect(
     ours: bool,
     own: &tls::TlsConnector,
     foreign: &Arc<rustls::ClientConfig>,
+    cost: Option<Arc<IoCost>>,
 ) -> Box<dyn Transport> {
-    let mut socket = TcpStream::connect_timeout(&address, Duration::from_secs(5)).unwrap();
+    let socket = TcpStream::connect_timeout(&address, Duration::from_secs(5)).unwrap();
     configure(&socket);
+    let mut socket = Socket(socket, cost);
     if ours {
         let stream = own
             .connect(
                 "localhost",
-                Socket(socket.try_clone().unwrap()),
-                Socket(socket),
+                Socket(socket.0.try_clone().unwrap(), socket.1.clone()),
+                socket,
             )
             .unwrap();
         assert_eq!(stream.version(), version.own);
@@ -233,7 +295,10 @@ fn peer(version: Version, ours: bool) -> Peer {
             sessions.push(std::thread::spawn(move || {
                 let mut stream: Box<dyn Transport> = if ours {
                     Box::new(Own(own
-                        .accept(Socket(socket.try_clone().unwrap()), Socket(socket))
+                        .accept(
+                            Socket(socket.try_clone().unwrap(), None),
+                            Socket(socket, None),
+                        )
                         .unwrap()))
                 } else {
                     let mut connection = rustls::ServerConnection::new(foreign).unwrap();
@@ -272,10 +337,97 @@ fn peer(version: Version, ours: bool) -> Peer {
     }
 }
 
+fn diagnose(version: Version, requests: usize) {
+    let peer = peer(version, false);
+    let own = version.own_client();
+    let foreign = version.foreign_client();
+    let payload = (0..65_536).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+    let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
+    frame.extend_from_slice(&payload);
+    for ours in [true, false] {
+        let cost = Arc::new(IoCost::default());
+        let mut stream = connect(
+            peer.address,
+            version,
+            ours,
+            &own,
+            &foreign,
+            Some(cost.clone()),
+        );
+        let mut reply = vec![0; payload.len()];
+        let mut operation = || {
+            stream.write_all(&frame).unwrap();
+            stream.flush().unwrap();
+            stream.read_exact(&mut reply).unwrap();
+            assert_eq!(reply, payload);
+        };
+        for _ in 0..8 {
+            operation();
+        }
+        for counter in [&cost.reads, &cost.writes, &cost.read_ns, &cost.write_ns] {
+            counter.store(0, Ordering::Relaxed);
+        }
+        let started = Instant::now();
+        for _ in 0..requests {
+            operation();
+        }
+        let total_ns = started.elapsed().as_nanos();
+        let read_ns = cost.read_ns.load(Ordering::Relaxed);
+        let write_ns = cost.write_ns.load(Ordering::Relaxed);
+        let per_call = |ns: u128| ns as f64 / requests as f64 / 1000.0;
+        println!("TLS_COST|protocol={}|client={}|server=rustls-aws-lc|bytes=65536|requests={requests}|wall_us={:.3}|socket_read_us={:.3}|socket_write_us={:.3}|outside_socket_us={:.3}|read_calls={}|write_calls={}|scope=client_after_warmup|instrumented=true",
+            version.label, if ours { "courierust" } else { "rustls-aws-lc" },
+            per_call(total_ns), per_call(read_ns.into()), per_call(write_ns.into()),
+            per_call(total_ns.saturating_sub(u128::from(read_ns) + u128::from(write_ns))),
+            cost.reads.load(Ordering::Relaxed), cost.writes.load(Ordering::Relaxed));
+    }
+}
+
+fn crypto_cost(requests: usize) {
+    use std::hint::black_box;
+    use tls::crypto::gcm;
+    let payload = vec![0xa7; 65_536];
+    let started = Instant::now();
+    for _ in 0..requests {
+        black_box(black_box(&payload).to_vec());
+    }
+    println!(
+        "TLS_COST|layer=allocate_copy_drop|bytes=65536|requests={requests}|us={:.3}",
+        started.elapsed().as_secs_f64() * 1e6 / requests as f64
+    );
+    let started = Instant::now();
+    let key = [0x37; 16];
+    let mut sequence = 0u64;
+    for _ in 0..requests {
+        for chunk in payload.chunks(16_384) {
+            let mut nonce = [0; 12];
+            nonce[4..].copy_from_slice(&sequence.to_be_bytes());
+            sequence += 1;
+            let sealed = gcm::seal(black_box(&key), &nonce, b"aad12", black_box(chunk)).unwrap();
+            assert_eq!(gcm::open(&key, &nonce, b"aad12", &sealed).unwrap(), chunk);
+        }
+    }
+    println!("TLS_COST|layer=aes128gcm_seal_open|bytes=65536|records=4|requests={requests}|us={:.3}|includes=key_setup_allocation_validation|network=none", started.elapsed().as_secs_f64() * 1e6 / requests as f64);
+    #[cfg(target_arch = "x86_64")]
+    println!(
+        "META|pclmulqdq={}|aesni={}",
+        std::is_x86_feature_detected!("pclmulqdq"),
+        std::is_x86_feature_detected!("aes")
+    );
+}
+
 fn main() {
     let requests = setting("BENCH_REQUESTS", 100);
     let repetitions = setting("BENCH_REPETITIONS", 4);
     let warmup = setting("BENCH_WARMUP", 4);
+    let diagnostics = match std::env::var("BENCH_TLS_DIAGNOSTICS").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("0") => false,
+        Ok("1") => true,
+        _ => panic!("BENCH_TLS_DIAGNOSTICS must be 0 or 1"),
+    };
+    if diagnostics {
+        crypto_cost(requests);
+    }
     println!("META|suite=tls|layer=tls_over_tcp|alpn=courierust-benchmark|verify=true|resumption=disabled|certificate=bench_h3_p256|courierust_clienthello=chrome_profile_with_pinned_crypto|rustls_provider=aws_lc_rs|nodelay=true|timeout_s=5|connections=1|load=closed_loop|validation=negotiated_parameters_and_full_payload|order=alternating");
     for version in [
         Version {
@@ -291,6 +443,10 @@ fn main() {
             label: "tls1.3-aes128gcm-x25519",
         },
     ] {
+        if diagnostics {
+            diagnose(version, requests);
+            continue;
+        }
         let own_client = version.own_client();
         let foreign_client = version.foreign_client();
         for server in [false, true] {
@@ -307,8 +463,16 @@ fn main() {
                     } else {
                         [false, true]
                     } {
-                        let make =
-                            || connect(peer.address, version, ours, &own_client, &foreign_client);
+                        let make = || {
+                            connect(
+                                peer.address,
+                                version,
+                                ours,
+                                &own_client,
+                                &foreign_client,
+                                None,
+                            )
+                        };
                         let mut operation: Box<dyn FnMut()> = if size == 0 {
                             Box::new(|| {
                                 drop(make());

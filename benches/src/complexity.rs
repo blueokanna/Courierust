@@ -6,12 +6,12 @@
 //! 1. **Time complexity** — how does the per-operation cost grow with the
 //!    input size? Every family is measured at several sizes spanning three
 //!    orders of magnitude, and each point is the minimum of three repeats
-//!    (noise only ever makes a measurement slower, so the minimum is the
-//!    right estimator — and a noisy point would otherwise invent curvature
-//!    that is not in the code). Two models are fitted: the affine model
+//!    (a lower-envelope diagnostic, not a typical-latency estimator;
+//!    frequency, cache state and scheduling can change it in either
+//!    direction). Two models are fitted: the affine model
 //!    `cost = a + b·n` (a fixed per-operation term plus a per-unit term,
 //!    with R²) and the *adjacent-pair exponents* whose median names the
-//!    asymptotic class (the maximum is reported beside it so a single
+//!    empirical scaling class (the maximum is reported beside it so a single
 //!    noisy pair cannot hide). The class is derived from the median
 //!    exponent: `O(1)` when it is ≈ 0, `O(n)` when it is ≈ 1, `O(n^k)`
 //!    otherwise (the bands are wide on purpose — over three orders of

@@ -630,7 +630,7 @@ fn frame_stream(
     max_message_size: usize,
     compress: bool,
 ) -> Result<Body> {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, body) = crate::courierust_body::channel();
     std::thread::Builder::new()
         .name("courierust-grpc-frame".into())
         .spawn(move || {
@@ -640,13 +640,13 @@ fn frame_stream(
                     Err(e) => Err(e),
                 };
                 let failed = frame.is_err();
-                if tx.send(frame.map(Bytes::from)).is_err() || failed {
+                if tx.send_result(frame.map(Bytes::from)).is_err() || failed {
                     break;
                 }
             }
         })
         .map_err(|e| Error::io(e.to_string()))?;
-    Ok(Body::Channel(rx))
+    Ok(body)
 }
 
 /// Simple percent-decoding for grpc-message (gRPC encodes non-ASCII as
@@ -946,7 +946,6 @@ impl<'a, I: Iterator<Item = Result<Bytes>>> Iterator for DeadlineIter<'a, I> {
 
 impl Handler for GrpcHandler {
     fn handle(&self, req: Request<Body>) -> Response<Body> {
-        // The request path is the method (we POST to /pkg.Svc/Method).
         let method = req.uri.as_str().to_string();
         let is_grpc = req
             .headers
@@ -963,9 +962,6 @@ impl Handler for GrpcHandler {
             return resp;
         }
 
-        // Deadline enforcement (gRPC A6): parse grpc-timeout. A malformed
-        // value is INVALID_ARGUMENT; an already-expired deadline is
-        // DEADLINE_EXCEEDED before any work is dispatched.
         let deadline = match Deadline::parse(&req.headers) {
             Ok(d) => d,
             Err(e) => {
@@ -979,8 +975,6 @@ impl Handler for GrpcHandler {
             return grpc_error_response(status::DEADLINE_EXCEEDED, "deadline exceeded");
         }
 
-        // Compression negotiation (gRPC A6): compress responses with gzip
-        // only when the client declared it can accept it.
         let accept_gzip = req
             .headers
             .get("grpc-accept-encoding")
@@ -992,7 +986,6 @@ impl Handler for GrpcHandler {
             })
             .unwrap_or(false);
 
-        // Decode all request messages from the buffered body.
         let raw = match req.body.collect() {
             Ok(b) => b.to_vec(),
             Err(e) => return grpc_error_response(status::INTERNAL, &e.to_string()),
@@ -1007,36 +1000,12 @@ impl Handler for GrpcHandler {
             }
         };
 
-        // The service runs on its own thread so that a server-streaming
-        // call (which may never return, e.g. health `Watch`) does not
-        // block the connection's worker. The service sends *raw* messages
-        // to `msg_tx`; a framing thread wraps each in a gRPC frame and
-        // forwards it to the response body channel, so messages stream to
-        // the peer incrementally.
-        //
-        // `handle()` returns as soon as the call either (a) produced its
-        // first response message (a streaming call: the response head is
-        // decided then and `grpc-status` rides in the trailing block) or
-        // (b) finished without producing a message (a finite call: its
-        // final status is known and reported exactly, including error
-        // codes). Fast-fail conditions above are still reported before
-        // any of this.
         let (msg_tx, msg_rx) = std::sync::mpsc::channel();
         let msg_sender = crate::courierust_body::BodySender::from_sender(msg_tx);
-        // Cancellation: set when nobody is reading the response any more
-        // (the peer went away) or when `handle()` gives up on it (deadline
-        // exceeded). A long-lived handler such as health `Watch` polls it
-        // between waits; without it both threads below outlived the
-        // response and leaked — one per timed-out streaming call.
         let cancel = msg_sender.cancel_flag();
         let (body_tx, body) = crate::courierust_body::channel();
         let max = self.max_message_size;
-        // Signals `Started` on the first forwarded message. Both threads
-        // drop their clones on exit, so `recv()` disconnecting means the
-        // call completed without streaming.
         let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
-        // The framing thread publishes this outcome only after the last
-        // message, while the handler also needs it for trailers-only calls.
         let result = Arc::new(Mutex::new(None));
         let framing_result = result.clone();
         let service_result = result.clone();
@@ -1091,9 +1060,6 @@ impl Handler for GrpcHandler {
                         }
                     };
                     if body_tx.send(Bytes::from(frame)).is_err() {
-                        // The response body was dropped: stop consuming and
-                        // tell the handler, which is what lets a service
-                        // blocked on its own logic return.
                         cancel_framing.store(true, std::sync::atomic::Ordering::Release);
                         break;
                     }
@@ -1116,13 +1082,7 @@ impl Handler for GrpcHandler {
 
         let service = self.service.clone();
         let method2 = method.clone();
-        // The original `started_tx` is moved into the serve thread: it is
-        // dropped only when that thread ends, so `started_rx` disconnects
-        // exactly when the call finishes (used to distinguish a finite
-        // call with no messages from a streaming one).
         let started_tx3 = started_tx;
-        // `deadline` is moved into the serve closure; snapshot the
-        // instant first so `handle()` can still wait with a timeout.
         let service_thread = std::thread::Builder::new()
             .name("courierust-grpc-serve".into())
             .spawn(move || {
@@ -1139,9 +1099,6 @@ impl Handler for GrpcHandler {
                     Err(_) => Err((status::INTERNAL, "service handler panicked".to_string())),
                 };
                 *crate::lock(&service_result) = Some(mapped);
-                // Dropping `started_tx3` (and, on the way out, the
-                // framing thread's clone once the message channel closes)
-                // lets `handle()` see the call finished.
                 drop(started_tx3);
             });
         if let Err(error) = service_thread {
@@ -1172,7 +1129,6 @@ impl Handler for GrpcHandler {
             }
         };
 
-        // The final metadata comes from the producer after its last message.
         let streaming_response = |body: Body| {
             let mut resp = Response::<Body>::with_status(200.into());
             resp.headers.insert(
@@ -1192,19 +1148,13 @@ impl Handler for GrpcHandler {
         };
 
         match wait {
-            // First message produced: the call is streaming.
             WaitOutcome::Started => streaming_response(body),
-            // All senders gone: the call finished without streaming, so
-            // its exact outcome is known.
             WaitOutcome::Finished => match crate::lock(&result).clone() {
                 Some(Ok(())) => streaming_response(body),
                 Some(Err((code, msg))) => grpc_error_response(code, &msg),
                 None => grpc_error_response(status::INTERNAL, "service thread exited"),
             },
             WaitOutcome::DeadlineExceeded => {
-                // Tell the handler the response is no longer wanted before
-                // answering: the serving thread and its channels end
-                // instead of running out the call in the background.
                 cancel.store(true, std::sync::atomic::Ordering::Release);
                 grpc_error_response(status::DEADLINE_EXCEEDED, "deadline exceeded")
             }

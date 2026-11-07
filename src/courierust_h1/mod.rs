@@ -307,13 +307,16 @@ pub fn body_length(
 fn read_into<R: Read>(reader: &mut BufReader<R>, out: &mut Vec<u8>, total: usize) -> Result<()> {
     out.reserve(total.saturating_sub(out.len()));
     while out.len() < total {
-        let b = reader.fill_buf()?;
-        if b.is_empty() {
-            return Err(Error::eof());
+        let filled = out.len();
+        let end = filled + (total - filled).min(64 * 1024);
+        out.resize(end, 0);
+        match reader.read_direct(&mut out[filled..end]) {
+            Ok(n) => out.truncate(filled + n),
+            Err(error) => {
+                out.truncate(filled);
+                return Err(error);
+            }
         }
-        let take = core::cmp::min(total - out.len(), b.len());
-        out.extend_from_slice(&b[..take]);
-        reader.consume(take);
     }
     Ok(())
 }
@@ -329,8 +332,8 @@ pub fn read_body_fixed<R: Read>(
     Ok(Bytes::from(out))
 }
 
-/// Read a fixed-length body into a scratch body buffer (no steady-state
-/// allocation).
+/// Read a fixed-length body using the scratch body buffer. Ownership is
+/// transferred to the result; its capacity is not retained in `scratch`.
 pub fn read_body_fixed_scratch<R: Read>(
     reader: &mut BufReader<R>,
     len: usize,
@@ -361,8 +364,8 @@ pub fn read_body_chunked<R: Read>(reader: &mut BufReader<R>, max: usize) -> Resu
     Ok(Bytes::from(out))
 }
 
-/// Read a chunked body into a scratch body buffer (no steady-state
-/// allocation).
+/// Read a chunked body using the scratch body buffer. Ownership is
+/// transferred to the result; its capacity is not retained in `scratch`.
 pub fn read_body_chunked_scratch<R: Read>(
     reader: &mut BufReader<R>,
     max: usize,
@@ -648,6 +651,50 @@ pub fn is_hop_by_hop(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_body_read_preserves_following_bytes_and_avoids_small_reads() {
+        struct Counted<'a> {
+            source: SliceReader<'a>,
+            calls: alloc::rc::Rc<core::cell::Cell<usize>>,
+        }
+        impl Read for Counted<'_> {
+            fn read(&mut self, out: &mut [u8]) -> Result<usize> {
+                self.calls.set(self.calls.get() + 1);
+                self.source.read(out)
+            }
+        }
+        let payload = vec![0xa7; 1024 * 1024];
+        let mut wire = b"head".to_vec();
+        wire.extend_from_slice(&payload);
+        wire.extend_from_slice(b"next");
+        let calls = alloc::rc::Rc::new(core::cell::Cell::new(0));
+        let mut reader = BufReader::new(
+            Counted {
+                source: SliceReader::new(&wire),
+                calls: calls.clone(),
+            },
+            16,
+        );
+        assert_eq!(reader.read_exact(4).unwrap(), b"head");
+        assert_eq!(
+            &*read_body_fixed(&mut reader, payload.len(), payload.len()).unwrap(),
+            payload
+        );
+        assert_eq!(calls.get(), 17, "bulk reads are capped at 64 KiB");
+        assert_eq!(reader.read_exact(4).unwrap(), b"next");
+    }
+
+    #[test]
+    fn incomplete_bulk_body_does_not_publish_zero_filled_tail() {
+        let mut reader = BufReader::new(SliceReader::new(b"partial"), 2);
+        let mut out = Vec::new();
+        assert_eq!(
+            read_into(&mut reader, &mut out, 16).unwrap_err().kind,
+            ErrorKind::UnexpectedEof
+        );
+        assert_eq!(out, b"partial");
+    }
 
     #[test]
     fn a_textual_start_line_cannot_claim_http2_or_http3() {

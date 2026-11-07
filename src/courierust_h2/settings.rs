@@ -34,7 +34,7 @@ pub struct Settings {
     pub header_table_size: u32,
     /// Whether server push is enabled (default 1; clients MUST send 0).
     pub enable_push: u32,
-    /// Maximum concurrent streams (0 = unlimited).
+    /// Maximum concurrent streams; zero prevents opening new streams.
     pub max_concurrent_streams: u32,
     /// Initial stream flow-control window (default 65535).
     pub initial_window_size: u32,
@@ -51,7 +51,7 @@ impl Default for Settings {
         Self {
             header_table_size: 4096,
             enable_push: 1,
-            max_concurrent_streams: 0,
+            max_concurrent_streams: u32::MAX,
             initial_window_size: 65535,
             max_frame_size: 16384,
             max_header_list_size: 0,

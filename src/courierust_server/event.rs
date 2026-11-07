@@ -1300,7 +1300,6 @@ pub(crate) fn serve_event(
             );
         })?;
 
-    // Event worker threads.
     let workers = if config.event_workers == 0 {
         std::thread::available_parallelism()
             .map(|n| n.get().clamp(1, 8))
@@ -1350,38 +1349,7 @@ pub(crate) fn serve_event(
     Ok(())
 }
 
-/// Create a loopback socket pair used as a self-pipe to wake a poller
-/// out of a blocking wait. Pure std, cross-platform (Windows has no
-/// native `socketpair`; a loopback pair is the portable equivalent).
-pub(crate) fn wakeup_pair() -> std::io::Result<(TcpStream, TcpStream)> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    let writer = TcpStream::connect(listener.local_addr()?)?;
-    let (reader, _) = listener.accept()?;
-    reader.set_nonblocking(true)?;
-    writer.set_nonblocking(true)?;
-    let _ = reader.set_nodelay(true);
-    let _ = writer.set_nodelay(true);
-    Ok((reader, writer))
-}
-
-/// Write one byte to the wake pipe (best-effort; a full or failed write
-/// only loses an optimization, never correctness).
-pub(crate) fn wake_nudge(w: &TcpStream) {
-    let mut s: &TcpStream = w;
-    let _ = std::io::Write::write(&mut s, &[1]);
-}
-
-/// Drain all pending wake bytes so the pipe cannot fire spuriously.
-pub(crate) fn drain_wake(r: &TcpStream) {
-    let mut buf = [0u8; 64];
-    loop {
-        let mut s: &TcpStream = r;
-        match std::io::Read::read(&mut s, &mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-    }
-}
+pub(crate) use crate::courierust_net::wake::{drain_wake, wake_nudge, wakeup_pair};
 
 /// The WebSocket connections whose keepalive or close-handshake deadline
 /// has elapsed.

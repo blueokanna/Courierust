@@ -316,6 +316,44 @@ fn h2_concurrent_streams_multiplex() {
 }
 
 #[test]
+fn h2_streaming_upload_splits_a_chunk_larger_than_its_send_buffer() {
+    let expected: Vec<u8> = (0..8193).map(|i| (i % 251) as u8).collect();
+    let server_expected = expected.clone();
+    let base = spawn_server(
+        ServerConfig {
+            http2: true,
+            ..Default::default()
+        },
+        move |req| {
+            let body = req.body.collect().unwrap();
+            assert_eq!(body.as_ref(), server_expected.as_slice());
+            let mut response =
+                courierust::courierust_http::response::Response::<Body>::with_status(200.into());
+            response.body = Body::Bytes(Bytes::from_static(b"complete"));
+            response
+        },
+    );
+    let client = Client::with_config(ClientConfig {
+        http2: true,
+        // This also configures the H2 per-stream send buffer.
+        max_body: 1024,
+        read_timeout: Some(std::time::Duration::from_secs(5)),
+        ..Default::default()
+    });
+    for _ in 0..2 {
+        let (sender, body) = courierust::courierust_body::channel();
+        sender.send(Bytes::from(expected.clone())).unwrap();
+        drop(sender);
+        let mut request = Request::new(Method::POST, "/oversized-chunk");
+        request.body = body;
+        let response = client
+            .execute(&format!("{base}/oversized-chunk"), request)
+            .unwrap();
+        assert_eq!(response.body.collect().unwrap().as_ref(), b"complete");
+    }
+}
+
+#[test]
 fn h2_one_connection_concurrent_burst_completes() {
     let server_cfg = ServerConfig {
         http2: true,

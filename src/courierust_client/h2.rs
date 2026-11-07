@@ -2,11 +2,12 @@
 //! streams over one TCP connection. Requests are submitted over a
 //! channel; responses stream back through per-stream channels.
 
-use crate::courierust_body::Body;
+use crate::courierust_body::{Body, ChannelStream};
 use crate::courierust_bytes::Bytes;
 use crate::courierust_client::ClientConfig;
 use crate::courierust_error::{Error, Result};
 use crate::courierust_h2::connection::{Config as H2Config, Connection, Event};
+use crate::courierust_h2::driver::{watch_body, Readiness};
 use crate::courierust_h2::error::ErrorCode;
 use crate::courierust_h2::priority::Priority;
 use crate::courierust_hpack::HeaderField;
@@ -15,6 +16,7 @@ use crate::courierust_http::response::ResponseHead;
 use crate::courierust_http::status::StatusCode;
 use crate::courierust_http::version::Version;
 use crate::courierust_net::stats::{ActiveH2Streams, Counting, Stats};
+use crate::courierust_net::wake::wake_nudge;
 use crate::courierust_net::ConnStream;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -63,7 +65,7 @@ pub enum H2Cmd {
         /// HPACK header block.
         fields: Vec<HeaderField>,
         /// Request-body chunks (or an error to abort the stream).
-        body: Receiver<Result<Bytes>>,
+        body: ChannelStream,
         /// RFC 9218 priority to signal.
         priority: Priority,
         /// Per-request deadline override; `None` uses the driver's
@@ -81,6 +83,7 @@ pub enum H2Cmd {
 pub struct H2Conn {
     /// Command channel to the driver thread.
     pub tx: Sender<H2Cmd>,
+    wake: Arc<std::net::TcpStream>,
     /// Remote address.
     pub peer: SocketAddr,
     /// Whether the connection still accepts new streams (flipped by the
@@ -205,10 +208,57 @@ fn deadline_from(timeout: Option<Duration>) -> Option<std::time::Instant> {
 /// An in-flight streaming request body being fed to the connection.
 struct StreamBody {
     /// The channel the caller feeds body chunks into.
-    rx: Receiver<Result<Bytes>>,
+    rx: ChannelStream,
     /// A chunk that could not be queued yet (flow control) and must be
     /// retried on the next poll.
     pending_chunk: Option<Bytes>,
+}
+
+struct DeferredCommand {
+    command: H2Cmd,
+    deadline: Option<std::time::Instant>,
+}
+
+fn expire_deferred(deferred: &mut VecDeque<DeferredCommand>) {
+    let now = std::time::Instant::now();
+    for _ in 0..deferred.len() {
+        let command = deferred.pop_front().expect("bounded by queue length");
+        if command.deadline.is_some_and(|deadline| now >= deadline) {
+            let error = Error::timeout("h2 peer did not make a stream slot available in time");
+            match command.command {
+                H2Cmd::Request { reply, .. } => {
+                    let _ = reply.send(Err(error));
+                }
+                H2Cmd::RequestStream { body, reply, .. } => {
+                    body.clear_wake();
+                    let _ = reply.send(Err(error));
+                }
+                H2Cmd::Shutdown => {}
+            }
+        } else {
+            deferred.push_back(command);
+        }
+    }
+}
+
+impl Drop for StreamBody {
+    fn drop(&mut self) {
+        self.rx.clear_wake();
+    }
+}
+
+impl H2Conn {
+    pub(crate) fn send(
+        &self,
+        command: H2Cmd,
+    ) -> std::result::Result<(), std::sync::mpsc::SendError<H2Cmd>> {
+        if let H2Cmd::RequestStream { body, .. } = &command {
+            watch_body(body, &self.wake);
+        }
+        self.tx.send(command)?;
+        wake_nudge(&self.wake);
+        Ok(())
+    }
 }
 
 /// Maximum number of commands waiting for a free stream slot on one
@@ -219,12 +269,12 @@ struct StreamBody {
 const MAX_DEFERRED: usize = 1024;
 
 /// Whether the peer's `SETTINGS_MAX_CONCURRENT_STREAMS` budget is
-/// exhausted. A limit of 0 means unlimited (RFC 9113 §6.5.2). `pending`
+/// exhausted. A limit of 0 prevents new streams (RFC 9113 §6.5.2). `pending`
 /// tracks every client-initiated stream whose response has not yet fully
 /// arrived, which is exactly the client's concurrent-stream count.
 fn stream_limit_reached(conn: &DriverConn<'_>, pending: &HashMap<u32, Pending>) -> bool {
     let limit = conn.peer_settings().max_concurrent_streams as usize;
-    limit != 0 && pending.len() >= limit
+    pending.len() >= limit
 }
 
 /// Start an h2 connection driver over `stream` (plain TCP or TLS).
@@ -254,6 +304,8 @@ fn start_inner(
     stream.configure(Some(DRIVER_READ_TIMEOUT))?;
     let peer = stream.peer_addr();
     let (tx, rx) = channel::<H2Cmd>();
+    let readiness = Readiness::new(&stream)?;
+    let wake = readiness.notifier();
     let cfg = cfg.clone();
     let accepting = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let accepting2 = accepting.clone();
@@ -278,10 +330,12 @@ fn start_inner(
                 reads,
                 writes,
                 stats,
+                readiness,
             );
         })?;
     Ok(H2Conn {
         tx,
+        wake,
         peer,
         accepting,
         reservations,
@@ -317,6 +371,7 @@ fn driver(
     reads: Arc<AtomicUsize>,
     writes: Arc<AtomicUsize>,
     stats: Option<Arc<Stats>>,
+    mut readiness: Readiness,
 ) {
     let stats = stats.as_deref();
     if let Some(s) = stats {
@@ -341,7 +396,7 @@ fn driver(
     let mut pending: HashMap<u32, Pending> = HashMap::new();
     let mut stream_bodies: HashMap<u32, StreamBody> = HashMap::new();
     let mut goaway = false;
-    let mut deferred: VecDeque<H2Cmd> = VecDeque::new();
+    let mut deferred: VecDeque<DeferredCommand> = VecDeque::new();
     let mut stream_stats = ActiveH2Streams::new(stats);
 
     if let Some(reply) = upgrade_reply {
@@ -407,10 +462,39 @@ fn driver(
         let has_work =
             got_cmd || !deferred.is_empty() || !pending.is_empty() || !stream_bodies.is_empty();
         if has_work {
-            // Queue ready upload chunks before polling: poll_available flushes
-            // outbound data before its potentially blocking socket read.
             drain_stream_bodies(&mut conn, &mut stream_bodies, &mut pending);
-            match conn.poll_available(64) {
+            let mut wait = if stream_bodies.values().any(|body| !body.rx.has_wake()) {
+                DRIVER_READ_TIMEOUT
+            } else {
+                Duration::from_millis(200)
+            };
+            let now = std::time::Instant::now();
+            for deadline in pending.values().filter_map(|request| request.deadline) {
+                wait = wait.min(deadline.saturating_duration_since(now));
+            }
+            for deadline in deferred.iter().filter_map(|command| command.deadline) {
+                wait = wait.min(deadline.saturating_duration_since(now));
+            }
+            for (base, interval) in [
+                (
+                    started,
+                    cfg.h2_settings_timeout
+                        .filter(|_| conn.settings_ack_pending()),
+                ),
+                (
+                    last_rx,
+                    cfg.h2_ping_interval.filter(|_| last_ping.is_none()),
+                ),
+                (
+                    last_ping.unwrap_or(now),
+                    cfg.h2_ping_timeout.filter(|_| last_ping.is_some()),
+                ),
+            ] {
+                if let Some(deadline) = interval.and_then(|interval| base.checked_add(interval)) {
+                    wait = wait.min(deadline.saturating_duration_since(now));
+                }
+            }
+            match readiness.poll(&mut conn, &stream, wait) {
                 Ok(true) => last_rx = std::time::Instant::now(),
                 Ok(false) => {}
                 Err(e) => {
@@ -620,7 +704,7 @@ fn handle_cmd(
     pending: &mut HashMap<u32, Pending>,
     stream_bodies: &mut HashMap<u32, StreamBody>,
     goaway: &mut bool,
-    deferred: &mut VecDeque<H2Cmd>,
+    deferred: &mut VecDeque<DeferredCommand>,
     cmd: H2Cmd,
     timeout: Option<Duration>,
     stats: Option<&Stats>,
@@ -644,13 +728,16 @@ fn handle_cmd(
             }
             if stream_limit_reached(conn, pending) {
                 if deferred.len() < MAX_DEFERRED {
-                    deferred.push_back(H2Cmd::Request {
-                        fields,
-                        body,
-                        end_stream,
-                        priority,
-                        timeout: request_timeout,
-                        reply,
+                    deferred.push_back(DeferredCommand {
+                        deadline: deadline_from(request_timeout.or(timeout)),
+                        command: H2Cmd::Request {
+                            fields,
+                            body,
+                            end_stream,
+                            priority,
+                            timeout: request_timeout,
+                            reply,
+                        },
                     });
                 } else {
                     let _ = reply.send(Err(Error::h2(
@@ -709,12 +796,15 @@ fn handle_cmd(
             }
             if stream_limit_reached(conn, pending) {
                 if deferred.len() < MAX_DEFERRED {
-                    deferred.push_back(H2Cmd::RequestStream {
-                        fields,
-                        body,
-                        priority,
-                        timeout: request_timeout,
-                        reply,
+                    deferred.push_back(DeferredCommand {
+                        deadline: deadline_from(request_timeout.or(timeout)),
+                        command: H2Cmd::RequestStream {
+                            fields,
+                            body,
+                            priority,
+                            timeout: request_timeout,
+                            reply,
+                        },
                     });
                 } else {
                     let _ = reply.send(Err(Error::h2(
@@ -803,14 +893,23 @@ fn retry_deferred(
     pending: &mut HashMap<u32, Pending>,
     stream_bodies: &mut HashMap<u32, StreamBody>,
     goaway: &mut bool,
-    deferred: &mut VecDeque<H2Cmd>,
+    deferred: &mut VecDeque<DeferredCommand>,
     timeout: Option<Duration>,
     stats: Option<&Stats>,
 ) -> bool {
-    while let Some(cmd) = deferred.pop_front() {
+    expire_deferred(deferred);
+    while let Some(mut entry) = deferred.pop_front() {
         if stream_limit_reached(conn, pending) {
-            deferred.push_front(cmd);
+            deferred.push_front(entry);
             return true;
+        }
+        if let Some(deadline) = entry.deadline {
+            match &mut entry.command {
+                H2Cmd::Request { timeout, .. } | H2Cmd::RequestStream { timeout, .. } => {
+                    *timeout = Some(deadline.saturating_duration_since(std::time::Instant::now()));
+                }
+                H2Cmd::Shutdown => {}
+            }
         }
         if !handle_cmd(
             conn,
@@ -818,7 +917,7 @@ fn retry_deferred(
             stream_bodies,
             goaway,
             deferred,
-            cmd,
+            entry.command,
             timeout,
             stats,
         ) {
@@ -838,40 +937,26 @@ fn drain_stream_bodies(
 ) {
     let mut done = Vec::new();
     for (&sid, b) in bodies.iter_mut() {
-        if let Some(chunk) = b.pending_chunk.take() {
-            match conn.send_data(sid, chunk.clone(), false) {
-                Ok(_) => {}
-                Err(e) if e.kind == crate::courierust_error::ErrorKind::Overflow => {
-                    b.pending_chunk = Some(chunk);
-                    continue;
-                }
-                Err(error) => {
-                    fail_request_body(conn, pending, sid, error);
-                    done.push(sid);
-                    continue;
-                }
-            }
-        }
         // A continuously producing channel must not starve other streams,
         // inbound WINDOW_UPDATE frames or deadline processing.
         for _ in 0..64 {
+            if let Some(chunk) = b.pending_chunk.as_mut() {
+                if let Err(error) = conn.send_body_chunk(sid, chunk) {
+                    fail_request_body(conn, pending, sid, error);
+                    done.push(sid);
+                    break;
+                }
+                if !chunk.is_empty() {
+                    break;
+                }
+                b.pending_chunk = None;
+            }
             match b.rx.try_recv() {
                 Ok(Ok(chunk)) => {
                     if chunk.is_empty() {
                         continue;
                     }
-                    match conn.send_data(sid, chunk.clone(), false) {
-                        Ok(_) => {}
-                        Err(e) if e.kind == crate::courierust_error::ErrorKind::Overflow => {
-                            b.pending_chunk = Some(chunk);
-                            break;
-                        }
-                        Err(error) => {
-                            fail_request_body(conn, pending, sid, error);
-                            done.push(sid);
-                            break;
-                        }
-                    }
+                    b.pending_chunk = Some(chunk);
                 }
                 Ok(Err(error)) => {
                     fail_request_body(conn, pending, sid, error);
@@ -1278,9 +1363,6 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 fn fail_all(pending: &mut HashMap<u32, Pending>, err: Error) {
     for (_, p) in pending.drain() {
-        // Notify both channels: streams whose response head was already
-        // delivered (so `reply` is gone) are still listening on the body
-        // channel and must not see the transport death as a clean EOF.
         let _ = p.body_tx.map(|tx| tx.send(Err(err.clone())));
         let _ = p.reply.map(|r| r.send(Err(err.clone())));
     }
@@ -1318,12 +1400,92 @@ pub fn request_fields(
 mod tests {
     use super::*;
 
+    #[test]
+    fn deferred_deadlines_expire_behind_a_longer_lived_request() {
+        let make = |timeout| {
+            let (reply, receiver) = channel();
+            (
+                DeferredCommand {
+                    command: H2Cmd::Request {
+                        fields: Vec::new(),
+                        body: None,
+                        end_stream: true,
+                        priority: Priority::default(),
+                        timeout,
+                        reply,
+                    },
+                    deadline: deadline_from(timeout),
+                },
+                receiver,
+            )
+        };
+        let (waiting, waiting_reply) = make(None);
+        let (expired, expired_reply) = make(Some(Duration::ZERO));
+        let mut deferred = VecDeque::from([waiting, expired]);
+        expire_deferred(&mut deferred);
+        assert_eq!(deferred.len(), 1);
+        assert!(matches!(
+            waiting_reply.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            expired_reply.try_recv().unwrap().err().unwrap().kind,
+            crate::courierust_error::ErrorKind::Timeout
+        );
+    }
+
+    #[test]
+    fn zero_stream_limit_defers_until_peer_raises_it() {
+        use crate::courierust_h2::{
+            frame::Frame,
+            settings::{Setting, SETTINGS_MAX_CONCURRENT_STREAMS},
+        };
+        let (mut peer, socket) = crate::courierust_net::wake::wakeup_pair().unwrap();
+        let stream = ConnStream::plain(socket);
+        let mut conn = Connection::new(
+            Counting::new(
+                &stream,
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            ),
+            Counting::new(
+                &stream,
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            ),
+            h2_config(&ClientConfig::default()),
+        );
+        let pending = HashMap::new();
+        assert!(!stream_limit_reached(&conn, &pending));
+        for limit in [0, 2] {
+            let mut bytes = crate::courierust_bytes::BytesMut::new();
+            Frame::Settings {
+                ack: false,
+                entries: vec![Setting {
+                    id: SETTINGS_MAX_CONCURRENT_STREAMS,
+                    value: limit,
+                }],
+            }
+            .encode(&mut bytes);
+            std::io::Write::write_all(&mut peer, &bytes).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while conn.peer_settings().max_concurrent_streams != limit {
+                conn.poll_available(64).unwrap();
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            assert_eq!(stream_limit_reached(&conn, &pending), limit == 0);
+        }
+    }
+
     /// A bare `H2Conn` with inert shared state, for accounting tests that
     /// never touch the driver thread.
     fn test_conn() -> H2Conn {
         let (tx, _rx) = channel::<H2Cmd>();
+        let (_reader, writer) = crate::courierust_net::wake::wakeup_pair().unwrap();
         H2Conn {
             tx,
+            wake: Arc::new(writer),
             peer: "127.0.0.1:1".parse().unwrap(),
             accepting: Arc::new(AtomicBool::new(true)),
             reservations: Arc::new(AtomicUsize::new(0)),

@@ -2,7 +2,7 @@
 //! as used by the TLS 1.3 AES-GCM suites.
 //!
 //! The GF(2^128) multiplication follows the NIST convention: the
-//! 128-bit block is a polynomial with the *leftmost* bit as x^127, so
+//! 128-bit block is a polynomial with the *leftmost* bit as x^0, so
 //! the multiply is the shift-right algorithm with reduction
 //! R = 11100001 || 0^120 (x^128 + x^7 + x^2 + x + 1).
 
@@ -12,13 +12,12 @@ use alloc::vec::Vec;
 /// Tag length in bytes (16 for TLS).
 pub const TAG_LEN: usize = 16;
 
-/// The GCM reduction constant R = x^128 + x^7 + x^2 + x + 1 (as a
-/// 128-bit value with bit 120 = x^127 ... per the NIST representation).
+/// Reduction mask for NIST's shift-right field representation.
 const R: u128 = 0xe1 << 120;
 
 /// Multiply two field elements in the GCM representation (NIST SP
-/// 800-38D Algorithm 1). `a` is consumed from its leftmost bit (x^127)
-/// down to bit 0 (x^0).
+/// 800-38D Algorithm 1). `a` is consumed from its leftmost bit (x^0)
+/// down to its rightmost bit (x^127).
 ///
 /// Both data-dependent decisions — "xor in `v`" and "reduce after the
 /// shift" — are taken with arithmetic masks instead of branches. `v`
@@ -41,6 +40,14 @@ fn gf_mul(a: u128, b: u128) -> u128 {
 
 /// GHASH over AAD and ciphertext, plus the 64-bit length block.
 fn ghash(h: u128, aad: &[u8], ct: &[u8]) -> u128 {
+    #[cfg(target_arch = "x86_64")]
+    if hardware::available() {
+        return ghash_with(h, aad, ct, hardware::multiply);
+    }
+    ghash_with(h, aad, ct, gf_mul)
+}
+
+fn ghash_with(h: u128, aad: &[u8], ct: &[u8], multiply: impl Fn(u128, u128) -> u128) -> u128 {
     let mut y = 0u128;
     let mut block = [0u8; 16];
     let mut process = |y: &mut u128, data: &[u8]| {
@@ -48,7 +55,7 @@ fn ghash(h: u128, aad: &[u8], ct: &[u8]) -> u128 {
             block.fill(0);
             block[..chunk.len()].copy_from_slice(chunk);
             *y ^= u128::from_be_bytes(block);
-            *y = gf_mul(*y, h);
+            *y = multiply(*y, h);
         }
     };
     process(&mut y, aad);
@@ -56,8 +63,11 @@ fn ghash(h: u128, aad: &[u8], ct: &[u8]) -> u128 {
     let la = (aad.len() as u128) * 8;
     let lc = (ct.len() as u128) * 8;
     y ^= (la << 64) | lc;
-    gf_mul(y, h)
+    multiply(y, h)
 }
+
+#[cfg(target_arch = "x86_64")]
+mod hardware;
 
 /// Increment the low 32 bits of a counter block (J0 inc32).
 #[inline]
@@ -83,7 +93,7 @@ pub fn seal(key: &[u8], iv: &[u8; 12], aad: &[u8], plaintext: &[u8]) -> Option<V
     let j0 = u128::from_be_bytes(j0_bytes);
 
     // GCTR keystream from counter = inc32(J0), inc32 twice, ...
-    let mut ct = Vec::with_capacity(plaintext.len());
+    let mut ct = Vec::with_capacity(plaintext.len() + TAG_LEN);
     let mut counter = inc32(j0);
     for chunk in plaintext.chunks(16) {
         let ks = cipher_block(&aes, counter);
@@ -143,6 +153,45 @@ pub fn open(key: &[u8], iv: &[u8; 12], aad: &[u8], sealed: &[u8]) -> Option<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn carryless_product_matches_all_field_basis_pairs() {
+        if !hardware::available() {
+            return;
+        }
+        for left in 0..128 {
+            for right in 0..128 {
+                let a = 1u128 << left;
+                let b = 1u128 << right;
+                assert_eq!(
+                    hardware::multiply(a, b),
+                    gf_mul(a, b),
+                    "basis {left}, {right}"
+                );
+            }
+        }
+        let mut state = 0x9e3779b97f4a7c15d1b54a32d192ed03u128;
+        for _ in 0..2048 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let other = state.rotate_left(53) ^ u128::MAX;
+            assert_eq!(hardware::multiply(state, other), gf_mul(state, other));
+        }
+    }
+
+    #[test]
+    fn dispatched_ghash_matches_portable_for_partial_and_large_blocks() {
+        for aad_len in [0, 1, 13, 16, 20, 33] {
+            let aad = vec![0xa7; aad_len];
+            for size in [0, 1, 15, 16, 17, 31, 32, 1024, 16_384, 65_536] {
+                let bytes = (0..size).map(|n| (n % 251) as u8).collect::<Vec<_>>();
+                let h = 0x66e94bd4ef8a2c3b884cfa59ca342b2eu128;
+                assert_eq!(ghash(h, &aad, &bytes), ghash_with(h, &aad, &bytes, gf_mul));
+            }
+        }
+    }
 
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())

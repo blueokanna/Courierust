@@ -6,6 +6,8 @@
 //! codec runs over TCP or a TLS stream.
 
 pub mod connection;
+#[cfg(feature = "std")]
+pub(crate) mod driver;
 pub mod error;
 pub mod flow;
 pub mod frame;

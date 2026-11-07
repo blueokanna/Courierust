@@ -146,9 +146,21 @@ fn compare_h2_connection_sweep(
     }
 }
 
-/// Bind a Courierust server that serves `payload` on every request and
-/// leak its shutdown handle so it outlives the bench process.
-fn serve_courierust(config: ServerConfig, payload: Payload) -> SocketAddr {
+struct Peer {
+    address: SocketAddr,
+    stop: Option<Box<dyn FnOnce()>>,
+}
+
+impl Drop for Peer {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            stop();
+        }
+    }
+}
+
+/// Keep the server alive only for this comparison, including shutdown.
+fn serve_courierust(config: ServerConfig, payload: Payload) -> Peer {
     let server = Server::bind_with_config("127.0.0.1:0", config).unwrap();
     let address = server.local_addr().unwrap();
     let body = response_bytes(payload);
@@ -157,11 +169,16 @@ fn serve_courierust(config: ServerConfig, payload: Payload) -> SocketAddr {
             Response::<Body>::with_status(200.into()).with_body(Body::Bytes(body.clone()))
         })
         .unwrap();
-    std::mem::forget(handle);
-    address
+    Peer {
+        address,
+        stop: Some(Box::new(move || {
+            handle.stop();
+            handle.join().unwrap();
+        })),
+    }
 }
 
-fn courierust_server(protocol: Protocol, payload: Payload) -> SocketAddr {
+fn courierust_server(protocol: Protocol, payload: Payload) -> Peer {
     serve_courierust(
         ServerConfig {
             http2: protocol.uses_http2(),
@@ -172,7 +189,7 @@ fn courierust_server(protocol: Protocol, payload: Payload) -> SocketAddr {
     )
 }
 
-fn hyper_server(protocol: Protocol, payload: Payload) -> SocketAddr {
+fn hyper_server(protocol: Protocol, payload: Payload) -> Peer {
     use http_body_util::{BodyExt, Full};
     use hyper::body::{Bytes as HyperBytes, Incoming};
     use hyper::service::service_fn;
@@ -191,10 +208,15 @@ fn hyper_server(protocol: Protocol, payload: Payload) -> SocketAddr {
     let address = listener.local_addr().unwrap();
     let body = HyperBytes::from(response_bytes(payload).to_vec());
 
-    std::thread::spawn(move || {
+    let (stop, mut stopped) = tokio::sync::oneshot::channel();
+    let thread = std::thread::spawn(move || {
         runtime.block_on(async move {
             loop {
-                let Ok((stream, _)) = listener.accept().await else {
+                let accepted = tokio::select! {
+                    _ = &mut stopped => break,
+                    accepted = listener.accept() => accepted,
+                };
+                let Ok((stream, _)) = accepted else {
                     break;
                 };
                 stream.set_nodelay(true).unwrap();
@@ -229,7 +251,13 @@ fn hyper_server(protocol: Protocol, payload: Payload) -> SocketAddr {
             }
         });
     });
-    address
+    Peer {
+        address,
+        stop: Some(Box::new(move || {
+            let _ = stop.send(());
+            thread.join().unwrap();
+        })),
+    }
 }
 
 fn assert_courierust_response(response: Response<Body>, expected_bytes: usize, protocol: Protocol) {
@@ -728,7 +756,7 @@ fn compare_servers(
 // --- HTTP/3: Courierust H3 client vs quinn+h3 client (same H3 server, pooled conn) ---
 
 /// A Courierust HTTP/3 (QUIC v1 + TLS 1.3, ALPN `h3`) server.
-fn h3_server(payload: Payload) -> SocketAddr {
+fn h3_server(payload: Payload) -> Peer {
     let identity = courierust::courierust_tls::Identity::from_der(
         vec![H3_SERVER_CERT_DER.to_vec()],
         H3_SERVER_KEY_DER.to_vec(),
@@ -903,7 +931,8 @@ fn compare_h3_clients(
     repetitions: usize,
     handle: &tokio::runtime::Handle,
 ) {
-    let address = h3_server(payload);
+    let peer = h3_server(payload);
+    let address = peer.address;
     let mut courierust_timing = None;
     for _ in 0..repetitions {
         merge_timing(
@@ -979,11 +1008,40 @@ fn main() {
         "META|suite=compare|requests_per_repetition={requests}|parallel_requests_per_repetition={parallel_requests}|parallel_workers={parallel_workers}|repetitions={repetitions}|max_samples={MAX_SAMPLES}"
     );
 
+    let mut payloads = vec![ONE_KIB, SIXTY_FOUR_KIB];
+    match std::env::var("BENCH_RESPONSE_SWEEP").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("0") => {}
+        Ok("1") => payloads.extend([
+            Payload {
+                name: "256k",
+                bytes: 256 * 1024,
+            },
+            Payload {
+                name: "512k",
+                bytes: 512 * 1024,
+            },
+            Payload {
+                name: "1m",
+                bytes: 1024 * 1024,
+            },
+            Payload {
+                name: "2m",
+                bytes: 2 * 1024 * 1024,
+            },
+            Payload {
+                name: "4m",
+                bytes: 4 * 1024 * 1024,
+            },
+        ]),
+        _ => panic!("BENCH_RESPONSE_SWEEP must be 0 or 1"),
+    }
     raw_tcp_floor(requests);
     for protocol in [Protocol::H1, Protocol::H2c] {
-        for payload in [ONE_KIB, SIXTY_FOUR_KIB] {
-            let hyper = hyper_server(protocol, payload);
-            let courierust = courierust_server(protocol, payload);
+        for &payload in &payloads {
+            let hyper_peer = hyper_server(protocol, payload);
+            let courierust_peer = courierust_server(protocol, payload);
+            let hyper = hyper_peer.address;
+            let courierust = courierust_peer.address;
             compare_clients(protocol, hyper, payload, requests, 1, repetitions, &handle);
             compare_servers(
                 protocol,

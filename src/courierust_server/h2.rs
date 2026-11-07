@@ -8,6 +8,7 @@ use crate::courierust_body::{Body, ChannelStream};
 use crate::courierust_bytes::Bytes;
 use crate::courierust_error::{Error, Result};
 use crate::courierust_h2::connection::{Config as H2Config, Connection, Event};
+use crate::courierust_h2::driver::{watch_body, Readiness};
 use crate::courierust_h2::error::ErrorCode;
 use crate::courierust_hpack::HeaderField;
 use crate::courierust_http::header::{HeaderMap, HeaderName, HeaderValue};
@@ -25,9 +26,16 @@ use std::sync::Arc;
 /// A response body waiting for flow-control room.
 struct Deferred {
     rx: ChannelStream,
+    pending_chunk: Option<Bytes>,
     ending: bool,
     /// Trailing header block to send once the body ends (HTTP/2).
     trailers: Option<Vec<HeaderField>>,
+}
+
+impl Drop for Deferred {
+    fn drop(&mut self) {
+        self.rx.clear_wake();
+    }
 }
 
 /// Consume and verify the 24-byte HTTP/2 client connection preface.
@@ -41,10 +49,9 @@ fn read_preface(stream: &ConnStream) -> Result<()> {
     Ok(())
 }
 
-/// A short read timeout lets the serve loop wake to flush deferred
-/// (channel) response bodies even while the peer is silent
-fn configure_read_timeout(stream: &ConnStream) {
-    let _ = stream.configure(Some(std::time::Duration::from_millis(250)));
+/// Bound partial-frame reads after a readiness notification.
+fn configure_read_timeout(stream: &ConnStream) -> Result<()> {
+    stream.configure(Some(STREAMING_READ_TIMEOUT))
 }
 
 const STREAMING_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5);
@@ -58,7 +65,7 @@ pub(crate) fn serve(
     config: &ServerConfig,
 ) -> Result<()> {
     read_preface(stream)?;
-    configure_read_timeout(stream);
+    configure_read_timeout(stream)?;
     let stats = config.stats.clone();
     let stats = stats.as_deref();
     if let Some(s) = stats {
@@ -83,7 +90,7 @@ pub(crate) fn serve_upgraded(
     is_head: bool,
 ) -> Result<()> {
     read_preface(stream)?;
-    configure_read_timeout(stream);
+    configure_read_timeout(stream)?;
     let stats = config.stats.clone();
     let stats = stats.as_deref();
     if let Some(s) = stats {
@@ -167,25 +174,51 @@ fn serve_loop(
     let started = std::time::Instant::now();
     let mut last_rx = started;
     let mut last_ping: Option<std::time::Instant> = None;
-    let mut streaming = false;
+    let mut readiness = Readiness::new(stream)?;
+    let wake = readiness.notifier();
     let mut stream_stats = ActiveH2Streams::new(stats);
 
     loop {
-        let want_streaming = !deferred.is_empty();
-        if want_streaming != streaming {
-            let _ = stream.configure(Some(if want_streaming {
-                STREAMING_READ_TIMEOUT
-            } else {
-                QUIET_READ_TIMEOUT
-            }));
-            streaming = want_streaming;
+        for body in deferred.values() {
+            if !body.rx.has_wake() {
+                watch_body(&body.rx, &wake);
+            }
         }
-        if want_streaming {
-            let _ = conn.flush();
-            flush_deferred(conn, deferred)?;
+        flush_deferred(conn, deferred)?;
+        let mut wait = if deferred.values().any(|body| !body.rx.has_wake()) {
+            STREAMING_READ_TIMEOUT
+        } else {
+            QUIET_READ_TIMEOUT
+        };
+        let now = std::time::Instant::now();
+        for (base, interval) in [
+            (
+                started,
+                config
+                    .h2_settings_timeout
+                    .filter(|_| conn.settings_ack_pending()),
+            ),
+            (
+                last_rx,
+                config
+                    .h2_idle_timeout
+                    .filter(|_| req_bodies.is_empty() && deferred.is_empty()),
+            ),
+            (
+                last_rx,
+                config.h2_ping_interval.filter(|_| last_ping.is_none()),
+            ),
+            (
+                last_ping.unwrap_or(now),
+                config.h2_ping_timeout.filter(|_| last_ping.is_some()),
+            ),
+        ] {
+            if let Some(deadline) = interval.and_then(|interval| base.checked_add(interval)) {
+                wait = wait.min(deadline.saturating_duration_since(now));
+            }
         }
 
-        match conn.poll_available(64) {
+        match readiness.poll(conn, stream, wait) {
             Ok(true) => last_rx = std::time::Instant::now(),
             Ok(false) => {}
             Err(e) => return Err(e),
@@ -457,6 +490,7 @@ fn send_response(
                 sid,
                 Deferred {
                     rx,
+                    pending_chunk: None,
                     ending: false,
                     trailers,
                 },
@@ -495,13 +529,24 @@ pub fn response_fields(resp: &Response<Body>) -> Vec<HeaderField> {
 }
 
 /// Drain deferred (channel) bodies into the connection as room allows.
-fn flush_deferred(
-    conn: &mut Connection<Counting<&ConnStream>, Counting<&ConnStream>>,
+fn flush_deferred<R: crate::courierust_io::Read, W: crate::courierust_io::Write>(
+    conn: &mut Connection<R, W>,
     deferred: &mut HashMap<u32, Deferred>,
 ) -> Result<()> {
     let mut done: Vec<u32> = Vec::new();
     for (sid, d) in deferred.iter_mut() {
-        loop {
+        for _ in 0..64 {
+            if let Some(chunk) = d.pending_chunk.as_mut() {
+                if conn.send_body_chunk(*sid, chunk).is_err() {
+                    conn.send_rst(*sid, ErrorCode::InternalError);
+                    done.push(*sid);
+                    break;
+                }
+                if !chunk.is_empty() {
+                    break;
+                }
+                d.pending_chunk = None;
+            }
             if d.ending {
                 let res = match &d.trailers {
                     Some(t) => conn.send_trailers(*sid, t),
@@ -512,14 +557,15 @@ fn flush_deferred(
                         done.push(*sid);
                         break;
                     }
-                    Err(_) => break, // buffer full; retry later
+                    Err(_) => {
+                        conn.send_rst(*sid, ErrorCode::InternalError);
+                        done.push(*sid);
+                        break;
+                    }
                 }
             }
             match d.rx.try_recv() {
-                Ok(Ok(b)) if !b.is_empty() => match conn.send_data(*sid, b, false) {
-                    Ok(_) => continue,
-                    Err(_) => break,
-                },
+                Ok(Ok(b)) if !b.is_empty() => d.pending_chunk = Some(b),
                 Ok(Err(_e)) => {
                     conn.send_rst(*sid, ErrorCode::InternalError);
                     done.push(*sid);
@@ -541,4 +587,99 @@ fn flush_deferred(
         deferred.remove(&sid);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::courierust_h2::priority::Priority;
+    use crate::courierust_io::{SliceReader, VecWriter};
+
+    #[test]
+    fn deferred_body_keeps_oversized_chunks_and_orders_trailers_after_data() {
+        let mut wire = VecWriter(Vec::new());
+        let mut conn = Connection::new(
+            SliceReader::new(&[]),
+            &mut wire,
+            H2Config {
+                max_send_buffer: 3,
+                ..H2Config::default()
+            },
+        );
+        let sid = conn.open_request(Priority::default()).unwrap();
+        let fields = vec![
+            HeaderField::new(
+                HeaderName::from_lowercase(":method"),
+                HeaderValue::from_static("POST"),
+            ),
+            HeaderField::new(
+                HeaderName::from_lowercase(":scheme"),
+                HeaderValue::from_static("http"),
+            ),
+            HeaderField::new(
+                HeaderName::from_lowercase(":path"),
+                HeaderValue::from_static("/"),
+            ),
+        ];
+        conn.send_headers(sid, &fields, false).unwrap();
+        conn.flush().unwrap();
+        let (tx, body) = crate::courierust_body::channel();
+        tx.send(Bytes::from_static(b"abcdefgh")).unwrap();
+        tx.send(Bytes::from_static(b"ijklm")).unwrap();
+        drop(tx);
+        let Body::Stream(rx) = body else {
+            panic!("expected stream")
+        };
+        let mut deferred = HashMap::from([(
+            sid,
+            Deferred {
+                rx,
+                pending_chunk: None,
+                ending: false,
+                trailers: Some(vec![HeaderField::new(
+                    HeaderName::from_lowercase("grpc-status"),
+                    HeaderValue::from_static("0"),
+                )]),
+            },
+        )]);
+        flush_deferred(&mut conn, &mut deferred).unwrap();
+        assert_eq!(
+            deferred[&sid].pending_chunk.as_ref().unwrap().as_slice(),
+            b"defgh"
+        );
+        // Repeated drains with a full buffer must neither consume nor lose data.
+        flush_deferred(&mut conn, &mut deferred).unwrap();
+        assert_eq!(
+            deferred[&sid].pending_chunk.as_ref().unwrap().as_slice(),
+            b"defgh"
+        );
+        for _ in 0..8 {
+            conn.flush().unwrap();
+            flush_deferred(&mut conn, &mut deferred).unwrap();
+        }
+        assert!(deferred.is_empty());
+        conn.flush().unwrap();
+        drop(conn);
+        assert!(crate::courierust_h2::connection::is_preface(&wire.0[..24]));
+        let mut offset = 24;
+        let mut data = Vec::new();
+        let mut ended = false;
+        while offset < wire.0.len() {
+            let header = &wire.0[offset..offset + 9];
+            let len =
+                ((header[0] as usize) << 16) | ((header[1] as usize) << 8) | header[2] as usize;
+            let payload = &wire.0[offset + 9..offset + 9 + len];
+            assert!(!ended, "frame after END_STREAM");
+            if header[3] == 0 {
+                data.extend_from_slice(payload);
+            }
+            if header[4] & 1 != 0 && (header[3] == 0 || header[3] == 1) {
+                assert_eq!(header[3], 1, "trailers must end the stream");
+                assert_eq!(data, b"abcdefghijklm");
+                ended = true;
+            }
+            offset += 9 + len;
+        }
+        assert!(ended);
+    }
 }

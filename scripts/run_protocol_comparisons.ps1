@@ -7,8 +7,6 @@ param(
     [string]$OutputDirectory = 'target/protocol-comparison'
 )
 
-# Build before measuring, run suites sequentially, and preserve failures.
-# Cargo's JSON artifacts identify the exact executable; no stale-binary glob.
 $ErrorActionPreference = 'Stop'
 if ($Repetitions % 2 -ne 0) { throw 'Use an even repetition count to balance execution order.' }
 $repoDirectory = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -21,6 +19,17 @@ if (-not $outputPath.StartsWith($repoDirectory + [System.IO.Path]::DirectorySepa
 $utf8 = [System.Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding = $utf8
 $suites = @('compare', 'grpc', 'tls', 'ws', 'h3', 'interop')
+function Get-SourceHashes {
+    $paths = (& git ls-files -z -co --exclude-standard) -join "`n"
+    if ($LASTEXITCODE -ne 0) { throw 'Source inventory could not be captured.' }
+    $paths.Split([char[]]@([char]0), [StringSplitOptions]::RemoveEmptyEntries) | Sort-Object -Unique | ForEach-Object {
+        if (Test-Path -LiteralPath $_ -PathType Leaf) {
+            $hash = Get-FileHash -LiteralPath $_ -Algorithm SHA256
+            "$($hash.Hash) $_"
+        }
+    }
+}
+$sourceHashes = @(Get-SourceHashes)
 $buildArguments = @("+$Toolchain", 'bench', '--manifest-path', 'benches/Cargo.toml', '--locked', '--no-run', '--message-format=json')
 foreach ($suite in $suites) { $buildArguments += @('--bench', $suite) }
 # PowerShell 5 treats native stderr as ErrorRecord even when Cargo succeeds.
@@ -30,6 +39,9 @@ $buildExit = $LASTEXITCODE
 $ErrorActionPreference = 'Stop'
 [System.IO.File]::WriteAllLines((Join-Path $outputPath 'build-artifacts.jsonl'), [string[]]$artifacts, $utf8)
 if ($buildExit -ne 0) { throw "Build failed ($buildExit); see build.log." }
+if (($sourceHashes -join "`n") -cne ((Get-SourceHashes) -join "`n")) {
+    throw 'Sources changed during compilation. Rerun after edits finish; this build cannot be attributed to one snapshot.'
+}
 $executables = @{}
 foreach ($line in $artifacts) {
     $artifact = $line | ConvertFrom-Json
@@ -46,27 +58,22 @@ $provenance = @(
     "Requests per repetition: $Requests; repetitions: $Repetitions; warmup: $Warmup",
     "RUSTFLAGS: $env:RUSTFLAGS",
     "Suite timeout seconds: $SuiteTimeoutSeconds"
+    "BENCH_RESPONSE_SWEEP: $env:BENCH_RESPONSE_SWEEP; GRPC_SERVER_NODELAY: 1; BENCH_TLS_DIAGNOSTICS: 0"
 )
 $provenance += & git rev-parse HEAD
 $provenance += & git status --short
 $provenance += & rustc "+$Toolchain" --version --verbose
 $provenance += & cargo "+$Toolchain" tree --manifest-path benches/Cargo.toml --locked --depth 1
 $provenance += Get-FileHash Cargo.lock, benches/Cargo.lock -Algorithm SHA256 | ForEach-Object { "$($_.Hash) $($_.Path)" }
+$provenance += $executables.Values | ForEach-Object { Get-FileHash -LiteralPath $_ -Algorithm SHA256 } | ForEach-Object { "$($_.Hash) $($_.Path)" }
 [System.IO.File]::WriteAllLines((Join-Path $outputPath 'benchmark-environment.log'), [string[]]$provenance, $utf8)
-$sourcePaths = (& git ls-files -z -co --exclude-standard) -join "`n"
-if ($LASTEXITCODE -ne 0) { throw 'Source inventory could not be captured.' }
-$sourceHashes = $sourcePaths.Split([char[]]@([char]0), [StringSplitOptions]::RemoveEmptyEntries) | Sort-Object -Unique | ForEach-Object {
-    if (Test-Path -LiteralPath $_ -PathType Leaf) {
-        $hash = Get-FileHash -LiteralPath $_ -Algorithm SHA256
-        "$($hash.Hash) $_"
-    }
-}
 [System.IO.File]::WriteAllLines((Join-Path $outputPath 'source-sha256.txt'), [string[]]$sourceHashes, $utf8)
 $metadata = & cargo "+$Toolchain" metadata --manifest-path benches/Cargo.toml --locked --format-version 1
 if ($LASTEXITCODE -ne 0) { throw 'Dependency provenance could not be captured.' }
 [System.IO.File]::WriteAllText((Join-Path $outputPath 'benchmark-dependencies.json'), ($metadata -join "`n"), $utf8)
 
 $outcomes = @{}
+$durations = @{}
 foreach ($suite in $suites) {
     if (-not $executables.ContainsKey($suite)) { throw "Cargo did not produce $suite." }
     $process = [System.Diagnostics.Process]::new()
@@ -80,10 +87,14 @@ foreach ($suite in $suites) {
     $process.StartInfo.EnvironmentVariables['BENCH_REPETITIONS'] = "$Repetitions"
     $process.StartInfo.EnvironmentVariables['BENCH_WARMUP'] = "$Warmup"
     $process.StartInfo.EnvironmentVariables['WS_BENCH_SECTION'] = 'compare'
+    $process.StartInfo.EnvironmentVariables['GRPC_SERVER_NODELAY'] = '1'
+    $process.StartInfo.EnvironmentVariables['BENCH_TLS_DIAGNOSTICS'] = '0'
     foreach ($variable in @('H3_SWEEP', 'H3_SWEEP_CHILD', 'H3_SCENARIOS')) {
         $process.StartInfo.EnvironmentVariables.Remove($variable)
     }
     Write-Output "Running $suite ..."
+    $startedUtc = [DateTime]::UtcNow.ToString('o')
+    $clock = [Diagnostics.Stopwatch]::StartNew()
     [void]$process.Start()
     $stdout = $process.StandardOutput.ReadToEndAsync()
     $stderr = $process.StandardError.ReadToEndAsync()
@@ -97,9 +108,12 @@ foreach ($suite in $suites) {
     [System.IO.File]::WriteAllText((Join-Path $outputPath "$suite.log"), $stdout.GetAwaiter().GetResult(), $utf8)
     [System.IO.File]::WriteAllText((Join-Path $outputPath "$suite.stderr.log"), $stderr.GetAwaiter().GetResult(), $utf8)
     $process.Dispose()
+    $clock.Stop()
+    $durations[$suite] = @{ started_utc = $startedUtc; elapsed_seconds = $clock.Elapsed.TotalSeconds }
     Write-Output "$suite exit: $($outcomes[$suite])"
 }
 [System.IO.File]::WriteAllText((Join-Path $outputPath 'suite-status.json'), ($outcomes | ConvertTo-Json), $utf8)
+[System.IO.File]::WriteAllText((Join-Path $outputPath 'suite-timing.json'), ($durations | ConvertTo-Json), $utf8)
 
 $bashCommand = 'bash'
 if ($env:OS -eq 'Windows_NT') {

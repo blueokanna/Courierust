@@ -27,6 +27,7 @@ use std::time::Duration;
 pub(crate) mod poller;
 pub mod stats;
 pub(crate) mod udp;
+pub(crate) mod wake;
 
 impl Read for &TcpStream {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {

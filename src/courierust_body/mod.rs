@@ -372,7 +372,7 @@ impl std::fmt::Debug for Body {
 /// watch loop — should poll [`BodySender::is_cancelled`] between waits,
 /// which is what lets its thread end instead of outliving the client.
 pub struct BodySender {
-    tx: Sender<Result<Bytes>>,
+    tx: Option<Sender<Result<Bytes>>>,
     cancelled: Arc<AtomicBool>,
     /// Shared with the receiver side (`Body::Stream`), which is where a
     /// transport installs its wake callback.
@@ -388,7 +388,7 @@ impl BodySender {
     /// resulting body must poll. Use [`channel`] for a wake-capable pair.
     pub fn from_sender(tx: std::sync::mpsc::Sender<Result<Bytes>>) -> Self {
         Self {
-            tx,
+            tx: Some(tx),
             cancelled: Arc::new(AtomicBool::new(false)),
             wake: BodyWake::new(),
             trailers: None,
@@ -429,7 +429,7 @@ impl BodySender {
 
     /// Send a chunk.
     pub fn send(&self, chunk: Bytes) -> Result<()> {
-        self.tx.send(Ok(chunk)).map_err(|_| {
+        self.sender().send(Ok(chunk)).map_err(|_| {
             self.cancel();
             Error::canceled("body receiver dropped")
         })?;
@@ -444,7 +444,7 @@ impl BodySender {
 
     /// Send a raw result (a chunk or a transport error) to the receiver.
     pub fn send_result(&self, result: Result<Bytes>) -> Result<()> {
-        self.tx.send(result).map_err(|_| {
+        self.sender().send(result).map_err(|_| {
             self.cancel();
             Error::canceled("body receiver dropped")
         })?;
@@ -454,9 +454,20 @@ impl BodySender {
 
     /// Send an error to the receiver.
     pub fn fail(&self, err: Error) {
-        if self.tx.send(Err(err)).is_ok() {
+        if self.sender().send(Err(err)).is_ok() {
             self.wake.fire();
         }
+    }
+
+    fn sender(&self) -> &Sender<Result<Bytes>> {
+        self.tx.as_ref().expect("sender exists until Drop")
+    }
+}
+
+impl Drop for BodySender {
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        self.wake.fire();
     }
 }
 
@@ -472,7 +483,7 @@ pub fn channel() -> (BodySender, Body) {
     let trailers = Arc::new(Mutex::new(None));
     (
         BodySender {
-            tx,
+            tx: Some(tx),
             cancelled: Arc::new(AtomicBool::new(false)),
             wake: wake.clone(),
             trailers: Some(trailers.clone()),
@@ -489,6 +500,27 @@ pub fn channel() -> (BodySender, Body) {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn producer_drop_notifies_after_channel_disconnection() {
+        let (sender, body) = channel();
+        let stream = Arc::new(Mutex::new(body.into_stream().unwrap()));
+        let receiver = Arc::downgrade(&stream);
+        let closed = Arc::new(AtomicBool::new(false));
+        let observed = closed.clone();
+        crate::lock(&stream).install_wake(move || {
+            let stream = receiver.upgrade().unwrap();
+            observed.store(
+                matches!(
+                    crate::lock(&stream).try_recv(),
+                    Err(TryRecvError::Disconnected)
+                ),
+                Ordering::Release,
+            );
+        });
+        drop(sender);
+        assert!(closed.load(Ordering::Acquire));
+    }
 
     /// The producer fires the wake once per chunk, a cleared wake stays
     /// quiet (a finished body must not wake its transport again), and a

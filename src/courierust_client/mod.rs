@@ -1209,11 +1209,6 @@ impl Client {
         priority: Priority,
         timeout: Option<Duration>,
     ) -> Result<crate::courierust_client::h2::H2Response> {
-        // Body bytes feed the weighted connection-selection load: a
-        // connection carrying a large upload is more expensive on the wire
-        // than one carrying several header-only RPCs, so the pool weights
-        // by size, not just by stream count. Unknown (streaming) bodies
-        // weigh 0 — an honest "don't know", not a guess.
         let body_bytes = req.body.len().unwrap_or(0);
         let conn = self.get_h2_conn(authority, addr, tls.as_ref(), proxy, &url.host, body_bytes)?;
         let fields = h2::request_fields(&req, &url.scheme, authority);
@@ -1558,7 +1553,7 @@ impl Client {
         rx: std::sync::mpsc::Receiver<Result<crate::courierust_client::h2::H2Response>>,
         body_bytes: usize,
     ) -> Result<crate::courierust_client::h2::H2Response> {
-        match conn.tx.send(cmd) {
+        match conn.send(cmd) {
             Ok(()) => {
                 let started = Instant::now();
                 let result = rx
@@ -1576,7 +1571,7 @@ impl Client {
                 let (tx2, rx2) = std::sync::mpsc::channel();
                 let cmd2 = retarget_reply(cmd, tx2);
                 let started = Instant::now();
-                let result = match fresh.tx.send(cmd2) {
+                let result = match fresh.send(cmd2) {
                     Ok(()) => rx2
                         .recv()
                         .map_err(|_| Error::canceled("h2 driver closed the channel"))
@@ -1767,14 +1762,14 @@ fn build_h2_cmd(
     match body {
         Body::Channel(body_rx) => H2Cmd::RequestStream {
             fields,
-            body: body_rx,
+            body: crate::courierust_body::ChannelStream::raw(body_rx),
             priority,
             timeout,
             reply: tx,
         },
         Body::Stream(stream) => H2Cmd::RequestStream {
             fields,
-            body: stream.into_receiver(),
+            body: stream,
             priority,
             timeout,
             reply: tx,
@@ -1943,7 +1938,6 @@ impl Proxy {
         if host.is_empty() || host.bytes().any(|b| b <= b' ' || b == 0x7f) {
             return Err(Error::protocol("invalid proxy host"));
         }
-        // curl's reading of a bare userinfo: the password is empty.
         let credentials = userinfo.map(|u| match u.split_once(':') {
             Some((user, pass)) => (user.to_string(), pass.to_string()),
             None => (u.to_string(), String::new()),

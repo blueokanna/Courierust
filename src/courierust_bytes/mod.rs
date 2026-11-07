@@ -20,7 +20,7 @@ pub struct Bytes {
 }
 
 impl Default for Bytes {
-    /// Empty buffer (no allocation). Kept explicit instead of derived:
+    /// Empty buffer. Kept explicit instead of derived:
     /// deriving `Default` needs `[u8]: Default`, which is only stable from
     /// Rust 1.79 — this manual impl keeps MSRV 1.78.
     #[inline]
@@ -40,7 +40,7 @@ impl Bytes {
         }
     }
 
-    /// Buffer from a static slice (no allocation).
+    /// Copy a static slice into reference-counted storage.
     #[inline]
     pub fn from_static(s: &'static [u8]) -> Self {
         Self {
