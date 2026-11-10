@@ -11,42 +11,42 @@
 		{
 			"label": "ci: clippy",
 			"type": "shell",
-			"command": "rustup run 1.78.0 cargo clippy --all-targets -- -D warnings",
+			"command": "rustup run 1.78.0 cargo clippy --locked --all-targets -- -D warnings",
 			"problemMatcher": [],
 			"group": "test"
 		},
 		{
 			"label": "ci: clippy (no default features)",
 			"type": "shell",
-			"command": "rustup run 1.78.0 cargo clippy --no-default-features --lib -- -D warnings",
+			"command": "rustup run 1.78.0 cargo clippy --locked --no-default-features --lib -- -D warnings",
 			"problemMatcher": [],
 			"group": "test"
 		},
 		{
 			"label": "ci: test all targets",
 			"type": "shell",
-			"command": "rustup run 1.78.0 cargo test --all-targets",
+			"command": "rustup run 1.78.0 cargo test --locked --all-targets",
 			"problemMatcher": [],
 			"group": "test"
 		},
 		{
 			"label": "ci: doc",
 			"type": "shell",
-			"command": "rustup run 1.78.0 cargo doc --no-deps",
+			"command": "rustup run 1.78.0 cargo doc --locked --no-deps",
 			"problemMatcher": [],
 			"group": "test"
 		},
 		{
 			"label": "ci: benches all targets (locked)",
 			"type": "shell",
-			"command": "rustup run stable cargo check --manifest-path benches/Cargo.toml --all-targets --locked",
+			"command": "rustup run 1.98.0 cargo check --manifest-path benches/Cargo.toml --all-targets --locked",
 			"problemMatcher": [],
 			"group": "test"
 		},
 		{
-			"label": "ci: fuzz all targets",
+			"label": "ci: fuzz all targets (locked)",
 			"type": "shell",
-			"command": "rustup run stable cargo check --manifest-path fuzz/Cargo.toml --all-targets",
+			"command": "rustup run 1.98.0 cargo check --manifest-path fuzz/Cargo.toml --all-targets --locked",
 			"problemMatcher": [],
 			"group": "test"
 		},
