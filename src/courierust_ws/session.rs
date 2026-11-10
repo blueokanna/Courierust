@@ -49,8 +49,9 @@ pub enum MaskSource {
     /// Never mask: the only legal choice for a server (§5.1).
     #[default]
     None,
-    /// A fixed key. Deterministic: for tests and fuzzing, and for
-    /// `no_std` callers that inject their own entropy.
+    /// A fixed key for deterministic tests and fuzzing only.
+    /// Production `no_std` clients must supply fresh unpredictable keys with
+    /// [`FrameWriter::set_mask_generator`].
     Fixed([u8; 4]),
     /// Platform CSPRNG, used to seed a ChaCha20 stream per session. The
     /// default for clients; RFC 6455 §5.3 requires the key to be
@@ -866,6 +867,7 @@ mod tests {
     use crate::courierust_io::{BufReader, SliceReader};
     use crate::courierust_ws::handshake::CompressionParams;
     use crate::courierust_ws::writer::VecSink;
+    use alloc::string::ToString;
     use alloc::vec;
 
     type TestSession = Session<SliceReader<'static>, VecSink>;
@@ -905,13 +907,20 @@ mod tests {
     }
 
     fn client() -> TestSession {
-        // The production client configuration: fresh, unpredictable mask
-        // key per frame from a CSPRNG-seeded stream.
         let cfg = SessionConfig {
             role: Role::Client,
             ..Default::default()
         };
+        #[cfg(feature = "std")]
         let writer = FrameWriter::new(VecSink::new(), MaskSource::Random, None);
+        #[cfg(not(feature = "std"))]
+        let writer = {
+            let mut counter = 0u32;
+            FrameWriter::with_mask_generator(VecSink::new(), None, move || {
+                counter = counter.wrapping_add(1);
+                Ok(counter.to_be_bytes())
+            })
+        };
         Session::new(BufReader::new(SliceReader::new(&[]), 4096), writer, cfg)
     }
 
@@ -964,7 +973,6 @@ mod tests {
         let mut s = server(&wire);
         assert_eq!(next(&mut s).unwrap(), Event::Ping(Bytes::from(&b"hi"[..])));
         assert_eq!(next(&mut s).unwrap(), Event::Pong(Bytes::from(&b"ho"[..])));
-        // The Pong we owe the peer must be on the wire, unmasked.
         let out = out_bytes(&s);
         let header = FrameHeader::parse(out).unwrap().unwrap();
         assert_eq!(header.opcode, OpCode::Pong);
@@ -980,7 +988,6 @@ mod tests {
         wire.extend_from_slice(&masked_frame(OpCode::Ping, b"p", true, false));
         wire.extend_from_slice(&masked_frame(OpCode::Continuation, b"b", true, false));
         let mut s = server(&wire);
-        // The ping is surfaced before the message that is still open.
         assert_eq!(next(&mut s).unwrap(), Event::Ping(Bytes::from(&b"p"[..])));
         assert_eq!(next(&mut s).unwrap(), Event::Text(String::from("ab")));
     }
@@ -1004,12 +1011,10 @@ mod tests {
         let out = out_bytes(&s);
         let header = FrameHeader::parse(out).unwrap().unwrap();
         assert_eq!(header.opcode, OpCode::Close);
-        // Our echo carries the same code.
         assert_eq!(
             u16::from_be_bytes([out[header.header_len], out[header.header_len + 1]]),
             1001
         );
-        // Further reads fail: the session is terminal.
         assert!(next(&mut s).is_err());
     }
 
@@ -1064,11 +1069,9 @@ mod tests {
             max_message: 16,
             ..Default::default()
         };
-        // 9 bytes in one frame: over max_frame.
         let wire = masked_frame(OpCode::Binary, &[0u8; 9], true, false);
         let mut s = server_on(&wire, cfg.clone());
         assert!(next(&mut s).unwrap_err().to_string().contains("size limit"));
-        // Eight-byte frames but a 24-byte message: over max_message.
         let mut wire = masked_frame(OpCode::Binary, &[0u8; 8], false, false);
         wire.extend_from_slice(&masked_frame(OpCode::Continuation, &[0u8; 8], false, false));
         wire.extend_from_slice(&masked_frame(OpCode::Continuation, &[0u8; 8], true, false));
@@ -1092,8 +1095,6 @@ mod tests {
 
     #[test]
     fn rejects_invalid_utf8_in_text_early() {
-        // 0xFF is never valid UTF-8: the session must fail on the frame
-        // that carries it, not after buffering the whole message.
         let wire = masked_frame(OpCode::Text, &[0x41, 0xff, 0x42], true, false);
         let mut s = server(&wire);
         assert!(next(&mut s).is_err());
@@ -1103,7 +1104,6 @@ mod tests {
     #[test]
     fn rejects_text_that_ends_inside_a_sequence() {
         let mut wire = masked_frame(OpCode::Text, &[0xe2], false, false);
-        // Second fragment completes nothing: the message ends mid-sequence.
         wire.extend_from_slice(&masked_frame(OpCode::Continuation, &[0x41], true, false));
         let mut s = server(&wire);
         assert!(next(&mut s).is_err());
@@ -1125,25 +1125,19 @@ mod tests {
 
     #[test]
     fn rejects_structural_violations() {
-        // Continuation without a started message.
         let wire = masked_frame(OpCode::Continuation, b"x", true, false);
         assert!(server(&wire).read_message().is_err());
-        // A new data frame while a message is open.
         let mut wire = masked_frame(OpCode::Text, b"a", false, false);
         wire.extend_from_slice(&masked_frame(OpCode::Text, b"b", true, false));
         assert!(server(&wire).read_message().is_err());
-        // RSV1 without a negotiated extension.
         let wire = masked_frame(OpCode::Text, b"a", true, true);
         assert!(server(&wire).read_message().is_err());
-        // Non-minimal 16-bit length.
         let mut wire = vec![0x81u8, 0x80 | 126, 0x00, 0x05];
         wire.extend_from_slice(&[1, 2, 3, 4]);
         wire.extend_from_slice(b"hello");
         assert!(server(&wire).read_message().is_err());
-        // Fragmented control frame.
         let wire = masked_frame(OpCode::Ping, b"x", false, false);
         assert!(server(&wire).read_message().is_err());
-        // Reserved opcode 0x3.
         let wire = vec![0x83, 0x80, 1, 2, 3, 4];
         assert!(server(&wire).read_message().is_err());
     }
@@ -1177,8 +1171,6 @@ mod tests {
 
     #[test]
     fn poll_returns_none_before_any_bytes_and_then_resumes() {
-        // A session whose input arrives later: the first poll must report
-        // "nothing yet" rather than an error.
         let wire = masked_frame(OpCode::Text, b"later", true, false);
         let leaked: &'static [u8] = alloc::boxed::Box::leak(wire.into_boxed_slice());
         let mut s = Session::new(
@@ -1247,7 +1239,6 @@ mod tests {
         c.set_compression(Some(params));
         c.send_text(&text).unwrap();
 
-        // The frame on the wire carries RSV1 and is smaller than the text.
         let out = c.writer().sink().bytes.clone();
         let header = FrameHeader::parse(&out).unwrap().unwrap();
         assert!(header.rsv1, "compressible payloads must be compressed");
@@ -1267,9 +1258,6 @@ mod tests {
 
     #[test]
     fn compressed_roundtrip_accepts_the_rfc7692_tail() {
-        // The receiver must re-append 00 00 FF FF: hand it a payload that
-        // a standard sender produces (tail already stripped) and check
-        // that it inflates.
         let params = CompressionParams::default();
         let text = "0123456789".repeat(40);
         let body = deflate_sync(text.as_bytes());
@@ -1310,8 +1298,6 @@ mod tests {
     #[test]
     fn a_decompression_bomb_hits_the_message_limit() {
         let params = CompressionParams::default();
-        // ~64 KiB of highly repetitive data compresses to a few hundred
-        // bytes; the session's limit is 1 KiB.
         let bomb = deflate_sync(&vec![0x41u8; 64 * 1024]);
         assert!(bomb.len() < 1024, "the compressed form must be small");
         let wire = masked_frame(OpCode::Binary, &bomb, true, true);
@@ -1360,7 +1346,6 @@ mod tests {
         };
         assert_eq!(u16::from_be_bytes([unmasked[0], unmasked[1]]), 1000);
         assert_eq!(&unmasked[2..], b"bye");
-        // A code that must never appear on the wire is replaced, not sent.
         let mut c = client_fixed_key([0xaa, 0xbb, 0xcc, 0xdd]);
         c.close(close::NO_STATUS, "").unwrap();
         let out = c.writer().sink().bytes.clone();
@@ -1387,9 +1372,6 @@ mod tests {
         let mut c = client();
         let big = vec![0x5au8; 4 * 1024 * 1024];
         c.send_binary(&big).unwrap();
-        // The whole frame is produced; the masking itself is streamed by
-        // the sink in bounded windows, so a large message never needs a
-        // large scratch buffer (or a second copy of the payload).
         assert!(out_bytes(&c).len() >= big.len());
         let out = c.writer().sink().bytes.clone();
         let header = FrameHeader::parse(&out).unwrap().unwrap();
@@ -1429,7 +1411,6 @@ mod tests {
         let wire = masked_frame(OpCode::Ping, &payload, true, false);
         let mut s = server(&wire);
         assert!(matches!(next(&mut s).unwrap(), Event::Ping(_)));
-        // ...and 126 must be rejected by the parser.
         let wire = masked_frame(OpCode::Ping, &[0u8; 126], true, false);
         let mut s = server(&wire);
         assert!(next(&mut s).is_err());

@@ -95,6 +95,31 @@ jobs:
       - name: Run doc tests
         run: cargo test --locked --doc
 
+  no-std:
+    name: no_std (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ['1.78.0', stable]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          targets: thumbv6m-none-eabi, x86_64-unknown-none
+      - uses: Swatinem/rust-cache@v2
+      - name: Check core without atomic read-modify-write support
+        run: cargo check --locked --no-default-features --target thumbv6m-none-eabi
+      - name: Check core with atomics and no operating system
+        run: cargo check --locked --no-default-features --target x86_64-unknown-none
+      - name: Test core without default features
+        run: cargo test --locked --no-default-features --lib
+      - name: Document core without std-only links
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-default-features --no-deps
+
   docs:
     name: docs (${{ matrix.toolchain }})
     runs-on: ubuntu-latest

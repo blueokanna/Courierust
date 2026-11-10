@@ -3,7 +3,7 @@
 //! Encodes/decodes the *cleartext* parts of a QUIC packet: the long or
 //! short header, connection id, packet number and the packet-number
 //! encoding (RFC 9000 §17.1). Header protection and AEAD are out of
-//! is provided by [`crate::courierust_quic::protection`] for the `std`
+//! is provided by `crate::courierust_quic::protection` for the `std`
 //! runtime (see the module docs in `courierust_quic`).
 
 use crate::courierust_error::{Error, Result};
@@ -346,12 +346,7 @@ mod tests {
 
     #[test]
     fn pn_recovery_appendix_a2() {
-        // RFC 9000 Appendix A.2 example: expected 0xac5c02 (11295916642
-        // mod 2^24 is 0x5c02 truncated... use the worked values).
-        // Truncated = 0x5c02, expected full = 0x0aac5c02, pn_len = 2.
         let full = decode_pn(&[0x5c, 0x02], 0x0aac_5c02, 2);
-        // RFC: with expected 0xa82f30ea (near) and truncated 0x9b32, the
-        // recovered full number is 0xa82f9b32.
         let recovered = decode_pn(&[0x9b, 0x32], 0xa82f_30ea, 2);
         assert_eq!(recovered, 0xa82f_9b32, "RFC 9000 Appendix A.2 case 3");
         assert_eq!(full & 0xffff, 0x5c02);
@@ -361,7 +356,6 @@ mod tests {
     fn malformed_rejected() {
         assert!(parse(&[], 0, 0).is_err());
         assert!(parse(&[0xc0, 0, 0, 0, 0], 0, 0).is_err());
-        // Version-negotiation packet is not parseable as a normal packet.
         assert!(parse(&[0xc0, 0, 0, 0, 0, 0, 0], 0, 0).is_err());
     }
 }

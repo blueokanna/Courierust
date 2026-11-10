@@ -10,7 +10,7 @@
 //!   prefix integers, Huffman strings, every field-line representation,
 //!   the dynamic table, and the encoder/decoder instruction streams.
 //!
-//! Under `std`, [`runtime`] wires these codecs to the built-in QUIC v1
+//! Under `std`, `runtime` wires these codecs to the built-in QUIC v1
 //! packet-protection/TLS adapter and a UDP reactor. That path is bounded and
 //! usable for the implemented HTTP/3 request/response subset: TLS 1.3 with
 //! ALPN `h3`, control/QPACK streams, request streams, response trailers,

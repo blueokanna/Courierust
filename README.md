@@ -389,6 +389,19 @@ courierust = { version = "1.1.0", default-features = false }
 
 Building with `--no-default-features` compiles only the protocol core, suitable for embedded / kernel contexts. The networking layer needs the `std` feature (the default).
 
+The core also builds on targets without atomic read-modify-write operations, including `thumbv6m-none-eabi`. Shared byte buffers and WebSocket close flags use `Rc` and `Cell` where atomics are unavailable; these values cannot be sent between threads. Targets with atomics retain thread-safe sharing. An allocator is still required.
+
+For a `no_std` WebSocket client, use `FrameWriter::with_mask_generator` with a stateful callback backed by the platform's cryptographic random source. Each frame requests a fresh key; callback errors abort the frame without falling back to a predictable mask. `MaskSource::Fixed` is for tests and fuzzing only. The `std` random-mask path also fails if initial OS entropy is unavailable.
+
+CI checks both freestanding targets, runs protocol-core tests without default features, and retains Rust 1.78 compatibility:
+
+```bash
+cargo check --locked --no-default-features --target thumbv6m-none-eabi
+cargo check --locked --no-default-features --target x86_64-unknown-none
+cargo test --locked --no-default-features --lib
+```
+
+
 ## Limitations
 
 Things this crate deliberately does not do:

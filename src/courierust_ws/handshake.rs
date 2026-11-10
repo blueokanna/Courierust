@@ -54,7 +54,7 @@ pub fn accept_key(key: &str) -> Result<String> {
 
 /// Encode 16 bytes of entropy as a `Sec-WebSocket-Key`.
 ///
-/// Split out from [`generate_key`] so the `no_std` core stays free of
+/// Split out from `generate_key` so the `no_std` core stays free of
 /// platform entropy sources and tests can pin the value.
 pub fn key_from_entropy(entropy: &[u8; 16]) -> String {
     base64::encode(entropy)
@@ -1584,10 +1584,8 @@ mod tests {
         assert!(header.contains("server_no_context_takeover"));
         assert!(header.contains("client_max_window_bits=10"));
 
-        // A valueless client_max_window_bits lets the server choose.
         let selected = PerMessageDeflate::negotiate(&offers[1], &policy).unwrap();
         assert_eq!(selected.client_max_window_bits, 15);
-        // ...and the choice is announced with a value.
         assert!(!selected
             .response_header()
             .contains("client_max_window_bits=15"));
@@ -1609,10 +1607,6 @@ mod tests {
         );
         let offer = parse_extensions(&headers).unwrap().remove(0);
         let policy = PmDeflatePolicy::default();
-
-        // RFC 7692 §7.1.2.1: a server MAY answer with
-        // server_max_window_bits even though the offer did not carry it,
-        // and refusing that rejects an otherwise compliant server.
         let mut ok = HeaderMap::new();
         ok.append(
             HeaderName::from_lowercase("sec-websocket-extensions"),
@@ -1623,7 +1617,6 @@ mod tests {
         assert_eq!(selected.server_max_window_bits, 10);
         assert_eq!(selected.client_max_window_bits, 15);
 
-        // ...but a value *larger than offered* is a failure (§7.1.2.1).
         let mut offered = HeaderMap::new();
         offered.append(
             HeaderName::from_lowercase("sec-websocket-extensions"),
@@ -1632,8 +1625,6 @@ mod tests {
         let offer_8 = parse_extensions(&offered).unwrap().remove(0);
         assert!(PerMessageDeflate::from_response(&offer_8, &resp, &policy).is_err());
 
-        // client_max_window_bits is the other way round (§7.1.2.2): the
-        // server may only pick it when the client offered it.
         let mut bad = HeaderMap::new();
         bad.append(
             HeaderName::from_lowercase("sec-websocket-extensions"),
@@ -1650,7 +1641,6 @@ mod tests {
         let resp = parse_extensions(&bad).unwrap().remove(0);
         assert!(PerMessageDeflate::from_response(&offer, &resp, &policy).is_err());
 
-        // The plain echo is fine.
         let resp = offer.clone();
         assert!(PerMessageDeflate::from_response(&offer, &resp, &policy).is_ok());
     }

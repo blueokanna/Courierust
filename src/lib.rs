@@ -13,6 +13,11 @@
 //! WebSocket client), `courierust_server` (the event-driven scheduler
 //! plus the WebSocket upgrade path) and `courierust_grpc`.
 //!
+//! The core supports targets without pointer-width atomics. Shared buffers
+//! use `Rc` there, and WebSocket close flags use `Cell` where byte atomics
+//! are unavailable; these types remain single-threaded. An allocator is
+//! required. Threaded networking and OS entropy remain behind `std`.
+//!
 //! Every public module carries the crate's `courierust_` prefix so no
 //! module path collides with a third-party crate of the same short name
 //! (e.g. `h2`, `http`, `bytes`, `grpc`, `tls`).
@@ -98,6 +103,8 @@ mod atomic;
 pub(crate) fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
+
+mod shared;
 
 pub mod courierust_bytes;
 pub mod courierust_crypto;

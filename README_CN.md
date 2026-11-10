@@ -361,6 +361,19 @@ courierust = { version = "1.1.0", default-features = false }
 
 `--no-default-features` 构建只编译协议核心，可用于嵌入式 / 内核态。网络层需要 `std` feature（默认开启）。
 
+协议核心也支持缺少原子读改写操作的目标，包括 `thumbv6m-none-eabi`。原子操作不可用时，共享字节缓冲区和 WebSocket 关闭标志使用 `Rc`、`Cell`，这些值不能跨线程传递；支持原子操作的目标继续使用线程安全的共享实现。最终程序仍需提供分配器。
+
+`no_std` WebSocket 客户端应通过 `FrameWriter::with_mask_generator` 接入平台的密码学随机源，回调可以持有自身状态。每帧请求一个新掩码，回调失败时停止发送，不降级为可预测掩码。`MaskSource::Fixed` 仅用于测试与模糊测试；`std` 随机掩码路径在初始系统熵不可用时也会返回错误。
+
+CI 检查这两个裸机目标，在关闭默认特性的情况下运行协议核心测试，并继续验证 Rust 1.78 兼容性：
+
+```bash
+cargo check --locked --no-default-features --target thumbv6m-none-eabi
+cargo check --locked --no-default-features --target x86_64-unknown-none
+cargo test --locked --no-default-features --lib
+```
+
+
 ## 设计限制
 
 这个仓库刻意不做的，以及你接手前应该知道的：

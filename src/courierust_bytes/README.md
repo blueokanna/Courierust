@@ -1,16 +1,16 @@
 # courierust_bytes
 
-`Bytes` — an immutable, `Arc`-backed byte slice with **O(1) slicing and cheap clone**. `BytesMut` — the growable builder used by encoders. `no_std`, zero dependencies.
+`Bytes` owns an immutable byte range with O(1) cloning and slicing. `BytesMut` is the growable encoder buffer. Both support `no_std + alloc` without external dependencies.
 
-## What it is
+## Storage and ownership
 
-If you know the `bytes` crate, you know this — it's the same idea, written by hand so the stack stays dependency-free. `Bytes` is the currency of frame payloads and header values: slicing off a sub-range is O(1) (no copy), cloning is a refcount bump (no copy), and the underlying allocation is shared safely.
+- `Bytes::new` and `Bytes::from_static` do not allocate. Static views borrow the original bytes.
+- Converting a nonempty `Vec<u8>`, `Box<[u8]>`, or `String`, and calling `BytesMut::freeze`, transfer the payload allocation without copying it. Shared ownership adds one small allocation.
+- Converting a borrowed slice copies its bytes. Use `from_static` when its lifetime permits borrowing.
+- `into_vec` reuses uniquely owned storage. A unique subrange is moved to the front in place; shared or static subranges copy only their visible bytes.
+- Empty slices release their ownership of the original allocation. Nonempty slices retain it, including spare vector capacity. Use `to_vec` to avoid retaining a large buffer for a small view.
 
-`BytesMut` is what encoders write into — a growable buffer that hands out `Bytes` views.
-
-## Why it matters here
-
-In a stack that's `no_std` and zero-dependency, you can't reach for `bytes` on crates.io. But you still need its properties, because every layer hands byte ranges to the next one: an h2 frame's payload, an HPACK literal's value, a chunked body segment. The alternative — copying everywhere — is how you end up with a networking stack that's slow and can't explain why.
+Targets with pointer-width atomics use `Arc`; other targets use `Rc`. The latter makes `Bytes` neither `Send` nor `Sync`, so unsupported cross-thread sharing is rejected by the compiler. `BytesMut` retains ordinary `Vec` ownership on either target.
 
 ## Usage
 
@@ -20,11 +20,11 @@ use courierust::courierust_bytes::{Bytes, BytesMut};
 # fn main() {
 let b = Bytes::from_static(b"hello world");
 let tail = b.slice_from(6);       // O(1), no copy
-let clone = tail.clone();         // refcount bump, no copy
+let clone = tail.clone();        // static view, no allocation
 
 let mut m = BytesMut::new();
 m.extend_from_slice(b"hello");
-let done: Bytes = m.freeze();
+let done: Bytes = m.freeze();    // preserves the payload allocation
 # let _ = (clone, done);
 # }
 ```

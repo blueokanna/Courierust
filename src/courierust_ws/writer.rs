@@ -14,8 +14,12 @@ use crate::courierust_error::{Error, Result};
 use crate::courierust_ws::frame::{self, FrameHeader, FrameSink, Mask, OpCode, MAX_HEADER_LEN};
 use crate::courierust_ws::handshake::CompressionParams;
 use crate::courierust_ws::session::{MaskSource, Stats};
-use alloc::sync::Arc;
+use crate::shared::Shared;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
+#[cfg(not(target_has_atomic = "8"))]
+use core::cell::Cell;
+#[cfg(target_has_atomic = "8")]
 use core::sync::atomic::{AtomicBool, Ordering};
 
 /// The connection-level “a Close frame has gone out” flag.
@@ -28,9 +32,15 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// flag lives here and is shared rather than duplicated. Without it, a
 /// push that races a close writes a data frame after the close frame and
 /// the peer is entitled to treat the connection as failed.
+///
+/// On targets without pointer atomics this uses single-threaded shared
+/// ownership and is neither `Send` nor `Sync`.
 #[derive(Clone, Default)]
 pub struct CloseFlag {
-    set: Arc<AtomicBool>,
+    #[cfg(target_has_atomic = "8")]
+    set: Shared<AtomicBool>,
+    #[cfg(not(target_has_atomic = "8"))]
+    set: Shared<Cell<bool>>,
 }
 
 impl CloseFlag {
@@ -42,14 +52,28 @@ impl CloseFlag {
     /// Whether a Close frame has been written.
     #[inline]
     pub fn is_set(&self) -> bool {
-        self.set.load(Ordering::Acquire)
+        #[cfg(target_has_atomic = "8")]
+        {
+            self.set.load(Ordering::Acquire)
+        }
+        #[cfg(not(target_has_atomic = "8"))]
+        {
+            self.set.get()
+        }
     }
 
     /// Record that a Close frame was written; returns whether this call
     /// was the one that set it (the loser of a race gets `false`).
     #[inline]
     pub fn set(&self) -> bool {
-        !self.set.swap(true, Ordering::AcqRel)
+        #[cfg(target_has_atomic = "8")]
+        {
+            !self.set.swap(true, Ordering::AcqRel)
+        }
+        #[cfg(not(target_has_atomic = "8"))]
+        {
+            !self.set.replace(true)
+        }
     }
 }
 
@@ -104,6 +128,7 @@ pub struct FrameWriter<S: FrameSink> {
     compression: Option<CompressionParams>,
     deflater: Option<Deflater>,
     mask_source: MaskSource,
+    mask_generator: Option<Box<dyn FnMut() -> Result<[u8; 4]> + Send>>,
     #[cfg(feature = "std")]
     rng: Option<crate::courierust_tls::crypto::rng::ChaChaRng>,
     comp_buf: Vec<u8>,
@@ -117,8 +142,9 @@ impl<S: FrameSink> FrameWriter<S> {
     /// Build a writer with its own close flag.
     ///
     /// `mask_source` must be [`MaskSource::None`] for a server (RFC 6455
-    /// §5.1: servers must not mask) and [`MaskSource::Random`] for a
-    /// client. A connection with a second writer (a server that pushes
+    /// §5.1: servers must not mask). Clients use `MaskSource::Random`
+    /// under `std`, or [`Self::with_mask_generator`] on other platforms.
+    /// A connection with a second writer (a server that pushes
     /// from application threads) must build both with
     /// [`FrameWriter::with_close_flag`] so a close on either side stops
     /// the other.
@@ -139,6 +165,7 @@ impl<S: FrameSink> FrameWriter<S> {
             compression: None,
             deflater: None,
             mask_source,
+            mask_generator: None,
             #[cfg(feature = "std")]
             rng: None,
             comp_buf: Vec::new(),
@@ -148,6 +175,40 @@ impl<S: FrameSink> FrameWriter<S> {
         };
         writer.set_compression(compression);
         writer
+    }
+
+    /// Build a client writer using application-supplied cryptographic randomness.
+    ///
+    /// The callback is called for every frame, including control frames. It
+    /// must return a fresh unpredictable key or an error; errors stop the frame
+    /// before any bytes reach the sink. This path is available under `no_std`.
+    pub fn with_mask_generator<G>(
+        sink: S,
+        compression: Option<CompressionParams>,
+        generator: G,
+    ) -> Self
+    where
+        G: FnMut() -> Result<[u8; 4]> + Send + 'static,
+    {
+        let mut writer = Self::new(sink, MaskSource::None, compression);
+        writer.set_mask_generator(generator);
+        writer
+    }
+
+    /// Replace this client's mask policy with an application CSPRNG callback.
+    ///
+    /// The callback owns its state and must supply a fresh unpredictable key
+    /// for every call. Do not install it on a server: servers send unmasked
+    /// frames. A callback failure is returned to the caller without fallback.
+    pub fn set_mask_generator<G>(&mut self, generator: G)
+    where
+        G: FnMut() -> Result<[u8; 4]> + Send + 'static,
+    {
+        self.mask_generator = Some(Box::new(generator));
+        #[cfg(feature = "std")]
+        {
+            self.rng = None;
+        }
     }
 
     /// The flag this writer shares with the rest of its connection.
@@ -291,13 +352,15 @@ impl<S: FrameSink> FrameWriter<S> {
     /// Send a message, compressing when negotiated *and* profitable.
     pub fn send_message(&mut self, opcode: OpCode, data: &[u8]) -> Result<()> {
         self.check_open()?;
+        // Obtain entropy before advancing any compression dictionary.
+        let mask = self.next_mask()?;
         if let Some(deflater) = self.deflater.as_mut() {
             let mut comp = core::mem::take(&mut self.comp_buf);
             let compressed = deflater.deflate_message(data, &mut comp).is_some();
             let result = if compressed {
-                self.write_frame(opcode, &comp, true, true)
+                self.write_frame_masked(opcode, &comp, true, true, mask)
             } else {
-                self.write_frame(opcode, data, true, false)
+                self.write_frame_masked(opcode, data, true, false, mask)
             };
             self.comp_buf = comp;
             result?;
@@ -310,7 +373,7 @@ impl<S: FrameSink> FrameWriter<S> {
             }
             Ok(())
         } else {
-            self.write_frame(opcode, data, true, false)?;
+            self.write_frame_masked(opcode, data, true, false, mask)?;
             self.stats.messages_written += 1;
             Ok(())
         }
@@ -324,11 +387,34 @@ impl<S: FrameSink> FrameWriter<S> {
         fin: bool,
         rsv1: bool,
     ) -> Result<()> {
-        debug_assert!(
-            !opcode.is_control() || payload.len() <= frame::MAX_CONTROL_PAYLOAD,
-            "control payload over 125 bytes"
-        );
-        let mask = self.next_mask();
+        self.check_open()?;
+        let mask = self.next_mask()?;
+        self.write_frame_masked(opcode, payload, fin, rsv1, mask)
+    }
+
+    fn write_frame_masked(
+        &mut self,
+        opcode: OpCode,
+        payload: &[u8],
+        fin: bool,
+        rsv1: bool,
+        mask: Option<Mask>,
+    ) -> Result<()> {
+        self.check_open()?;
+        if opcode.is_control() {
+            self.check_control(payload)?;
+            if !fin || rsv1 {
+                return Err(Error::protocol("websocket: invalid control frame flags"));
+            }
+        }
+        if opcode == OpCode::Close
+            && !payload.is_empty()
+            && (payload.len() < 2
+                || !frame::close::is_valid_to_send(u16::from_be_bytes([payload[0], payload[1]]))
+                || core::str::from_utf8(&payload[2..]).is_err())
+        {
+            return Err(Error::protocol("websocket: invalid close payload"));
+        }
         let header = FrameHeader {
             fin,
             rsv1,
@@ -343,6 +429,9 @@ impl<S: FrameSink> FrameWriter<S> {
         let n = header.write(&mut self.head);
         // One `write_frame` call per frame: the sink makes it atomic.
         self.sink.write_frame(&self.head[..n], payload, mask)?;
+        if opcode == OpCode::Close {
+            self.close_flag.set();
+        }
         self.stats.frames_written += 1;
         self.stats.bytes_written += (n + payload.len()) as u64;
         Ok(())
@@ -350,48 +439,152 @@ impl<S: FrameSink> FrameWriter<S> {
 
     /// A fresh masking key for the next frame.
     ///
-    /// RFC 6455 §5.3 requires a new, unpredictable key per frame. Keys
-    /// come from a ChaCha20 stream seeded once per writer from the
-    /// platform CSPRNG: stronger than mixing OS entropy per frame (a real
-    /// CSPRNG stream, not a hash) and free of a syscall in the send path.
-    fn next_mask(&mut self) -> Option<Mask> {
+    /// RFC 6455 requires an unpredictable key per frame. An application
+    /// callback supplies it under `no_std`; the `std` default uses an
+    /// OS-seeded ChaCha20 stream, failing if initial entropy is unavailable.
+    fn next_mask(&mut self) -> Result<Option<Mask>> {
+        if let Some(generator) = self.mask_generator.as_mut() {
+            return generator().map(|key| Some(Mask::new(key)));
+        }
         match self.mask_source {
-            MaskSource::None => None,
-            MaskSource::Fixed(key) => Some(Mask::new(key)),
+            MaskSource::None => Ok(None),
+            MaskSource::Fixed(key) => Ok(Some(Mask::new(key))),
             #[cfg(feature = "std")]
-            MaskSource::Random => {
-                if self.rng.is_none() {
-                    let addr_seed = self as *const Self as usize as u64;
-                    let time_seed = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as u64)
-                        .unwrap_or(0);
-                    let rng =
-                        crate::courierust_tls::crypto::rng::ChaChaRng::new().unwrap_or_else(|| {
-                            let mut seed = [0u8; 44];
-                            seed[..8].copy_from_slice(&time_seed.to_le_bytes());
-                            seed[8..16].copy_from_slice(&addr_seed.to_le_bytes());
-                            seed[16..24].copy_from_slice(
-                                &(self.head.as_ptr() as usize as u64).to_le_bytes(),
-                            );
-                            crate::courierust_tls::crypto::rng::ChaChaRng::from_seed(&seed)
-                        });
-                    self.rng = Some(rng);
-                }
-                let mut key = [0u8; 4];
-                if let Some(rng) = self.rng.as_mut() {
-                    rng.fill(&mut key);
-                }
-                Some(Mask::new(key))
-            }
+            MaskSource::Random => random_mask(
+                &mut self.rng,
+                crate::courierust_tls::crypto::rng::ChaChaRng::new,
+            )
+            .map(Some),
         }
     }
+}
+
+#[cfg(feature = "std")]
+fn random_mask(
+    state: &mut Option<crate::courierust_tls::crypto::rng::ChaChaRng>,
+    seed: impl FnOnce() -> Option<crate::courierust_tls::crypto::rng::ChaChaRng>,
+) -> Result<Mask> {
+    let rng = match state {
+        Some(rng) => rng,
+        None => state.insert(seed().ok_or_else(|| Error::io("websocket: OS entropy unavailable"))?),
+    };
+    let mut key = [0u8; 4];
+    rng.fill(&mut key);
+    Ok(Mask::new(key))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::courierust_deflate::Inflater;
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn unavailable_os_entropy_never_produces_a_mask() {
+        let mut state = None;
+        assert!(random_mask(&mut state, || None).is_err());
+        assert!(state.is_none());
+        let seeded = crate::courierust_tls::crypto::rng::ChaChaRng::from_seed(&[7; 44]);
+        assert!(random_mask(&mut state, || Some(seeded)).is_ok());
+        // A seeded writer must not request OS entropy for every frame.
+        assert!(random_mask(&mut state, || panic!("unexpected reseed")).is_ok());
+    }
+
+    #[test]
+    fn application_masks_are_requested_per_frame_and_failure_writes_nothing() {
+        let mut count = 0u8;
+        let mut writer = FrameWriter::with_mask_generator(VecSink::new(), None, move || {
+            count += 1;
+            if count == 3 {
+                return Err(Error::io("entropy unavailable"));
+            }
+            Ok([count; 4])
+        });
+        writer.send_text("a").unwrap();
+        let first_len = writer.sink().bytes.len();
+        writer.send_ping(b"b").unwrap();
+        let first = FrameHeader::parse(&writer.sink().bytes).unwrap().unwrap();
+        let second = FrameHeader::parse(&writer.sink().bytes[first_len..])
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.mask_key, [1; 4]);
+        assert_eq!(second.mask_key, [2; 4]);
+        let before = writer.sink().bytes.clone();
+        let stats = *writer.stats();
+        assert!(writer.send_close(1000, "").is_err());
+        assert_eq!(writer.sink().bytes, before);
+        assert_eq!(writer.stats().frames_written, stats.frames_written);
+        assert!(!writer.is_closed());
+    }
+
+    #[test]
+    fn entropy_failure_does_not_advance_the_compression_dictionary() {
+        let params = CompressionParams::default();
+        let data = "compressible payload ".repeat(100);
+        let mut first = true;
+        let mut retried =
+            FrameWriter::with_mask_generator(VecSink::new(), Some(params), move || {
+                if first {
+                    first = false;
+                    return Err(Error::io("entropy unavailable"));
+                }
+                Ok([7; 4])
+            });
+        assert!(retried.send_text(&data).is_err());
+        assert!(retried.sink().bytes.is_empty());
+        retried.send_text(&data).unwrap();
+        let mut fresh =
+            FrameWriter::with_mask_generator(VecSink::new(), Some(params), || Ok([7; 4]));
+        fresh.send_text(&data).unwrap();
+        assert_eq!(retried.sink().bytes, fresh.sink().bytes);
+    }
+
+    #[test]
+    fn low_level_frames_obey_control_limits_and_close_state() {
+        let mut writer = FrameWriter::new(VecSink::new(), MaskSource::None, None);
+        assert!(writer
+            .write_frame(OpCode::Ping, &[0; 126], true, false)
+            .is_err());
+        assert!(writer.write_frame(OpCode::Ping, b"", false, false).is_err());
+        assert!(writer.write_frame(OpCode::Ping, b"", true, true).is_err());
+        assert!(writer.sink().bytes.is_empty());
+        writer.write_frame(OpCode::Close, b"", true, false).unwrap();
+        assert!(writer.is_closed());
+        assert!(writer
+            .write_frame(OpCode::Binary, b"late", true, false)
+            .is_err());
+        assert_eq!(writer.stats().frames_written, 1);
+    }
+
+    #[test]
+    fn cloned_close_flags_share_one_transition() {
+        let flag = CloseFlag::new();
+        let clone = flag.clone();
+        assert!(!clone.is_set());
+        assert!(flag.set());
+        assert!(clone.is_set());
+        assert!(!clone.set());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn concurrent_close_flags_have_exactly_one_winner() {
+        let flag = CloseFlag::new();
+        let winners = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..16)
+                .map(|_| {
+                    let flag = flag.clone();
+                    scope.spawn(move || flag.set())
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| usize::from(worker.join().unwrap()))
+                .sum::<usize>()
+        });
+        assert_eq!(winners, 1);
+        assert!(flag.is_set());
+    }
 
     /// RFC 7692 §7.1.2.1: `*_max_window_bits` is a promise the *encoder*
     /// makes and the decoder enforces. A compressor that ignores it emits

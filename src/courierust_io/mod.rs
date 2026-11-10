@@ -9,13 +9,13 @@ use alloc::vec::Vec;
 
 /// A byte source. Returns `Ok(0)` on clean EOF.
 pub trait Read {
-    /// Read into `buf`, returning the number of bytes read.
+    /// Read into `buf`, returning a count no greater than `buf.len()`.
     fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
 }
 
 /// A byte sink.
 pub trait Write {
-    /// Write as many bytes as possible; returns the count written.
+    /// Write as many bytes as possible; return a count no greater than `buf.len()`.
     fn write(&mut self, buf: &[u8]) -> Result<usize>;
 
     /// Flush any buffered output.
@@ -33,7 +33,10 @@ pub trait Write {
             if n == 0 {
                 return Err(Error::io("write made no progress"));
             }
-            data = &data[n.min(data.len())..];
+            if n > data.len() {
+                return Err(Error::io("writer returned a count larger than its input"));
+            }
+            data = &data[n..];
         }
         Ok(())
     }
@@ -114,12 +117,9 @@ impl<R> BufReader<R> {
         if cap <= self.buf.len() {
             return;
         }
-        let mut grown = vec![0u8; cap];
         let held = self.cap - self.pos;
-        if held > 0 {
-            grown[..held].copy_from_slice(&self.buf[self.pos..self.cap]);
-        }
-        self.buf = grown;
+        self.buf.copy_within(self.pos..self.cap, 0);
+        self.buf.resize(cap, 0);
         self.pos = 0;
         self.cap = held;
     }
@@ -136,14 +136,21 @@ impl<R: Read> BufReader<R> {
             if n == 0 {
                 return Ok(&[]);
             }
+            if n > self.buf.len() {
+                return Err(Error::io("reader returned a count larger than its buffer"));
+            }
             self.cap = n;
         }
         Ok(&self.buf[self.pos..self.cap])
     }
 
     /// Mark `n` buffered bytes as consumed.
+    /// Panics if `n` exceeds the number of buffered bytes.
     pub fn consume(&mut self, n: usize) {
-        debug_assert!(n <= self.cap - self.pos);
+        assert!(
+            n <= self.cap - self.pos,
+            "consumed more bytes than buffered"
+        );
         self.pos += n;
         if self.pos == self.cap {
             self.pos = 0;
@@ -153,7 +160,9 @@ impl<R: Read> BufReader<R> {
 
     /// Read exactly `n` bytes (fails with `UnexpectedEof` on short read).
     pub fn read_exact(&mut self, n: usize) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(n);
+        let mut out = Vec::new();
+        out.try_reserve_exact(n)
+            .map_err(|_| Error::new(ErrorKind::Overflow))?;
         while out.len() < n {
             let b = self.fill_buf()?;
             if b.is_empty() {
@@ -170,6 +179,10 @@ impl<R: Read> BufReader<R> {
     pub fn read_exact_into(&mut self, out: &mut [u8]) -> Result<()> {
         let mut filled = 0;
         while filled < out.len() {
+            if self.buffered() == 0 && out.len() - filled >= self.buf.len() {
+                filled += self.read_direct(&mut out[filled..])?;
+                continue;
+            }
             let b = self.fill_buf()?;
             if b.is_empty() {
                 return Err(Error::eof());
@@ -232,6 +245,9 @@ impl<R: Read> BufReader<R> {
         }
         match self.inner.read(out) {
             Ok(0) => Err(Error::eof()),
+            Ok(n) if n > out.len() => {
+                Err(Error::io("reader returned a count larger than its buffer"))
+            }
             other => other,
         }
     }
@@ -347,6 +363,8 @@ impl<R: Read> BufReader<R> {
 pub struct BufWriter<W> {
     inner: W,
     buf: Vec<u8>,
+    /// Accepted prefix retained until the pending tail is fully drained.
+    pos: usize,
     /// Bytes the inner writer has accepted since construction. Lets a
     /// driver tell "the peer took some of it" from "everything is
     /// parked", which is what decides whether a stalled connection is
@@ -360,6 +378,7 @@ impl<W> BufWriter<W> {
         Self {
             inner,
             buf: Vec::with_capacity(cap),
+            pos: 0,
             written: 0,
         }
     }
@@ -378,7 +397,7 @@ impl<W> BufWriter<W> {
     /// Number of bytes currently buffered.
     #[inline]
     pub fn buffered(&self) -> usize {
-        self.buf.len()
+        self.buf.len() - self.pos
     }
 }
 
@@ -396,8 +415,15 @@ impl<W: Write> BufWriter<W> {
         if self.buf.is_empty() && data.len() >= self.buf.capacity() {
             return self.write_loop(data);
         }
-        if self.buf.len() + data.len() > self.buf.capacity() {
+        if data.len() > self.buf.capacity() - self.buffered() {
             self.flush()?;
+        }
+        // Compact only when appending, never on repeated backpressure polls.
+        if self.pos != 0 {
+            let pending = self.buffered();
+            self.buf.copy_within(self.pos.., 0);
+            self.buf.truncate(pending);
+            self.pos = 0;
         }
         self.buf.extend_from_slice(data);
         Ok(())
@@ -416,9 +442,11 @@ impl<W: Write> BufWriter<W> {
             match self.inner.write(&data[written..]) {
                 Ok(0) => break Err(Error::io("write made no progress")),
                 Ok(n) => {
-                    let n = n.min(data.len() - written);
+                    if n > data.len() - written {
+                        break Err(Error::io("writer returned a count larger than its input"));
+                    }
                     written += n;
-                    self.written += n as u64;
+                    self.written = self.written.saturating_add(n as u64);
                 }
                 Err(e) => break Err(e),
             }
@@ -444,30 +472,19 @@ impl<W: Write> BufWriter<W> {
     /// flush that stops half-way retries only its tail: clearing on
     /// success alone would resend the prefix and corrupt the stream.
     pub fn flush(&mut self) -> Result<()> {
-        let mut written = 0usize;
-        let len = self.buf.len();
-        let mut outcome = Ok(());
-        while written < len {
-            match self.inner.write(&self.buf[written..]) {
-                Ok(0) => {
-                    outcome = Err(Error::io("write made no progress"));
-                    break;
-                }
-                Ok(n) => {
-                    let n = n.min(len - written);
-                    written += n;
-                    self.written += n as u64;
-                }
-                Err(e) => {
-                    outcome = Err(e);
-                    break;
-                }
+        while self.pos < self.buf.len() {
+            let n = self.inner.write(&self.buf[self.pos..])?;
+            if n == 0 {
+                return Err(Error::io("write made no progress"));
             }
+            if n > self.buffered() {
+                return Err(Error::io("writer returned a count larger than its input"));
+            }
+            self.pos += n;
+            self.written = self.written.saturating_add(n as u64);
         }
-        if written > 0 {
-            self.buf.drain(..written);
-        }
-        outcome?;
+        self.buf.clear();
+        self.pos = 0;
         self.inner.flush()
     }
 }
@@ -566,6 +583,131 @@ impl Scratch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct InvalidCount;
+    impl Read for InvalidCount {
+        fn read(&mut self, _: &mut [u8]) -> Result<usize> {
+            Ok(usize::MAX)
+        }
+    }
+    impl Write for InvalidCount {
+        fn write(&mut self, _: &[u8]) -> Result<usize> {
+            Ok(usize::MAX)
+        }
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn invalid_adapter_counts_are_errors_without_corrupting_buffer_state() {
+        let mut reader = BufReader::new(InvalidCount, 8);
+        assert_eq!(reader.fill_buf().unwrap_err().kind, ErrorKind::Io);
+        assert_eq!(reader.buffered(), 0);
+        assert_eq!(
+            reader.read_direct(&mut [0; 8]).unwrap_err().kind,
+            ErrorKind::Io
+        );
+        assert_eq!(
+            Write::write_all(&mut InvalidCount, b"x").unwrap_err().kind,
+            ErrorKind::Io
+        );
+        let mut writer = BufWriter::new(InvalidCount, 8);
+        writer.write_all(b"data").unwrap();
+        assert_eq!(writer.flush().unwrap_err().kind, ErrorKind::Io);
+        assert_eq!(writer.buffered(), 4);
+        assert_eq!(writer.written(), 0);
+        let mut direct = BufWriter::new(InvalidCount, 0);
+        assert_eq!(direct.write_all(b"data").unwrap_err().kind, ErrorKind::Io);
+        assert_eq!(direct.buffered(), 4);
+        assert_eq!(direct.written(), 0);
+    }
+
+    #[test]
+    fn impossible_read_capacity_returns_an_error() {
+        let mut reader = BufReader::new(SliceReader::new(b""), 8);
+        assert_eq!(
+            reader.read_exact(usize::MAX).unwrap_err().kind,
+            ErrorKind::Overflow
+        );
+    }
+
+    #[test]
+    fn exact_bulk_reads_bypass_scratch_but_preserve_seeded_bytes() {
+        struct RecordingReader {
+            data: SliceReader<'static>,
+            sizes: Vec<usize>,
+        }
+        impl Read for RecordingReader {
+            fn read(&mut self, out: &mut [u8]) -> Result<usize> {
+                self.sizes.push(out.len());
+                self.data.read(out)
+            }
+        }
+        let mut reader = BufReader::new(
+            RecordingReader {
+                data: SliceReader::new(b"0123456789"),
+                sizes: Vec::new(),
+            },
+            4,
+        );
+        reader.seed(b"ab");
+        let mut out = [0; 12];
+        reader.read_exact_into(&mut out).unwrap();
+        assert_eq!(&out, b"ab0123456789");
+        assert_eq!(reader.get_ref().sizes, [10]);
+    }
+
+    #[test]
+    fn repeated_backpressure_keeps_the_tail_in_place_and_in_order() {
+        struct Drip {
+            out: Vec<u8>,
+            blocked: bool,
+        }
+        impl Write for Drip {
+            fn write(&mut self, data: &[u8]) -> Result<usize> {
+                self.blocked = !self.blocked;
+                if !self.blocked {
+                    return Err(Error::new(ErrorKind::WouldBlock));
+                }
+                self.out.push(data[0]);
+                Ok(1)
+            }
+            fn flush(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let input: Vec<_> = (0..=255).collect();
+        let mut writer = BufWriter::new(
+            Drip {
+                out: Vec::new(),
+                blocked: false,
+            },
+            512,
+        );
+        writer.write_all(&input).unwrap();
+        for accepted in 1..input.len() {
+            assert_eq!(writer.flush().unwrap_err().kind, ErrorKind::WouldBlock);
+            assert_eq!(writer.buffered(), input.len() - accepted);
+            assert_eq!(writer.written(), accepted as u64);
+            // Previously every blocked flush shifted this entire tail.
+            assert_eq!(writer.buf, input);
+            assert_eq!(writer.get_ref().out, input[..accepted]);
+        }
+        writer.flush().unwrap();
+        assert_eq!(writer.get_ref().out, input);
+        assert_eq!(writer.buffered(), 0);
+    }
+
+    #[test]
+    fn write_counter_saturates_without_wrapping() {
+        let mut writer = BufWriter::new(VecWriter(Vec::new()), 8);
+        writer.written = u64::MAX - 1;
+        writer.write_all(b"abc").unwrap();
+        writer.flush().unwrap();
+        assert_eq!(writer.written(), u64::MAX);
+        assert_eq!(writer.get_ref().0, b"abc");
+    }
 
     #[test]
     fn zero_capacity_reader_does_not_report_false_eof() {

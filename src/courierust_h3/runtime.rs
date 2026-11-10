@@ -537,10 +537,13 @@ fn build_client_connection(
     if options.max_body == 0 {
         return Err(protocol("HTTP/3 max_body must be non-zero"));
     }
-    let socket = UdpSocket::bind(match addr {
-        SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
-        SocketAddr::V6(_) => SocketAddr::from(([0u16; 8], 0)),
-    })
+    let socket = crate::courierust_net::outbound::udp_bind(
+        match addr {
+            SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
+            SocketAddr::V6(_) => SocketAddr::from(([0u16; 8], 0)),
+        },
+        addr,
+    )
     .map_err(|e| io_error(e.to_string()))?;
     socket
         .set_nonblocking(true)
@@ -585,8 +588,6 @@ pub(crate) enum H3Cmd {
     Request {
         request: Request<Body>,
         reply: mpsc::Sender<Result<Response<Body>>>,
-        /// Per-request deadline override; `None` uses the connection's
-        /// configured timeout.
         timeout: Option<Duration>,
     },
     Shutdown,
@@ -2595,11 +2596,6 @@ impl ServerConnection {
                                 packet_keys_from_flight(flight.application_read)?,
                                 packet_keys_from_flight(flight.application_write)?,
                             );
-                            // Keep the TLS flight for incremental delivery:
-                            // a flight larger than the congestion window is
-                            // sent in pieces on successive ticks instead of
-                            // failing the handshake (see
-                            // `flush_pending_crypto`).
                             self.pending_initial = flight.initial;
                             self.pending_handshake = flight.handshake;
                             self.tls_ready = true;
@@ -2733,10 +2729,6 @@ impl ServerConnection {
         {
             Ok(()) => {}
             Err(error) if error.kind == ErrorKind::WouldBlock => {
-                // The peer has not ACKed enough in-flight handshake data
-                // to admit the control stream; on_tick retries. Trace it
-                // because a connection parked here holds the client's
-                // requests hostage until the SETTINGS gets out.
                 if std::env::var_os("COURIERUST_H3_TRACE").is_some() {
                     eprintln!(
                         "H3TRACE|server|control-deferred: cwnd={} unacked={}",
@@ -3472,10 +3464,6 @@ fn process_unidirectional_stream(
         };
         stream.frame_buf.drain(..used);
         stream.stream_type = Some(kind);
-        // RFC 9114 §6.2.3: unknown stream types — including the reserved
-        // 0x1f * N + 0x21 grease types, which compliant peers (e.g. the
-        // h3 crate) MAY open at any time — MUST be ignored, not rejected.
-        // We record the type so the `_` match arm below drains the stream.
     }
     let Some(kind) = stream.stream_type else {
         return Ok(None);
@@ -3494,9 +3482,6 @@ fn process_unidirectional_stream(
                     }
                     let peer_capacity =
                         validate_settings(&settings, limits.max_header_list, peer_max_header_list)?;
-                    // Enable the encoder table (emits the Set Capacity
-                    // instruction on the encoder stream) now that the
-                    // peer's limit is known.
                     qpack.set_peer_capacity(peer_capacity);
                     stream.control_started = true;
                     *control_received = true;
@@ -3707,16 +3692,10 @@ fn drain_request_frames(
     }
     if stream.reassembly.finished() && !stream.completed {
         if stream.blocked {
-            // The request ended while its headers were still blocked;
-            // cancel the section so the encoder does not wait on it.
             qpack.cancel_stream(stream.id);
             stream.completed = true;
             return Ok(());
         }
-        // A client's GOAWAY carries a Push ID, not a request stream ID
-        // (RFC 9114 §5.2), so it says nothing about which requests this
-        // server may accept. Refusing `stream.id > push_id` here would
-        // break every connection whose client greeted it with GOAWAY(0).
         if !*control_received {
             return Err(protocol("HTTP/3 request arrived before peer SETTINGS"));
         }
@@ -3766,16 +3745,6 @@ fn drain_response_frames(
                 match qpack.decode(stream.id, &block, max_header_list)? {
                     Some(fields) => {
                         if stream.headers.is_none() {
-                            // A first header block whose `:status` is
-                            // informational (100..=199) is an interim
-                            // response (RFC 9110 §15.2, e.g. 103 Early
-                            // Hints). It must not become the stream's
-                            // final headers: the real response arrives
-                            // in a later HEADERS block and would
-                            // otherwise be misread as trailers. Interim
-                            // responses carry no body, so the block is
-                            // simply skipped and the stream keeps
-                            // awaiting the final response.
                             let interim = fields.iter().any(|f| {
                                 f.name == ":status"
                                     && f.value.len() == 3
@@ -3916,10 +3885,6 @@ fn validate_content_length(headers: &HeaderMap, actual: usize) -> Result<()> {
 }
 
 fn validate_goaway_id(id: u64, previous: Option<u64>, client_side: bool) -> Result<()> {
-    // RFC 9114 §5.2/§7.2.6: a server's GOAWAY names a client-initiated
-    // bidirectional stream; a client's GOAWAY names a Push ID, which has
-    // no stream-id shape at all — requiring `id % 4 == 0` there would
-    // reject a compliant peer's push id 1.
     if client_side && id & 0x03 != 0 {
         return Err(protocol("HTTP/3 GOAWAY contains an invalid stream id"));
     }
@@ -4939,10 +4904,6 @@ impl QuicTransport {
             }
         }
         let adaptive_delay = self.current_ack_delay();
-        // Snapshotted before `self.spaces` is mutably borrowed for the
-        // frame loop: a MAX_STREAM_DATA must not shadow the transport
-        // parameter's initial limit with a smaller one, and the defaults
-        // are per direction (RFC 9000 §4.1).
         let server_side = self.server;
         let stream_data_defaults = (
             self.peer_max_stream_data_uni,
@@ -5252,7 +5213,6 @@ impl QuicTransport {
             let previous = self.sent_stream_data.get(&id).copied().unwrap_or(0);
             let newly_sent = end.saturating_sub(previous);
             if self.sent_data.saturating_add(newly_sent) > self.peer_max_data {
-                // Same for the connection-level window: wait for MAX_DATA.
                 return Err(Error::new(ErrorKind::WouldBlock));
             }
             self.sent_data = self.sent_data.saturating_add(newly_sent);
@@ -6482,7 +6442,6 @@ mod tests {
     fn malformed_version_negotiation_packet_is_dropped() {
         let local_cid = vec![0x44; 8];
         let mut conn = raw_client_connection(local_cid, vec![0x55; 8], vec![0x66; 8]);
-        // Long header, version 1, DCID length 0xff (> 20, invalid).
         let mut malformed = vec![0x80, 0x00, 0x00, 0x00, 0x01, 0xff, 0x11, 0x22, 0x33, 0x44];
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let source = socket.local_addr().unwrap();
@@ -6846,9 +6805,6 @@ mod tests {
 
     #[test]
     fn loopback_http3_connection_is_reused_across_requests() {
-        // The pool must multiplex sequential requests over one QUIC
-        // connection: after the handshake, response bodies arrive on
-        // fresh streams without a second handshake round.
         let identity = crate::courierust_tls::testdata::server_identity();
         let tls = TlsSettings {
             identity,

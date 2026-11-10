@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+pub mod outbound;
 pub(crate) mod poller;
 pub mod stats;
 pub(crate) mod udp;
@@ -49,8 +50,6 @@ impl Write for &TcpStream {
                     && (e.kind() == std::io::ErrorKind::TimedOut
                         || e.raw_os_error() == Some(997)) =>
             {
-                // Winsock cannot report how many bytes a timed-out blocking
-                // send accepted. IO_PENDING is not WSAEWOULDBLOCK either.
                 let _ = self.shutdown(std::net::Shutdown::Both);
                 Err(e.into())
             }
@@ -450,11 +449,7 @@ pub fn configure(stream: &TcpStream, read_timeout: Option<Duration>) -> Result<(
 
 /// Connect with an optional timeout.
 pub fn connect(addr: &std::net::SocketAddr, timeout: Option<Duration>) -> Result<TcpStream> {
-    let stream = match timeout {
-        Some(t) => TcpStream::connect_timeout(addr, t),
-        None => TcpStream::connect(addr),
-    }
-    .map_err(|e| Error::io(e.to_string()))?;
+    let stream = outbound::connect(addr, timeout).map_err(|e| Error::io(e.to_string()))?;
     stream
         .set_nodelay(true)
         .map_err(|e| Error::io(e.to_string()))?;

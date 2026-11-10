@@ -1,8 +1,8 @@
 //! WebSocket (RFC 6455) with `permessage-deflate` (RFC 7692), zero
 //! third-party dependencies. A `no_std + alloc` protocol core
 //! ([`frame`], [`utf8`], [`handshake`], [`session`]) plus thin `std`
-//! adapters in [`crate::courierust_server`] and
-//! [`crate::courierust_client`].
+//! adapters in `crate::courierust_server` and
+//! `crate::courierust_client`.
 //!
 //! What is unusual here:
 //!
