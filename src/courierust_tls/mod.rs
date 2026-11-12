@@ -1126,8 +1126,8 @@ impl TlsConnector {
     /// Perform a TLS handshake over `stream`, authenticating `hostname`
     /// against the server certificate. The negotiated version is chosen
     /// by the server within `min_version..=max_version`; a TLS 1.2
-    /// response to a client that offered TLS 1.3 is accepted only with
-    /// the RFC 8446 downgrade sentinel, and a TLS 1.3 response to a
+    /// response to a client that offered TLS 1.3 is rejected if it carries
+    /// either RFC 8446 downgrade sentinel, and a TLS 1.3 response to a
     /// client that did not offer TLS 1.3 is rejected.
     pub fn connect<R: crate::courierust_io::Read, W: crate::courierust_io::Write>(
         &self,
@@ -1458,6 +1458,7 @@ impl TlsAcceptor {
                 &self.config.identity,
                 &self.config.alpn,
                 &ch_body,
+                allow13,
             ) {
                 Ok(r) => r,
                 Err(e) => {
@@ -2326,23 +2327,16 @@ mod tests {
         server.join().unwrap();
     }
 
-    /// Downgrade protection (RFC 8446 §4.1.3): a client that offered
-    /// TLS 1.3 must reject a TLS 1.2 ServerHello without the downgrade
-    /// sentinel. The honest server (max_version = TLS 1.2) always adds
-    /// the sentinel, so this test drives a real server and then asserts
-    /// the sentinel was present by checking the client accepted the
-    /// negotiated TLS 1.2; the absence case is covered at the unit level
-    /// in `tls12.rs` (the sentinel bytes are asserted on the wire there).
+    /// A TLS 1.2-only server sends an ordinary random. A client offering
+    /// both TLS 1.2 and TLS 1.3 must accept it after certificate validation.
     #[test]
-    fn tls12_negotiated_with_sentinel_when_client_offers_13() {
+    fn tls13_capable_client_accepts_tls12_only_server() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            // Server refuses TLS 1.3 but accepts TLS 1.2; the client
-            // offered TLS 1.3, so the ServerHello must carry the
-            // sentinel (the client aborts otherwise).
+            // A server configured for TLS 1.2 only must not send a downgrade marker.
             let acceptor = TlsAcceptor::new(ServerConfig {
                 identity: testdata::rsa_server_identity(),
                 alpn: Vec::new(),

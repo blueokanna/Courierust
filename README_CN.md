@@ -356,7 +356,7 @@ fn main() {
 
 ```toml
 [dependencies]
-courierust = { version = "1.1.0", default-features = false }
+courierust = { version = "1.1", default-features = false }
 ```
 
 `--no-default-features` 构建只编译协议核心，可用于嵌入式 / 内核态。网络层需要 `std` feature（默认开启）。

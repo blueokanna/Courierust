@@ -384,7 +384,7 @@ The protocol core does not require `std`:
 
 ```toml
 [dependencies]
-courierust = { version = "1.1.0", default-features = false }
+courierust = { version = "1.1", default-features = false }
 ```
 
 Building with `--no-default-features` compiles only the protocol core, suitable for embedded / kernel contexts. The networking layer needs the `std` feature (the default).

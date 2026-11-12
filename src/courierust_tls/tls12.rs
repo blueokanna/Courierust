@@ -18,7 +18,7 @@
 //!   layer.
 //! * Version policy — the negotiated version is explicit, never
 //!   inferred. A client that offered TLS 1.3 and receives a TLS 1.2
-//!   ServerHello *without* the RFC 8446 §4.1.3 downgrade sentinel in the
+//!   ServerHello containing either RFC 8446 §4.1.3 downgrade sentinel in the
 //!   server random aborts (downgrade protection), and a TLS 1.2 client
 //!   that receives a TLS 1.3 ServerHello aborts (it never offered it).
 //! * No session resumption / session tickets on this path; every TLS 1.2
@@ -52,11 +52,11 @@ pub(crate) const HS_NEW_SESSION_TICKET: u8 = 4;
 /// TLS 1.2 record-layer version (also the ClientHello legacy_version).
 pub(crate) const VERSION_12: [u8; 2] = [0x03, 0x03];
 
-/// RFC 8446 §4.1.3 downgrade sentinel that a server MUST append to the
-/// last 8 bytes of `ServerHello.random` when it negotiates TLS 1.2 with
-/// a client that offered TLS 1.3; a conforming client MUST abort if the
-/// sentinel is absent in that situation.
+/// RFC 8446 §4.1.3 marker emitted by TLS 1.3-capable servers negotiating
+/// TLS 1.2. A client that offered TLS 1.3 MUST reject this marker or the
+/// TLS 1.1-and-below marker, since either indicates a version downgrade.
 pub(crate) const DOWNGRADE_SENTINEL_12: [u8; 8] = *b"DOWNGRD\x01";
+const DOWNGRADE_SENTINEL_11: [u8; 8] = *b"DOWNGRD\x00";
 
 /// Named curve `secp256r1` (RFC 8422 §5.1.1).
 pub(crate) const GROUP_SECP256R1: u16 = 0x0017;
@@ -439,8 +439,6 @@ pub(crate) fn open_record(
     aad.extend_from_slice(&seq.to_be_bytes());
     aad.push(content_type);
     aad.extend_from_slice(&header[1..3]);
-    // Same AAD rule as seal: length is the plaintext length, i.e. the
-    // wire record length minus the 8-byte explicit nonce and 16-byte tag.
     let wire_len = ((header[3] as usize) << 8) | header[4] as usize;
     let plaintext_len = wire_len.saturating_sub(8 + 16);
     aad.extend_from_slice(&(plaintext_len as u16).to_be_bytes());
@@ -510,9 +508,6 @@ pub(crate) struct ClientHello12 {
     pub(crate) signature_algorithms: Vec<u16>,
     pub(crate) server_name: Option<String>,
     pub(crate) alpn: Vec<Vec<u8>>,
-    /// Whether the client offered TLS 1.3 (supported_versions with
-    /// 0x0304); drives the server's downgrade sentinel.
-    pub(crate) offered_tls13: bool,
     /// Whether the client offered the RFC 5746 `renegotiation_info`
     /// extension. The server MUST echo it only if offered (§3.2).
     pub(crate) offered_renegotiation: bool,
@@ -560,7 +555,6 @@ pub(crate) fn parse_client_hello12(body: &[u8]) -> TlsResult<ClientHello12> {
     let mut signature_algorithms = Vec::new();
     let mut server_name = None;
     let mut alpn = Vec::new();
-    let mut offered_tls13 = false;
     let mut offered_renegotiation = false;
     if !c.done() {
         let ext_total =
@@ -669,13 +663,8 @@ pub(crate) fn parse_client_hello12(body: &[u8]) -> TlsResult<ClientHello12> {
                     let list = g
                         .take(list_len)
                         .ok_or_else(|| TlsError::Protocol("bad versions".into()))?;
-                    let mut lc = Cur::new(list);
-                    while !lc.done() {
-                        if let Some(v) = lc.u16() {
-                            if v == 0x0304 {
-                                offered_tls13 = true;
-                            }
-                        }
+                    if list.is_empty() || list.len() % 2 != 0 || !g.done() {
+                        return Err(TlsError::Protocol("bad versions".into()));
                     }
                 }
                 EXT_RENEGOTIATION_INFO => {
@@ -693,7 +682,6 @@ pub(crate) fn parse_client_hello12(body: &[u8]) -> TlsResult<ClientHello12> {
         signature_algorithms,
         server_name,
         alpn,
-        offered_tls13,
         offered_renegotiation,
     })
 }
@@ -701,7 +689,7 @@ pub(crate) fn parse_client_hello12(body: &[u8]) -> TlsResult<ClientHello12> {
 /// Build a TLS 1.2 ServerHello (no `supported_versions` extension). If
 /// `downgrade_sentinel` is set, the last 8 bytes of `random` are
 /// overwritten with the RFC 8446 §4.1.3 sentinel (server negotiating
-/// TLS 1.2 with a TLS 1.3-capable client). `alpn` carries the negotiated
+/// TLS 1.2 while also supporting TLS 1.3). `alpn` carries the negotiated
 /// protocol in an ALPN extension (RFC 7301), when one was selected.
 /// `renegotiation` echoes the RFC 5746 secure-renegotiation indicator
 /// (empty for a fresh handshake) — the server MUST include it only when
@@ -1173,10 +1161,11 @@ pub(crate) fn client_handshake<R: crate::courierust_io::Read, W: crate::courieru
         return Err(TlsError::Protocol("expected ServerHello".into()));
     }
     let sh = parse_server_hello12(&sh_body)?;
-    if offered_tls13 && !sh.random[24..].starts_with(&DOWNGRADE_SENTINEL_12) {
-        return Err(TlsError::Protocol(
-            "TLS 1.2 ServerHello missing downgrade sentinel".into(),
-        ));
+    if offered_tls13
+        && (sh.random[24..] == DOWNGRADE_SENTINEL_12 || sh.random[24..] == DOWNGRADE_SENTINEL_11)
+    {
+        let _ = io.write_plaintext_record_v(VERSION_12, CONTENT_ALERT, &[2, 47]);
+        return Err(TlsError::Protocol("TLS downgrade detected".into()));
     }
     let suite = Tls12Suite::from_wire(sh.suite_wire)
         .ok_or_else(|| TlsError::Protocol("server chose unsupported suite".into()))?;
@@ -1499,6 +1488,7 @@ pub(crate) fn server_handshake<R: crate::courierust_io::Read, W: crate::courieru
     identity: &super::Identity,
     alpn: &[Vec<u8>],
     ch_body: &[u8],
+    server_supports_tls13: bool,
 ) -> TlsResult<Tls12HandshakeResult> {
     let ch = parse_client_hello12(ch_body)?;
     let key_type = super::sign::identity_key_type(identity)?;
@@ -1552,14 +1542,14 @@ pub(crate) fn server_handshake<R: crate::courierust_io::Read, W: crate::courieru
     if !super::crypto::rng::fill_random(&mut s_random) {
         return Err(TlsError::Internal("RNG unavailable".into()));
     }
-    if ch.offered_tls13 {
+    if server_supports_tls13 {
         s_random[24..].copy_from_slice(&DOWNGRADE_SENTINEL_12);
     }
     let sh = build_server_hello12(
         s_random,
         &ch.session_id,
         suite,
-        ch.offered_tls13,
+        server_supports_tls13,
         negotiated_alpn.as_deref(),
         ch.offered_renegotiation,
     );
@@ -1798,7 +1788,7 @@ mod tests {
     }
 
     #[test]
-    fn downgrade_sentinel_present_when_offering_13() {
+    fn downgrade_sentinel_present_when_server_supports_13() {
         let random = [0u8; 32];
         let sh = build_server_hello12(
             random,
@@ -1827,6 +1817,44 @@ mod tests {
         c2.take(2).unwrap();
         let r2: &[u8] = c2.take(32).unwrap();
         assert!(!r2[24..].starts_with(&DOWNGRADE_SENTINEL_12));
+    }
+
+    #[test]
+    fn tls13_client_rejects_both_downgrade_markers_with_fatal_alert() {
+        use crate::courierust_io::{SliceReader, VecWriter};
+        for marker in [DOWNGRADE_SENTINEL_12, DOWNGRADE_SENTINEL_11] {
+            let mut random = [0x42; 32];
+            random[24..].copy_from_slice(&marker);
+            let hello = build_server_hello12(
+                random,
+                &[],
+                Tls12Suite::EcdheRsaAes128GcmSha256,
+                false,
+                None,
+                false,
+            );
+            let mut output = VecWriter(Vec::new());
+            let error = {
+                let mut io = super::super::TlsIo::new(SliceReader::new(&[]), &mut output);
+                client_handshake(
+                    &mut io,
+                    &super::super::RootStore::new(),
+                    0,
+                    true,
+                    Some("localhost"),
+                    &[],
+                    &[0; 32],
+                    &hello,
+                    true,
+                )
+                .err()
+                .expect("downgrade must fail before reading certificates")
+            };
+            assert!(
+                matches!(error, TlsError::Protocol(ref message) if message == "TLS downgrade detected")
+            );
+            assert_eq!(output.0, [CONTENT_ALERT, 3, 3, 0, 2, 2, 47]);
+        }
     }
 
     #[test]
