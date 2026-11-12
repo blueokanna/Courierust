@@ -497,7 +497,11 @@ pub(crate) fn build_client_hello_negotiated(
 
     if offer13 {
         let mut versions = Vec::new();
-        versions.extend_from_slice(&[0x02, 0x03, 0x04]);
+        if offer12 {
+            versions.extend_from_slice(&[0x04, 0x03, 0x04, 0x03, 0x03]);
+        } else {
+            versions.extend_from_slice(&[0x02, 0x03, 0x04]);
+        }
         exts.push((EXT_SUPPORTED_VERSIONS, versions));
 
         let mut ks = Vec::new();
@@ -636,7 +640,6 @@ pub(crate) fn client_hello_session_id(ch: &[u8]) -> TlsResult<Vec<u8>> {
     let body = ch
         .get(4..)
         .ok_or_else(|| TlsError::Protocol("bad CH".into()))?;
-    // legacy_version (2) || random (32) || session_id<1..32>
     let sid_len = *body
         .get(34)
         .ok_or_else(|| TlsError::Protocol("bad CH".into()))? as usize;
@@ -1482,9 +1485,6 @@ impl ServerHandshake {
         ee_body.extend_from_slice(&(ee_bytes.len() as u16).to_be_bytes());
         ee_body.extend_from_slice(&ee_bytes);
         let ee = encode_hs(HS_ENCRYPTED_EXTENSIONS, &ee_body);
-        // A resumed handshake authenticates with the PSK, so no
-        // CertificateRequest, Certificate or CertificateVerify
-        // (RFC 8446 §4.4.2, §4.3.2).
         let cr = if resumed {
             None
         } else {
@@ -2151,6 +2151,32 @@ mod tests {
                 count,
                 "duplicate extension for random byte {byte}"
             );
+        }
+    }
+
+    #[test]
+    fn supported_versions_matches_the_requested_version_window() {
+        for (offer13, offer12, expected) in [
+            (true, true, Some(vec![4, 3, 4, 3, 3])),
+            (true, false, Some(vec![2, 3, 4])),
+            (false, true, None),
+        ] {
+            let hello = build_client_hello_negotiated(
+                &[0x42; 32],
+                Some(&[0x77; 32]),
+                &[],
+                Some("localhost"),
+                None,
+                offer13,
+                offer12,
+                None,
+            );
+            let message = parse_hs(&hello).unwrap();
+            let versions = extensions(message.body)
+                .into_iter()
+                .find(|(id, _)| *id == EXT_SUPPORTED_VERSIONS)
+                .map(|(_, bytes)| bytes.to_vec());
+            assert_eq!(versions, expected);
         }
     }
 

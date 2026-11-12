@@ -801,9 +801,14 @@ pub(crate) fn build_server_key_exchange(
     encode_hs(HS_SERVER_KEY_EXCHANGE, &body)
 }
 
+enum EcdhePoint12 {
+    P256([u8; 65]),
+    X25519([u8; 32]),
+}
+
 /// Parsed ECDHE `ServerKeyExchange` data.
 pub(crate) struct ServerKeyExchange12 {
-    pub(crate) point: [u8; 65],
+    point: EcdhePoint12,
     pub(crate) params: Vec<u8>,
     pub(crate) hash_alg: u8,
     pub(crate) sig_alg: u8,
@@ -819,18 +824,30 @@ pub(crate) fn parse_server_key_exchange(body: &[u8]) -> TlsResult<ServerKeyExcha
     let group = c
         .u16()
         .ok_or_else(|| TlsError::Protocol("bad SKE".into()))?;
-    if group != GROUP_SECP256R1 {
-        return Err(TlsError::Protocol("unsupported SKE named curve".into()));
-    }
+    let expected_len = match group {
+        GROUP_SECP256R1 => 65,
+        super::handshake::GROUP_X25519 => 32,
+        _ => return Err(TlsError::Protocol("unsupported SKE named curve".into())),
+    };
     let point_len = c.u8().ok_or_else(|| TlsError::Protocol("bad SKE".into()))? as usize;
-    if point_len != 65 {
+    if point_len != expected_len {
         return Err(TlsError::Protocol("bad SKE point length".into()));
     }
     let point_bytes = c
         .take(point_len)
         .ok_or_else(|| TlsError::Protocol("bad SKE".into()))?;
-    let mut point = [0u8; 65];
-    point.copy_from_slice(point_bytes);
+    let point = if group == GROUP_SECP256R1 {
+        let mut point = [0; 65];
+        point.copy_from_slice(point_bytes);
+        if point[0] != 4 {
+            return Err(TlsError::Protocol("bad SKE point encoding".into()));
+        }
+        EcdhePoint12::P256(point)
+    } else {
+        let mut point = [0; 32];
+        point.copy_from_slice(point_bytes);
+        EcdhePoint12::X25519(point)
+    };
     let params = body[..body.len() - c.rest().len()].to_vec();
     let hash_alg = c
         .u8()
@@ -867,7 +884,7 @@ pub(crate) fn build_server_hello_done() -> Vec<u8> {
 
 /// Build the client's ECDHE `ClientKeyExchange` (RFC 8422 §5.7): the
 /// public point is `opaque point<1..2^8-1>` (1-byte length prefix).
-pub(crate) fn build_client_key_exchange(point: &[u8; 65]) -> Vec<u8> {
+pub(crate) fn build_client_key_exchange(point: &[u8]) -> Vec<u8> {
     let mut body = Vec::with_capacity(1 + point.len());
     body.push(point.len() as u8);
     body.extend_from_slice(point);
@@ -1137,6 +1154,32 @@ fn verify_server_key_exchange(
     }
 }
 
+fn generate_client_key_exchange(point: &EcdhePoint12) -> TlsResult<(Vec<u8>, [u8; 32])> {
+    match point {
+        EcdhePoint12::P256(peer) => {
+            let (secret, public) = super::crypto::ecdsa::ecdhe_generate(None)
+                .ok_or_else(|| TlsError::Internal("ECDHE key generation failed".into()))?;
+            let shared =
+                super::crypto::ecdsa::ecdhe_shared(&secret, peer).ok_or(TlsError::Alert {
+                    level: 2,
+                    description: 40,
+                })?;
+            Ok((build_client_key_exchange(&public), shared))
+        }
+        EcdhePoint12::X25519(peer) => {
+            use super::crypto::x25519::{x25519, BASE_POINT};
+            let mut secret = [0; 32];
+            if !super::crypto::rng::fill_random(&mut secret) {
+                return Err(TlsError::Internal("RNG unavailable".into()));
+            }
+            let public = x25519(&secret, &BASE_POINT);
+            let shared = x25519(&secret, peer);
+            super::handshake::validate_shared_secret(&shared)?;
+            Ok((build_client_key_exchange(&public), shared))
+        }
+    }
+}
+
 /// Run the TLS 1.2 client handshake. `ch` is the full ClientHello that
 /// was already sent (needed for the transcript); `first_record` is the
 /// raw payload of the first plaintext handshake record already read
@@ -1209,14 +1252,7 @@ pub(crate) fn client_handshake<R: crate::courierust_io::Read, W: crate::courieru
 
     verify_server_key_exchange(&ske, &spki, client_random, &sh.random)?;
 
-    let (client_priv, client_point) = super::crypto::ecdsa::ecdhe_generate(None)
-        .ok_or_else(|| TlsError::Internal("ECDHE key generation failed".into()))?;
-    let cke = build_client_key_exchange(&client_point);
-    let shared =
-        super::crypto::ecdsa::ecdhe_shared(&client_priv, &ske.point).ok_or(TlsError::Alert {
-            level: 2,
-            description: 40, // handshake_failure
-        })?;
+    let (cke, shared) = generate_client_key_exchange(&ske.point)?;
 
     let mut transcript = Tls12Transcript::new(suite.hash());
     transcript.update(ch);
@@ -1393,8 +1429,6 @@ fn parse_server_hello12(body: &[u8]) -> TlsResult<ServerHello12> {
                         "invalid extended_master_secret extension".into(),
                     ));
                 }
-                // RFC 7627 §5.2: the echo is what puts the handshake into
-                // extended mode; absence means the classic derivation.
                 extended_master_secret = true;
             }
             if ext_type == EXT_ALPN {
@@ -1919,6 +1953,69 @@ mod tests {
             let len = e2.u16().unwrap() as usize;
             let _ = e2.take(len).unwrap();
             assert_ne!(t, EXT_RENEGOTIATION_INFO, "must not echo when not offered");
+        }
+    }
+
+    #[test]
+    fn tls12_x25519_exchange_and_low_order_rejection() {
+        use super::super::crypto::x25519::{x25519, BASE_POINT};
+        let secret = [0x42; 32];
+        let public = x25519(&secret, &BASE_POINT);
+        let (cke, shared) = generate_client_key_exchange(&EcdhePoint12::X25519(public)).unwrap();
+        assert_eq!(&cke[..5], &[HS_CLIENT_KEY_EXCHANGE, 0, 0, 33, 32]);
+        let mut client_public = [0; 32];
+        client_public.copy_from_slice(&cke[5..]);
+        assert_eq!(shared, x25519(&secret, &client_public));
+        assert!(generate_client_key_exchange(&EcdhePoint12::X25519([0; 32])).is_err());
+    }
+
+    #[test]
+    fn server_marker_depends_on_server_version_support() {
+        use crate::courierust_io::{SliceReader, VecWriter};
+        let hello = super::super::handshake::build_client_hello_negotiated(
+            &[0x42; 32],
+            None,
+            &[],
+            Some("localhost"),
+            None,
+            false,
+            true,
+            None,
+        );
+        for supports_tls13 in [false, true] {
+            let mut output = VecWriter(Vec::new());
+            {
+                let mut io = super::super::TlsIo::new(SliceReader::new(&[]), &mut output);
+                assert!(server_handshake(
+                    &mut io,
+                    &super::super::testdata::rsa_server_identity(),
+                    &[],
+                    &hello[4..],
+                    supports_tls13,
+                )
+                .is_err()); // The synthetic client stops after ClientHello.
+            }
+            assert_eq!(output.0[0], CONTENT_HANDSHAKE);
+            let record_len = u16::from_be_bytes([output.0[3], output.0[4]]) as usize;
+            let server_hello = parse_server_hello12(&output.0[9..5 + record_len]).unwrap();
+            assert_eq!(
+                server_hello.random[24..] == DOWNGRADE_SENTINEL_12,
+                supports_tls13
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_version_vector_is_rejected() {
+        for versions in [&[0][..], &[1, 3], &[2, 3, 4, 0], &[2, 3]] {
+            let mut body = vec![3, 3];
+            body.extend_from_slice(&[0; 32]);
+            body.extend_from_slice(&[0, 0, 2, 0xc0, 0x2f, 1, 0]);
+            body.extend_from_slice(&((4 + versions.len()) as u16).to_be_bytes());
+            body.extend_from_slice(&EXT_SUPPORTED_VERSIONS.to_be_bytes());
+            body.extend_from_slice(&(versions.len() as u16).to_be_bytes());
+            body.extend_from_slice(versions);
+            assert!(parse_client_hello12(&body).is_err());
         }
     }
 

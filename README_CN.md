@@ -316,10 +316,12 @@ RSA-PKCS#1 v1.5 / ECDSA P-256 / P-384 / Ed25519 证书签名；完整的 X.509
 
 **版本窗口完全可配置。** 客户端与服务端的 `TlsSettings::min_version` /
 `max_version`（默认 `Tls12..=Tls13`）控制提供与协商的范围。两端都钉到
-`Tls13` 即恢复纯 TLS 1.3 策略；接受过 TLS 1.3 客户端的 TLS 1.2 服务器
-仍会把 RFC 8446 §4.1.3 降级哨兵写进 ServerHello 随机数，使客户端能检测
-到降级；纯 TLS 1.3 客户端遇到 TLS 1.2 ServerHello 会拒绝且绝不静默降
-级。从不提供 0-RTT / early data；TLS 1.3 会话恢复走标准 1-RTT PSK
+`Tls13` 即恢复纯 TLS 1.3 策略。支持 TLS 1.3 的服务端协商 TLS 1.2 时，
+必须在 ServerHello.random 中写入 RFC 8446 §4.1.3 降级标记；仅支持 TLS 1.2
+的服务端不写入该标记。提供 TLS 1.3 的客户端会拒绝两种降级标记，但在版本
+策略允许、证书验证通过时接受正常的 TLS 1.2 服务端。纯 TLS 1.3 客户端会
+拒绝 TLS 1.2 ServerHello。
+从不提供 0-RTT / early data；TLS 1.3 会话恢复走标准 1-RTT PSK
 路径（服务端签发 session ticket，`psk_dhe_ke`）。QUIC 必须协商 ALPN `h3`；HTTPS
 的 ALPN 必须是 `h2` 或 `http/1.1`。
 `cargo run --example https` 可跑一个自签名证书的端到端示例；`cargo run --example h3` 是 HTTP/3（QUIC v1 + TLS 1.3）端到端示例（冷连接 vs 池化复用、大响应流控、并发多路复用、证书拒绝）；`cargo run --example grpc_streaming` 演示 gRPC 服务端流/客户端流/双向流、deadline、gzip 压缩协商与元数据/拦截器；`cargo run --example ws_echo` / `cargo run --example ws_client` 则是 WebSocket 的服务端+客户端组合与生产级客户端配置。

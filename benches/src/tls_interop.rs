@@ -1,8 +1,8 @@
 //! TLS version window: `COURIERUST_TLS_MIN_VERSION` /
 //! `COURIERUST_TLS_MAX_VERSION` (e.g. `TLSv1.2`) pin the ClientHello. A
-//! TLS 1.2-only peer (OpenSSL `s_server -tls1_2`, nginx with
-//! `ssl_protocols TLSv1.2`) MUST NOT see a `supported_versions` extension
-//! advertising TLS 1.3 — OpenSSL rejects such a ClientHello outright.
+//! TLS 1.2-only peer (OpenSSL `s_server -tls1_2`) accepts a dual-version
+//! ClientHello when supported_versions advertises both 0x0304 and 0x0303.
+//! Keep the default version window in the interoperability test to cover fallback.
 //! The mirror direction (a Courierust TLS server validated by curl /
 //! openssl s_client) reuses the `network` server mode.
 

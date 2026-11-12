@@ -332,10 +332,12 @@ store).
 **The version window is fully configurable.** `TlsSettings::min_version`
 / `max_version` on both client and server (default `Tls12..=Tls13`)
 control what is offered and negotiated. Pinning both to `Tls13` restores
-a TLS 1.3-only policy; a TLS 1.2 server that accepted a TLS
-1.3-capable client still writes the RFC 8446 §4.1.3 downgrade sentinel
-into its ServerHello random so the client can detect the downgrade, and
-a TLS 1.3-only client refuses a TLS 1.2 ServerHello with no silent
+a TLS 1.3-only policy. When a TLS 1.3-capable server negotiates TLS 1.2,
+it writes the RFC 8446 §4.1.3 downgrade marker into ServerHello.random;
+a TLS 1.2-only server does not. Clients that offered TLS 1.3 reject either
+downgrade marker, while accepting an authenticated TLS 1.2-only peer
+when their version policy permits it. A TLS 1.3-only client refuses a
+TLS 1.2 ServerHello with no silent
 protocol downgrade. 0-RTT / early data are never offered; TLS 1.3
 session resumption uses the standard 1-RTT PSK path (server-issued
 session tickets with `psk_dhe_ke`).
